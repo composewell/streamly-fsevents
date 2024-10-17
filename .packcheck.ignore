@@ -1,0 +1,6 @@
+.github/workflows/haskell.yml
+.gitignore
+.packcheck.ignore
+cabal.project
+stack.yaml
+.hlint.yaml
