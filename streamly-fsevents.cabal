@@ -235,16 +235,17 @@ library
 
     build-depends:
                        base              >= 4.12  && < 4.21
-                     , containers        >= 0.6.0 && < 0.8
                      , streamly-core     == 0.3.0
 
 
     -- For FileSystem.Event module
     if os(linux)
       build-depends: directory >= 1.2.2 && < 1.4
+                   , containers >= 0.6.0 && < 0.8
 
     if os(windows)
       build-depends: Win32 >= 2.6 && < 2.14
+                   , streamly == 0.11.0
 
     if os(darwin)
       build-depends: directory >= 1.2.2 && < 1.4

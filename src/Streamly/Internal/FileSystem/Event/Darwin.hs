@@ -164,7 +164,6 @@ import Control.Concurrent (MVar, newMVar, takeMVar, putMVar)
 import Control.Monad (when)
 import Control.Monad.Cont (runCont, cont)
 import Data.Bits ((.|.), (.&.), complement)
-import Data.Functor.Identity (runIdentity)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Word (Word8, Word32, Word64)
 import Foreign.C.Types (CInt(..), CDouble(..), CSize(..), CUChar(..))
@@ -176,15 +175,15 @@ import GHC.IO.Handle.FD (fdToHandle)
 import Streamly.Internal.Data.Stream (Stream)
 import Streamly.Internal.Data.Parser (Parser)
 import Streamly.Internal.Data.Array (Array(..))
+import Streamly.Internal.FileSystem.Path (Path)
 import System.IO (Handle, hClose)
 
 import qualified Data.List.NonEmpty as NonEmpty
-import qualified Streamly.Data.Fold as FL
 import qualified Streamly.Internal.Data.Parser as PR
 import qualified Streamly.Internal.Data.Stream as S
-import qualified Streamly.Internal.Unicode.Stream as U
 import qualified Streamly.Internal.FileSystem.Handle as FH
 import qualified Streamly.Internal.Data.Array as A
+import qualified Streamly.Internal.FileSystem.Path as Path
 
 -------------------------------------------------------------------------------
 -- Utils
@@ -448,7 +447,7 @@ data Watch = Watch Handle (Ptr CWatch) (MVar Bool)
 --
 -- /Pre-release/
 --
-openWatch :: Config -> NonEmpty (Array Word8) -> IO Watch
+openWatch :: Config -> NonEmpty Path -> IO Watch
 openWatch Config{..} paths = do
     -- XXX write a test case when path does not exist
     -- XXX write a test case when there are no permissions
@@ -473,9 +472,9 @@ openWatch Config{..} paths = do
 
     where
 
-    withPathName :: Array Word8 -> (PathName -> IO a) -> IO a
-    withPathName arr act = do
-        A.unsafePinnedAsPtr arr $ \ptr byteLen ->
+    withPathName :: Path -> (PathName -> IO a) -> IO a
+    withPathName path act = do
+        A.unsafePinnedAsPtr (Path.toChunk path) $ \ptr byteLen ->
             let pname = PathName (castPtr ptr) (fromIntegral byteLen)
             in act pname
 
@@ -504,8 +503,8 @@ closeWatch (Watch h watchPtr mvar) = do
 data Event = Event
    { eventId :: Word64
    , eventFlags :: Word32
-   , eventAbsPath :: Array Word8
-   } deriving (Show, Ord, Eq)
+   , eventAbsPath :: Path
+   }
 
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
@@ -524,7 +523,7 @@ readOneEvent = do
     return $ Event
         { eventId = eid
         , eventFlags = fromIntegral eflags
-        , eventAbsPath = path
+        , eventAbsPath = Path.unsafeFromChunk path
         }
 
 watchToStream :: Watch -> Stream IO Event
@@ -583,7 +582,7 @@ watchToStream (Watch handle _ _) =
 -- /Pre-release/
 --
 watchWith ::
-    (Config -> Config) -> NonEmpty (Array Word8) -> Stream IO Event
+    (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before after watchToStream
 
     where
@@ -595,14 +594,14 @@ watchWith f paths = S.bracketIO before after watchToStream
 --
 -- >>> watchRecursive = watchWith id
 --
-watchRecursive :: NonEmpty (Array Word8) -> Stream IO Event
+watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = watchWith id
 
 -- | Same as 'watchWith' using defaultConfig and non-recursive mode.
 --
 -- /Unimplemented/
 --
-watch :: NonEmpty (Array Word8) -> Stream IO Event
+watch :: NonEmpty Path -> Stream IO Event
 watch _paths = undefined
 
 -------------------------------------------------------------------------------
@@ -641,7 +640,7 @@ isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 --
 -- /Pre-release/
 --
-getAbsPath :: Event -> Array Word8
+getAbsPath :: Event -> Path
 getAbsPath Event{..} = eventAbsPath
 
 -------------------------------------------------------------------------------
@@ -1060,7 +1059,7 @@ isLastHardLink = getFlag kFSEventStreamEventFlagItemIsLastHardlink
 -- | Convert an 'Event' record to a String representation.
 showEvent :: Event -> String
 showEvent ev@Event{..} =
-    let path = runIdentity $ S.fold FL.toList $ U.decodeUtf8' $ A.read eventAbsPath
+    let path = Path.toString eventAbsPath
     in "--------------------------"
         ++ "\nId = " ++ show eventId
         ++ "\nPath = " ++ show path
