@@ -162,6 +162,7 @@ where
 
 import Control.Concurrent (MVar, newMVar, takeMVar, putMVar)
 import Control.Monad (when)
+import Control.Monad.Cont (runCont, cont)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Functor.Identity (runIdentity)
 import Data.List.NonEmpty (NonEmpty)
@@ -173,7 +174,6 @@ import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable(..))
 import GHC.IO.Handle.FD (fdToHandle)
 import Streamly.Internal.Data.Stream (Stream)
-import Streamly.Internal.Data.Cont (contListMap)
 import Streamly.Internal.Data.Parser (Parser)
 import Streamly.Internal.Data.Array (Array(..))
 import System.IO (Handle, hClose)
@@ -185,6 +185,30 @@ import qualified Streamly.Internal.Data.Stream as S
 import qualified Streamly.Internal.Unicode.Stream as U
 import qualified Streamly.Internal.FileSystem.Handle as FH
 import qualified Streamly.Internal.Data.Array as A
+
+-------------------------------------------------------------------------------
+-- Utils
+-------------------------------------------------------------------------------
+
+-- | Given a continuation based transformation from @a@ to @b@ and a
+-- continuation based transformation from @[b]@ to @c@, make continuation based
+-- transformation from @[a]@ to @c@.
+--
+-- /Pre-release/
+
+-- You can read the definition as:
+--
+-- > contListMap f g = \xs final ->
+--
+contListMap ::
+       (a -> (b -> r) -> r)      -- transform a -> b
+    -> ([b] -> (c -> r) -> r)    -- transform [b] -> c
+    -> ([a] -> (c -> r) -> r)    -- transform [a] -> c
+contListMap f g xs final =
+    let bconts = fmap (cont . f) xs  -- [Cont b]
+        blistCont = sequence bconts  -- Cont [b]
+        k ys = g ys final            -- [b] -> r
+     in runCont blistCont k          -- r
 
 -------------------------------------------------------------------------------
 -- Subscription to events
