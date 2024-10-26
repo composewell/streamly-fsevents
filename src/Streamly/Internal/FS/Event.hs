@@ -1,5 +1,5 @@
 -- |
--- Module      : Streamly.FileSystem.Event
+-- Module      : Streamly.FS.Event
 -- Copyright   : (c) 2020 Composewell Technologies
 -- License     : BSD-3-Clause
 -- Maintainer  : streamly@composewell.com
@@ -16,14 +16,14 @@
 --
 -- For platform specific APIs please see the following modules:
 --
--- * "Streamly.Internal.FileSystem.Event.Darwin"
--- * "Streamly.Internal.FileSystem.Event.Linux"
--- * "Streamly.Internal.FileSystem.Event.Windows"
+-- * "Streamly.Internal.FS.Event.Darwin"
+-- * "Streamly.Internal.FS.Event.Linux"
+-- * "Streamly.Internal.FS.Event.Windows"
 
 -- XXX Need to ensure that the signatures of the exported APIs are same on all
 -- platforms.
 
-module Streamly.Internal.FileSystem.Event
+module Streamly.Internal.FS.Event
     (
     -- * Creating a Watch
 
@@ -53,14 +53,14 @@ import Streamly.Data.Stream (Stream)
 import Streamly.FileSystem.Path (Path)
 
 #if defined(CABAL_OS_DARWIN)
-import Streamly.Internal.FileSystem.Event.Darwin (Event)
-import qualified Streamly.Internal.FileSystem.Event.Darwin as Event
+import Streamly.Internal.FS.Event.Darwin (Event)
+import qualified Streamly.Internal.FS.Event.Darwin as Event
 #elif defined(CABAL_OS_LINUX)
-import Streamly.Internal.FileSystem.Event.Linux (Event)
-import qualified Streamly.Internal.FileSystem.Event.Linux as Event
+import Streamly.Internal.FS.Event.Linux (Event)
+import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
-import Streamly.Internal.FileSystem.Event.Windows (Event)
-import qualified Streamly.Internal.FileSystem.Event.Windows as Event
+import Streamly.Internal.FS.Event.Windows (Event)
+import qualified Streamly.Internal.FS.Event.Windows as Event
 #else
 #error "FS Events not supported on this platform"
 #endif

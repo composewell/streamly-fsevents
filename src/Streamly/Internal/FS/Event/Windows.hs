@@ -2,7 +2,7 @@
 -- http://hackage.haskell.org/package/fsnotify-0.3.0.1/
 --
 -- |
--- Module      : Streamly.Internal.FileSystem.Event.Windows
+-- Module      : Streamly.Internal.FS.Event.Windows
 -- Copyright   : (c) 2020 Composewell Technologies
 --               (c) 2012, Mark Dittmer
 -- License     : BSD-3-Clause
@@ -42,7 +42,7 @@
 -- * Minimum supported client: Windows XP [desktop apps | UWP apps]
 -- * Minimum supported server: Windows Server 2003 [desktop apps | UWP apps
 
-module Streamly.Internal.FileSystem.Event.Windows
+module Streamly.Internal.FS.Event.Windows
     (
     -- * Subscribing to events
 

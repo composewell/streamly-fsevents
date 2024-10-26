@@ -1,5 +1,5 @@
 -- |
--- Module      : Streamly.Internal.FileSystem.Event.Linux
+-- Module      : Streamly.Internal.FS.Event.Linux
 -- Copyright   : (c) 2020 Composewell Technologies
 -- License     : BSD-3-Clause
 -- Maintainer  : streamly@composewell.com
@@ -58,7 +58,7 @@
 #include "config.h"
 
 #if HAVE_DECL_IN_EXCL_UNLINK
-module Streamly.Internal.FileSystem.Event.Linux
+module Streamly.Internal.FS.Event.Linux
     (
     -- * Subscribing to events
 
@@ -1272,6 +1272,6 @@ showEvent ev@Event{..} =
 
         where showev f str = if f ev then "\n" ++ str else ""
 #else
-#warning "Disabling module Streamly.Internal.FileSystem.Event.Linux. Does not support kernels older than 2.6.36."
-module Streamly.Internal.FileSystem.Event.Linux () where
+#warning "Disabling module Streamly.Internal.FS.Event.Linux. Does not support kernels older than 2.6.36."
+module Streamly.Internal.FS.Event.Linux () where
 #endif

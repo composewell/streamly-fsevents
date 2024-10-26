@@ -12,7 +12,7 @@
 #include <CoreServices/CoreServices.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <FileSystem/Event/Darwin.h>
+#include <FS/Event/Darwin.h>
 
 /*
  * For reference documentaion see:
