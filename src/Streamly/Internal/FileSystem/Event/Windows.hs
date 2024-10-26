@@ -91,11 +91,9 @@ where
 
 import Data.Bits ((.|.), (.&.), complement)
 import Data.List.NonEmpty (NonEmpty)
-import Foreign.C.String (peekCWStringLen)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Storable (peekByteOff)
 import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr)
-import System.IO.Unsafe (unsafePerformIO)
 import System.Win32.File
     ( FileNotificationFlag
     , LPOVERLAPPED
@@ -123,6 +121,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Stream.Prelude as S
+import qualified Streamly.Internal.Data.Array as Array
 import qualified Streamly.Internal.FileSystem.Path as Path
 
 -- | Watch configuration, used to specify the events of interest and the
@@ -279,10 +278,10 @@ getConfigRecMode Config{..} = watchRec
 
 data Event = Event
     { eventFlags :: DWORD
-    , eventRelPath :: String
-    , eventRootPath :: String
+    , eventRelPath :: Path
+    , eventRootPath :: Path
     , totalBytes :: DWORD
-    } deriving (Show, Ord, Eq)
+    }
 
 -- For reference documentation see:
 --
@@ -290,16 +289,17 @@ data Event = Event
 data FILE_NOTIFY_INFORMATION = FILE_NOTIFY_INFORMATION
     { fniNextEntryOffset :: DWORD
     , fniAction :: DWORD
-    , fniFileName :: String
-    } deriving Show
+    , fniFileName :: Path
+    }
 
 type LPOVERLAPPED_COMPLETION_ROUTINE =
     FunPtr ((DWORD, DWORD, LPOVERLAPPED) -> IO ())
 
 -- | A handle for a watch.
-getWatchHandle :: FilePath -> IO (HANDLE, FilePath)
+getWatchHandle :: Path -> IO (HANDLE, Path)
 getWatchHandle dir = do
-    h <- createFile dir
+    let dirStr = Path.toString dir
+    h <- createFile dirStr
         -- Access mode
         fILE_LIST_DIRECTORY
         -- Share mode
@@ -349,18 +349,13 @@ peekFNI :: Ptr FILE_NOTIFY_INFORMATION -> IO FILE_NOTIFY_INFORMATION
 peekFNI buf = do
     neof <- peekByteOff buf 0
     acti <- peekByteOff buf 4
-    fnle <- peekByteOff buf 8
-    -- Note: The path is UTF-16 encoded C WChars, peekCWStringLen converts
-    -- UTF-16 to UTF-32 Char String
-    fnam <- peekCWStringLen
-        -- start of array
-        (buf `plusPtr` 12,
-        -- fnle is the length in *bytes*, and a WCHAR is 2 bytes
-        fromEnum (fnle :: DWORD) `div` 2)
+    (fnle :: DWORD) <- peekByteOff buf 8
+    fnam0 <- Array.fromPtrN (fromIntegral fnle) (buf `plusPtr` 12)
+    fnam <- Path.fromChunk fnam0
     return $ FILE_NOTIFY_INFORMATION neof acti fnam
 
 readChangeEvents ::
-    Ptr FILE_NOTIFY_INFORMATION -> String -> DWORD -> IO [Event]
+    Ptr FILE_NOTIFY_INFORMATION -> Path -> DWORD -> IO [Event]
 readChangeEvents pfni root bytesRet = do
     fni <- peekFNI pfni
     let entry = Event
@@ -377,7 +372,7 @@ readChangeEvents pfni root bytesRet = do
     return $ entry : entries
 
 readDirectoryChanges ::
-    String -> HANDLE -> Bool -> FileNotificationFlag -> IO [Event]
+    Path -> HANDLE -> Bool -> FileNotificationFlag -> IO [Event]
 readDirectoryChanges root h wst mask = do
     let maxBuf = 63 * 1024
     allocaBytes maxBuf $ \buffer -> do
@@ -404,7 +399,7 @@ fILE_ACTION_RENAMED_OLD_NAME  =  4
 fILE_ACTION_RENAMED_NEW_NAME  :: FileAction
 fILE_ACTION_RENAMED_NEW_NAME  =  5
 
-eventStreamAggr :: (HANDLE, FilePath, Config) -> Stream IO Event
+eventStreamAggr :: (HANDLE, Path, Config) -> Stream IO Event
 eventStreamAggr (handle, rootPath, cfg) =  do
     let recMode = getConfigRecMode cfg
         flagMasks = getConfigFlag cfg
@@ -413,7 +408,7 @@ eventStreamAggr (handle, rootPath, cfg) =  do
         $ readDirectoryChanges rootPath handle recMode flagMasks
 
 pathsToHandles ::
-    NonEmpty FilePath -> Config -> Stream IO (HANDLE, FilePath, Config)
+    NonEmpty Path -> Config -> Stream IO (HANDLE, Path, Config)
 pathsToHandles paths cfg = do
     let pathStream = S.fromList (NonEmpty.toList paths)
         st2 = S.mapM getWatchHandle pathStream
@@ -425,7 +420,7 @@ pathsToHandles paths cfg = do
 
 -- | Close a Directory handle.
 --
-closePathHandleStream :: Stream IO (HANDLE, FilePath, Config) -> IO ()
+closePathHandleStream :: Stream IO (HANDLE, Path, Config) -> IO ()
 closePathHandleStream =
     let f (h, _, _) = closeHandle h
         in S.fold (Fold.drainMapM f)
@@ -467,10 +462,7 @@ watchWith f paths =
 
     where
 
-    before =
-        return
-            $ pathsToHandles (NonEmpty.map Path.toString paths)
-            $ f defaultConfig
+    before = return $ pathsToHandles paths $ f defaultConfig
     after = closePathHandleStream
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
@@ -500,14 +492,14 @@ getFlag mask Event{..} = eventFlags == mask
 -- /Pre-release/
 --
 getRelPath :: Event -> Path
-getRelPath Event{..} = unsafePerformIO $ Path.fromString eventRelPath
+getRelPath Event{..} = eventRelPath
 
 -- | Get the watch root directory to which this event belongs.
 --
 -- /Pre-release/
 --
 getRoot :: Event -> Path
-getRoot Event{..} = unsafePerformIO $ Path.fromString eventRootPath
+getRoot Event{..} = eventRootPath
 
 -- | Get the absolute file system object path for which the event is generated.
 --
