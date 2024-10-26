@@ -1,5 +1,5 @@
 -- |
--- Module      : Streamly.Internal.FileSystem.Event.Darwin
+-- Module      : Streamly.Internal.FS.Event.Darwin
 -- Copyright   : (c) 2020 Composewell Technologies
 -- License     : BSD-3-Clause
 -- Maintainer  : streamly@composewell.com
@@ -86,7 +86,7 @@
 -- macOS 10.7+
 #if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFILEEVENTS
 
-module Streamly.Internal.FileSystem.Event.Darwin
+module Streamly.Internal.FS.Event.Darwin
     (
     -- * Creating a Watch
 
@@ -231,7 +231,7 @@ data Config = Config
 -------------------------------------------------------------------------------
 
 foreign import ccall safe
-    "FileSystem/Event/Darwin.h FSEventStreamCreateFlagNoDefer"
+    "FS/Event/Darwin.h FSEventStreamCreateFlagNoDefer"
     kFSEventStreamCreateFlagNoDefer :: Word32
 
 -- | Determines how multiple events are batched or throttled.
@@ -394,11 +394,11 @@ defaultConfig = setFileEvents True $ Config
 -- Open an event stream (C FFI)
 -------------------------------------------------------------------------------
 
--- See FileSystem/Event/Darwin.h
+-- See FS/Event/Darwin.h
 
 data CWatch
 
--- Representation of "struct pathName" in "FileSystem/Event/Darwin.h"
+-- Representation of "struct pathName" in "FS/Event/Darwin.h"
 data PathName = PathName
     { pathBytes :: Ptr CUChar
     , pathLen :: CSize
@@ -415,7 +415,7 @@ instance Storable PathName where
         pokeByteOff ptr 0 pathBytes
         pokeByteOff ptr (sizeOf (undefined :: Ptr CUChar)) pathLen
 
-foreign import ccall safe "FileSystem/Event/Darwin.h createWatch" createWatch
+foreign import ccall safe "FS/Event/Darwin.h createWatch" createWatch
     :: Ptr PathName
     -> CInt
     -> Word32
@@ -425,7 +425,7 @@ foreign import ccall safe "FileSystem/Event/Darwin.h createWatch" createWatch
     -> Ptr (Ptr CWatch)
     -> IO CInt
 
-foreign import ccall safe "FileSystem/Event/Darwin.h destroyWatch" destroyWatch
+foreign import ccall safe "FS/Event/Darwin.h destroyWatch" destroyWatch
     :: Ptr CWatch -> IO ()
 
 -------------------------------------------------------------------------------
@@ -1097,11 +1097,11 @@ showEvent ev@Event{..} =
 
         where showev f str = if f ev then "\n" ++ str else ""
 #else
-module Streamly.Internal.FileSystem.Event.Darwin () where
+module Streamly.Internal.FS.Event.Darwin () where
 #warning "Autoconf did not find the definition \
 kFSEventStreamCreateFlagFileEvents in Darwin header files.\
 Do you have Cocoa framework header files installed?\
-Not compiling the Streamly.Internal.FileSystem.Event.Darwin module. \
+Not compiling the Streamly.Internal.FS.Event.Darwin module. \
 Programs depending on this module may not compile. \
 Check if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFILEEVENTS is defined in config.h \
 generated from src/config.h.in"
