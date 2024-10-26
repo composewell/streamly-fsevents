@@ -29,7 +29,7 @@ build-type:          Configure
 extra-source-files:
     configure
     configure.ac
-    src/Streamly/Internal/FileSystem/Event/Darwin.h
+    src/Streamly/Internal/FS/Event/Darwin.h
     src/config.h.in
 
 extra-doc-files:
@@ -220,25 +220,25 @@ library
     hs-source-dirs: src
 
     if os(windows)
-          exposed-modules: Streamly.Internal.FileSystem.Event.Windows
+          exposed-modules: Streamly.Internal.FS.Event.Windows
 
     if os(darwin)
           include-dirs:  src/Streamly/Internal
-          c-sources: src/Streamly/Internal/FileSystem/Event/Darwin.c
-          exposed-modules: Streamly.Internal.FileSystem.Event.Darwin
+          c-sources: src/Streamly/Internal/FS/Event/Darwin.c
+          exposed-modules: Streamly.Internal.FS.Event.Darwin
 
     if os(linux)
-          exposed-modules: Streamly.Internal.FileSystem.Event.Linux
+          exposed-modules: Streamly.Internal.FS.Event.Linux
 
     if os(linux) || os(darwin) || os(windows)
-          exposed-modules: Streamly.Internal.FileSystem.Event
+          exposed-modules: Streamly.Internal.FS.Event
 
     build-depends:
                        base              >= 4.12  && < 4.21
                      , streamly-core     == 0.3.0
 
 
-    -- For FileSystem.Event module
+    -- For FS.Event module
     if os(linux)
       build-depends: directory >= 1.2.2 && < 1.4
                    , containers >= 0.6.0 && < 0.8
