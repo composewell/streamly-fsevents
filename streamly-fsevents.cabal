@@ -248,7 +248,7 @@ library
           exposed-modules: Streamly.Internal.FS.Event
 
     build-depends:
-                       base              >= 4.12  && < 4.21
+                       base              >= 4.12  && < 4.22
                      , streamly-core     == 0.3.0
 
 
@@ -258,7 +258,7 @@ library
                    , containers >= 0.6.0 && < 0.8
 
     if os(windows)
-      build-depends: Win32 >= 2.6 && < 2.14
+      build-depends: Win32 >= 2.6 && < 2.15
                    , streamly == 0.11.0
 
     if os(darwin)

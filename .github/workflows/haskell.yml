@@ -115,6 +115,18 @@ jobs:
           - name: ci
             command: cabal
             runner: ubuntu-latest
+            ghc_version: 9.12.1
+            cabal_project: cabal.project
+
+          - name: ci
+            command: cabal
+            runner: ubuntu-latest
+            ghc_version: 9.10.1
+            cabal_project: cabal.project
+
+          - name: ci
+            command: cabal
+            runner: ubuntu-latest
             ghc_version: 9.8.1
             cabal_project: cabal.project
 
