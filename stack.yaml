@@ -4,11 +4,11 @@ packages:
 
 extra-deps:
   - github: composewell/streamly
-    commit: '8befc441dc654e15b6c10b0b31d10cb4f7f64066'
+    commit: '04d6fcd39be10d494eb901bff1a6bd973daf0a1b'
     subdirs:
       - core
   - github: composewell/streamly
-    commit: '8befc441dc654e15b6c10b0b31d10cb4f7f64066'
+    commit: '04d6fcd39be10d494eb901bff1a6bd973daf0a1b'
 
 #allow-newer: true
 rebuild-ghc-options: true

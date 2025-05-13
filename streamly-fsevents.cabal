@@ -27,6 +27,7 @@ stability:           Stable
 build-type:          Configure
 
 extra-source-files:
+    README.md
     configure
     configure.ac
     src/Streamly/Internal/FS/Event/Darwin.h
