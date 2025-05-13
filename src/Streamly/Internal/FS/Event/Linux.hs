@@ -701,13 +701,14 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
     -- XXX Ensure that we generate events that we may have missed while we were
     -- adding the dirs. That may generate spurious events though.
     --
+    -- XXX Are the following comments obselete?
     -- XXX readDirs currently uses paths as String, we need to convert it
     -- to "/" separated by byte arrays.
     -- XXX Need a FileSystem.Stat module to remove this
     pathIsDir <- doesDirectoryExist (Path.toString absPath)
     when (watchRec && pathIsDir) $ do
         let f = addToWatch cfg watch0 . addSub prep
-            in S.fold (FL.drainMapM f) $ Dir.readDirs absPath
+            in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
