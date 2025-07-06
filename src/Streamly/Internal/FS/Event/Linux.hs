@@ -562,12 +562,12 @@ type PathRep =
 {-# INLINE combinePathRep #-}
 combinePathRep :: PathRep -> Path
 combinePathRep (root, Nothing) = root
-combinePathRep (root, Just sub) = Path.append root sub
+combinePathRep (root, Just sub) = Path.extend root sub
 
 {-# INLINE addSub #-}
 addSub :: PathRep -> Path -> PathRep
 addSub (root, Nothing) sub = (root, Just sub)
-addSub (root, Just sub0) sub1 = (root, Just (Path.append sub0 sub1))
+addSub (root, Just sub0) sub1 = (root, Just (Path.extend sub0 sub1))
 
 {-# INLINE getRepRoot #-}
 getRepRoot :: PathRep -> Path
@@ -970,7 +970,7 @@ getRelPath Event{..} = eventRelPath
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
-        Just relPath -> Path.append (getRoot ev) relPath
+        Just relPath -> Path.extend (getRoot ev) relPath
         Nothing -> getRoot ev
 
 -- XXX should we use a Maybe?
