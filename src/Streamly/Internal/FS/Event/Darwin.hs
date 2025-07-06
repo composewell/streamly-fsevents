@@ -189,6 +189,9 @@ import qualified Streamly.Internal.FileSystem.Path as Path
 -- Utils
 -------------------------------------------------------------------------------
 
+-- NOTE: "contListMap" is part of the unexposed module:
+-- Streamly.Internal.Data.Cont
+
 -- | Given a continuation based transformation from @a@ to @b@ and a
 -- continuation based transformation from @[b]@ to @c@, make continuation based
 -- transformation from @[a]@ to @c@.
@@ -515,10 +518,10 @@ data Event = Event
 readOneEvent :: Parser Word8 IO Event
 readOneEvent = do
     arr <- PR.takeEQ 24 (A.createOf 24)
-    let arr1 = A.castUnsafe arr :: Array Word64
-        eid = A.getIndexUnsafe 0 arr1
-        eflags = A.getIndexUnsafe 1 arr1
-        pathLen = fromIntegral $ A.getIndexUnsafe 2 arr1
+    let arr1 = A.unsafeCast arr :: Array Word64
+        eid = A.unsafeGetIndex 0 arr1
+        eflags = A.unsafeGetIndex 1 arr1
+        pathLen = fromIntegral $ A.unsafeGetIndex 2 arr1
     path <- PR.takeEQ pathLen (A.createOf pathLen)
     return $ Event
         { eventId = eid
