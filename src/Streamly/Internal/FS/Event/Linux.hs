@@ -609,12 +609,16 @@ foreign import ccall unsafe
 createWatch :: IO Watch
 createWatch = do
     rawfd <- throwErrnoIfMinus1 "createWatch" c_inotify_init
+
     -- We could use fdToHandle but it cannot determine the fd type
     -- automatically for the inotify fd because fdStat fails for Stream type
     -- fd.
     --
     -- Do not use mkFD as it locks a regular file causing "resource busy" error
     -- in some test cases.
+    --
+    -- XXX We can use fdToHandle/mkFD if the fd type is not a regular file, as
+    -- it won't call fdStat in that case.
     let fd =
             FD
                 { fdFD = rawfd
@@ -630,6 +634,17 @@ createWatch = do
     -- FD.setNonBlockingMode to determine the fd type which fails for Stream
     -- type fd. However, without non-blocking IO "select" has a limitation on
     -- the number of FDs being watched (1024).
+
+    -- XXX This does not take a lock but adds a finalizer to release the lock.
+    -- That should be ok, as no-one else shares this fd/file, or does it? If we
+    -- call another inotify it will return another fd?
+    --
+    -- XXX It is not a Stream type. Perhaps the original code used the Stream
+    -- type to avoid locking code. It should not be locked, as there is no
+    -- meaningful dev and inode associated with it. Here, since this API does
+    -- not call the locking API we can use a regular file type, but then
+    -- unlocking code may trigger. But there should be no lock entry for this
+    -- fd so unlocking be ok.
     h <-
         mkHandleFromFD
            fd
@@ -686,6 +701,11 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
     --
     -- XXX The file may have even got deleted and then recreated which we will
     -- never get to know, document this.
+     --
+     -- XXX If the caller does not have permission, it will return EACCES.
+     -- Similar to what we do readdir, maybe we can use some config in the same
+     -- way.
+     -- XXX We should perhaps ignore errors instead of throwing?
     wd <- A.asCStringUnsafe (Path.toChunk absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
                 c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
@@ -721,11 +741,11 @@ foreign import ccall unsafe
 -- /Pre-release/
 --
 removeFromWatch :: Watch -> Path -> IO ()
-removeFromWatch (Watch handle wdMap) root = do
+removeFromWatch (Watch handle wdMapRef) root = do
     fd <- handleToFd handle
-    km <- readIORef wdMap
-    wdMap1 <- foldlM (step fd) Map.empty (Map.toList km)
-    writeIORef wdMap wdMap1
+    wdMap <- readIORef wdMapRef
+    wdMap1 <- foldlM (step fd) Map.empty (Map.toList wdMap)
+    writeIORef wdMapRef wdMap1
 
     where
 
@@ -864,7 +884,7 @@ watchToStream cfg wt@(Watch handle _) = do
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
---
+
 -- | Start monitoring a list of file system paths for file system events with
 -- the supplied configuration operation over the 'defaultConfig'. The
 -- paths could be files or directories. When recursive mode is set and the
