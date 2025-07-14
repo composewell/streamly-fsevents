@@ -468,6 +468,7 @@ openWatch Config{..} paths = do
             when (r /= 0) $
                 ioError (userError "openWatch: failed to create watch.")
             fd <- peek fdPtr
+            -- Note: fdToHandle locks the file
             h <- fdToHandle fd
             watchPtr <- peek watchPPtr
             closeLock <- newMVar False
