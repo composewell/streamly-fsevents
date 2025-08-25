@@ -562,12 +562,12 @@ type PathRep =
 {-# INLINE combinePathRep #-}
 combinePathRep :: PathRep -> Path
 combinePathRep (root, Nothing) = root
-combinePathRep (root, Just sub) = Path.extend root sub
+combinePathRep (root, Just sub) = Path.join root sub
 
 {-# INLINE addSub #-}
 addSub :: PathRep -> Path -> PathRep
 addSub (root, Nothing) sub = (root, Just sub)
-addSub (root, Just sub0) sub1 = (root, Just (Path.extend sub0 sub1))
+addSub (root, Just sub0) sub1 = (root, Just (Path.join sub0 sub1))
 
 {-# INLINE getRepRoot #-}
 getRepRoot :: PathRep -> Path
@@ -686,7 +686,7 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
     --
     -- XXX The file may have even got deleted and then recreated which we will
     -- never get to know, document this.
-    wd <- A.asCStringUnsafe (Path.toChunk absPath) $ \pathPtr ->
+    wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
                 c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
 
@@ -732,7 +732,7 @@ removeFromWatch (Watch handle wdMap) root = do
     step fd newMap (wd, v) = do
         -- XXX Path is currently not guaranteed to be normalized.
         -- See: https://github.com/composewell/streamly/issues/2888
-        if Path.toChunk (getRepRoot v) == Path.toChunk root
+        if Path.toArray (getRepRoot v) == Path.toArray root
         then do
             let err = "removeFromWatch: " ++ show (Path.toString root)
                 rm = c_inotify_rm_watch (fdFD fd) (fromIntegral wd)
@@ -820,7 +820,7 @@ readOneEvent cfg  wt@(Watch _ wdMap) = do
                     $ FL.take pathLen (A.createOf pathLen)
             let remaining = pathLen - byteLength pth - 1
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
-            return $ addSub prep (Path.unsafeFromChunk pth)
+            return $ addSub prep (Path.unsafeFromArray pth)
         else return $ prep
     -- Check for "ISDIR" first because it is less likely
     let isDirCreate = eflags .&. iN_ISDIR /= 0 && eflags .&. iN_CREATE /= 0
@@ -970,7 +970,7 @@ getRelPath Event{..} = eventRelPath
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
-        Just relPath -> Path.extend (getRoot ev) relPath
+        Just relPath -> Path.join (getRoot ev) relPath
         Nothing -> getRoot ev
 
 -- XXX should we use a Maybe?

@@ -351,7 +351,7 @@ peekFNI buf = do
     acti <- peekByteOff buf 4
     (fnle :: DWORD) <- peekByteOff buf 8
     fnam0 <- Array.fromPtrN (fromIntegral fnle) (buf `plusPtr` 12)
-    fnam <- Path.fromChunk (Array.unsafeCast fnam0)
+    fnam <- Path.fromArray (Array.unsafeCast fnam0)
     return $ FILE_NOTIFY_INFORMATION neof acti fnam
 
 readChangeEvents ::
@@ -508,7 +508,7 @@ getRoot Event{..} = eventRootPath
 -- /Pre-release/
 --
 getAbsPath :: Event -> Path
-getAbsPath ev = Path.extend (getRoot ev) (getRelPath ev)
+getAbsPath ev = Path.join (getRoot ev) (getRelPath ev)
 
 -- XXX need to document the exact semantics of these.
 --

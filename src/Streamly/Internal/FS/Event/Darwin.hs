@@ -477,7 +477,7 @@ openWatch Config{..} paths = do
 
     withPathName :: Path -> (PathName -> IO a) -> IO a
     withPathName path act = do
-        A.unsafePinnedAsPtr (Path.toChunk path) $ \ptr byteLen ->
+        A.unsafePinnedAsPtr (Path.toArray path) $ \ptr byteLen ->
             let pname = PathName (castPtr ptr) (fromIntegral byteLen)
             in act pname
 
@@ -526,7 +526,7 @@ readOneEvent = do
     return $ Event
         { eventId = eid
         , eventFlags = fromIntegral eflags
-        , eventAbsPath = Path.unsafeFromChunk path
+        , eventAbsPath = Path.unsafeFromArray path
         }
 
 watchToStream :: Watch -> Stream IO Event
