@@ -246,7 +246,8 @@ library
           exposed-modules: Streamly.Internal.FS.Event.Linux
 
     if os(linux) || os(darwin) || os(windows)
-          exposed-modules: Streamly.Internal.FS.Event
+          exposed-modules: Streamly.FileSystem.Event
+                           Streamly.Internal.FS.Event
 
     build-depends:
                        base              >= 4.12  && < 4.22
@@ -263,8 +264,7 @@ library
                    , streamly == 0.11.0
 
     if os(darwin)
-      build-depends: directory >= 1.2.2 && < 1.4
-                   , mtl       >= 2.2.2 && < 2.4
+      build-depends: mtl       >= 2.2.2 && < 2.4
       frameworks: Cocoa
 
 
