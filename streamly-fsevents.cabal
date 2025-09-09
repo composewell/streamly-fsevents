@@ -51,23 +51,8 @@ flag fusion-plugin
   manual: True
   default: False
 
-flag inspection
-  description: Enable inspection testing
-  manual: True
-  default: False
-
-flag debug
-  description: Debug build with asserts enabled
-  manual: True
-  default: False
-
-flag dev
+flag internal-dev
   description: Development build
-  manual: True
-  default: False
-
-flag has-llvm
-  description: Use llvm backend for code generation
   manual: True
   default: False
 
@@ -78,11 +63,6 @@ flag opt
 
 flag limit-build-mem
   description: Limits memory when building
-  manual: True
-  default: False
-
-flag use-unliftio
-  description: Use unliftio-core instead of monad-control
   manual: True
   default: False
 
@@ -102,11 +82,8 @@ common compile-options
     if os(windows)
       cpp-options:    -DCABAL_OS_WINDOWS
 
-    if flag(dev)
+    if flag(internal-dev)
       cpp-options:    -DDEVBUILD
-
-    if flag(inspection)
-      cpp-options:    -DINSPECTION
 
     ghc-options:    -Weverything
                     -Wno-implicit-prelude
@@ -132,18 +109,12 @@ common compile-options
       ghc-options:
         -Wno-missing-role-annotations
 
-    if flag(has-llvm)
-      ghc-options: -fllvm
-
-    if flag(dev)
+    if flag(internal-dev)
       ghc-options:    -Wmissed-specialisations
                       -Wall-missed-specialisations
 
     if flag(limit-build-mem)
         ghc-options: +RTS -M1000M -RTS
-
-    if flag(use-unliftio)
-      cpp-options: -DUSE_UNLIFTIO
 
 common default-extensions
     default-extensions:
@@ -189,9 +160,8 @@ common optimization-options
                  -fmax-worker-args=16
 
   -- For this to be effective it must come after the -O2 option
-  if flag(dev) || flag(debug) || !flag(opt)
+  if flag(internal-dev) || !flag(opt)
     ghc-options: -fno-ignore-asserts
-    cpp-options: -DDEBUG
 
 common threading-options
   ghc-options:  -threaded
