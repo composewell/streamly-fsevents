@@ -9,6 +9,7 @@ extra-deps:
       - core
   - github: composewell/streamly
     commit: '4aa7ae215f64cf98f7b3c175d3a8c47c8bd3177e'
+  - fusion-plugin-0.2.7
 
 #allow-newer: true
 rebuild-ghc-options: true

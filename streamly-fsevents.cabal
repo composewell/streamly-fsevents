@@ -47,9 +47,9 @@ source-repository head
     location: https://github.com/composewell/streamly
 
 flag fusion-plugin
-  description: Use fusion plugin for benchmarks and executables
+  description: Enable fusion plugin
   manual: True
-  default: False
+  default: True
 
 flag internal-dev
   description: Development build
@@ -163,6 +163,10 @@ common optimization-options
   if flag(internal-dev) || !flag(opt)
     ghc-options: -fno-ignore-asserts
 
+  if flag(fusion-plugin)
+    ghc-options: -fplugin Fusion.Plugin
+
+
 common threading-options
   ghc-options:  -threaded
                 -with-rtsopts=-N
@@ -189,6 +193,9 @@ common test-options
                , directory
                , filepath
                , temporary
+  if flag(fusion-plugin)
+    build-depends:
+      fusion-plugin     >= 0.2   && < 0.3
 
 -------------------------------------------------------------------------------
 -- Library
@@ -223,6 +230,9 @@ library
                        base              >= 4.12  && < 4.22
                      , streamly-core     == 0.3.0
 
+    if flag(fusion-plugin)
+      build-depends:
+        fusion-plugin     >= 0.2   && < 0.3
 
     -- For FS.Event module
     if os(linux)
