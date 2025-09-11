@@ -49,7 +49,7 @@ source-repository head
 flag fusion-plugin
   description: Enable fusion plugin
   manual: True
-  default: True
+  default: False
 
 flag internal-dev
   description: Development build
