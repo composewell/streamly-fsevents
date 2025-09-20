@@ -6,19 +6,6 @@
 -- Stability   : pre-release
 -- Portability : GHC
 --
--- File system event notification API portable across Linux, macOS and Windows
--- platforms.
---
--- Note that recursive directory tree watch does not work reliably on Linux
--- (see notes in the Linux module), therefore, recursive watch API is not
--- provided in this module. However, you can use it from the platform specific
--- modules.
---
--- For platform specific APIs please see the following modules:
---
--- * "Streamly.Internal.FS.Event.Darwin"
--- * "Streamly.Internal.FS.Event.Linux"
--- * "Streamly.Internal.FS.Event.Windows"
 
 -- XXX Need to ensure that the signatures of the exported APIs are same on all
 -- platforms.

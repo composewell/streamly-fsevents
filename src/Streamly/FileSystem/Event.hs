@@ -6,15 +6,30 @@
 -- Stability   : pre-release
 -- Portability : GHC
 --
--- File system event notification API portable across Linux, macOS and Windows
--- platforms.
+-- Portable file system event notification API for Linux, macOS, and Windows.
 --
--- Note that recursive directory tree watch does not work reliably on Linux
--- (see notes in the Linux module), therefore, recursive watch API is not
--- provided in this module. However, you can use it from the platform specific
--- modules.
+-- This module provides a common interface for file system event monitoring
+-- across major platforms. In most cases, behavior is consistent across
+-- operating systems, but certain platform-specific idiosyncrasies remain.
 --
--- For platform specific APIs please see the following modules:
+-- Compared to Linux inotify, the kernel event notification APIs on macOS and
+-- Windows are more robust. In particular, recursive directory watching on
+-- Linux must be emulated in user space, which introduces unavoidable race
+-- conditions.
+--
+-- For this reason, this portable module does not expose a recursive watch API.
+-- If you need recursive monitoring, you can use the platform-specific modules,
+-- which provide their own recursive APIs. Recursive watches for macOS and
+-- windows are robust.
+--
+-- On Linux, watches are tied to file handles. As a result:
+--
+-- * If a watched file is deleted and recreated, the new file is not watched.
+-- * If a watched file is renamed, we can continue to monitor it.
+--
+-- On macOS, by contrast, watches are path-based.
+--
+-- For platform-specific APIs, see:
 --
 -- * "Streamly.Internal.FS.Event.Darwin"
 -- * "Streamly.Internal.FS.Event.Linux"
