@@ -1,28 +1,32 @@
 cabal-version:      2.2
 name:               streamly-fsevents
 version:            0.1.0
-synopsis:           File system event notification API
-description:        File system event notification API
+synopsis:           File system event notification streams
+description:
+  A portable, robust, and stream-based file system event notification API for
+  Linux, macOS, and Windows. This library provides a streaming alternative to
+  the fsnotify package.
+  .
+  The portable module offers a consistent, cross-platform interface — the
+  common denominator across all supported systems. For platform-specific needs,
+  dedicated modules expose more extensive APIs that leverage each operating
+  system’s native capabilities.
 
 homepage:            https://streamly.composewell.com
-bug-reports:         https://github.com/composewell/streamly/issues
+bug-reports:         https://github.com/composewell/streamly-fsevents/issues
 license:             BSD-3-Clause
 license-file:        LICENSE
-tested-with:         GHC==8.6.5
-                   , GHC==8.8.4
-                   , GHC==8.10.7
-                   , GHC==9.0.2
-                   , GHC==9.2.8
+tested-with:         GHC==9.2.8
                    , GHC==9.4.7
                    , GHC==9.6.3
                    , GHC==9.8.1
+                   , GHC==9.10.1
+                   , GHC==9.12.1
 author:              Composewell Technologies
 maintainer:          streamly@composewell.com
-copyright:           2017 Composewell Technologies
+copyright:           2025 Composewell Technologies
 category:
-    Streamly, Concurrency, Streaming, Dataflow, Pipes, Reactivity, List,
-    Logic, Non-determinism, Parsing, Array, Time, Unicode, Filesystem,
-    Network
+    Streamly, Streaming, Filesystem
 stability:           Stable
 build-type:          Configure
 
@@ -44,7 +48,7 @@ extra-tmp-files:
 
 source-repository head
     type: git
-    location: https://github.com/composewell/streamly
+    location: https://github.com/composewell/streamly-fsevents
 
 flag fusion-plugin
   description: Enable fusion plugin
