@@ -1,6 +1,6 @@
 cabal-version:      2.2
 name:               streamly-fsevents
-version:            0.1.0
+version:            0.1.1
 synopsis:           File system event notification streams
 description:
   A portable, robust, and stream-based file system event notification API for
