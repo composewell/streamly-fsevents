@@ -604,7 +604,8 @@ watchRecursive = watchWith id
 -- /Unimplemented/
 --
 watch :: NonEmpty Path -> Stream IO Event
-watch _paths = undefined
+watch _paths =
+    error "'watch' is not yet implemented on macOS, please use watchRecursive"
 
 -------------------------------------------------------------------------------
 -- Examine the event stream
