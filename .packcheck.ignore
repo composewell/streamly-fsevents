@@ -5,3 +5,5 @@ appveyor.yml
 cabal.project
 stack.yaml
 .hlint.yaml
+flake.lock
+flake.nix
