@@ -21,6 +21,7 @@
 - **Breaking:** macOS: when a watch root is a symbolic link, `getAbsPath`
   returns the path via the original symbolic link, consistent with Linux and
   Windows. It returned the path via the resolved target earlier.
+- Linux: export the `Cookie` type returned by `getCookie`.
 - **Breaking:** Windows: `getRelPath` returns `Maybe Path`, consistent with
   Linux.
 
