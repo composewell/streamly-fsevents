@@ -97,19 +97,17 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- deleted.
 --
 -- This API watches for changes in the watch root directory only, any changes
--- in the subdirectories of the watch root are not watched. However, on macOS
--- the watch is always recursive, but do not rely on that behavior, it may
--- change without notice in future. If you want to use recursive watch please
--- use platform specific modules.
+-- in the subdirectories of the watch root are not watched. If you want to use
+-- recursive watch please use platform specific modules.
+--
+-- On macOS FSEvents can only watch a directory tree recursively, the events
+-- for paths more than one level below a watch root are dropped by this API.
+-- The OS still generates and delivers those events to this process.
 --
 -- /Pre-release/
 --
 watch :: NonEmpty Path -> Stream IO Event
-#if defined(CABAL_OS_DARWIN)
-watch = Event.watchRecursive
-#else
 watch = Event.watch
-#endif
 
 -- | Like 'watch' except that if a watched path is a directory the whole
 -- directory tree under it is watched recursively.

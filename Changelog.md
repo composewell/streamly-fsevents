@@ -7,6 +7,9 @@
 - Add `setRecursiveMode` to the macOS `Config`. **Breaking:** `watchWith` on
   macOS is now non-recursive by default, consistent with Linux and Windows,
   use `setRecursiveMode True` for the earlier behavior.
+- **Breaking:** `Streamly.FileSystem.Event.watch` on macOS is now
+  non-recursive, consistent with Linux and Windows, it watched recursively
+  earlier.
 
 ## 0.1.1
 
