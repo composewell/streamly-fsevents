@@ -27,9 +27,7 @@ UInt32 FSEventStreamCreateFlagNoDefer ();
 UInt32 FSEventStreamCreateFlagWatchRoot ();
 UInt32 FSEventStreamCreateFlagFileEvents ();
 UInt32 FSEventStreamCreateFlagIgnoreSelf ();
-#if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFULLHISTORY
-UInt32 FSEventStreamCreateFlagFullHistory;
-#endif
+UInt32 FSEventStreamCreateFlagFullHistory ();
 
 /******************************************************************************
  * Event Flags
@@ -51,13 +49,9 @@ UInt32 FSEventStreamEventFlagItemCreated ();
 UInt32 FSEventStreamEventFlagItemRemoved ();
 UInt32 FSEventStreamEventFlagItemRenamed ();
 UInt32 FSEventStreamEventFlagItemModified ();
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMCLONED
 UInt32 FSEventStreamEventFlagItemCloned ();
-#endif
 UInt32 FSEventStreamEventFlagItemIsDir ();
 UInt32 FSEventStreamEventFlagItemIsFile ();
 UInt32 FSEventStreamEventFlagItemIsSymlink ();
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
 UInt32 FSEventStreamEventFlagItemIsHardlink ();
-#endif
 UInt32 FSEventStreamEventFlagItemIsLastHardlink ();

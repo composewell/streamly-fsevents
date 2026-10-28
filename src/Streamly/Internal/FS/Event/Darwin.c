@@ -40,9 +40,20 @@ UInt32 FSEventStreamCreateFlagFileEvents () {
 UInt32 FSEventStreamCreateFlagIgnoreSelf () {
   return kFSEventStreamCreateFlagIgnoreSelf;
 }
-#if 0
-UInt32 FSEventStreamCreateFlagFullHistory = kFSEventStreamCreateFlagFullHistory;
+
+/*
+ * The following flags are not available in older SDKs. When a flag is not
+ * available we return 0, setting it is then a no-op and checking it always
+ * returns false.
+ */
+
+UInt32 FSEventStreamCreateFlagFullHistory () {
+#if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFULLHISTORY
+  return kFSEventStreamCreateFlagFullHistory;
+#else
+  return 0;
 #endif
+}
 
 /******************************************************************************
  * Event Flags
@@ -96,11 +107,13 @@ UInt32 FSEventStreamEventFlagItemRenamed () {
 UInt32 FSEventStreamEventFlagItemModified () {
   return kFSEventStreamEventFlagItemModified;
 }
-#if __MAC_OS_X_VERSION_MIN_REQUIRED >= 101300
 UInt32 FSEventStreamEventFlagItemCloned () {
+#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMCLONED
   return kFSEventStreamEventFlagItemCloned;
-}
+#else
+  return 0;
 #endif
+}
 UInt32 FSEventStreamEventFlagItemIsDir () {
   return kFSEventStreamEventFlagItemIsDir;
 }
@@ -110,13 +123,20 @@ UInt32 FSEventStreamEventFlagItemIsFile () {
 UInt32 FSEventStreamEventFlagItemIsSymlink () {
   return kFSEventStreamEventFlagItemIsSymlink;
 }
-#if __MAC_OS_X_VERSION_MIN_REQUIRED >= 101000
+/* IsHardlink and IsLastHardlink were introduced together in macOS 10.10 */
 UInt32 FSEventStreamEventFlagItemIsHardlink () {
+#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
   return kFSEventStreamEventFlagItemIsHardlink;
-}
+#else
+  return 0;
 #endif
+}
 UInt32 FSEventStreamEventFlagItemIsLastHardlink () {
+#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
   return kFSEventStreamEventFlagItemIsLastHardlink;
+#else
+  return 0;
+#endif
 }
 
 /******************************************************************************

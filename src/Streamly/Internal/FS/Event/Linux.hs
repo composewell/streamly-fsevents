@@ -264,6 +264,12 @@ setUnwatchMoved = setFlag iN_EXCL_UNLINK
 #if HAVE_DECL_IN_MASK_CREATE
 foreign import capi
     "sys/inotify.h value IN_MASK_CREATE" iN_MASK_CREATE :: Word32
+#else
+-- IN_MASK_CREATE was added in Linux 4.18, older C library headers do not
+-- define it. The value is from the Linux kernel header
+-- include/uapi/linux/inotify.h.
+iN_MASK_CREATE :: Word32
+iN_MASK_CREATE = 0x10000000
 #endif
 
 foreign import capi
@@ -277,9 +283,8 @@ foreign import capi
 data WhenExists =
       AddIfExists -- ^ Do not set an existing setting to 'False' only set to 'True'
     | ReplaceIfExists -- ^ Replace the existing settings with new settings
-#if HAVE_DECL_IN_MASK_CREATE
-    | FailIfExists -- ^ Fail the API
-#endif
+    | FailIfExists -- ^ Fail the API. Requires Linux 4.18 or later, older
+                   -- kernels do not support it.
 
 -- | When adding a new path to the watch, specify what to do if a watch already
 -- exists on that path.
@@ -293,9 +298,7 @@ setWhenExists val cfg =
     case val of
         AddIfExists -> setFlag iN_MASK_ADD True cfg
         ReplaceIfExists -> setFlag iN_MASK_ADD False cfg
-#if HAVE_DECL_IN_MASK_CREATE
         FailIfExists -> setFlag iN_MASK_CREATE True cfg
-#endif
 
 foreign import capi
     "sys/inotify.h value IN_ONESHOT" iN_ONESHOT :: Word32

@@ -102,9 +102,7 @@ module Streamly.Internal.FS.Event.Darwin
     , setRootPathEvents
     , setFileEvents
     , setIgnoreSelf
-#if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFULLHISTORY
     , setFullHistory
-#endif
     , setAllEvents
 
     -- ** Watch APIs
@@ -136,18 +134,14 @@ module Streamly.Internal.FS.Event.Darwin
     , isDeleted
     , isMoved
     , isModified
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMCLONED
     , isCloned
-#endif
 
     -- ** Item Path info
     , isDir
     , isFile
     , isSymLink
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
     , isHardLink
     , isLastHardLink
-#endif
 
     -- ** Exception Conditions
     , isEventIdWrapped
@@ -371,7 +365,6 @@ foreign import ccall safe
 setIgnoreSelf :: Bool -> Config -> Config
 setIgnoreSelf = setFlag kFSEventStreamCreateFlagIgnoreSelf
 
-#if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFULLHISTORY
 foreign import ccall safe
     "FSEventStreamCreateFlagFullHistory"
     kFSEventStreamCreateFlagFullHistory :: Word32
@@ -380,13 +373,12 @@ foreign import ccall safe
 --
 -- /default: False/
 --
--- /macOS 10.15+/
+-- /macOS 10.15+/, this setting is a no-op when built with an older SDK.
 --
 -- /Pre-release/
 --
 setFullHistory :: Bool -> Config -> Config
 setFullHistory = setFlag kFSEventStreamCreateFlagFullHistory
-#endif
 
 -- | Set all tunable events 'True' or 'False'. Equivalent to setting:
 --
@@ -411,9 +403,7 @@ setAllEvents s =
 -- * 'setFileEvents' 'True'
 -- * 'setRootPathEvents' 'False'
 -- * 'setIgnoreSelf' 'False'
-#if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFULLHISTORY
 -- * 'setFullHistory' 'False'
-#endif
 --
 -- /Pre-release/
 --
@@ -1013,7 +1003,6 @@ foreign import ccall safe
 isModified :: Event -> Bool
 isModified = getFlag kFSEventStreamEventFlagItemModified
 
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMCLONED
 foreign import ccall safe
     "FSEventStreamEventFlagItemCloned"
     kFSEventStreamEventFlagItemCloned :: Word32
@@ -1024,13 +1013,12 @@ foreign import ccall safe
 --
 -- Applicable only when 'setFileEvents' is 'True'.
 --
--- /macOS 10.13+/
+-- /macOS 10.13+/, always 'False' when built with an older SDK.
 --
 -- /Pre-release/
 --
 isCloned :: Event -> Bool
 isCloned = getFlag kFSEventStreamEventFlagItemCloned
-#endif
 
 -------------------------------------------------------------------------------
 -- Information about path type (applicable only when 'setFileEvents' is 'True')
@@ -1081,7 +1069,6 @@ foreign import ccall safe
 isSymLink :: Event -> Bool
 isSymLink = getFlag kFSEventStreamEventFlagItemIsSymlink
 
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
 foreign import ccall safe
     "FSEventStreamEventFlagItemIsHardlink"
     kFSEventStreamEventFlagItemIsHardlink :: Word32
@@ -1094,7 +1081,7 @@ foreign import ccall safe
 --
 -- Applicable only when 'setFileEvents' is 'True'.
 --
--- /macOS 10.10+/
+-- /macOS 10.10+/, always 'False' when built with an older SDK.
 --
 -- /Pre-release/
 --
@@ -1112,13 +1099,12 @@ foreign import ccall safe
 --
 -- Applicable only when 'setFileEvents' is 'True'.
 --
--- /macOS 10.10+/
+-- /macOS 10.10+/, always 'False' when built with an older SDK.
 --
 -- /Pre-release/
 --
 isLastHardLink :: Event -> Bool
 isLastHardLink = getFlag kFSEventStreamEventFlagItemIsLastHardlink
-#endif
 
 -------------------------------------------------------------------------------
 -- Debugging
@@ -1151,17 +1137,13 @@ showEvent ev@Event{..} =
         ++ showev isDeleted "Deleted"
         ++ showev isModified "Modified"
         ++ showev isMoved "Moved"
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMCLONED
         ++ showev isCloned "Cloned"
-#endif
 
         ++ showev isDir "Dir"
         ++ showev isFile "File"
         ++ showev isSymLink "SymLink"
-#if HAVE_DECL_KFSEVENTSTREAMEVENTFLAGITEMISHARDLINK
         ++ showev isHardLink "HardLink"
         ++ showev isLastHardLink "LastHardLink"
-#endif
         ++ "\n"
 
         where showev f str = if f ev then "\n" ++ str else ""

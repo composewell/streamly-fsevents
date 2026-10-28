@@ -10,6 +10,11 @@
 - **Breaking:** `Streamly.FileSystem.Event.watch` on macOS is now
   non-recursive, consistent with Linux and Windows, it watched recursively
   earlier.
+- macOS: `setFullHistory`, `isCloned`, `isHardLink` and `isLastHardLink` are
+  always exported. When built with an SDK that does not have the
+  corresponding flag, the setter is a no-op and the predicates return
+  `False`. `setFullHistory` failed to link earlier.
+- Linux: the `FailIfExists` constructor of `WhenExists` is always available.
 
 ## 0.1.1
 
