@@ -6,6 +6,10 @@
 -- Stability   : pre-release
 -- Portability : GHC
 --
+-- The internal modules of this package are named @Streamly.Internal.FS.*@
+-- instead of @Streamly.Internal.FileSystem.*@ to avoid a conflict with the
+-- modules of the same name in the @streamly@ package, which provides
+-- @Streamly.Internal.FileSystem.Event@ and its platform specific modules.
 
 -- XXX Need to ensure that the signatures of the exported APIs are same on all
 -- platforms.

@@ -216,6 +216,9 @@ library
 
     hs-source-dirs: src
 
+    -- The internal modules are named Streamly.Internal.FS.* instead of
+    -- Streamly.Internal.FileSystem.* to avoid a conflict with the modules of
+    -- the same name in the streamly package.
     if os(windows)
           exposed-modules: Streamly.Internal.FS.Event.Windows
 
