@@ -972,9 +972,9 @@ getRoot Event{..} =
                     ++ "watch descriptor " ++ show eventWd
     else error $ "getRoot: ewd = " ++ show eventWd
 
--- XXX should we use a Maybe here?
 -- | Get the file system object path for which the event is generated, relative
--- to the watched root. The path is a "/" separated array of bytes.
+-- to the watched root. Returns 'Nothing' if the event is for the watch root
+-- itself.
 --
 -- /Pre-release/
 --

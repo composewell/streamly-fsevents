@@ -15,6 +15,8 @@
   corresponding flag, the setter is a no-op and the predicates return
   `False`. `setFullHistory` failed to link earlier.
 - Linux: the `FailIfExists` constructor of `WhenExists` is always available.
+- **Breaking:** Windows: `getRelPath` returns `Maybe Path`, consistent with
+  Linux.
 
 ## 0.1.1
 

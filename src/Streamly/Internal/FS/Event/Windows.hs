@@ -485,12 +485,14 @@ getFlag :: DWORD -> Event -> Bool
 getFlag mask Event{..} = eventFlags == mask
 
 -- | Get the file system object path for which the event is generated, relative
--- to the watched root.
+-- to the watched root. Windows does not report events for the watch root
+-- itself, therefore, this is always a 'Just' value. The return type is
+-- 'Maybe' for consistency with the other platforms.
 --
 -- /Pre-release/
 --
-getRelPath :: Event -> Path
-getRelPath Event{..} = eventRelPath
+getRelPath :: Event -> Maybe Path
+getRelPath Event{..} = Just eventRelPath
 
 -- | Get the watch root directory to which this event belongs.
 --
@@ -507,7 +509,10 @@ getRoot Event{..} = eventRootPath
 -- /Pre-release/
 --
 getAbsPath :: Event -> Path
-getAbsPath ev = Path.join (getRoot ev) (getRelPath ev)
+getAbsPath ev =
+    case getRelPath ev of
+        Just relPath -> Path.join (getRoot ev) relPath
+        Nothing -> getRoot ev
 
 -- XXX need to document the exact semantics of these.
 --
@@ -603,7 +608,7 @@ showEvent :: Event -> String
 showEvent ev@Event{..} =
         "--------------------------"
     ++ "\nRoot = " ++ Path.toString (getRoot ev)
-    ++ "\nPath = " ++ Path.toString (getRelPath ev)
+    ++ "\nPath = " ++ maybe "" Path.toString (getRelPath ev)
     ++ "\ngetAbsPath = " ++ Path.toString (getAbsPath ev)
     ++ "\nFlags " ++ show eventFlags
     ++ showev isEventsLost "Overflow"
