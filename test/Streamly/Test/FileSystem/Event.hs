@@ -17,12 +17,12 @@ moduleName = "FS.Event"
 
 main :: IO ()
 main = do
-    let run = runTests moduleName "non-recursive" Event.watch
-    run DirType commonTests
+    let run = runTests moduleName "non-recursive" (failNested Event.watch)
+    run DirType (nestedOpsTest : commonTests)
     run
 #if defined(CABAL_OS_DARWIN)
         SymLinkResolvedPath
 #else
         SymLinkOrigPath
 #endif
-        commonTests
+        (nestedOpsTest : commonTests)

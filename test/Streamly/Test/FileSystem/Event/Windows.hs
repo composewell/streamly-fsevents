@@ -30,11 +30,11 @@ main = do
         --
         -- ++ dirDelete "" (\dir -> [(dir, Event.isDeleted)])
 
-    let w = Event.watchWith (Event.setAllEvents True)
+    let w = failNested (Event.watchWith (Event.setAllEvents True))
         run = runTests moduleName "non-recursive" w
 
-    run DirType regularRootTests
-    run SymLinkOrigPath commonTests
+    run DirType (nestedOpsTest : regularRootTests)
+    run SymLinkOrigPath (nestedOpsTest : commonTests)
 
     let recTests =
             [ dirCreateWithParent "subdir\\dir"

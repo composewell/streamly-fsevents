@@ -35,6 +35,10 @@ module Streamly.Test.FileSystem.Event.Common
 
     , commonTests
     , commonRecTests
+
+    -- * Non-recursive watch tests
+    , failNested
+    , nestedOpsTest
     )
 
 where
@@ -56,7 +60,8 @@ import System.Directory
     , renameDirectory
     , renamePath
     )
-import System.FilePath ((</>), takeDirectory)
+import System.FilePath
+    ((</>), dropTrailingPathSeparator, takeDirectory, takeFileName)
 import System.IO
     ( BufferMode(..), hSetBuffering, stdout, IOMode (WriteMode), openFile
     , hClose)
@@ -378,6 +383,40 @@ rootFileMove suffix events =
     , const (return ())
     , \fp -> renamePath fp (fp <> suffix)
     , events ""
+    )
+
+-------------------------------------------------------------------------------
+-- Non-recursive watch tests
+-------------------------------------------------------------------------------
+
+-- | Raise an exception if the watch reports an event for a path in a
+-- directory named @nested@.
+failNested :: EventWatcher -> EventWatcher
+failNested w paths = Stream.mapM check (w paths)
+
+    where
+
+    check ev =
+        let path =
+                dropTrailingPathSeparator
+                    $ Path.toString (Event.getAbsPath ev)
+         in if takeFileName (takeDirectory path) == "nested"
+            then error $ "Event for a nested path: " ++ Event.showEvent ev
+            else return ev
+
+-- | Create @nested/file@ and @nested/dir@ and then @file@ in the watch root.
+-- The events are reported in order, therefore, the events for @nested/file@
+-- and @nested/dir@, if reported by a non-recursive watch, arrive before the
+-- event for @file@ and 'failNested' raises an exception.
+nestedOpsTest :: TestDesc
+nestedOpsTest =
+    ( "nested ops not reported (nested/file nested/dir)"
+    , \fp -> createDirectory (fp </> "nested")
+    , \fp -> do
+        writeFile (fp </> "nested" </> "file") ""
+        createDirectory (fp </> "nested" </> "dir")
+        writeFile (fp </> "file") ""
+    , [("file", fileEvent Event.isCreated)]
     )
 
 -------------------------------------------------------------------------------

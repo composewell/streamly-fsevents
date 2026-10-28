@@ -108,7 +108,7 @@ main = do
 #endif
             regSymTests
 
-    let w = Event.watchWith (Event.setAllEvents True)
+    let w = failNested (Event.watchWith (Event.setAllEvents True))
         run = runTests moduleName "non-recursive" w
 
 #if 0
@@ -123,13 +123,13 @@ main = do
 #if 0
         $ filter (\(desc, _, _, _) -> desc `List.notElem` failingTests)
 #endif
-        regTests
+        (nestedOpsTest : regTests)
 
     run SymLinkOrigPath
 #if 0
         $ filter (\(desc, _, _, _) -> desc `List.notElem` failingTests)
 #endif
-        symTests
+        (nestedOpsTest : symTests)
 
     let fileRootTests =
             [ fileDelete "" (\path ->

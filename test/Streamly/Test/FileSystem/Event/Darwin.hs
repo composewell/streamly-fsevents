@@ -8,53 +8,12 @@
 --
 module Streamly.Test.FileSystem.Event.Darwin (main) where
 
-import Data.List.NonEmpty (NonEmpty)
-import Streamly.Data.Stream (Stream)
-import Streamly.Internal.FileSystem.Path (Path)
-import Streamly.Internal.FS.Event.Darwin (Event)
-import System.Directory (createDirectory)
-import System.FilePath
-    ((</>), dropTrailingPathSeparator, takeDirectory, takeFileName)
-
-import qualified Streamly.Data.Stream as Stream
-import qualified Streamly.Internal.FileSystem.Path as Path
 import qualified Streamly.Internal.FS.Event.Darwin as Event
 
 import Streamly.Test.FileSystem.Event.Common
 
 moduleName :: String
 moduleName = "FS.Event.Darwin"
-
--- | Raise an exception if the watch reports an event for a path in a
--- directory named @nested@.
-failNested ::
-    (NonEmpty Path -> Stream IO Event) -> NonEmpty Path -> Stream IO Event
-failNested w paths = Stream.mapM check (w paths)
-
-    where
-
-    check ev =
-        let path =
-                dropTrailingPathSeparator
-                    $ Path.toString (Event.getAbsPath ev)
-         in if takeFileName (takeDirectory path) == "nested"
-            then error $ "Event for a nested path: " ++ Event.showEvent ev
-            else return ev
-
--- | Create @nested/file@ and @nested/dir@ and then @file@ in the watch root.
--- FSEvents reports events in order, therefore, the events for @nested/file@
--- and @nested/dir@, if not dropped by the non-recursive watch, arrive before
--- the event for @file@ and 'failNested' raises an exception.
-nestedOpsTest :: TestDesc
-nestedOpsTest =
-    ( "nested ops not reported (nested/file nested/dir)"
-    , \fp -> createDirectory (fp </> "nested")
-    , \fp -> do
-        writeFile (fp </> "nested" </> "file") ""
-        createDirectory (fp </> "nested" </> "dir")
-        writeFile (fp </> "file") ""
-    , [("file", fileEvent Event.isCreated)]
-    )
 
 -- TODO:
 -- Creation/deletion/move of hard links
