@@ -18,11 +18,19 @@ module Streamly.Internal.FS.Event
     (
     -- * Creating a Watch
 
-      watch
-    -- , watchRecursive
+    -- ** Configuration
+      Config
+    , setRecursiveMode
+
+    -- ** Watch APIs
+    , watch
+    , watchRecursive
+    , watchWith
 
     -- * Handling Events
     , Event
+    , getRoot
+    , getRelPath
     , getAbsPath
 
     -- ** Item CRUD events
@@ -44,19 +52,21 @@ import Streamly.Data.Stream (Stream)
 import Streamly.FileSystem.Path (Path)
 
 #if defined(CABAL_OS_DARWIN)
-import Streamly.Internal.FS.Event.Darwin (Event)
+import Streamly.Internal.FS.Event.Darwin (Config, Event)
 import qualified Streamly.Internal.FS.Event.Darwin as Event
 #elif defined(CABAL_OS_LINUX)
-import Streamly.Internal.FS.Event.Linux (Event)
+import Streamly.Internal.FS.Event.Linux (Config, Event)
 import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
-import Streamly.Internal.FS.Event.Windows (Event)
+import Streamly.Internal.FS.Event.Windows (Config, Event)
 import qualified Streamly.Internal.FS.Event.Windows as Event
 #else
 #error "FS Events not supported on this platform"
 #endif
 
--- XXX Ensure that defaultConfig is the same for all platforms.
+-- The defaultConfig of all the platforms enables the create, delete, move and
+-- modify events, and disables the recursive mode. The other settings are
+-- platform specific.
 --
 -- XXX Ensure that equivalent events are generated on all platforms when same
 -- operations are done. Document any differences in behavior on different
@@ -69,8 +79,50 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- for the common subset of those.
 
 -------------------------------------------------------------------------------
+-- Configuration
+-------------------------------------------------------------------------------
+
+-- | Watch the whole directory tree under a watch root recursively instead of
+-- watching only the watch root directory.
+--
+-- macOS and Windows watch a directory tree natively. Linux inotify watches
+-- only one directory, a recursive watch adds a watch for each directory in
+-- the tree, and adds a watch for a new directory when its create event is
+-- received:
+--
+-- * Starting a watch on a large tree takes time and memory proportional to
+-- the number of directories in the tree.
+-- * Creating a directory and adding a watch for it is not atomic, events that
+-- occur in a new directory before its watch is added may be lost.
+--
+-- /default: False/
+--
+-- /Pre-release/
+--
+setRecursiveMode :: Bool -> Config -> Config
+setRecursiveMode = Event.setRecursiveMode
+
+-------------------------------------------------------------------------------
 -- Creating a watch
 -------------------------------------------------------------------------------
+
+-- | Start monitoring a list of paths for file system events, with the
+-- supplied modifications applied to the default 'Config'. The default
+-- configuration enables the create, delete, move and modify events on all
+-- platforms.
+--
+-- The 'Config' type is the same as the 'Config' type of the platform specific
+-- module, therefore, the platform specific settings can also be applied when
+-- the code is not meant to be portable:
+--
+-- @
+-- watchWith (setRecursiveMode True . Linux.setFollowSymLinks False) paths
+-- @
+--
+-- /Pre-release/
+--
+watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
+watchWith = Event.watchWith
 
 -- macOS and Windows seem to do a path level watch i.e. they watch the path
 -- rather than the underlying inode, possibly they can map the inode back to a
@@ -100,12 +152,14 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- deleted.
 --
 -- This API watches for changes in the watch root directory only, any changes
--- in the subdirectories of the watch root are not watched. If you want to use
--- recursive watch please use platform specific modules.
+-- in the subdirectories of the watch root are not watched. Use
+-- 'watchRecursive' to watch the whole directory tree.
 --
 -- On macOS FSEvents can only watch a directory tree recursively, the events
 -- for paths more than one level below a watch root are dropped by this API.
 -- The OS still generates and delivers those events to this process.
+--
+-- >>> watch = watchWith id
 --
 -- /Pre-release/
 --
@@ -113,18 +167,36 @@ watch :: NonEmpty Path -> Stream IO Event
 watch = Event.watch
 
 -- | Like 'watch' except that if a watched path is a directory the whole
--- directory tree under it is watched recursively.
+-- directory tree under it is watched recursively. See 'setRecursiveMode' for
+-- the limitations on Linux.
 --
--- On Linux 'watchRecursive' may be more expensive than 'watch'.
+-- >>> watchRecursive = watchWith (setRecursiveMode True)
 --
 -- /Pre-release/
 --
-_watchRecursive :: NonEmpty Path -> Stream IO Event
-_watchRecursive = Event.watchRecursive
+watchRecursive :: NonEmpty Path -> Stream IO Event
+watchRecursive = Event.watchRecursive
 
 -------------------------------------------------------------------------------
 -- Handling Events
 -------------------------------------------------------------------------------
+
+-- | Get the watch root to which the event belongs, as it was supplied to the
+-- watch API.
+--
+-- /Pre-release/
+--
+getRoot :: Event -> Path
+getRoot = Event.getRoot
+
+-- | Get the path of the file system object for which the event is generated,
+-- relative to the watch root. Returns 'Nothing' if the event is for the watch
+-- root itself.
+--
+-- /Pre-release/
+--
+getRelPath :: Event -> Maybe Path
+getRelPath = Event.getRelPath
 
 -- XXX Ensure that on all paltforms the path has same conventions. That is do
 -- not have a trailing path separator on one platfrom and not on another.

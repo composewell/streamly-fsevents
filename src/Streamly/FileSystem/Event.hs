@@ -12,15 +12,10 @@
 -- across major platforms. In most cases, behavior is consistent across
 -- operating systems, but certain platform-specific idiosyncrasies remain.
 --
--- Compared to Linux inotify, the kernel event notification APIs on macOS and
--- Windows are more robust. In particular, recursive directory watching on
--- Linux must be emulated in user space, which introduces unavoidable race
--- conditions.
---
--- For this reason, this portable module does not expose a recursive watch API.
--- If you need recursive monitoring, you can use the platform-specific modules,
--- which provide their own recursive APIs. Recursive watches for macOS and
--- windows are robust.
+-- Recursive directory watching is native on macOS and Windows. On Linux,
+-- inotify watches only one directory, recursive watching is emulated in user
+-- space by adding a watch for each new directory, and events in a new
+-- directory may be lost before its watch is added. See 'setRecursiveMode'.
 --
 -- On Linux, watches are tied to file handles. As a result:
 --
@@ -39,11 +34,19 @@ module Streamly.FileSystem.Event
     (
     -- * Creating a Watch
 
-      watch
-    -- , watchRecursive
+    -- ** Configuration
+      Config
+    , setRecursiveMode
+
+    -- ** Watch APIs
+    , watch
+    , watchRecursive
+    , watchWith
 
     -- * Handling Events
     , Event
+    , getRoot
+    , getRelPath
     , getAbsPath
 
     -- ** Item CRUD events

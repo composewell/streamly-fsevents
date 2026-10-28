@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
+  and `getRelPath` to the portable module `Streamly.FileSystem.Event`.
 - Implement the non-recursive `watch` on macOS, it raised an exception
   earlier.
 - Add `setRecursiveMode` to the macOS `Config`. **Breaking:** `watchWith` on

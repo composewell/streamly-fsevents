@@ -20,3 +20,7 @@ main = do
     let run = runTests moduleName "non-recursive" (failNested Event.watch)
     run DirType (nestedOpsTest : commonTests)
     run SymLinkOrigPath (nestedOpsTest : commonTests)
+
+    let runRec = runTests moduleName "recursive" Event.watchRecursive
+    runRec DirType (commonTests ++ commonRecTests)
+    runRec SymLinkOrigPath (commonTests ++ commonRecTests)
