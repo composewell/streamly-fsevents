@@ -92,7 +92,6 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 
 -- | Start monitoring a list of directories or symbolic links to directories
 -- for file system events.  Monitoring starts from the current time onwards.
--- The paths are specified as UTF-8 encoded 'Array' of 'Word8'.
 --
 -- If a watch root is a symbolic link then the target of the link is watched.
 -- Fails if the watched path does not exist. If the user does not have
@@ -134,7 +133,7 @@ _watchRecursive = Event.watchRecursive
 -- symlink becomes platform independent.
 --
 -- | Get the absolute path of the file system object for which the event is
--- generated. The path is a UTF-8 encoded array of bytes.
+-- generated.
 --
 -- When the watch root is a symlink the behavior is different on different
 -- platforms:
@@ -159,8 +158,8 @@ getAbsPath = Event.getAbsPath
 --
 -- For hard links the behavior is different on different operating systems. On
 -- macOS hard linking does not generate a create event, it generates an
--- 'isInodeAttrsChanged' event on the directory instead (see the Darwin
--- module). On Linux and Windows hard linking generates a create event.
+-- 'Streamly.Internal.FS.Event.Darwin.isAttrsModified' event on the directory
+-- instead. On Linux and Windows hard linking generates a create event.
 --
 -- /Pre-release/
 --
@@ -178,7 +177,8 @@ isCreated = Event.isCreated
 -- is deleted. On macOS it occurs on deleting the watch root when it is not a
 -- symbolic link.
 --
--- See also 'isRootDeleted' event for Linux.
+-- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
+-- Linux.
 --
 -- /Pre-release/
 --

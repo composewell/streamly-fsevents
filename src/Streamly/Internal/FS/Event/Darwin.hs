@@ -13,7 +13,6 @@
 -- occurring under the watched paths.
 --
 -- @
--- {-\# LANGUAGE MagicHash #-}
 -- Stream.mapM_ (putStrLn . 'showEvent') $ 'watchRecursive' [Path.fromString "path"]
 -- @
 --
@@ -634,7 +633,6 @@ filterNonRecursive paths stream = S.concatEffect $ do
 -- full absolute path. This is the observed behavior on macOS 10.15.1.
 --
 -- @
--- {-\# LANGUAGE MagicHash #-}
 -- watchWith
 --      ('setIgnoreSelf' 'True' . 'setRootPathEvents' 'True')
 --      [Path.fromString "path"]
@@ -703,7 +701,7 @@ isEventIdWrapped :: Event -> Bool
 isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 
 -- | Get the absolute path of the file system object for which the event is
--- generated. The path is a UTF-8 encoded array of bytes.
+-- generated.
 --
 -- When the watch root is a symlink, the absolute path returned is via the real
 -- path of the root after resolving the symlink.

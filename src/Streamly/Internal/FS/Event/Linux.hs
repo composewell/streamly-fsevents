@@ -8,12 +8,12 @@
 --
 -- =Overview
 --
--- Use 'watchPaths' with a list of file system paths you want to watch as
--- argument. It returns a stream of 'Event' representing the file system events
+-- Use 'watch' or 'watchRecursive' with a list of file system paths you want
+-- to watch as argument. It returns a stream of 'Event' representing the file system events
 -- occurring under the watched paths.
 --
 -- @
--- Stream.mapM_ (putStrLn . 'showEvent') $ 'watchPaths' [Path.fromString "dir"]
+-- Stream.mapM_ (putStrLn . 'showEvent') $ 'watch' [Path.fromString "dir"]
 -- @
 --
 -- 'Event' is an opaque type. Accessor functions (e.g. 'showEvent' above)
@@ -52,7 +52,7 @@
 -- 3. In macOS the path of the subject of the event is absolute, in Linux the
 -- path is the name of the object inside the dir being watched.
 --
--- 4. On Linux 'watchPaths' fails if a path does not exist, on macOS it does
+-- 4. On Linux 'watch' fails if a path does not exist, on macOS it does
 -- not fail.
 
 #include "config.h"
@@ -254,7 +254,7 @@ foreign import capi
 -- | If an object moves out of the directory being watched then stop watching
 -- it.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -284,7 +284,7 @@ data WhenExists =
 -- | When adding a new path to the watch, specify what to do if a watch already
 -- exists on that path.
 --
--- /default: FailIfExists/
+-- /default: AddIfExists/
 --
 -- /Pre-release/
 --
@@ -331,7 +331,7 @@ foreign import capi
 
 -- | Report when the watched path itself gets deleted.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -343,7 +343,7 @@ foreign import capi
 
 -- | Report when the watched root path itself gets renamed.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -352,7 +352,7 @@ setRootMoved = setFlag iN_MOVE_SELF
 
 -- | Report when the watched root path itself gets deleted or renamed.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -365,7 +365,7 @@ foreign import capi
 -- | Report when the metadata e.g. owner, permission modes, modifications times
 -- of an object changes.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -377,7 +377,7 @@ foreign import capi
 
 -- | Report when a file is accessed.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -389,7 +389,7 @@ foreign import capi
 
 -- | Report when a file is opened.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -401,7 +401,7 @@ foreign import capi
 
 -- | Report when a file that was opened for writes is closed.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -413,7 +413,7 @@ foreign import capi
 
 -- | Report when a file that was opened for not writing is closed.
 --
--- /default: True/
+-- /default: False/
 --
 -- /Pre-release/
 --
@@ -522,7 +522,7 @@ setAllEvents s =
 -- | The default configuration settings are:
 --
 -- * 'setFollowSymLinks' 'True'
--- * 'setUnwatchMoved' 'True'
+-- * 'setUnwatchMoved' 'False'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
 -- * 'setWhenExists' 'AddIfExists'
@@ -908,7 +908,7 @@ watchToStream cfg wt@(Watch handle _) = do
 -- See the Linux __inotify__ man page for more details.
 --
 -- @
--- watchwith
+-- watchWith
 --      ('setFollowSymLinks' True . 'setUnwatchMoved' False)
 --      [Path.fromString "dir"]
 -- @
