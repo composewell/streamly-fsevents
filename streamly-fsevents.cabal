@@ -250,6 +250,7 @@ library
 
     if os(darwin)
       build-depends: mtl       >= 2.2.2 && < 2.4
+                   , directory >= 1.2.2 && < 1.4
       frameworks: Cocoa
 
 
