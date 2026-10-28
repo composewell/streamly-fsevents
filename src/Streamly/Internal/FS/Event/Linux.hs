@@ -665,7 +665,7 @@ foreign import ccall unsafe
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
+addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- XXX do not add if the path is already added
     -- XXX if the watch is added by the scan and not via an event we can
     -- generate a create event assuming that the create may have been lost. We
@@ -711,7 +711,7 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
     -- We add the parent first so that we start getting events for any new
     -- creates and add the new subdirectories on creates while we are adding
     -- the children.
-    modifyIORef wdMap (Map.insert (fromIntegral wd) prep)
+    modifyIORef wdMapRef (Map.insert (fromIntegral wd) prep)
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
@@ -739,11 +739,11 @@ foreign import ccall unsafe
 -- /Pre-release/
 --
 removeFromWatch :: Watch -> Path -> IO ()
-removeFromWatch (Watch handle wdMap) root = do
+removeFromWatch (Watch handle wdMapRef) root = do
     fd <- handleToFd handle
-    km <- readIORef wdMap
-    wdMap1 <- foldlM (step fd) Map.empty (Map.toList km)
-    writeIORef wdMap wdMap1
+    wdMap <- readIORef wdMapRef
+    wdMap1 <- foldlM (step fd) Map.empty (Map.toList wdMap)
+    writeIORef wdMapRef wdMap1
 
     where
 
@@ -811,14 +811,14 @@ data Event = Event
 -- to measure the perf.
 --
 readOneEvent :: Config -> Watch -> Parser Word8 IO Event
-readOneEvent cfg  wt@(Watch _ wdMap) = do
+readOneEvent cfg  wt@(Watch _ wdMapRef) = do
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
     (ewd, eflags, cookie, pathLen) <- PR.fromEffect $ A.unsafePinnedAsPtr arr readHeader
     -- XXX need the "initial" in parsers to return a step type so that "take 0"
     -- can return without an input. otherwise if pathLen is 0 we will keep
     -- waiting to read one more char before we return this event.
-    wdm <- PR.fromEffect $ readIORef wdMap
+    wdm <- PR.fromEffect $ readIORef wdMapRef
     let prep =
             case Map.lookup (fromIntegral ewd) wdm of
                     Just prep0 -> prep0
