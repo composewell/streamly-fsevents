@@ -15,6 +15,10 @@
   corresponding flag, the setter is a no-op and the predicates return
   `False`. `setFullHistory` failed to link earlier.
 - Linux: the `FailIfExists` constructor of `WhenExists` is always available.
+- macOS: add `getRoot` and `getRelPath`.
+- **Breaking:** macOS: when a watch root is a symbolic link, `getAbsPath`
+  returns the path via the original symbolic link, consistent with Linux and
+  Windows. It returned the path via the resolved target earlier.
 - **Breaking:** Windows: `getRelPath` returns `Maybe Path`, consistent with
   Linux.
 

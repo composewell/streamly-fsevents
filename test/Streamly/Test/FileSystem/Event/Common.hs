@@ -141,8 +141,6 @@ type TestDesc =
 data WatchRootType =
       DirType             -- watch root is a directory
     | FileType            -- watch root is a file
-    | SymLinkResolvedPath -- symlink to a directory,
-                          -- Event contains path via the resolved dir
     | SymLinkOrigPath     -- symlink to a directory,
                           -- Event contains path via the original symlink
     deriving Show
@@ -168,12 +166,6 @@ driver checker symlinkStyle (desc, pre, ops, expected) =
                         FileType -> do
                             openFile root WriteMode >>= hClose
                             return root
-                        SymLinkResolvedPath -> do
-                            -- root -> target
-                            let tgt = fp </> "watch-root-real"
-                            createDirectory tgt
-                            createDirectoryLink tgt root
-                            return tgt
                         SymLinkOrigPath -> do
                             -- root -> target
                             let tgt = fp </> "watch-root-real"

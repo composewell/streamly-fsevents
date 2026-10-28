@@ -76,7 +76,7 @@ main = do
         run = runTests moduleName "non-recursive" w
 
     run DirType regularNonRecTests
-    run SymLinkResolvedPath symLinkNonRecTests
+    run SymLinkOrigPath symLinkNonRecTests
     run FileType fileRootTests
 
     let symLinkRecTests =
@@ -97,5 +97,5 @@ main = do
         runRec = runTests moduleName "recursive" recw
 
     runRec DirType regularRecTests
-    runRec SymLinkResolvedPath symLinkRecTests
+    runRec SymLinkOrigPath symLinkRecTests
     runRec FileType fileRootTests

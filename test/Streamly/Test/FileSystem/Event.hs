@@ -19,10 +19,4 @@ main :: IO ()
 main = do
     let run = runTests moduleName "non-recursive" (failNested Event.watch)
     run DirType (nestedOpsTest : commonTests)
-    run
-#if defined(CABAL_OS_DARWIN)
-        SymLinkResolvedPath
-#else
-        SymLinkOrigPath
-#endif
-        (nestedOpsTest : commonTests)
+    run SymLinkOrigPath (nestedOpsTest : commonTests)

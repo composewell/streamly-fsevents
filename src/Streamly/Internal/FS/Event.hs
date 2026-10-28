@@ -129,23 +129,11 @@ _watchRecursive = Event.watchRecursive
 -- XXX Ensure that on all paltforms the path has same conventions. That is do
 -- not have a trailing path separator on one platfrom and not on another.
 --
--- XXX We should use getRelPath instead so that the behavior when the root is a
--- symlink becomes platform independent.
---
 -- | Get the absolute path of the file system object for which the event is
 -- generated.
 --
--- When the watch root is a symlink the behavior is different on different
--- platforms:
---
--- * On Linux and Windows, the absolute path returned is via the original
--- symlink.
---
--- * On macOS the absolute path returned is via the real path of the root after
--- resolving the symlink.
---
--- This API is subject to removal in future, to be replaced by a platform
--- independent @getRelPath@.
+-- When the watch root is a symlink, the absolute path returned is via the
+-- original symlink and not through the resolved path.
 --
 -- /Pre-release/
 --
