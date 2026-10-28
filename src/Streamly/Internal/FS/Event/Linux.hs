@@ -609,12 +609,17 @@ foreign import ccall unsafe
 createWatch :: IO Watch
 createWatch = do
     rawfd <- throwErrnoIfMinus1 "createWatch" c_inotify_init
-    -- We could use fdToHandle but it cannot determine the fd type
-    -- automatically for the inotify fd because fdStat fails for Stream type
-    -- fd.
+    -- We cannot use fdToHandle because it calls fdStat, and fdStat raises an
+    -- "unknown file type" exception for the inotify fd. The inotify fd is an
+    -- anonymous inode and its st_mode has no file type bits.
     --
-    -- Do not use mkFD as it locks a regular file causing "resource busy" error
-    -- in some test cases.
+    -- mkFD calls fdStat only when its stat argument is Nothing, and locks the
+    -- fd only when the fd type is RegularFile. Locking a regular file leads to
+    -- a "resource busy" error in some test cases.
+    --
+    -- XXX "mkFD rawfd ReadMode (Just (Stream, 0, 0)) False False" neither
+    -- calls fdStat nor locks the fd, we can use it instead of constructing
+    -- the FD below.
     let fd =
             FD
                 { fdFD = rawfd
@@ -627,9 +632,17 @@ createWatch = do
 
     -- XXX Do we need non-blocking IO?
     -- With non-blocking IO it fails because GHC-9.10 uses fdStat in
-    -- FD.setNonBlockingMode to determine the fd type which fails for Stream
-    -- type fd. However, without non-blocking IO "select" has a limitation on
+    -- FD.setNonBlockingMode to determine the fd type which fails for the
+    -- inotify fd. However, without non-blocking IO "select" has a limitation on
     -- the number of FDs being watched (1024).
+    --
+    -- XXX Since base-4.20.1 (GHC 9.10.2) setNonBlockingMode uses
+    -- statGetType_maybe which does not fail for an unknown file type, so
+    -- non-blocking IO may work with newer GHC versions.
+
+    -- mkHandleFromFD does not lock the fd. The fd type Stream is used because
+    -- statGetType has no type for an anonymous inode, and the inotify fd is
+    -- read like a stream, it is not seekable.
     h <-
         mkHandleFromFD
            fd
@@ -686,6 +699,11 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMap) prep = do
     --
     -- XXX The file may have even got deleted and then recreated which we will
     -- never get to know, document this.
+    --
+    -- XXX If the caller does not have permission to read the path,
+    -- inotify_add_watch fails with EACCES and we throw an exception. We could
+    -- add a config option to ignore such errors, like the options for
+    -- ignoring errors when reading a directory.
     wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
                 c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
@@ -864,7 +882,7 @@ watchToStream cfg wt@(Watch handle _) = do
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
---
+
 -- | Start monitoring a list of file system paths for file system events with
 -- the supplied configuration operation over the 'defaultConfig'. The
 -- paths could be files or directories. When recursive mode is set and the

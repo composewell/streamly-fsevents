@@ -468,6 +468,8 @@ openWatch Config{..} paths = do
             when (r /= 0) $
                 ioError (userError "openWatch: failed to create watch.")
             fd <- peek fdPtr
+            -- fdToHandle locks the fd if it is a regular file. This fd is
+            -- the read end of a pipe, therefore, it is not locked.
             h <- fdToHandle fd
             watchPtr <- peek watchPPtr
             closeLock <- newMVar False
