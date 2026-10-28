@@ -33,6 +33,11 @@
 - Linux: report the queue overflow (`isEventsLost`) event once for each
   watch root. `getRoot` and `getAbsPath` raised an exception on this event
   because the kernel reports it without a watch descriptor.
+- Linux: fix an exception raised by the event stream or by `getRoot` for an
+  event whose watch was removed, for example an event read after
+  `removeFromWatch`. The watch descriptor is now removed when its
+  `isRootUnwatched` event is read, events for unknown watch descriptors are
+  dropped.
 
 ## 0.1.1
 

@@ -105,6 +105,10 @@ module Streamly.Internal.FS.Event.Linux
     , watchWith
 
     -- Low level watch APIs
+    , Watch
+    , openWatch
+    , closeWatch
+    , watchToStream
     , addToWatch
     , removeFromWatch
 
@@ -151,18 +155,17 @@ module Streamly.Internal.FS.Event.Linux
     )
 where
 
-import Control.Monad (void, when)
+import Control.Monad (when)
 import Data.Bits ((.|.), (.&.), complement)
-import Data.Foldable (foldlM)
 import Data.IntMap.Lazy (IntMap)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (isNothing)
 #if !(MIN_VERSION_base(4,13,0))
 import Data.Semigroup (Semigroup(..))
 #endif
 import Data.Word (Word8, Word32)
-import Foreign.C.Error (throwErrnoIfMinus1)
+import Foreign.C.Error (eINVAL, getErrno, throwErrno, throwErrnoIfMinus1)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt(..), CUInt(..))
 import Foreign.Ptr (Ptr)
@@ -720,7 +723,8 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- We add the parent first so that we start getting events for any new
     -- creates and add the new subdirectories on creates while we are adding
     -- the children.
-    modifyIORef wdMapRef (Map.insert (fromIntegral wd) prep)
+    atomicModifyIORef' wdMapRef
+        $ \m -> (Map.insert (fromIntegral wd) prep m, ())
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
@@ -750,22 +754,25 @@ foreign import ccall unsafe
 removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch (Watch handle wdMapRef) root = do
     fd <- handleToFd handle
+    -- The watch descriptors stay in the map until the kernel reports
+    -- 'isRootUnwatched' for them, so that the events already queued for the
+    -- removed root, including 'isRootUnwatched', report the root. EINVAL
+    -- means that the kernel has already removed the watch, for example, when
+    -- this root was removed earlier or the root was deleted.
     wdMap <- readIORef wdMapRef
-    wdMap1 <- foldlM (step fd) Map.empty (Map.toList wdMap)
-    writeIORef wdMapRef wdMap1
+    mapM_ (step fd) (Map.toList wdMap)
 
     where
 
-    step fd newMap (wd, v) = do
+    step fd (wd, v) =
         -- XXX Path is currently not guaranteed to be normalized.
         -- See: https://github.com/composewell/streamly/issues/2888
-        if Path.toArray (getRepRoot v) == Path.toArray root
-        then do
+        when (Path.toArray (getRepRoot v) == Path.toArray root) $ do
             let err = "removeFromWatch: " ++ show (Path.toString root)
-                rm = c_inotify_rm_watch (fdFD fd) (fromIntegral wd)
-            void $ throwErrnoIfMinus1 err rm
-            return newMap
-        else return $ Map.insert wd v newMap
+            r <- c_inotify_rm_watch (fdFD fd) (fromIntegral wd)
+            when (r == -1) $ do
+                errno <- getErrno
+                when (errno /= eINVAL) $ throwErrno err
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -824,12 +831,19 @@ data Event = Event
 foreign import capi
     "sys/inotify.h value IN_Q_OVERFLOW" iN_Q_OVERFLOW :: Word32
 
+foreign import capi
+    "sys/inotify.h value IN_IGNORED" iN_IGNORED :: Word32
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
 -- The overflow event has an invalid watch descriptor (-1), it is expanded to
 -- one event per watch root. A root entry in the map is the one without a sub
 -- path.
+--
+-- An IN_IGNORED event removes its watch descriptor from the map, the event
+-- itself still reports the root. Events for a watch descriptor that is not in
+-- the map are dropped.
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
@@ -840,15 +854,7 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
     -- XXX need the "initial" in parsers to return a step type so that "take 0"
     -- can return without an input. otherwise if pathLen is 0 we will keep
     -- waiting to read one more char before we return this event.
-    wdm <- PR.fromEffect $ readIORef wdMapRef
-    let prep =
-            case Map.lookup (fromIntegral ewd) wdm of
-                    Just prep0 -> prep0
-                    Nothing ->
-                        error $ "readOneEvent: "
-                                  <> "Unknown watch descriptor: "
-                                  <> show ewd
-    prep1 <-
+    mpth <-
         if pathLen /= 0
         then do
             -- XXX takeEndBy_ drops the separator so assumes a null
@@ -860,16 +866,9 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                     $ FL.take pathLen (A.createOf pathLen)
             let remaining = pathLen - byteLength pth - 1
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
-            return $ addSub prep (Path.unsafeFromArray pth)
-        else return $ prep
-    -- Check for "ISDIR" first because it is less likely
-    let isDirCreate = eflags .&. iN_ISDIR /= 0 && eflags .&. iN_CREATE /= 0
-    when (watchRec cfg && isDirCreate)
-        $ PR.fromEffect $ addToWatch cfg wt prep1
-    -- XXX Handle IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF, IN_MOVED_FROM,
-    -- IN_MOVED_TO
-    -- What if a large dir tree gets moved in to our hierarchy? Do we get a
-    -- single event for the top level dir in this case?
+            return $ Just (Path.unsafeFromArray pth)
+        else return Nothing
+    wdm <- PR.fromEffect $ readIORef wdMapRef
     let mkEvent wd rel =
             Event
                 { eventWd = wd
@@ -878,13 +877,30 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                 , eventRelPath = rel
                 , eventMap = wdm
                 }
-    return $
-        if eflags .&. iN_Q_OVERFLOW /= 0
-        then
+    if eflags .&. iN_Q_OVERFLOW /= 0
+    then return
             [ mkEvent (fromIntegral wd) Nothing
             | (wd, p) <- Map.toList wdm, isNothing (getRepSub p)
             ]
-        else [mkEvent (fromIntegral ewd) (getRepSub prep1)]
+    else
+        case Map.lookup (fromIntegral ewd) wdm of
+            Nothing -> return []
+            Just prep -> do
+                let prep1 = maybe prep (addSub prep) mpth
+                -- Check for "ISDIR" first because it is less likely
+                let isDirCreate =
+                        eflags .&. iN_ISDIR /= 0 && eflags .&. iN_CREATE /= 0
+                when (watchRec cfg && isDirCreate)
+                    $ PR.fromEffect $ addToWatch cfg wt prep1
+                when (eflags .&. iN_IGNORED /= 0)
+                    $ PR.fromEffect
+                    $ atomicModifyIORef' wdMapRef
+                    $ \m -> (Map.delete (fromIntegral ewd) m, ())
+                -- XXX Handle IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF,
+                -- IN_MOVED_FROM, IN_MOVED_TO
+                -- What if a large dir tree gets moved in to our hierarchy? Do
+                -- we get a single event for the top level dir in this case?
+                return [mkEvent (fromIntegral ewd) (getRepSub prep1)]
 
     where
 
@@ -896,6 +912,12 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
         pathLen :: Word32 <- peekByteOff ptr (len + 8)
         return (ewd, eflags, cookie, fromIntegral pathLen)
 
+-- | Read the events from a 'Watch' as a stream. The 'Config' must be the one
+-- used to open the watch. The stream does not close the watch, use
+-- 'closeWatch' to close it.
+--
+-- /Pre-release/
+--
 watchToStream :: Config -> Watch -> Stream IO Event
 watchToStream cfg wt@(Watch handle _) = do
     -- Do not use too small a buffer. As per inotify man page:
@@ -1063,9 +1085,6 @@ isEventsLost = getFlag iN_Q_OVERFLOW
 -------------------------------------------------------------------------------
 -- Events affecting the watched path only
 -------------------------------------------------------------------------------
-
-foreign import capi
-    "sys/inotify.h value IN_IGNORED" iN_IGNORED :: Word32
 
 -- Compare with isRootChanged on macOS. isRootChanged includes all these cases.
 --
