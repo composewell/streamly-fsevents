@@ -157,6 +157,7 @@ import Data.Foldable (foldlM)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef)
 import Data.List.NonEmpty (NonEmpty)
+import Data.Maybe (isNothing)
 #if !(MIN_VERSION_base(4,13,0))
 import Data.Semigroup (Semigroup(..))
 #endif
@@ -183,6 +184,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as FL
 import qualified Streamly.Data.Array as A (createOf)
 import qualified Streamly.Data.Stream as S
+import qualified Streamly.Data.Unfold as UF
 import qualified Streamly.FileSystem.Handle as FH
 import qualified Streamly.Internal.FileSystem.Path as Path
 
@@ -819,10 +821,18 @@ data Event = Event
 --                char     name[];   /* Optional null-terminated name */
 --            };
 --
+foreign import capi
+    "sys/inotify.h value IN_Q_OVERFLOW" iN_Q_OVERFLOW :: Word32
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
-readOneEvent :: Config -> Watch -> Parser Word8 IO Event
+-- The overflow event has an invalid watch descriptor (-1), it is expanded to
+-- one event per watch root. A root entry in the map is the one without a sub
+-- path.
+--
+{-# INLINE readOneEvent #-}
+readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
 readOneEvent cfg  wt@(Watch _ wdMapRef) = do
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
@@ -860,13 +870,21 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
     -- IN_MOVED_TO
     -- What if a large dir tree gets moved in to our hierarchy? Do we get a
     -- single event for the top level dir in this case?
-    return $ Event
-        { eventWd = fromIntegral ewd
-        , eventFlags = eflags
-        , eventCookie = cookie
-        , eventRelPath = getRepSub prep1
-        , eventMap = wdm
-        }
+    let mkEvent wd rel =
+            Event
+                { eventWd = wd
+                , eventFlags = eflags
+                , eventCookie = cookie
+                , eventRelPath = rel
+                , eventMap = wdm
+                }
+    return $
+        if eflags .&. iN_Q_OVERFLOW /= 0
+        then
+            [ mkEvent (fromIntegral wd) Nothing
+            | (wd, p) <- Map.toList wdm, isNothing (getRepSub p)
+            ]
+        else [mkEvent (fromIntegral ewd) (getRepSub prep1)]
 
     where
 
@@ -890,7 +908,10 @@ watchToStream cfg wt@(Watch handle _) = do
     --          sizeof(struct inotify_event) + NAME_MAX + 1
     --
     -- will be sufficient to read at least one event.
-    S.catRights $ S.parseMany (readOneEvent cfg wt) $ S.unfold FH.reader handle
+    S.unfoldEach UF.fromList
+        $ S.catRights
+        $ S.parseMany (readOneEvent cfg wt)
+        $ S.unfold FH.reader handle
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
@@ -1024,17 +1045,15 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 -- Error events
 -------------------------------------------------------------------------------
 
-foreign import capi
-    "sys/inotify.h value IN_Q_OVERFLOW" iN_Q_OVERFLOW :: Word32
-
 -- XXX rename to isQOverflowed or hasOverflowed?
 --
--- macOS overflow API is more specific, it tells which paths have lost the
--- events due to overflow.
+-- | Event queue overflowed and we may have lost some events. The user
+-- application must scan everything under the watched paths to know the
+-- current state.
 --
--- | Event queue overflowed (WD is invalid for this event) and we may have lost
--- some events..  The user application must scan everything under the watched
--- paths to know the current state.
+-- The kernel generates a single overflow event for all the watch roots. It is
+-- reported as one event per watch root, 'getRoot' returns the root and
+-- 'getRelPath' returns 'Nothing'.
 --
 -- /Pre-release/
 --

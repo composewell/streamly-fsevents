@@ -30,6 +30,9 @@
   Linux.
 - Linux: fix `setWhenExists`, it set both `IN_MASK_ADD` and `IN_MASK_CREATE`
   for `FailIfExists` after `defaultConfig`, adding a watch then failed.
+- Linux: report the queue overflow (`isEventsLost`) event once for each
+  watch root. `getRoot` and `getAbsPath` raised an exception on this event
+  because the kernel reports it without a watch descriptor.
 
 ## 0.1.1
 

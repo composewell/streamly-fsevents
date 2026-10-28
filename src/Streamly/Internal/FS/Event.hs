@@ -274,6 +274,10 @@ isModified = Event.isModified
 -- | An event that indicates that some events before this may have been lost,
 -- therefore, we need to take some recovery action.
 --
+-- 'getRoot' returns the watch root whose events may have been lost. On
+-- Linux, where the kernel reports a single event for all the roots, one
+-- event is generated for each watch root.
+--
 -- /Pre-release/
 --
 isEventsLost :: Event -> Bool
