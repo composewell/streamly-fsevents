@@ -28,6 +28,8 @@
 - Linux: export the `Cookie` type returned by `getCookie`.
 - **Breaking:** Windows: `getRelPath` returns `Maybe Path`, consistent with
   Linux.
+- Linux: fix `setWhenExists`, it set both `IN_MASK_ADD` and `IN_MASK_CREATE`
+  for `FailIfExists` after `defaultConfig`, adding a watch then failed.
 
 ## 0.1.1
 

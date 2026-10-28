@@ -295,11 +295,14 @@ data WhenExists =
 -- /Pre-release/
 --
 setWhenExists :: WhenExists -> Config -> Config
-setWhenExists val cfg =
+setWhenExists val =
+    -- inotify_add_watch fails with EINVAL if both IN_MASK_ADD and
+    -- IN_MASK_CREATE are set, therefore, we always clear the other one.
     case val of
-        AddIfExists -> setFlag iN_MASK_ADD True cfg
-        ReplaceIfExists -> setFlag iN_MASK_ADD False cfg
-        FailIfExists -> setFlag iN_MASK_CREATE True cfg
+        AddIfExists -> setFlag iN_MASK_ADD True . setFlag iN_MASK_CREATE False
+        ReplaceIfExists ->
+            setFlag iN_MASK_ADD False . setFlag iN_MASK_CREATE False
+        FailIfExists -> setFlag iN_MASK_CREATE True . setFlag iN_MASK_ADD False
 
 foreign import capi
     "sys/inotify.h value IN_ONESHOT" iN_ONESHOT :: Word32
