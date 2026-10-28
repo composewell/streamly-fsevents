@@ -26,9 +26,24 @@
 --
 -- For platform-specific APIs, see:
 --
--- * "Streamly.Internal.FS.Event.Darwin"
--- * "Streamly.Internal.FS.Event.Linux"
--- * "Streamly.Internal.FS.Event.Windows"
+-- * "Streamly.FileSystem.Event.Darwin"
+-- * "Streamly.FileSystem.Event.Linux"
+-- * "Streamly.FileSystem.Event.Windows"
+--
+-- The 'Config' and 'Event' types of this module are the same as those of the
+-- platform specific module, therefore, the platform specific settings and
+-- event predicates can be used along with this module. For example, on Linux:
+--
+-- @
+-- import qualified Streamly.FileSystem.Event as Event
+-- import qualified Streamly.FileSystem.Event.Linux as Linux
+--
+-- Event.watchWith (Linux.setFollowSymLinks False) paths
+--     & Stream.filter Linux.isDir
+-- @
+--
+-- A platform specific module is available only on its platform, the Haddock
+-- documentation of the module is built only on that platform.
 
 module Streamly.FileSystem.Event
     (

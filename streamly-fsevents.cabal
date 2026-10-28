@@ -220,15 +220,18 @@ library
     -- Streamly.Internal.FileSystem.* to avoid a conflict with the modules of
     -- the same name in the streamly package.
     if os(windows)
-          exposed-modules: Streamly.Internal.FS.Event.Windows
+          exposed-modules: Streamly.FileSystem.Event.Windows
+                           Streamly.Internal.FS.Event.Windows
 
     if os(darwin)
           include-dirs:  src/Streamly/Internal
           c-sources: src/Streamly/Internal/FS/Event/Darwin.c
-          exposed-modules: Streamly.Internal.FS.Event.Darwin
+          exposed-modules: Streamly.FileSystem.Event.Darwin
+                           Streamly.Internal.FS.Event.Darwin
 
     if os(linux)
-          exposed-modules: Streamly.Internal.FS.Event.Linux
+          exposed-modules: Streamly.FileSystem.Event.Linux
+                           Streamly.Internal.FS.Event.Linux
 
     if os(linux) || os(darwin) || os(windows)
           exposed-modules: Streamly.FileSystem.Event

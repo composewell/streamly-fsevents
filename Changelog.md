@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the platform specific modules `Streamly.FileSystem.Event.Darwin`,
+  `Streamly.FileSystem.Event.Linux` and `Streamly.FileSystem.Event.Windows`.
+  Earlier the platform specific APIs were available only from the internal
+  modules.
 - Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
   and `getRelPath` to the portable module `Streamly.FileSystem.Event`.
 - Implement the non-recursive `watch` on macOS, it raised an exception
