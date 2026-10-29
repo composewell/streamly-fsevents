@@ -860,6 +860,24 @@ markRemoved p m =
             then ((wd : wds, shared), WdPaths wps1)
             else ((wds, shared1), WdPaths wps1)
 
+-- | Undo 'markRemoved' for the listed paths. For each path, the first path of
+-- its watch descriptor that is marked removed and equal to it is unmarked.
+-- Identical paths of a watch descriptor report the same events, it does not
+-- matter which one is unmarked.
+unmarkRemoved :: [(Int, PathRep)] -> IntMap WdEntry -> IntMap WdEntry
+unmarkRemoved paths m0 = foldl step m0 paths
+
+    where
+
+    step m (wd, prep) =
+        let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) prep
+         in case Map.lookup wd m of
+                Just (WdPaths wps)
+                    | (xs, wp : ys) <- break isMatch wps ->
+                        let wp1 = wp {wpRemoved = False}
+                         in Map.insert wd (WdPaths (xs ++ wp1 : ys)) m
+                _ -> m
+
 -- | Queue a marker IN_IGNORED event after the events already queued, by
 -- adding and removing a watch on a private pipe. The pipe is watched via
 -- @\/proc\/self\/fd@, the user cannot add the pipe to the watch, therefore,
@@ -892,34 +910,45 @@ addRemovalMarker fd wdMapRef paths =
 -- 'isRootUnwatched' event for each path.
 --
 -- Removing a path that shares the directory with another path requires
--- @\/proc@ to be mounted, throw an exception if it is not.
+-- @\/proc@ to be mounted and a free fd for a pipe, throw an exception if
+-- not. The paths of the shared watch descriptors are not removed in that
+-- case, the call can be retried.
 --
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
 unwatchPaths (Watch fd lock wdMapRef) desc p =
     withMVar lock $ \closed -> when (not closed) $ do
-        -- The paths stay in the map until their 'isRootUnwatched' event is
-        -- read, so that the events already queued for the removed paths,
-        -- including 'isRootUnwatched', report the paths.
+        -- Only when all the paths of a watch descriptor are removed we remove
+        -- the kernel watch. Otherwise, the kernel watch is still needed for
+        -- the other paths, we queue a marker event instead.
         --
-        -- If all the paths of a watch descriptor are removed we remove the
-        -- kernel watch, the kernel queues an IN_IGNORED event for it.
-        -- Otherwise, the kernel watch is still needed for the other paths, we
-        -- queue a marker event instead.
         (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
+
+        -- The kernel queues an IN_IGNORED event for a removed watch. After
+        -- calling inotify_rm_watch, a path still stays in the map until an
+        -- IN_IGNORED event arrives, so that the events already queued for the
+        -- removed path, including IN_IGNORED, reports the path.
         mapM_ rmWatch wds
-        when (not (null shared)) $ addRemovalMarker fd wdMapRef shared
+
+        -- If the kernel watch is still needed for the other paths, we queue a
+        -- marker event instead. If the marker is not queued the paths would
+        -- never be removed from the map, they would keep reporting the events,
+        -- and a retry would find them already removed.
+        when (not (null shared))
+            $ addRemovalMarker fd wdMapRef shared
+                `onException` atomicModifyIORef' wdMapRef
+                    (\m -> (unmarkRemoved shared m, ()))
 
     where
 
-    -- EINVAL means that the kernel has already removed the watch, for
-    -- example, when the directory was deleted.
     rmWatch wd = do
         let err = "unwatchPaths: " ++ desc
         r <- c_inotify_rm_watch fd (fromIntegral wd)
         when (r == -1) $ do
             errno <- getErrno
+            -- EINVAL means that the kernel has already removed the watch, for
+            -- example, when the directory was deleted.
             when (errno /= eINVAL) $ throwErrno err
 
 -- | Remove an absolute root path from a 'Watch', if a path was moved after
@@ -931,7 +960,9 @@ unwatchPaths (Watch fd lock wdMapRef) desc p =
 -- that is also watched via another root remains watched for that root.
 --
 -- Removing a root that shares a directory with another root requires
--- @\/proc@ to be mounted, throw an exception if it is not.
+-- @\/proc@ to be mounted and a free fd for a pipe, throw an exception if
+-- not. The shared directories remain watched for the root in that case, the
+-- call can be retried.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'watchToStream'. The call does not wait for an

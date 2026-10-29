@@ -286,6 +286,7 @@ test-suite FileSystem.Event.Linux
   other-modules: Streamly.Test.FileSystem.Event.Common
   cpp-options: -DFILESYSTEM_EVENT_LINUX
   ghc-options: -main-is Streamly.Test.FileSystem.Event.Linux
+  build-depends: unix >= 2.7 && < 2.9
   if impl(ghc < 9.4) || !os(linux)
     buildable: False
 
