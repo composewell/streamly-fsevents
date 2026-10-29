@@ -140,11 +140,17 @@ import Foreign.C.Error
     , eWOULDBLOCK, errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
     , throwErrnoIfMinus1_
     )
+#if defined(CABAL_OS_FREEBSD)
+import Foreign.C.Error (eEXIST)
+#endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
+import Foreign.Storable (peek, peekByteOff, sizeOf)
+#if !defined(CABAL_OS_FREEBSD)
+import Foreign.Storable (peekElemOff)
+#endif
 import GHC.Conc
     ( TVar, atomically, closeFdWith, newTVarIO, orElse, readTVar
     , retry, threadWaitReadSTM, writeTVar
@@ -2188,8 +2194,13 @@ addDirWithScan cfg wtch pRep
 concatStreams :: [Stream IO a] -> Stream IO a
 concatStreams = S.concatMap id . S.fromList
 
+#if defined(CABAL_OS_FREEBSD)
+foreign import capi
+    "sys/inotify.h value IN_MASK_CREATE" iN_MASK_CREATE :: Word32
+#else
 foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
+#endif
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
 
@@ -2243,13 +2254,41 @@ unmarkRemoved paths m0 = foldl' step m0 paths
 
 -- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
 -- removing it. The action is run with the watch descriptor after adding the
--- watch and before removing it. The string is used in the exception
--- messages.
+-- watch and before removing it. The watch descriptor is not shared with any
+-- user path. The string is used in the exception messages.
 --
--- Returns 'False' and does not run the action if @\/proc@ is not mounted or
--- access to it is denied. Requires a free fd for a pipe, throw an exception
--- if not.
+-- Returns 'False' and does not run the action if the watch cannot be added,
+-- see below. Throw an exception on any other failure.
 queueIgnored :: String -> CInt -> (CInt -> IO ()) -> IO Bool
+#if defined(CABAL_OS_FREEBSD)
+-- FreeBSD has no @\/proc\/self\/fd@ and cannot watch a pipe. The directory
+-- @\/@ is watched instead, or @\/dev@ if that fails. With IN_MASK_CREATE the
+-- add fails with EEXIST if the directory is already watched by the inotify
+-- fd, instead of returning the watch descriptor of the user path. Returns
+-- 'False' if the inotify fd already watches both, or access to both is
+-- denied.
+queueIgnored err fd action = add "/" ["/dev"]
+
+    where
+
+    flags = iN_ACCESS .|. iN_MASK_CREATE .|. iN_ONLYDIR .|. iN_DONT_FOLLOW
+
+    add dir dirs = do
+        wd <- withCString dir $ \p -> c_inotify_add_watch fd p (CUInt flags)
+        errno <- getErrno
+        case dirs of
+            _ | wd /= -1 -> do
+                action wd
+                throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
+                return True
+            next : rest -> add next rest
+            []  | errno == eEXIST || errno == eACCES || errno == eNOENT ->
+                    return False
+                | otherwise ->
+                    ioError (errnoToIOError err errno Nothing Nothing)
+#else
+-- Returns 'False' if @\/proc@ is not mounted or access to it is denied.
+-- Requires a free fd for a pipe, throw an exception if not.
 queueIgnored err fd action =
     allocaArray 2 $ \fds -> do
         -- For the marker event we need an inode that no user path can use,
@@ -2276,6 +2315,7 @@ queueIgnored err fd action =
             else if errno == eNOENT || errno == eACCES
             then return False
             else ioError (errnoToIOError err errno Nothing Nothing)
+#endif
 
 -- | Remove the given removed paths from the map. Returns the paths that were
 -- still in the map.
@@ -2305,8 +2345,8 @@ removeListed paths m0 =
 -- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
 -- we know that's the end point we were looking for.
 --
--- If @\/proc@ is not available the marker cannot be queued. The paths are
--- then removed from the map at once, and the paths
+-- If the marker cannot be queued, see 'queueIgnored', the paths are then
+-- removed from the map at once, and the paths
 -- still in the map are returned, to be reported 'isRootUnwatched' by the
 -- caller. The events already queued for the paths and not yet read are not
 -- reported. Returns an empty list if the marker is queued.
@@ -2334,14 +2374,15 @@ addRemovalMarker Watch {watchFd = fd, watchWdMap = wdMapRef} paths = do
 -- The events already queued for the paths are reported, followed by an
 -- 'isRootUnwatched' event for each path.
 --
--- If @\/proc@ is not mounted or access to it is denied, a path that shares
+-- If the marker cannot be queued, see 'queueIgnored', a path that shares
 -- the directory with another path is removed at once: the events queued for
 -- it and not yet read are not reported. Returns such paths, the caller
 -- reports their 'isRootUnwatched' events. See 'removeRoot'.
 --
--- Removing a path that shares the directory with another path requires a
--- free fd for a pipe, throw an exception if not. The paths of the shared
--- watch descriptors are not removed in that case, the call can be retried.
+-- On Linux, removing a path that shares the directory with another path
+-- requires a free fd for a pipe, throw an exception if not. The paths of the
+-- shared watch descriptors are not removed in that case, the call can be
+-- retried.
 --
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
@@ -2406,17 +2447,19 @@ unwatchPaths
 -- 'isRootUnwatched' event for each path watched under the root. A directory
 -- that is also watched via another root remains watched for that root.
 --
--- If @\/proc@ is not mounted or access to it is denied, the directories that
--- the root shares with another root are removed for the root at once: the
--- events queued for them and not yet read are not reported for the root, and
--- their 'isRootUnwatched' events are reported before the events of the next
--- read of the fd, the events already read are reported first. A thread
+-- On Linux, if @\/proc@ is not mounted or access to it is denied, and on
+-- FreeBSD, if the watch also watches both @\/@ and @\/dev@, the directories
+-- that the root shares with another root are removed for the root at once:
+-- the events queued for them and not yet read are not reported for the root,
+-- and their 'isRootUnwatched' events are reported before the events of the
+-- next read of the fd, the events already read are reported first. A thread
 -- waiting for events reports them at once in the threaded RTS, and when the
 -- next event arrives in the non-threaded RTS.
 --
--- Removing a root that shares a directory with another root requires a free
--- file descriptor, raise an exception if none is free. The shared directories
--- remain watched for the root in that case, the call can be retried.
+-- On Linux, removing a root that shares a directory with another root
+-- requires a free file descriptor, raise an exception if none is free. The
+-- shared directories remain watched for the root in that case, the call can
+-- be retried.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
@@ -2447,9 +2490,10 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- event.
 --
 -- With the non-threaded RTS, waking up the threads waiting for events
--- requires @\/proc@ to be mounted and a free file descriptor. If either is
--- not available, the waiting threads wake up when the next event arrives,
--- their streams end then.
+-- requires, on Linux, @\/proc@ to be mounted and a free file descriptor, and
+-- on FreeBSD, that the watch does not watch both @\/@ and @\/dev@. If not,
+-- the waiting threads wake up when the next event arrives, their streams end
+-- then.
 --
 -- /Pre-release/
 --
