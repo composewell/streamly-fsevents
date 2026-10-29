@@ -180,10 +180,11 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
    raises an exception and can be retried, as on Linux when `/proc` is not
    mounted.
 
-   Side effects: adding the watch reads `/` and looks up each entry. On
-   main, the kernel also opens and closes `/` to read it; a watch of `/` in
-   another process with `setOpened` or `setNonWriteClosed` enabled may see
-   these events.
+   Side effects: adding the watch reads `/` and looks up each entry. The
+   read generates `IN_ACCESS` on `/`, and on main the kernel also opens and
+   closes `/` to read it. A watch of `/` in another process with
+   `setAccessed`, `setOpened` or `setNonWriteClosed` enabled may see these
+   events.
 
 3. **`IN_EXCL_UNLINK` has no effect.** FreeBSD never reports the events
    of an unlinked file, as if `IN_EXCL_UNLINK` were always set. The default
@@ -204,14 +205,16 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
 
 6. **Adding a directory watch reads the directory.** `inotify_add_watch`
    on a directory reads all its entries and looks up each one, to fill
-   the name cache. The cost is proportional to the number of entries, and
-   two failures follow:
+   the name cache. The cost is proportional to the number of entries. The
+   read generates `IN_ACCESS` for the directory, reported by a watch on its
+   parent. Two failures follow:
 
    * An entry deleted between the read and the lookup fails the add with
-     `ENOENT`, although the directory exists. The backend retries the add,
-     up to 10 times, while the path still exists (`stat`, or `lstat` with
-     `setFollowSymLinks False`). In recursive mode, a subdirectory that
-     failed with `ENOENT` would otherwise be skipped silently as deleted.
+     `ENOENT`, although the directory exists. The backend retries the add
+     up to 10 times on `ENOENT`. A path that does not exist fails all the
+     retries; a retry costs one failed lookup. In recursive mode, a
+     subdirectory that failed with `ENOENT` would otherwise be skipped
+     silently as deleted.
    * A directory that is readable but not searchable (mode `r--`) fails
      with `EACCES`. Linux watches it. Documented.
 
@@ -314,20 +317,21 @@ The same as on Linux:
 * On FreeBSD 15 the system calls are in `libsys`, which `libc` links;
   no `extra-libraries` entry.
 
-## Open questions for review
+## Decisions
+
+Decided in review:
 
 1. FreeBSD 14.4 and earlier are not supported. A kqueue backend for them
-   would be a separate backend with weaker semantics (no entry names, one
-   fd per file). Proposed: not supported, documented.
-2. `setExcludeUnlinked False` has no effect on FreeBSD. Proposed:
-   document it. Alternative: raise an exception when it is set.
-3. The marker uses a watch on `/`, then `/dev`. Proposed as above.
-   Alternative: a private directory created with `mkdtemp` and removed,
-   watched through an open fd with `inotify_add_watch_at(fd, dirfd, ".")`;
-   it cannot collide with a user's root, but it creates and deletes a
-   directory in `$TMPDIR`, and whether a lookup of `.` in a removed
-   directory succeeds on ZFS and tmpfs is not verified.
-4. Module organisation: re-export the Linux module, as above.
+   would be a separate backend with weaker semantics: no entry names, one
+   fd per watched file.
+2. `setExcludeUnlinked False` has no effect on FreeBSD, documented.
+3. The marker watches `/`, then `/dev`. The rejected alternative is a
+   private directory created with `mkdtemp`, removed, and watched through
+   an open fd with `inotify_add_watch_at(fd, dirfd, ".")`. It cannot
+   collide with a user root, but it creates and deletes a directory in
+   `$TMPDIR`, and a lookup of `.` in a removed directory is not verified on
+   ZFS and tmpfs.
+4. The FreeBSD modules re-export the Linux module.
 
 ## Sources
 
