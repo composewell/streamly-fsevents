@@ -198,7 +198,7 @@ setAttrsModified = setFlag fILE_NOTIFY_CHANGE_ATTRIBUTES
 -- written to the disk. For operating systems that use extensive caching,
 -- detection occurs only when the cache is sufficiently flushed.
 --
--- /default: False/
+-- /default: True/
 --
 -- /Pre-release/
 --
@@ -215,7 +215,7 @@ setSizeModified = setFlag fILE_NOTIFY_CHANGE_SIZE
 -- that use extensive caching, detection occurs only when the cache is
 -- sufficiently flushed.
 --
--- /default: False/
+-- /default: True/
 --
 -- /Pre-release/
 --
