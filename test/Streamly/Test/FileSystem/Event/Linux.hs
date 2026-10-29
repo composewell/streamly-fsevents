@@ -9,10 +9,12 @@
 module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Concurrent
-    (forkIO, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
+    ( forkIO, killThread, newEmptyMVar, putMVar, rtsSupportsBoundThreads
+    , takeMVar, threadDelay
+    )
 import Control.Exception
     (IOException, SomeException, bracket, finally, throwIO, try)
-import Control.Monad (filterM)
+import Control.Monad (filterM, when)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
 import Numeric (readOct)
@@ -623,11 +625,12 @@ removeWhileReading =
             unwatched evs `shouldBe` [(root, root)]
 
 -- The reader thread is blocked reading the watch fd. The stream ends when
--- the watch is closed.
+-- the watch is closed. With the non-threaded RTS, the reader wakes up on the
+-- next event after the close.
 closeWhileReading :: Spec
 closeWhileReading =
     it "closeWatch does not block while another thread reads the events"
-        $ withRoot watchCfg $ \_ w -> do
+        $ withRoot watchCfg $ \root w -> do
             mv <- newEmptyMVar
             let reader = Stream.drain (Event.watchToStream watchCfg w)
             bracket
@@ -637,6 +640,8 @@ closeWhileReading =
                     threadDelay 200000
                     timeout 2000000 (Event.closeWatch w)
                         `shouldReturn` Just ()
+                    when (not rtsSupportsBoundThreads)
+                        $ createFile (root </> "file")
                     -- The stream ends without an exception
                     r <- timeout 2000000 (takeMVar mv)
                     fmap (either (\(_ :: SomeException) -> False) ok) r
