@@ -14,7 +14,7 @@ import Control.Concurrent
 import Control.Exception (IOException, evaluate, try)
 import Control.Monad (forM, forever, void)
 import Data.Either (lefts)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Foreign.C.Types (CUInt(..))
 import System.Directory (createDirectory, listDirectory)
@@ -238,6 +238,45 @@ childInherits =
             killThread watcher
             n1 `shouldBe` n0
 
+-- | With 'Event.setFileEvents' 'False' the path of an event is the
+-- directory in which an item changed. A non-recursive watch must not
+-- report the event for the subdirectory @nested@ when @nested/file@ is
+-- written; it reports the event for the root when @file@ is written.
+nestedDirEvents :: Spec
+nestedDirEvents =
+    it "non-recursive dir events: nested ops not reported (nested/file)" $
+        withSystemTempDirectory "fsevent_dir" $ \dir -> do
+            let rootDir = dir </> "root"
+            createDirectory rootDir
+            createDirectory (rootDir </> "nested")
+            root <- Path.fromString rootDir
+            started <- newEmptyMVar
+            evs <- newIORef []
+            let record ev = do
+                    let rel = fmap Path.toString (Event.getRelPath ev)
+                    modifyIORef evs (rel :)
+                    _ <- tryPutMVar started ()
+                    return ev
+            watcher <- forkIO $ Stream.drain $ Stream.mapM record
+                $ Event.watchWith
+                    (Event.setFileEvents False) (NonEmpty.fromList [root])
+            -- Repeat the write, the watch may not be started for the first
+            probe <- forkIO $ forever $ do
+                writeFile (rootDir </> "probe") ""
+                threadDelay 100000
+            takeMVar started
+            killThread probe
+            threadDelay 500000
+            writeIORef evs []
+            writeFile (rootDir </> "nested" </> "file") ""
+            threadDelay 500000
+            writeFile (rootDir </> "file") ""
+            threadDelay 1000000
+            killThread watcher
+            rels <- readIORef evs
+            rels `shouldSatisfy` notElem (Just "nested")
+            rels `shouldSatisfy` elem Nothing
+
 -- TODO:
 -- Creation/deletion/move of hard links
 -- Deletion of last hard link
@@ -327,4 +366,5 @@ main = do
         closeWithSigPipe
         closeWithReader
         childInherits
+        nestedDirEvents
         manyWatches
