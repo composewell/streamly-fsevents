@@ -10,4 +10,5 @@ stack.yaml
 .hlint.yaml
 flake.lock
 flake.nix
+sources.nix
 dev
