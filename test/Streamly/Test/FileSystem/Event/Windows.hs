@@ -8,14 +8,16 @@
 --
 module Streamly.Test.FileSystem.Event.Windows (main) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent
+    (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
 import System.Directory (createDirectory, renameDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performMajorGC)
+import System.Timeout (timeout)
 import System.Win32.File
     ( closeHandle
     , createFile
@@ -102,10 +104,46 @@ rootRenamed =
     , [("file", Event.isCreated)]
     )
 
+-- | Block the consumer at the first event while creating enough files to
+-- overflow both the stream buffer (1500 events) and the event buffer of the
+-- system. The watch must report isEventsLost instead of raising an exception
+-- or parsing an empty buffer.
+eventsLost :: Spec
+eventsLost =
+    it "reports isEventsLost when the event buffer overflows" $
+        withRoot $ \root -> do
+            p <- Path.fromString root
+            created <- newEmptyMVar
+            let create name = writeFile (root </> name) ""
+                longName i = replicate 100 'x' ++ show (i :: Int)
+                producer = do
+                    threadDelay 500000
+                    create "first"
+                    mapM_ (create . longName) [1 .. 4000]
+                    putMVar created ()
+                    -- The overflow is reported when a read returns, keep
+                    -- generating events to make the reads return.
+                    forM_ [1 :: Int ..] $ \i -> do
+                        threadDelay 100000
+                        create ("sentinel" ++ show i)
+            tid <- forkIO producer
+            r <- timeout 120000000
+                    $ Stream.fold (Fold.find Event.isEventsLost)
+                    $ Stream.mapM (\ev -> readMVar created >> return ev)
+                    $ Event.watch (p :| [])
+            killThread tid
+            case r of
+                Nothing -> expectationFailure "timed out"
+                Just Nothing -> expectationFailure "the stream ended"
+                Just (Just ev) -> do
+                    fmap (const ()) (Event.getRelPath ev) `shouldBe` Nothing
+                    Path.toString (Event.getAbsPath ev) `shouldBe` root
+
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
         handleClosedOnGC
+        eventsLost
 
 -- TODO Test isModified event for parent directories when a file is created or
 -- deleted.
