@@ -11,7 +11,7 @@ module Streamly.Test.FileSystem.Event.Linux (main) where
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception
-    (IOException, SomeException, bracket, throwIO, try)
+    (IOException, SomeException, bracket, finally, throwIO, try)
 import Control.Monad (filterM)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
@@ -30,7 +30,9 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory)
 import System.IO
-    (IOMode(AppendMode, WriteMode), hClose, hFlush, hPutStr, openFile)
+    ( IOMode(AppendMode, ReadMode, WriteMode), hClose, hFlush, hPutStr
+    , openFile
+    )
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -619,6 +621,42 @@ closeWhileReading =
 
     ok () = True
 
+-------------------------------------------------------------------------------
+-- Failure tests
+-------------------------------------------------------------------------------
+
+-- | Run the action with all the file descriptors of the process in use.
+-- Returns 'Nothing' if the limit is not reached in 100000 opens.
+withFdsExhausted :: IO a -> IO (Maybe a)
+withFdsExhausted action = go [] (100000 :: Int)
+
+    where
+
+    go hs 0 = mapM_ hClose hs >> return Nothing
+    go hs n = do
+        r <- try (openFile "/dev/null" ReadMode)
+        case r of
+            Right h -> go (h : hs) (n - 1)
+            Left (_ :: IOException) ->
+                (Just <$> action) `finally` mapM_ hClose hs
+
+-- The marker of the shared watch descriptor of sub needs a pipe, the pipe
+-- fails with EMFILE.
+removeFailRetry :: Spec
+removeFailRetry =
+    it "removeFromWatch can be retried after it fails"
+        $ withNestedRoots $ \_ sub w -> do
+            p <- Path.fromString sub
+            r <- withFdsExhausted (try (Event.removeFromWatch w p))
+            case r of
+                Nothing -> pendingWith "the open file limit is too high"
+                Just (Right ()) ->
+                    expectationFailure "removeFromWatch did not fail"
+                Just (Left (_ :: IOException)) -> do
+                    Event.removeFromWatch w p
+                    evs <- readUntil recCfg Event.isRootUnwatched w
+                    unwatched evs `shouldBe` [(sub, sub)]
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -647,6 +685,7 @@ watchTests =
                 addWhileReading
                 removeWhileReading
                 closeWhileReading
+            describe "failures" removeFailRetry
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
