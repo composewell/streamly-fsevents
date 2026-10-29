@@ -817,6 +817,14 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     -- XXX Ensure that we generate events that we may have missed while we were
     -- adding the dirs. That may generate spurious events though.
     --
+    when (isNew && watchRec) $ addSubdirs cfg watch0 prep
+
+-- | Add the subdirectories of a path to the watch, if the path is a
+-- directory. The subdirectories already watched via the same root are not
+-- scanned again.
+addSubdirs :: Config -> Watch -> PathRep -> IO ()
+addSubdirs cfg wt prep = do
+    let absPath = combinePathRep prep
     -- XXX Are the following comments obselete?
     -- XXX readDirs currently uses paths as String, we need to convert it
     -- to "/" separated by byte arrays.
@@ -828,8 +836,8 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     -- otherwise the exception would stop the scan of the remaining entries,
     -- and 'addSubdirToWatch' would ignore it silently.
     pathIsDir <- doesDirectoryExist (Path.toString absPath)
-    when (isNew && watchRec && pathIsDir) $ do
-        let f = addSubdirToWatch cfg watch0 . addSub prep
+    when pathIsDir $ do
+        let f = addSubdirToWatch cfg wt . addSub prep
             in S.fold (FL.drainMapM f)
                 $ Dir.readDirs (Dir.ignoreMissing True) absPath
 
@@ -1167,6 +1175,26 @@ syncRemovals (Watch fd lock wdMapRef) =
             $ addRemovalMarker fd wdMapRef markers paths
                 `catchIOError` \_ -> return ()
 
+-- | Add the unwatched subdirectories of the watched directories. In
+-- recursive mode, a subdirectory is added on its IN_CREATE or IN_MOVED_TO
+-- event, the event is dropped when the event queue overflows.
+rescanSubdirs :: Config -> Watch -> IntMap WdEntry -> IO ()
+rescanSubdirs cfg wt m =
+    mapM_ rescan
+        [ wpRep wp
+        | WdPaths wps <- Map.elems m
+        , wp <- wps
+        , not (wpRemoved wp)
+        ]
+
+    where
+
+    -- The directory may have been deleted or moved after its watch was
+    -- added, its IN_IGNORED event may have been dropped too.
+    rescan prep =
+        addSubdirs cfg wt prep `catchIOError` \e ->
+            if isDoesNotExistError e then return () else ioError e
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
@@ -1220,6 +1248,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
         PR.fromEffect $ syncRemovals wt
+        when (watchRec cfg) $ PR.fromEffect $ rescanSubdirs cfg wt wdm
         return
             [ mkEvent (fromIntegral wd) (wpRep wp)
             | (wd, WdPaths wps) <- Map.toList wdm
@@ -1512,6 +1541,11 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 -- The kernel generates a single overflow event for all the watch roots. It is
 -- reported as one event per watch root, 'getRoot' returns the root and
 -- 'getRelPath' returns 'Nothing'.
+--
+-- In recursive mode, the watched directories are scanned again on an
+-- overflow, the subdirectories whose create or move events were lost are
+-- added to the watch. A subdirectory moved out of the tree, whose move event
+-- was lost, remains watched with its old path.
 isEventsLost :: Event -> Bool
 isEventsLost = getFlag iN_Q_OVERFLOW
 

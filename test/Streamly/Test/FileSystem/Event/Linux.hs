@@ -764,6 +764,24 @@ overflowRemoveShared =
                     evs1 <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs1 `shouldBe` [root]
 
+-- The kernel drops the create event of the directory when the queue is full.
+overflowRecCreate :: Spec
+overflowRecCreate =
+    it "watches a directory created during a queue overflow"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                file = dir </> "sub" </> "file"
+            r <- withOverflow root $ do
+                createDirectory dir
+                createDirectory (dir </> "sub")
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    _ <- readUntil recCfg Event.isEventsLost w
+                    createFile file
+                    evs <- readUntil recCfg (isCreatedAt file) w
+                    createdRoots file evs `shouldBe` [root]
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -796,6 +814,7 @@ watchTests =
             describe "queue overflow" $ do
                 overflowRemove
                 overflowRemoveShared
+                overflowRecCreate
             describe "recursive mode robustness" $ do
                 recFailIfExists
                 recDirReplacedByFile
