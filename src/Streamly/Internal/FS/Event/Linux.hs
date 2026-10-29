@@ -156,8 +156,9 @@ module Streamly.Internal.FS.Event.Linux
     )
 where
 
+import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
-    (MVar, modifyMVar_, newMVar, readMVar, withMVar)
+    (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (finally, onException)
 import Control.Monad (void, when)
 import Data.Bits ((.|.), (.&.), complement)
@@ -195,7 +196,7 @@ import System.Posix.Types (CSsize(..), Fd(..))
 import Streamly.Internal.Data.Array (byteLength, unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
 
-import qualified Control.Exception as Exception (mask)
+import qualified Control.Exception as Exception (mask, uninterruptibleMask_)
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as FL
@@ -633,6 +634,15 @@ data WdEntry =
     -- shared watch descriptor, report 'isRootUnwatched'.
     | WdMarker [(Int, PathRep)]
 
+-- | The state of the fd of a watch.
+data FdState = FdState
+    { fsClosed :: !Bool -- ^ 'closeWatch' was called
+    , fsFdOpen :: !Bool -- ^ The fd is not closed yet
+    -- | The threads waiting for the fd to become readable, counted in the
+    -- non-threaded RTS only.
+    , fsWaiters :: !Int
+    }
+
 -- | A handle for a watch.
 --
 -- The fd is not wrapped in a 'System.IO.Handle'. A thread blocked reading a
@@ -642,11 +652,11 @@ data WdEntry =
 data Watch =
     Watch
         CInt                    -- The inotify fd
-        -- 'True' if the watch is closed. The lock is held during a system call
-        -- on the fd, 'closeWatch' cannot close the fd, and the fd number
-        -- cannot be reused, while the system call is in progress. The system
-        -- calls made with the lock held must not block.
-        (MVar Bool)
+        -- The lock is held during a system call on the fd, 'closeWatch'
+        -- cannot close the fd, and the fd number cannot be reused, while the
+        -- system call is in progress. The system calls made with the lock
+        -- held must not block.
+        (MVar FdState)
         (IORef
             (IntMap             -- Key is the watch descriptor
                 WdEntry
@@ -684,7 +694,9 @@ createWatch = do
     fd <-
         throwErrnoIfMinus1 "createWatch"
             $ c_inotify_init1 (iN_CLOEXEC .|. iN_NONBLOCK)
-    lock <- newMVar False
+    lock <-
+        newMVar
+            FdState {fsClosed = False, fsFdOpen = True, fsWaiters = 0}
     emptyMapRef <- newIORef Map.empty
     return $ Watch fd lock emptyMapRef
 
@@ -693,8 +705,8 @@ createWatch = do
 -- string is the name of the operation, used in the exception message.
 withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
 withWatchFd op (Watch fd lock _) action =
-    withMVar lock $ \closed ->
-        if closed
+    withMVar lock $ \st ->
+        if fsClosed st
         then ioError
                 $ mkIOError
                     illegalOperationErrorType
@@ -704,7 +716,7 @@ withWatchFd op (Watch fd lock _) action =
         else action fd
 
 isWatchClosed :: Watch -> IO Bool
-isWatchClosed (Watch _ lock _) = readMVar lock
+isWatchClosed (Watch _ lock _) = fsClosed <$> readMVar lock
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -949,7 +961,7 @@ addRemovalMarker fd wdMapRef paths =
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
 unwatchPaths (Watch fd lock wdMapRef) desc p =
-    withMVar lock $ \closed -> when (not closed) $ do
+    withMVar lock $ \st -> when (not (fsClosed st)) $ do
         -- The paths stay in the map until their 'isRootUnwatched' event is
         -- read, so that the events already queued for the removed paths,
         -- including 'isRootUnwatched', report the paths.
@@ -998,19 +1010,35 @@ removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch wt root =
     unwatchPaths wt (show (Path.toString root)) (eqPath root . getRepRoot)
 
+-- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
+-- the fd to become readable, in the threaded RTS. The kernel releases the fd
+-- even if close fails.
+closeInotifyFd :: CInt -> IO ()
+closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
+
 -- | Close a 'Watch' handle. The event streams of the watch end, a thread
 -- waiting for events in 'watchToStream' is woken up. Closing a closed watch
 -- does nothing.
+--
+-- With the non-threaded RTS, a thread waiting for events wakes up when the
+-- next event arrives, its stream ends then. The fd is closed when no thread
+-- is waiting for events.
 --
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
 closeWatch (Watch fd lock _) =
-    modifyMVar_ lock $ \closed -> do
-        -- closeFdWith wakes up the threads waiting for the fd to become
-        -- readable. The kernel releases the fd even if close fails.
-        when (not closed) $ closeFdWith (\_ -> void (c_close fd)) (Fd fd)
-        return True
+    modifyMVar_ lock $ \st ->
+        if fsClosed st
+        then return st
+        -- The non-threaded RTS waits for the fds in select, select fails
+        -- with EBADF if a waited fd is closed, and the RTS terminates the
+        -- program. The last waiting thread closes the fd.
+        else if rtsSupportsBoundThreads || fsWaiters st == 0
+        then do
+            closeInotifyFd fd
+            return st {fsClosed = True, fsFdOpen = False}
+        else return st {fsClosed = True}
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -1248,28 +1276,60 @@ readEvents (Watch fd lock _) = loop
             then return 0
             else throwErrno "watchToStream"
 
-    -- The wait is registered with the IO manager with the lock held, if
-    -- 'closeWatch' closes the fd after that, the wait raises an exception.
-    -- If the fd were closed before the registration, the registration could
-    -- wait on a reused fd number.
+    -- In the threaded RTS, the wait is registered with the IO manager with
+    -- the lock held, if 'closeWatch' closes the fd after that, the wait
+    -- raises an exception. If the fd were closed before the registration, the
+    -- registration could wait on a reused fd number.
+    --
+    -- In the non-threaded RTS, the waiting thread is counted with the lock
+    -- held, 'closeWatch' does not close the fd while the thread waits.
+    register st =
+        if rtsSupportsBoundThreads
+        then do
+            (wait, unregister) <- threadWaitReadSTM (Fd fd)
+            -- The next iteration returns 'Nothing' if the exception is due
+            -- to 'closeWatch'.
+            let waitTh restore =
+                    restore (atomically wait) `catchIOError` (\_ -> return ())
+                        `onException` unregister
+            return (st, Just (Left waitTh))
+        else do
+            -- The lock is never held across a blocking call, taking it
+            -- uninterruptibly cannot block for long.
+            let waitNonTh restore =
+                    restore (threadWaitRead (Fd fd))
+                        `finally` Exception.uninterruptibleMask_
+                            (modifyMVar_ lock unregisterNonTh)
+            return (st {fsWaiters = fsWaiters st + 1}, Just (Left waitNonTh))
+
+    unregisterNonTh st = do
+        let st1 = st {fsWaiters = fsWaiters st - 1}
+        if fsClosed st1 && fsFdOpen st1 && fsWaiters st1 == 0
+        then do
+            closeInotifyFd fd
+            return st1 {fsFdOpen = False}
+        else return st1
+
+    -- The wait must be counted or unregistered even if an async exception
+    -- arrives after the registration.
     loop = do
-        r <- withMVar lock $ \closed ->
-            if closed
-            then return Nothing
-            else do
-                arr <- MArray.unsafeCreateWithPtr' bufSize readFd
-                if MArray.byteLength arr /= 0
-                then return $ Just $ Right $ unsafeFreezeWithShrink arr
-                else Just . Left <$> threadWaitReadSTM (Fd fd)
+        r <- Exception.mask $ \restore -> do
+            r <- modifyMVar lock $ \st ->
+                if fsClosed st
+                then return (st, Nothing)
+                else do
+                    arr <- MArray.unsafeCreateWithPtr' bufSize readFd
+                    if MArray.byteLength arr /= 0
+                    then return (st, Just $ Right $ unsafeFreezeWithShrink arr)
+                    else register st
+            case r of
+                Just (Left wait) -> wait restore >> return (Just (Left ()))
+                Just (Right arr) -> return (Just (Right arr))
+                Nothing -> return Nothing
         case r of
             Nothing -> return Nothing
             Just (Right arr) -> return (Just arr)
-            Just (Left (wait, unregister)) -> do
-                -- The next iteration returns 'Nothing' if the exception is
-                -- due to 'closeWatch'.
-                atomically wait `catchIOError` (\_ -> return ())
-                    `onException` unregister
-                loop
+            Just (Left ()) -> loop
 
 -- | Read the events from a 'Watch' as a stream. The 'Config' must be the one
 -- used to open the watch. The stream does not close the watch, use
