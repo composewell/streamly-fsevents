@@ -667,8 +667,16 @@ defaultConfig =
 -- non-recursive mode. A root that reports IN_MOVE_SELF is removed from the
 -- watch if its path no longer refers to the watched object, see
 -- 'unwatchGoneRoots'.
+--
+-- FreeBSD 15.0 and 15.1 do not generate IN_IGNORED for a deleted object, and
+-- do not remove its watch, unless the watch has IN_DELETE_SELF. The deleted
+-- path would never report 'isRootUnwatched' and would stay in the map.
 rootEvents :: Word32
+#if defined(CABAL_OS_FREEBSD)
+rootEvents = iN_MOVE_SELF .|. iN_DELETE_SELF
+#else
 rootEvents = iN_MOVE_SELF
+#endif
 
 -- | The events that the kernel watch must generate in recursive mode, to add
 -- and remove the watches of the subdirectories.
