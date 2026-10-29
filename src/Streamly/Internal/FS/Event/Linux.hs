@@ -1293,6 +1293,10 @@ watch = watchWith id
 getRoot :: Event -> Path
 getRoot = eventRoot
 
+-- getRelPath returns 'Nothing' rather than "." for the watch root because
+-- the watch root may be a file, see the comment on getRelPath in
+-- "Streamly.Internal.FS.Event".
+
 -- | Get the file system object path for which the event is generated, relative
 -- to the watched root. Returns 'Nothing' if the event is for the watch root
 -- itself.

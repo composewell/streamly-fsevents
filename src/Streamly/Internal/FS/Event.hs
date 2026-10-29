@@ -190,6 +190,17 @@ watchRecursive = Event.watchRecursive
 getRoot :: Event -> Path
 getRoot = Event.getRoot
 
+-- Why getRelPath returns a Maybe instead of "." for the watch root:
+--
+-- "." is a valid relative path only when the watch root is a directory. On
+-- Linux (inotify) and macOS (FSEvents with file events) the watch root can be
+-- a regular file. For a file root "/a/f", Path.join "/a/f" "." is "/a/f/.",
+-- which fails to resolve with ENOTDIR. "." would then be a marker that the
+-- caller has to recognise rather than a path that can be joined, and the type
+-- checker would not catch a caller that joins it. An empty path is not an
+-- option, the streamly Path type does not allow it. 'Nothing' means "the
+-- watch root itself" whether the root is a file or a directory.
+
 -- | Get the path of the file system object for which the event is generated,
 -- relative to the watch root. Returns 'Nothing' if the event is for the watch
 -- root itself.

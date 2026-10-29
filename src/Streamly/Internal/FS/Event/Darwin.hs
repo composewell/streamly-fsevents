@@ -756,6 +756,10 @@ isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 getRoot :: Event -> Path
 getRoot Event{..} = fromMaybe eventPath eventRoot
 
+-- getRelPath returns 'Nothing' rather than "." for the watch root because
+-- the watch root may be a file, see the comment on getRelPath in
+-- "Streamly.Internal.FS.Event".
+
 -- | Get the file system object path for which the event is generated,
 -- relative to the watch root. Returns 'Nothing' if the event is for the watch
 -- root itself, or if the event path is not under any watch root (see
