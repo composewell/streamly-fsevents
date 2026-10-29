@@ -1239,9 +1239,40 @@ takeSynthEvents Watch {watchSynthEvents = synthVar} =
         writeTVar synthVar []
         return (reverse ps)
 
+#if defined(CABAL_OS_FREEBSD)
+-- On FreeBSD, adding a watch on a directory reads all its entries, the call
+-- may take long on a large directory.
+foreign import ccall safe
+    "sys/inotify.h inotify_add_watch" c_inotify_add_watch
+        :: CInt -> CString -> CUInt -> IO CInt
+#else
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
         :: CInt -> CString -> CUInt -> IO CInt
+#endif
+
+-- | Add a kernel watch for a path, returns -1 and sets errno on failure.
+--
+-- On FreeBSD, adding a watch on a directory looks up each entry of the
+-- directory, the call fails with ENOENT if an entry is deleted in between.
+-- The call is retried a few times on ENOENT, an object that does not exist
+-- fails all the retries.
+inotifyAddWatch :: CInt -> CString -> Word32 -> IO CInt
+#if defined(CABAL_OS_FREEBSD)
+inotifyAddWatch fd pathPtr flags = go (10 :: Int)
+
+    where
+
+    go n = do
+        wd <- c_inotify_add_watch fd pathPtr (CUInt flags)
+        if wd /= -1 || n == 0
+        then return wd
+        else do
+            errno <- getErrno
+            if errno == eNOENT then go (n - 1) else return wd
+#else
+inotifyAddWatch fd pathPtr flags = c_inotify_add_watch fd pathPtr (CUInt flags)
+#endif
 
 foreign import capi "fcntl.h openat" c_openat3
     :: CInt -> CString -> CInt -> IO CInt
@@ -1408,7 +1439,7 @@ addWatchByPath :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchByPath fd flags pRep =
     A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
         throwErrnoIfMinus1 ("add watch: " ++ Path.toString absPath)
-            $ c_inotify_add_watch fd pathPtr (CUInt flags)
+            $ inotifyAddWatch fd pathPtr flags
 
     where
 
@@ -1435,8 +1466,7 @@ addWatchViaFd fd flags pRep dirFd = do
     -- /proc/self/fd/N itself must be followed to reach the directory.
     wd <-
         withCString procPath $ \pathPtr ->
-            c_inotify_add_watch fd pathPtr
-                (CUInt (flags .&. complement iN_DONT_FOLLOW))
+            inotifyAddWatch fd pathPtr (flags .&. complement iN_DONT_FOLLOW)
     errno <- getErrno
     if wd /= -1
     then return wd
