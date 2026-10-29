@@ -12,7 +12,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (void)
 import Data.List.NonEmpty (NonEmpty(..))
-import System.Directory (createDirectory)
+import System.Directory (createDirectory, renameDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performMajorGC)
@@ -90,6 +90,18 @@ handleClosedOnGC =
             writeFile (root </> "file2") ""
             retrying 50 (performMajorGC >> openExclusive root)
 
+-- | Rename the watch root, then create a file in it. The watch reports the
+-- event with the original root path.
+rootRenamed :: TestDesc
+rootRenamed =
+    ( "watch root renamed while watched"
+    , const (return ())
+    , \fp -> do
+        renameDirectory fp (fp ++ "-moved")
+        writeFile (fp ++ "-moved" </> "file") ""
+    , [("file", Event.isCreated)]
+    )
+
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
@@ -101,13 +113,17 @@ robustnessTests =
 main :: IO ()
 main = do
     let regularRootTests =
-            commonTests
-        -- The following watch-root deletion test results in:
+            rootRenamed : commonTests
+        -- The following watch-root deletion test failed with a sharing
+        -- violation when the directory handle was opened without
+        -- FILE_SHARE_DELETE:
         -- C:\tmp\fsevent_dir-e061f0b0a00e1696\watch-root:
         -- removePathForcibly:RemoveDirectory
         -- "\\\\?\\C:\\tmp\\fsevent_dir-e061f0b0a00e1696\\watch-root":
         -- permission denied (The process cannot access the file because it is
         -- being used by another process.)
+        -- ReadDirectoryChangesW does not report changes to the watched
+        -- directory itself, so no isDeleted event is expected.
         --
         -- ++ dirDelete "" (\dir -> [(dir, Event.isDeleted)])
 

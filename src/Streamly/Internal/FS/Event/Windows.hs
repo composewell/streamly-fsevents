@@ -106,6 +106,7 @@ import System.Win32.File
     , fILE_NOTIFY_CHANGE_SIZE
     , fILE_NOTIFY_CHANGE_LAST_WRITE
     , fILE_NOTIFY_CHANGE_SECURITY
+    , fILE_SHARE_DELETE
     , fILE_SHARE_READ
     , fILE_SHARE_WRITE
     , oPEN_EXISTING
@@ -273,8 +274,9 @@ openDirHandle dir = do
     createFile dirStr
         -- Access mode
         fILE_LIST_DIRECTORY
-        -- Share mode
-        (fILE_SHARE_READ .|. fILE_SHARE_WRITE)
+        -- Share mode. FILE_SHARE_DELETE lets other processes delete or
+        -- rename the watched directory.
+        (fILE_SHARE_READ .|. fILE_SHARE_WRITE .|. fILE_SHARE_DELETE)
         -- Security attributes
         Nothing
         -- Create mode, we want to look at an existing directory
