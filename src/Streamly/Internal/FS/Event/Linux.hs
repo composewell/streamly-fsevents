@@ -394,7 +394,10 @@ foreign import capi
 -- | Report when the metadata e.g. owner, permission modes, modifications times
 -- of an object changes.
 --
--- /default: False/
+-- macOS reports the metadata changes. On Linux, @touch@ on an existing file
+-- generates 'isAttrsModified' but not 'isModified'.
+--
+-- /default: True/
 --
 -- /Pre-release/
 --
@@ -563,6 +566,7 @@ setAllEvents s =
 -- * setMovedFrom True
 -- * setMovedTo True
 -- * setModified True
+-- * setAttrsModified True
 --
 -- /Pre-release/
 --
@@ -575,6 +579,7 @@ defaultConfig =
     $ setMovedFrom True
     $ setMovedTo True
     $ setModified True
+    $ setAttrsModified True
     $ Config
         { watchRec = False
         , createFlags = 0

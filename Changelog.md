@@ -43,6 +43,8 @@
   module as a deprecated alias. The setting maps to `IN_EXCL_UNLINK`, it
   stops the events of a file after the file is unlinked, it does not affect
   the objects moved out of a watched directory as documented earlier.
+- Linux: enable `setAttrsModified` in `defaultConfig`, consistent with macOS.
+  A `touch` or `chmod` of an existing file does not generate `isModified`.
 
 ## 0.1.1
 

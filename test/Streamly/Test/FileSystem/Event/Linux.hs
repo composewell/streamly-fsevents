@@ -10,7 +10,14 @@ module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Exception (bracket)
 import Streamly.Internal.FS.Event.Linux (Event)
-import System.Directory (createDirectory, removeDirectory, removeFile)
+import System.Directory
+    ( createDirectory
+    , getPermissions
+    , removeDirectory
+    , removeFile
+    , setOwnerExecutable
+    , setPermissions
+    )
 import System.FilePath ((</>))
 import System.IO
     (IOMode(AppendMode, WriteMode), hClose, hFlush, hPutStr, openFile)
@@ -342,6 +349,18 @@ defaultExcludeUnlinked =
             evs <- readUntil Event.defaultConfig (isCreatedAt sentinel) w
             pathsOf Event.isModified evs `shouldBe` []
 
+-- chmod generates IN_ATTRIB only.
+defaultAttrsModified :: Spec
+defaultAttrsModified =
+    it "reports the metadata change of a file"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            let file = root </> "file"
+            createFile file
+            perms <- getPermissions file
+            setPermissions file (setOwnerExecutable True perms)
+            evs <- readUntil Event.defaultConfig Event.isAttrsModified w
+            pathsOf Event.isAttrsModified evs `shouldBe` [file]
+
 removeTests :: IO ()
 removeTests =
     hspec
@@ -359,6 +378,7 @@ removeTests =
             describe "watch descriptors" largeWd
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
+                defaultAttrsModified
 
 main :: IO ()
 main = do
