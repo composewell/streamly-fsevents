@@ -10,7 +10,7 @@ module Streamly.Test.FileSystem.Event.Windows (main) where
 
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, evaluate, throwIO, try)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
 import System.Directory (createDirectory, makeAbsolute, renameDirectory)
@@ -177,12 +177,30 @@ missingRoot =
                 Right Nothing -> expectationFailure "timed out"
                 Right (Just ()) -> expectationFailure "the stream ended"
 
+-- | NTFS does not validate the UTF-16 in names. showEvent must not raise an
+-- exception for a name with an unpaired surrogate.
+unpairedSurrogate :: Spec
+unpairedSurrogate =
+    it "showEvent accepts a name with an unpaired surrogate" $
+        withRoot $ \root -> do
+            p <- Path.fromString root
+            void $ forkIO $ do
+                threadDelay 500000
+                writeFile (root </> "a\xD800") ""
+            r <- Stream.fold Fold.one (Event.watch (p :| []))
+            case r of
+                Nothing -> expectationFailure "the stream ended"
+                Just ev -> do
+                    n <- evaluate (length (Event.showEvent ev))
+                    n `shouldSatisfy` (> 0)
+
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
         handleClosedOnGC
         eventsLost
         missingRoot
+        unpairedSurrogate
 
 -- TODO Test isModified event for parent directories when a file is created or
 -- deleted.

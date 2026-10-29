@@ -593,12 +593,15 @@ isEventsLost Event{..} = totalBytes == 0
 -------------------------------------------------------------------------------
 
 -- | Convert an 'Event' record to a String representation.
+--
+-- Paths are decoded leniently, invalid UTF-16 such as an unpaired surrogate,
+-- which NTFS allows in names, is shown as the Unicode replacement character.
 showEvent :: Event -> String
 showEvent ev@Event{..} =
         "--------------------------"
-    ++ "\nRoot = " ++ Path.toString (getRoot ev)
-    ++ "\nPath = " ++ maybe "" Path.toString (getRelPath ev)
-    ++ "\ngetAbsPath = " ++ Path.toString (getAbsPath ev)
+    ++ "\nRoot = " ++ Path.toString_ (getRoot ev)
+    ++ "\nPath = " ++ maybe "" Path.toString_ (getRelPath ev)
+    ++ "\ngetAbsPath = " ++ Path.toString_ (getAbsPath ev)
     ++ "\nFlags " ++ show eventFlags
     ++ showev isEventsLost "Overflow"
     ++ showev isCreated "Created"
