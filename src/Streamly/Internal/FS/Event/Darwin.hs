@@ -357,7 +357,13 @@ foreign import ccall safe
     "FSEventStreamCreateFlagFullHistory"
     kFSEventStreamCreateFlagFullHistory :: Word32
 
--- | When this is 'True' all events since the beginning of time are reported.
+-- | When the historical events are replayed starting from an event id,
+-- FSEvents may skip some of the events stored in the same chunk as that id.
+-- When this is 'True', all the events of that chunk are reported, including
+-- those with an id lower than the starting id.
+--
+-- The watch APIs in this module always start a watch from the current time,
+-- historical events are not replayed. Therefore, this setting has no effect.
 --
 -- /default: False/
 --
@@ -802,9 +808,12 @@ foreign import ccall safe
     kFSEventStreamEventFlagHistoryDone :: Word32
 
 -- | Determine whether the event is a history done marker event. A history done
--- event is generated when the historical events from before the current time
--- are done. Historical events are generated when the "since" parameter in the
--- watch config is set to before the current time.
+-- event is generated after the historical events, the events from before the
+-- start of the watch, are reported. Its path is not meaningful.
+--
+-- Historical events are reported only when a watch is started from a past
+-- event id. The watch APIs in this module always start a watch from the
+-- current time, therefore, this event does not occur.
 --
 -- /macOS 10.5+/
 isHistoryDone :: Event -> Bool
