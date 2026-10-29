@@ -3334,17 +3334,6 @@ See 'config.log' for more details" "$LINENO" 5; } ;; #(
     ac_c_undeclared_builtin_options=$ac_cv_c_undeclared_builtin_options ;;
 esac
 
-ac_fn_check_decl "$LINENO" "IN_MASK_CREATE" "ac_cv_have_decl_IN_MASK_CREATE" "#include <sys/inotify.h>
-" "$ac_c_undeclared_builtin_options" "CFLAGS"
-if test "x$ac_cv_have_decl_IN_MASK_CREATE" = xyes
-then :
-  ac_have_decl=1
-else case e in #(
-  e) ac_have_decl=0 ;;
-esac
-fi
-printf "%s\n" "#define HAVE_DECL_IN_MASK_CREATE $ac_have_decl" >>confdefs.h
-
 ac_fn_check_decl "$LINENO" "IN_EXCL_UNLINK" "ac_cv_have_decl_IN_EXCL_UNLINK" "#include <sys/inotify.h>
 " "$ac_c_undeclared_builtin_options" "CFLAGS"
 if test "x$ac_cv_have_decl_IN_EXCL_UNLINK" = xyes

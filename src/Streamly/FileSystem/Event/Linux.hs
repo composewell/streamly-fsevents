@@ -31,8 +31,6 @@ module Streamly.FileSystem.Event.Linux
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
-    , WhenExists (..)
-    , setWhenExists
 
     -- ** Events of Interest
     -- *** Root Path Events

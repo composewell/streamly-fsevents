@@ -4,10 +4,6 @@
    you don't. */
 #undef HAVE_DECL_IN_EXCL_UNLINK
 
-/* Define to 1 if you have the declaration of 'IN_MASK_CREATE', and to 0 if
-   you don't. */
-#undef HAVE_DECL_IN_MASK_CREATE
-
 /* Define to 0 if kFSEventStreamCreateFlagFileEvents is unusable */
 #undef HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFILEEVENTS
 

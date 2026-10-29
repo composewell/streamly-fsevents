@@ -288,41 +288,27 @@ setExcludeUnlinked = setFlag iN_EXCL_UNLINK
 setUnwatchMoved :: Bool -> Config -> Config
 setUnwatchMoved = setExcludeUnlinked
 
-#if HAVE_DECL_IN_MASK_CREATE
-foreign import capi
-    "sys/inotify.h value IN_MASK_CREATE" iN_MASK_CREATE :: Word32
-#else
--- IN_MASK_CREATE was added in Linux 4.18, older C library headers do not
--- define it. The value is from the Linux kernel header
--- include/uapi/linux/inotify.h.
-iN_MASK_CREATE :: Word32
-iN_MASK_CREATE = 0x10000000
-#endif
-
 foreign import capi
     "sys/inotify.h value IN_MASK_ADD" iN_MASK_ADD :: Word32
 
--- | What to do if a watch already exists when 'openWatch' or 'addToWatch' is
--- called for a path.
+-- | What to do when a path being added to the watch is already watched, for
+-- example, when the same directory is reached via two roots. 'setWhenExists'
+-- has no effect, a path that is already watched is always added with
+-- 'AddIfExists'.
+{-# DEPRECATED WhenExists "The setting has no effect" #-}
 data WhenExists =
-      AddIfExists -- ^ Do not set an existing setting to 'False' only set to 'True'
-    | ReplaceIfExists -- ^ Replace the existing settings with new settings
-    | FailIfExists -- ^ Fail the API. Requires Linux 4.18 or later, older
-                   -- kernels do not support it.
+      AddIfExists -- ^ Add the new events to the events already watched on
+                  -- the path.
+    | ReplaceIfExists -- ^ Watch only the new events, events already watched
+                      -- on the path but not in the new set are no longer
+                      -- watched.
+    | FailIfExists -- ^ Raise an exception.
 
--- | When adding a new path to the watch, specify what to do if a watch already
--- exists on that path.
---
--- /default: AddIfExists/
+-- | Has no effect. A path that is already watched is always added with
+-- 'AddIfExists'.
+{-# DEPRECATED setWhenExists "The setting has no effect" #-}
 setWhenExists :: WhenExists -> Config -> Config
-setWhenExists val =
-    -- inotify_add_watch fails with EINVAL if both IN_MASK_ADD and
-    -- IN_MASK_CREATE are set, therefore, we always clear the other one.
-    case val of
-        AddIfExists -> setFlag iN_MASK_ADD True . setFlag iN_MASK_CREATE False
-        ReplaceIfExists ->
-            setFlag iN_MASK_ADD False . setFlag iN_MASK_CREATE False
-        FailIfExists -> setFlag iN_MASK_CREATE True . setFlag iN_MASK_ADD False
+setWhenExists _ = id
 
 foreign import capi
     "sys/inotify.h value IN_ONESHOT" iN_ONESHOT :: Word32
@@ -515,7 +501,6 @@ setAllEvents s =
 -- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
--- * 'setWhenExists' 'AddIfExists'
 --
 -- The tunable events enabled by default are:
 --
@@ -530,8 +515,7 @@ setAllEvents s =
 --
 defaultConfig :: Config
 defaultConfig =
-      setWhenExists AddIfExists
-    $ setExcludeUnlinked True
+      setExcludeUnlinked True
     $ setCreated True
     $ setDeleted True
     $ setMovedFrom True
@@ -549,11 +533,35 @@ recursiveEvents :: Word32
 recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO
 
 -- | The flags of the kernel watch.
+--
+-- Every directory is added with IN_MASK_ADD. Each call to the 'watch' API is a
+-- different inotify instance, and it keeps one watch per directory in that
+-- instance. A directory can have an existing watch only if it is added to the
+-- same 'Watch' more than once, following are the only ways that can happen:
+--
+-- * a watch root is listed twice, or two watch roots are paths to the same
+--   directory, for example, via a symbolic link;
+-- * in recursive mode, a root is under another root, the scan of the outer
+--   root adds it too;
+-- * in recursive mode, a subdirectory created while its parent is scanned is
+--   added by the scan and again on its create event.
+--
+-- For the public 'watch' API it does not make a difference even if we do not
+-- specify IN_MASK_ADD, in that case the watch will be replaced and the
+-- replaced watch is the same as the original because same Config is used for
+-- all watches. However, if we happen to use the internal API with different
+-- event masks that would result in the mask getting changed. So we use
+-- IN_MASK_ADD for that case to add both the event masks.
+--
 watchFlags :: Config -> Word32
 watchFlags Config{..} =
     if watchRec
-    then createFlags .|. recursiveEvents
-    else createFlags
+    then flags .|. recursiveEvents
+    else flags
+
+    where
+
+    flags = createFlags .|. iN_MASK_ADD
 
 -------------------------------------------------------------------------------
 -- Path representation for events

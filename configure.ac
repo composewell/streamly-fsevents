@@ -13,7 +13,6 @@ AC_ARG_WITH([compiler], [GHC])
 # -----------------------------------------------------------------------------
 
 # XXX Do this only for linux
-AC_CHECK_DECLS([IN_MASK_CREATE],[],[],[#include <sys/inotify.h>])
 AC_CHECK_DECLS([IN_EXCL_UNLINK],[],[],[#include <sys/inotify.h>])
 
 # -----------------------------------------------------------------------------
