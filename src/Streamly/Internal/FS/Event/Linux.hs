@@ -172,8 +172,8 @@ import Data.Semigroup (Semigroup(..))
 #endif
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
-    ( eAGAIN, eINTR, eINVAL, eWOULDBLOCK, getErrno, throwErrno
-    , throwErrnoIfMinus1, throwErrnoIfMinus1_
+    ( Errno(..), eAGAIN, eINTR, eINVAL, eNOTDIR, eWOULDBLOCK, getErrno
+    , throwErrno, throwErrnoIfMinus1, throwErrnoIfMinus1_
     )
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
@@ -181,6 +181,7 @@ import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
 import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
+import GHC.IO.Exception (IOException(ioe_errno))
 import Streamly.Data.Array (Array)
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Parser (Parser)
@@ -245,7 +246,8 @@ setFlag mask status cfg@Config{..} =
 -- A directory created in or moved into the tree is added to the watch. A
 -- directory moved out of the tree is removed from the watch, its paths
 -- report 'isRootUnwatched'. A directory renamed within the tree is removed
--- and added again with the new path.
+-- and added again with the new path. A symbolic link to a directory in the
+-- tree is not followed.
 --
 -- The kernel watch always generates the create and move events in recursive
 -- mode, they are reported only if enabled in the 'Config'.
@@ -811,11 +813,15 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
             in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
--- exist or if the watch is closed. Used to add the subdirectories found by
--- the scan or reported by IN_CREATE or IN_MOVED_TO, a subdirectory may be
--- deleted or moved before its watch is added. Its parent reports the deletion
--- or the move. The watch may be closed by another thread while the event
--- stream adds a subdirectory.
+-- exist, is not a directory, or if the watch is closed. Used to add the
+-- subdirectories found by the scan or reported by IN_CREATE or IN_MOVED_TO,
+-- a subdirectory may be deleted, moved or replaced by another file before its
+-- watch is added. Its parent reports the deletion or the move. The watch may
+-- be closed by another thread while the event stream adds a subdirectory.
+--
+-- The subdirectory is added with 'setOnlyDir' and without
+-- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
+-- or a symbolic link. The scan does not follow symbolic links either.
 --
 -- 'FailIfExists' applies to the paths added by the user, a subdirectory is
 -- added with 'AddIfExists' instead. A directory created while its parent is
@@ -825,14 +831,19 @@ addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wt prep =
     addToWatch subCfg wt prep `catchIOError` \e -> do
         closed <- isWatchClosed wt
-        if isDoesNotExistError e || closed then return () else ioError e
+        let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
+        if isDoesNotExistError e || notDir || closed
+        then return ()
+        else ioError e
 
     where
 
-    subCfg =
+    whenExists =
         if createFlags cfg .&. iN_MASK_CREATE /= 0
-        then setWhenExists AddIfExists cfg
-        else cfg
+        then setWhenExists AddIfExists
+        else id
+
+    subCfg = setOnlyDir True $ setFollowSymLinks False $ whenExists cfg
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
