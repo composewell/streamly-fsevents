@@ -10,7 +10,9 @@ module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (filterM)
+import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
+import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
@@ -521,6 +523,24 @@ openWatchNoLeak =
                     expectationFailure "openWatch did not fail"
             inotifyFds `shouldReturn` fds
 
+-- | The flags of a file descriptor from @\/proc\/self\/fdinfo@.
+fdFlags :: FilePath -> IO Integer
+fdFlags fd = do
+    info <- readFile ("/proc/self/fdinfo" </> fd)
+    case [w | ("flags:" : w : _) <- map words (lines info)] of
+        (w : _) | [(n, "")] <- readOct w -> return n
+        _ -> error $ "fdFlags: no flags in fdinfo of " ++ fd
+
+-- O_CLOEXEC is 02000000 on Linux.
+cloexecWatch :: Spec
+cloexecWatch =
+    it "the inotify fd is close-on-exec"
+        $ withRoot watchCfg $ \_ _ -> do
+            fds <- inotifyFds
+            flags <- mapM fdFlags fds
+            null flags `shouldBe` False
+            filter (\f -> f .&. 0o2000000 == 0) flags `shouldBe` []
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -542,7 +562,9 @@ watchTests =
                 recMoveOutUnrequested
                 recMoveIn
                 recRenameWithin
-            describe "resources" openWatchNoLeak
+            describe "resources" $ do
+                openWatchNoLeak
+                cloexecWatch
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified

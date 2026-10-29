@@ -638,9 +638,12 @@ data Watch =
 
 newtype WD = WD CInt deriving Show
 
--- XXX Use inotify_init1? and IN_NONBLOCK?
+-- XXX Use IN_NONBLOCK?
 foreign import ccall unsafe
-    "sys/inotify.h inotify_init" c_inotify_init :: IO CInt
+    "sys/inotify.h inotify_init1" c_inotify_init1 :: CInt -> IO CInt
+
+foreign import capi
+    "sys/inotify.h value IN_CLOEXEC" iN_CLOEXEC :: CInt
 
 -- | Create a 'Watch' handle. 'addToWatch' can be used to add paths being
 -- monitored by this watch.
@@ -649,7 +652,10 @@ foreign import ccall unsafe
 --
 createWatch :: IO Watch
 createWatch = do
-    rawfd <- throwErrnoIfMinus1 "createWatch" c_inotify_init
+    -- The fd must not be inherited by child processes. An inherited fd
+    -- keeps the inotify instance and its watches alive after 'closeWatch',
+    -- and counts against the max_user_instances limit.
+    rawfd <- throwErrnoIfMinus1 "createWatch" $ c_inotify_init1 iN_CLOEXEC
     -- We cannot use fdToHandle because it calls fdStat, and fdStat raises an
     -- "unknown file type" exception for the inotify fd. The inotify fd is an
     -- anonymous inode and its st_mode has no file type bits.
@@ -811,7 +817,10 @@ foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
         :: CInt -> CInt -> IO CInt
 
-foreign import ccall unsafe "unistd.h pipe" c_pipe :: Ptr CInt -> IO CInt
+foreign import ccall unsafe "unistd.h pipe2"
+    c_pipe2 :: Ptr CInt -> CInt -> IO CInt
+
+foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
 
 foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
 
@@ -850,7 +859,7 @@ addRemovalMarker ::
     CInt -> IORef (IntMap WdEntry) -> [(Int, PathRep)] -> IO ()
 addRemovalMarker fd wdMapRef paths =
     allocaArray 2 $ \fds -> do
-        throwErrnoIfMinus1_ err $ c_pipe fds
+        throwErrnoIfMinus1_ err $ c_pipe2 fds o_CLOEXEC
         rfd <- peekElemOff fds 0
         wfd <- peekElemOff fds 1
         let path = "/proc/self/fd/" ++ show rfd
