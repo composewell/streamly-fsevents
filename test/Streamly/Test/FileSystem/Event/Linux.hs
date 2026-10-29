@@ -380,6 +380,11 @@ recEventsOf cfg root w action = do
     createFile sentinel
     readUntil cfg (isCreatedAt sentinel) w
 
+-- | Read the events up to the create event of @dir@. The watch adds @dir@
+-- and the directories under it when it reads the event.
+waitWatched :: Event.Config -> Event.Watch -> FilePath -> IO ()
+waitWatched cfg w dir = () <$ readUntil cfg (isCreatedAt dir) w
+
 -- The subdirectory watch generates IN_DELETE_SELF and IN_MOVE_SELF, the
 -- events are not reported.
 recSubdirSelfEvents :: Spec
@@ -391,6 +396,7 @@ recSubdirSelfEvents =
                 dir3 = root </> "dir3"
             createDirectory dir1
             createDirectory dir2
+            waitWatched recCfg w dir2
             evs <- recEventsOf recCfg root w $ do
                 renameDirectory dir1 dir3
                 removeDirectory dir2
@@ -418,6 +424,7 @@ recMoveOut cfg =
             sentinel = root </> "sentinel"
         createDirectory dir
         createDirectory sub
+        waitWatched cfg w dir
         renameDirectory dir out
         evs <- readUntil cfg (isUnwatchedAt sub) w
         unwatched evs `shouldBe` [(root, dir), (root, sub)]
@@ -468,6 +475,7 @@ recRenameWithin =
                 file = dir2 </> "sub" </> "file"
             createDirectory dir1
             createDirectory (dir1 </> "sub")
+            waitWatched recCfg w dir1
             renameDirectory dir1 dir2
             _ <- readUntil recCfg (isUnwatchedAt (dir1 </> "sub")) w
             createFile file

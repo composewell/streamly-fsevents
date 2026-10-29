@@ -54,6 +54,8 @@
   kept reporting events with its old path, a directory moved in was not
   watched. The create and move events needed for this are generated even if
   they are disabled in the `Config`, they are not reported.
+- Linux: in recursive mode, fix an exception when a subdirectory is deleted
+  or moved before its create event is read.
 
 ## 0.1.1
 

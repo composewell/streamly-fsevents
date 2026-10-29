@@ -185,6 +185,7 @@ import Streamly.Data.Stream (Stream)
 import Streamly.Data.Parser (Parser)
 import System.Directory (doesDirectoryExist)
 import System.IO (Handle, hClose, IOMode(ReadMode))
+import System.IO.Error (catchIOError, isDoesNotExistError)
 import GHC.IO.Handle.FD (handleToFd)
 
 import Streamly.Internal.Data.Array (byteLength)
@@ -814,10 +815,8 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
 
     fd <- handleToFd handle
 
-    -- XXX we need to tolerate an error where we are adding a watch for a
-    -- non-existing file because the file may have got deleted by the time we
-    -- added the watch. Perhaps we can have a flag in config for this and keep
-    -- the default value to tolerate the error.
+    -- A subdirectory may be deleted or moved before its watch is added,
+    -- 'addSubdirToWatch' ignores the error in that case.
     --
     -- XXX The file may have even got deleted and then recreated which we will
     -- never get to know, document this.
@@ -861,8 +860,17 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- XXX Need a FileSystem.Stat module to remove this
     pathIsDir <- doesDirectoryExist (Path.toString absPath)
     when (isNew && watchRec && pathIsDir) $ do
-        let f = addToWatch cfg watch0 . addSub prep
+        let f = addSubdirToWatch cfg watch0 . addSub prep
             in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
+
+-- | Like 'addToWatch' but does not raise an exception if the path does not
+-- exist. Used to add the subdirectories found by the scan or reported by
+-- IN_CREATE or IN_MOVED_TO, a subdirectory may be deleted or moved before its
+-- watch is added. Its parent reports the deletion or the move.
+addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
+addSubdirToWatch cfg wt prep =
+    addToWatch cfg wt prep `catchIOError` \e ->
+        if isDoesNotExistError e then return () else ioError e
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -1156,7 +1164,7 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                         live
                 when (watchRec cfg && isDirAdded)
                     $ PR.fromEffect
-                    $ mapM_ (addToWatch cfg wt) live
+                    $ mapM_ (addSubdirToWatch cfg wt) live
                 when isIgnored
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
