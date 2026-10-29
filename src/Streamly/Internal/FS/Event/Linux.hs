@@ -173,7 +173,7 @@ import Foreign.C.Error
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CUInt(..))
 import Foreign.Marshal.Array (allocaArray)
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
 import GHC.IO.Device (IODeviceType(Stream))
 import GHC.IO.FD (fdFD, FD(..))
@@ -1076,13 +1076,13 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                 -- IN_MOVED_FROM, IN_MOVED_TO
                 -- What if a large dir tree gets moved in to our hierarchy? Do
                 -- we get a single event for the top level dir in this case?
-                return [mkEvent (fromIntegral ewd) (wpRep wp) | wp <- wps1]
+                return [mkEvent ewd (wpRep wp) | wp <- wps1]
 
     where
 
     readHeader (ptr :: Ptr Word8) _ = do
         let len = sizeOf (undefined :: CInt)
-        ewd <- peek ptr
+        ewd :: CInt <- peek (castPtr ptr)
         eflags <- peekByteOff ptr len
         cookie <- peekByteOff ptr (len + 4)
         pathLen :: Word32 <- peekByteOff ptr (len + 8)

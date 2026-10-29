@@ -278,6 +278,29 @@ overlapRemoveBoth =
                     && getAbsPath ev == sub) w
             unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
 
+-------------------------------------------------------------------------------
+-- Watch descriptor tests
+-------------------------------------------------------------------------------
+
+-- inotify allocates the watch descriptors of a watch in increasing order, the
+-- last of the 300 roots gets a watch descriptor greater than 255.
+largeWd :: Spec
+largeWd =
+    it "reports the path of a watch descriptor greater than 255"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let dirs = [fp </> ("dir" ++ show i) | i <- [1 .. 300 :: Int]]
+                file = fp </> "dir300" </> "file"
+            mapM_ createDirectory dirs
+            roots <- mapM Path.fromString dirs
+            bracket
+                (Event.openWatch watchCfg (NonEmpty.fromList roots))
+                Event.closeWatch
+                $ \w -> do
+                    createFile file
+                    evs <- readUntil watchCfg Event.isCreated w
+                    map getAbsPath (filter Event.isCreated evs)
+                        `shouldBe` [file]
+
 removeTests :: IO ()
 removeTests =
     hspec
@@ -292,6 +315,7 @@ removeTests =
                 overlapRemoveInner
                 overlapRemoveOuter
                 overlapRemoveBoth
+            describe "watch descriptors" largeWd
 
 main :: IO ()
 main = do
