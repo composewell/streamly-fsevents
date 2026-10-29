@@ -536,6 +536,17 @@ defaultAttrsModified =
             evs <- readUntil Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
 
+-- isRootDeleted is not enabled by default. The kernel watch generates
+-- IN_DELETE_SELF on FreeBSD, the event is not reported.
+defaultRootDeleted :: Spec
+defaultRootDeleted =
+    it "reports isRootUnwatched for a deleted root"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            removeDirectory root
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+            pathsOf Event.isRootDeleted evs `shouldBe` []
+
 -------------------------------------------------------------------------------
 -- Renamed roots tests
 -------------------------------------------------------------------------------
@@ -2489,6 +2500,7 @@ watchTests =
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
+                defaultRootDeleted
                 lastRootEvent
             describe "symbolic link roots" recRootSymlinkNoFollow
 
