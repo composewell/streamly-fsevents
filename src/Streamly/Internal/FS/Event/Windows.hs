@@ -80,7 +80,16 @@ import System.Win32.File
     , fILE_SHARE_WRITE
     , oPEN_EXISTING
     )
-import System.Win32.Types (BOOL, DWORD, HANDLE, LPVOID, LPDWORD, failIfFalse_)
+import System.Win32.Types
+    ( BOOL
+    , DWORD
+    , ErrCode
+    , HANDLE
+    , LPVOID
+    , LPDWORD
+    , failWith
+    , getLastError
+    )
 
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Stream.Prelude (eager)
@@ -276,6 +285,14 @@ foreign import ccall safe
         -> LPOVERLAPPED_COMPLETION_ROUTINE
         -> IO BOOL
 
+-- | An asynchronous ReadDirectoryChangesW call reports this error code when
+-- the system was unable to record all the changes to the directory.
+eRROR_NOTIFY_ENUM_DIR :: ErrCode
+eRROR_NOTIFY_ENUM_DIR = 1022
+
+-- | Returns 'False' if the call failed with 'eRROR_NOTIFY_ENUM_DIR', in that
+-- case the number of bytes returned is not set. Throws an exception on any
+-- other failure.
 readDirectoryChangesW ::
        HANDLE
     -> Ptr FILE_NOTIFY_INFORMATION
@@ -283,11 +300,17 @@ readDirectoryChangesW ::
     -> BOOL
     -> FileNotificationFlag
     -> LPDWORD
-    -> IO ()
-readDirectoryChangesW h buf bufSize wst f br =
-    let res = c_ReadDirectoryChangesW
-                    h (castPtr buf) bufSize wst f br nullPtr nullFunPtr
-     in failIfFalse_ "ReadDirectoryChangesW" res
+    -> IO Bool
+readDirectoryChangesW h buf bufSize wst f br = do
+    res <- c_ReadDirectoryChangesW
+                h (castPtr buf) bufSize wst f br nullPtr nullFunPtr
+    if res
+    then return True
+    else do
+        err <- getLastError
+        if err == eRROR_NOTIFY_ENUM_DIR
+        then return False
+        else failWith "ReadDirectoryChangesW" err
 
 peekFNI :: Ptr FILE_NOTIFY_INFORMATION -> IO FILE_NOTIFY_INFORMATION
 peekFNI buf = do
@@ -315,15 +338,37 @@ readChangeEvents pfni root bytesRet = do
         else readChangeEvents (pfni `plusPtr` nioff) root bytesRet
     return $ entry : entries
 
+-- | The event reported when the changes were lost. 'totalBytes' 0 identifies
+-- it. 'eventRelPath' is a placeholder, 'getRelPath' returns 'Nothing'.
+eventsLostEvent :: Path -> Event
+eventsLostEvent root =
+    Event
+        { eventFlags = 0
+        , eventRelPath = root
+        , eventRootPath = root
+        , totalBytes = 0
+        }
+
+-- | The changes that occur between two ReadDirectoryChangesW calls are held
+-- in a buffer that the system allocates on the first call. This function
+-- calls ReadDirectoryChangesW with a 63 KiB buffer.
+--
+-- On overflow of the system's change buffer, a synchronous call succeeds
+-- with zero bytes returned. An asynchronous call reports the same condition
+-- as 'eRROR_NOTIFY_ENUM_DIR'; handle that error code too in case a
+-- synchronous call also reports it. The buffer has no records in either
+-- case.
 readDirectoryChanges ::
     Path -> HANDLE -> Bool -> FileNotificationFlag -> IO [Event]
 readDirectoryChanges root h wst mask = do
     let maxBuf = 63 * 1024
     allocaBytes maxBuf $ \buffer -> do
         alloca $ \bret -> do
-            readDirectoryChangesW h buffer (toEnum maxBuf) wst mask bret
-            bytesRet <- peekByteOff bret 0
-            readChangeEvents buffer root bytesRet
+            ok <- readDirectoryChangesW h buffer (toEnum maxBuf) wst mask bret
+            bytesRet <- if ok then peekByteOff bret 0 else return 0
+            if bytesRet == 0
+            then return [eventsLostEvent root]
+            else readChangeEvents buffer root bytesRet
 
 -- XXX Try to get these from windows header files
 type FileAction = DWORD
@@ -396,10 +441,14 @@ getFlag mask Event{..} = eventFlags == mask
 
 -- | Get the file system object path for which the event is generated, relative
 -- to the watched root. Windows does not report events for the watch root
--- itself, therefore, this is always a 'Just' value. The return type is
--- 'Maybe' for consistency with the other platforms.
+-- itself, therefore, this is a 'Just' value for all events except
+-- 'isEventsLost', for which it is 'Nothing'.
 getRelPath :: Event -> Maybe Path
-getRelPath Event{..} = Just eventRelPath
+getRelPath Event{..} =
+    -- totalBytes == 0 is the isEventsLost event
+    if totalBytes == 0
+    then Nothing
+    else Just eventRelPath
 
 -- | Get the watch root directory to which this event belongs.
 getRoot :: Event -> Path
@@ -476,6 +525,12 @@ isModified = getFlag fILE_ACTION_MODIFIED
 -- discarded, therefore, events are lost.  The user application must scan
 -- everything under the watched paths to know the current state of the file
 -- system tree.
+--
+-- The overflow occurs when the application does not consume the events fast
+-- enough.
+--
+-- For this event, 'getRoot' and 'getAbsPath' return the watch root whose
+-- events were lost, and 'getRelPath' returns 'Nothing'.
 isEventsLost :: Event -> Bool
 isEventsLost Event{..} = totalBytes == 0
 
