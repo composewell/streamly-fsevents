@@ -178,9 +178,14 @@ import Foreign.C.Error
     )
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
+#if !defined(CABAL_OS_FREEBSD)
 import Foreign.Marshal.Array (allocaArray)
+#endif
 import Foreign.Ptr (Ptr, castPtr)
-import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
+import Foreign.Storable (peek, peekByteOff, sizeOf)
+#if !defined(CABAL_OS_FREEBSD)
+import Foreign.Storable (peekElemOff)
+#endif
 import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
 import GHC.IO.Exception (IOException(ioe_errno))
 import Streamly.Data.Array (Array)
@@ -878,10 +883,12 @@ foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
         :: CInt -> CInt -> IO CInt
 
+#if !defined(CABAL_OS_FREEBSD)
 foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
+#endif
 
 foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
 
@@ -930,13 +937,30 @@ unmarkRemoved paths m0 = foldl step m0 paths
                          in Map.insert wd (WdPaths (xs ++ wp1 : ys)) m
                 _ -> m
 
--- | Queue a marker IN_IGNORED event after the events already queued, by
--- adding and removing a watch on a private pipe. The pipe is watched via
--- @\/proc\/self\/fd@, the user cannot add the pipe to the watch, therefore,
--- the watch descriptor is not shared with any user path.
-addRemovalMarker ::
-    CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
-addRemovalMarker fd wdMapRef markers paths =
+-- | Run an action with the watch descriptor of a new private watch, the
+-- watch descriptor is not shared with any user path. The string is used in
+-- the exception message.
+withMarkerWatch :: CInt -> String -> (CInt -> IO a) -> IO a
+#if defined(CABAL_OS_FREEBSD)
+-- FreeBSD has no @\/proc\/self\/fd@ and cannot watch a pipe. The directory
+-- @\/@ is watched instead, or @\/dev@ if the add fails. With IN_MASK_CREATE
+-- the add fails with EEXIST if the directory is already watched by the
+-- inotify fd, instead of returning the watch descriptor of the user path.
+withMarkerWatch fd err action = add "/" ["/dev"] >>= action
+
+    where
+
+    flags = iN_ACCESS .|. iN_MASK_CREATE .|. iN_ONLYDIR .|. iN_DONT_FOLLOW
+
+    add dir dirs = do
+        wd <- withCString dir $ \p -> c_inotify_add_watch fd p (CUInt flags)
+        case dirs of
+            next : rest | wd == -1 -> add next rest
+            _ -> throwErrnoIfMinus1 err (return wd)
+#else
+-- A private pipe is watched via @\/proc\/self\/fd@, the user cannot add the
+-- pipe to the watch.
+withMarkerWatch fd err action =
     allocaArray 2 $ \fds -> do
         throwErrnoIfMinus1_ err $ c_pipe2 fds o_CLOEXEC
         rfd <- peekElemOff fds 0
@@ -946,12 +970,21 @@ addRemovalMarker fd wdMapRef markers paths =
             wd <- withCString path $ \pathPtr ->
                 throwErrnoIfMinus1 err
                     $ c_inotify_add_watch fd pathPtr (CUInt iN_ACCESS)
-            -- The marker must be in the map before its IN_IGNORED is read.
-            atomicModifyIORef' wdMapRef
-                $ \m ->
-                    let e = WdMarker markers paths
-                     in (Map.insert (fromIntegral wd) e m, ())
-            throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
+            action wd
+#endif
+
+-- | Queue a marker IN_IGNORED event after the events already queued, by
+-- adding and removing a private watch.
+addRemovalMarker ::
+    CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
+addRemovalMarker fd wdMapRef markers paths =
+    withMarkerWatch fd err $ \wd -> do
+        -- The marker must be in the map before its IN_IGNORED is read.
+        atomicModifyIORef' wdMapRef
+            $ \m ->
+                let e = WdMarker markers paths
+                 in (Map.insert (fromIntegral wd) e m, ())
+        throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
 
     where
 
@@ -963,8 +996,9 @@ addRemovalMarker fd wdMapRef markers paths =
 -- The events already queued for the paths are reported, followed by an
 -- 'isRootUnwatched' event for each path.
 --
--- Removing a path that shares the directory with another path requires
--- @\/proc@ to be mounted and a free fd for a pipe, throw an exception if
+-- Removing a path that shares the directory with another path requires, on
+-- Linux, @\/proc@ to be mounted and a free fd for a pipe, and on FreeBSD,
+-- that the watch does not watch both @\/@ and @\/dev@. Throw an exception if
 -- not. The paths of the shared watch descriptors are not removed in that
 -- case, the call can be retried.
 --
@@ -1010,8 +1044,9 @@ unwatchPaths (Watch fd lock wdMapRef) desc p =
 -- 'isRootUnwatched' event for each path watched under the root. A directory
 -- that is also watched via another root remains watched for that root.
 --
--- Removing a root that shares a directory with another root requires
--- @\/proc@ to be mounted and a free fd for a pipe, throw an exception if
+-- Removing a root that shares a directory with another root requires, on
+-- Linux, @\/proc@ to be mounted and a free fd for a pipe, and on FreeBSD,
+-- that the watch does not watch both @\/@ and @\/dev@. Throw an exception if
 -- not. The shared directories remain watched for the root in that case, the
 -- call can be retried.
 --
