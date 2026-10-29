@@ -117,7 +117,6 @@ import Streamly.Data.Stream.Prelude (eager)
 import Streamly.Internal.FileSystem.Path (Path)
 
 import qualified Data.List.NonEmpty as NonEmpty
-import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Stream.Prelude as S
 import qualified Streamly.Internal.Data.Array as Array
@@ -267,11 +266,11 @@ data FILE_NOTIFY_INFORMATION = FILE_NOTIFY_INFORMATION
 type LPOVERLAPPED_COMPLETION_ROUTINE =
     FunPtr ((DWORD, DWORD, LPOVERLAPPED) -> IO ())
 
--- | A handle for a watch.
-getWatchHandle :: Path -> IO (HANDLE, Path)
-getWatchHandle dir = do
+-- | Open a directory handle for watching.
+openDirHandle :: Path -> IO HANDLE
+openDirHandle dir = do
     let dirStr = Path.toString dir
-    h <- createFile dirStr
+    createFile dirStr
         -- Access mode
         fILE_LIST_DIRECTORY
         -- Share mode
@@ -284,7 +283,6 @@ getWatchHandle dir = do
         fILE_FLAG_BACKUP_SEMANTICS
         -- No template file
         Nothing
-    return (h, dir)
 
 -- For reference documentation see:
 --
@@ -371,31 +369,20 @@ fILE_ACTION_RENAMED_OLD_NAME  =  4
 fILE_ACTION_RENAMED_NEW_NAME  :: FileAction
 fILE_ACTION_RENAMED_NEW_NAME  =  5
 
-eventStreamAggr :: (HANDLE, Path, Config) -> Stream IO Event
-eventStreamAggr (handle, rootPath, cfg) =  do
-    let recMode = getConfigRecMode cfg
-        flagMasks = getConfigFlag cfg
-        repeatM = S.sequence . S.repeat
-    S.concatMap S.fromList $ repeatM
-        $ readDirectoryChanges rootPath handle recMode flagMasks
-
-pathsToHandles ::
-    NonEmpty Path -> Config -> Stream IO (HANDLE, Path, Config)
-pathsToHandles paths cfg = do
-    let pathStream = S.fromList (NonEmpty.toList paths)
-        st2 = S.mapM getWatchHandle pathStream
-    fmap (\(h, f) -> (h, f, cfg)) st2
-
--------------------------------------------------------------------------------
--- Utilities
--------------------------------------------------------------------------------
-
--- | Close a Directory handle.
---
-closePathHandleStream :: Stream IO (HANDLE, Path, Config) -> IO ()
-closePathHandleStream =
-    let f (h, _, _) = closeHandle h
-        in S.fold (Fold.drainMapM f)
+-- | The events of one watch root. The directory handle is opened when the
+-- stream starts and closed when it ends, on an exception, or on garbage
+-- collection. It is never closed while a read on it is in progress: on an
+-- exception, the worker thread reading the handle closes it after the read
+-- returns; the stream is garbage collected only after the worker thread has
+-- stopped running it.
+eventStreamAggr :: Config -> Path -> Stream IO Event
+eventStreamAggr cfg rootPath =
+    S.bracketIO (openDirHandle rootPath) closeHandle $ \handle ->
+        let recMode = getConfigRecMode cfg
+            flagMasks = getConfigFlag cfg
+            repeatM = S.sequence . S.repeat
+         in S.concatMap S.fromList $ repeatM
+                $ readDirectoryChanges rootPath handle recMode flagMasks
 
 -- XXX
 -- Remove the encoding requirement of paths? It can be encoding agnostic
@@ -426,12 +413,8 @@ closePathHandleStream =
 -- @
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths =
-    S.bracketIO before after (S.parConcatMap (eager True) eventStreamAggr)
-
-    where
-
-    before = return $ pathsToHandles paths $ f defaultConfig
-    after = closePathHandleStream
+    S.parConcatMap (eager True) (eventStreamAggr (f defaultConfig))
+        $ S.fromList (NonEmpty.toList paths)
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
