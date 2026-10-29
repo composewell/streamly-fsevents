@@ -1,8 +1,9 @@
 # File System Event Notification (fsnotify)
 
 A **portable, robust, and stream-based file system event notification API** for
-**Linux, macOS, and Windows**. This library provides a streaming alternative to
-the [`fsnotify`](https://github.com/fsnotify/fsnotify) package.
+**Linux, macOS, Windows, and FreeBSD** (14.5, 15.0 and later). This library
+provides a streaming alternative to the
+[`fsnotify`](https://github.com/fsnotify/fsnotify) package.
 
 The portable module in this package offers a consistent, cross-platform,
 common denominator API across all supported systems whereas

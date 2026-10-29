@@ -90,6 +90,10 @@
 
 ### Enhancements
 
+- Add FreeBSD support, using the inotify API of FreeBSD 14.5, 15.0 and
+  later, in `Streamly.FileSystem.Event` and the new module
+  `Streamly.FileSystem.Event.FreeBSD`. The API is the same as on Linux, see
+  the module documentation for the differences.
 - Add the public platform specific modules
   `Streamly.FileSystem.Event.Darwin`, `Streamly.FileSystem.Event.Linux` and
   `Streamly.FileSystem.Event.Windows`.
