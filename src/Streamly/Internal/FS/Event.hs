@@ -60,6 +60,9 @@ import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
 import Streamly.Internal.FS.Event.Windows (Config, Event)
 import qualified Streamly.Internal.FS.Event.Windows as Event
+#elif defined(CABAL_OS_FREEBSD)
+import Streamly.Internal.FS.Event.FreeBSD (Config, Event)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Event
 #else
 #error "FS Events not supported on this platform"
 #endif
@@ -85,10 +88,10 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- | Watch the whole directory tree under a watch root recursively instead of
 -- watching only the watch root directory.
 --
--- macOS and Windows watch a directory tree natively. Linux inotify watches
--- only one directory, a recursive watch adds a watch for each directory in
--- the tree, and adds a watch for a new directory when its create event is
--- received:
+-- macOS and Windows watch a directory tree natively. Linux and FreeBSD
+-- inotify watch only one directory, a recursive watch adds a watch for each
+-- directory in the tree, and adds a watch for a new directory when its create
+-- event is received:
 --
 -- * Starting a watch on a large tree takes time and memory proportional to
 -- the number of directories in the tree.
@@ -160,7 +163,7 @@ watch = Event.watch
 
 -- | Like 'watch' except that if a watched path is a directory the whole
 -- directory tree under it is watched recursively. See 'setRecursiveMode' for
--- the limitations on Linux.
+-- the limitations on Linux and FreeBSD.
 --
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
 watchRecursive :: NonEmpty Path -> Stream IO Event
@@ -210,7 +213,8 @@ getAbsPath = Event.getAbsPath
 -- For hard links the behavior is different on different operating systems. On
 -- macOS hard linking does not generate a create event, it generates an
 -- 'Streamly.Internal.FS.Event.Darwin.isAttrsModified' event on the directory
--- instead. On Linux and Windows hard linking generates a create event.
+-- instead. On Linux, FreeBSD and Windows hard linking generates a create
+-- event.
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
 
@@ -218,15 +222,15 @@ isCreated = Event.isCreated
 -- macOS?
 --
 -- | Determine whether the event indicates deletion of an object within the
--- monitored path. On Linux and Windows hard link deletion generates a delete
--- event.
+-- monitored path. On Linux, FreeBSD and Windows hard link deletion generates
+-- a delete event.
 --
--- On Linux and Windows, this event does not occur when the watch root itself
--- is deleted. On macOS it occurs on deleting the watch root when it is not a
--- symbolic link.
+-- On Linux, FreeBSD and Windows, this event does not occur when the watch
+-- root itself is deleted. On macOS it occurs on deleting the watch root when
+-- it is not a symbolic link.
 --
 -- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
--- Linux.
+-- Linux and FreeBSD.
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
@@ -244,9 +248,10 @@ isMoved = Event.isMoved
 -- monitored path. This event is generated on file modification on all
 -- platforms.
 --
--- On Linux and macOS this event is never generated for directories.  On
--- Windows (in recursive watch mode) this event is generated for directories as
--- well when an object is created in or deleted from the directory.
+-- On Linux, FreeBSD and macOS this event is never generated for directories.
+-- On Windows (in recursive watch mode) this event is generated for
+-- directories as well when an object is created in or deleted from the
+-- directory.
 isModified :: Event -> Bool
 isModified = Event.isModified
 
@@ -254,8 +259,8 @@ isModified = Event.isModified
 -- therefore, we need to take some recovery action.
 --
 -- 'getRoot' returns the watch root whose events may have been lost. On
--- Linux, where the kernel reports a single event for all the roots, one
--- event is generated for each watch root.
+-- Linux and FreeBSD, where the kernel reports a single event for all the
+-- roots, one event is generated for each watch root.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 

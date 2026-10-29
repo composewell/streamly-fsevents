@@ -286,7 +286,8 @@ foreign import capi
 -- directory. A process can keep a file open after the file is deleted, its
 -- reads and writes generate events, the events have the deleted path.
 --
--- macOS does not report the events of an unlinked file.
+-- macOS does not report the events of an unlinked file. FreeBSD does not
+-- report them either, setting this to 'False' has no effect on FreeBSD.
 --
 -- /default: True/
 setExcludeUnlinked :: Bool -> Config -> Config
@@ -1705,6 +1706,9 @@ isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 -- (e.g., utimensat(2)), extended attributes (setxattr(2)), link count (since
 -- Linux 2.6.25; e.g., for the target of link(2) and for unlink(2)), and
 -- user/group ID (e.g., chown(2)).
+--
+-- On FreeBSD, a link count change is reported only by a watch on the object
+-- itself, not by a watch on its directory, and rmdir(2) does not report it.
 --
 -- /Can occur for watched path or a file inside it/
 isAttrsModified :: Event -> Bool

@@ -4,8 +4,8 @@ version:            0.1.1
 synopsis:           File system event notification streams
 description:
   A portable, robust, and stream-based file system event notification API for
-  Linux, macOS, and Windows. This library provides a streaming alternative to
-  the fsnotify package.
+  Linux, macOS, Windows, and FreeBSD. This library provides a streaming
+  alternative to the fsnotify package.
   .
   The portable module in this package offers a consistent,
   cross-platform, common denominator API across all supported systems
@@ -86,6 +86,9 @@ common compile-options
 
     if os(windows)
       cpp-options:    -DCABAL_OS_WINDOWS
+
+    if os(freebsd)
+      cpp-options:    -DCABAL_OS_FREEBSD
 
     if flag(internal-dev)
       cpp-options:    -DDEVBUILD
@@ -233,7 +236,13 @@ library
           exposed-modules: Streamly.FileSystem.Event.Linux
                            Streamly.Internal.FS.Event.Linux
 
-    if os(linux) || os(darwin) || os(windows)
+    -- FreeBSD uses the inotify implementation of the Linux module.
+    if os(freebsd)
+          exposed-modules: Streamly.FileSystem.Event.FreeBSD
+                           Streamly.Internal.FS.Event.FreeBSD
+          other-modules: Streamly.Internal.FS.Event.Linux
+
+    if os(linux) || os(darwin) || os(windows) || os(freebsd)
           exposed-modules: Streamly.FileSystem.Event
                            Streamly.Internal.FS.Event
 
@@ -246,7 +255,7 @@ library
         fusion-plugin     >= 0.2   && < 0.3
 
     -- For FS.Event module
-    if os(linux)
+    if os(linux) || os(freebsd)
       build-depends: directory >= 1.2.2 && < 1.4
                    , containers >= 0.6.0 && < 0.9
 

@@ -6,18 +6,22 @@
 -- Stability   : released
 -- Portability : GHC
 --
--- Portable file system event notification API for Linux, macOS, and Windows.
+-- Portable file system event notification API for Linux, macOS, Windows, and
+-- FreeBSD.
 --
 -- This module provides a common interface for file system event monitoring
 -- across major platforms. In most cases, behavior is consistent across
 -- operating systems, but certain platform-specific idiosyncrasies remain.
 --
--- Recursive directory watching is native on macOS and Windows. On Linux,
--- inotify watches only one directory, recursive watching is emulated in user
--- space by adding a watch for each new directory, and events in a new
+-- Recursive directory watching is native on macOS and Windows. On Linux and
+-- FreeBSD, inotify watches only one directory, recursive watching is emulated
+-- in user space by adding a watch for each new directory, and events in a new
 -- directory may be lost before its watch is added. See 'setRecursiveMode'.
 --
--- On Linux, watches are tied to file handles. As a result:
+-- FreeBSD is supported from FreeBSD 14.5 and 15.0, the earlier releases do
+-- not have inotify.
+--
+-- On Linux and FreeBSD, watches are tied to file handles. As a result:
 --
 -- * If a watched file is deleted and recreated, the new file is not watched.
 -- * If a watched file is renamed, we can continue to monitor it.
@@ -27,6 +31,7 @@
 -- For platform-specific APIs, see:
 --
 -- * "Streamly.FileSystem.Event.Darwin"
+-- * "Streamly.FileSystem.Event.FreeBSD"
 -- * "Streamly.FileSystem.Event.Linux"
 -- * "Streamly.FileSystem.Event.Windows"
 --
