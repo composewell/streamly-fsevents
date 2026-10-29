@@ -19,6 +19,7 @@ import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
+    , createDirectoryLink
     , getPermissions
     , getSymbolicLinkTarget
     , listDirectory
@@ -723,6 +724,38 @@ recSubdirAddedTwice =
                     _ <- readUntil recCfg (isCreatedAt sentinel) w
                     takeMVar done
 
+-- The directory is replaced by a file before its create event is read.
+recDirReplacedByFile :: Spec
+recDirReplacedByFile =
+    it "does not watch a file that replaced a created directory"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+            createDirectory dir
+            removeDirectory dir
+            createFile dir
+            waitWatched recCfg w dir
+            evs <- recEventsOf recCfg root w (appendFile dir "x")
+            pathsOf Event.isModified evs `shouldBe` [dir]
+
+-- The directory is replaced by a symbolic link to a directory outside the
+-- tree before its create event is read.
+recDirReplacedBySymlink :: Spec
+recDirReplacedBySymlink =
+    it "does not follow a symlink that replaced a created directory"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                out = takeDirectory root </> "out"
+            createDirectory out
+            createDirectory (out </> "sub")
+            createDirectory dir
+            removeDirectory dir
+            createDirectoryLink out dir
+            waitWatched recCfg w dir
+            evs <- recEventsOf recCfg root w $ do
+                createFile (out </> "file")
+                createFile (out </> "sub" </> "file")
+            filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -753,7 +786,10 @@ watchTests =
                 removeWhileReading
                 closeWhileReading
             describe "failures" removeFailRetry
-            describe "recursive mode robustness" recSubdirAddedTwice
+            describe "recursive mode robustness" $ do
+                recSubdirAddedTwice
+                recDirReplacedByFile
+                recDirReplacedBySymlink
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
