@@ -46,6 +46,11 @@
   a large tree no longer overflows the event queue at the start.
 - macOS: raise an exception when a watch fails to start.
 - macOS: closing a watch no longer hangs or crashes the process.
+- Windows: a watched directory can be deleted or renamed while it is
+  watched, and is no longer kept open after the watch ends.
+- Windows: when events are lost because they were not consumed fast enough,
+  the stream reports `isEventsLost` and continues, instead of raising an
+  exception or reporting bogus events.
 - The file descriptors of a watch are no longer inherited by child
   processes.
 
