@@ -276,6 +276,8 @@ test-suite FileSystem.Event.Darwin
   other-modules: Streamly.Test.FileSystem.Event.Common
   cpp-options: -DFILESYSTEM_EVENT_DARWIN
   ghc-options: -main-is Streamly.Test.FileSystem.Event.Darwin
+  if os(darwin)
+    build-depends: unix
   if !os(darwin)
     buildable: False
 

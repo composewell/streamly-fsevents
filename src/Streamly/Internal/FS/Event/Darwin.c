@@ -277,7 +277,17 @@ int createWatch
     *fd = pfds[0];
     *wp = w;
     FSEventStreamSetDispatchQueue(w->eventStream, w->queue);
-    FSEventStreamStart(w->eventStream);
+    /*
+     * Start fails e.g. for the streams beyond the 512th in a process. The
+     * stream would never call the callback, the watch would report no
+     * events.
+     */
+    if (!FSEventStreamStart(w->eventStream)) {
+      /* Stop is not allowed on a stream that is not started */
+      FSEventStreamInvalidate(w->eventStream);
+      dispatch_release(w->queue);
+      goto cleanup_es;
+    }
     return 0;
 
 cleanup_es:
