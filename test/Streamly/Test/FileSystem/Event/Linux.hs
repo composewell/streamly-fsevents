@@ -718,6 +718,52 @@ recDirReplacedBySymlink =
                 createFile (out </> "sub" </> "file")
             filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
 
+-- | Run the action after overflowing the event queue of the watch, by
+-- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
+-- the queue limit is more than 100000 events.
+withOverflow :: FilePath -> IO a -> IO (Maybe a)
+withOverflow dir action = do
+    limit <- read <$> readFile "/proc/sys/fs/inotify/max_queued_events"
+    if limit > (100000 :: Int)
+    then return Nothing
+    else do
+        mapM_ (\i -> createFile (dir </> show i)) [1 .. limit + 1000]
+        Just <$> action
+
+-- The kernel drops the IN_IGNORED event of the removed root when the queue
+-- is full.
+overflowRemove :: Spec
+overflowRemove =
+    it "removeFromWatch reports isRootUnwatched after a queue overflow"
+        $ withTwoRoots $ \root1 root2 w -> do
+            p <- Path.fromString root2
+            r <- withOverflow root1 (Event.removeFromWatch w p)
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    evs <- readUntil watchCfg Event.isRootUnwatched w
+                    any Event.isEventsLost evs `shouldBe` True
+                    unwatched evs `shouldBe` [(root2, root2)]
+
+-- The marker of the shared watch descriptor of sub is dropped when the queue
+-- is full.
+overflowRemoveShared :: Spec
+overflowRemoveShared =
+    it "removing a shared root stops its events after a queue overflow"
+        $ withNestedRoots $ \root sub w -> do
+            p <- Path.fromString sub
+            r <- withOverflow root (Event.removeFromWatch w p)
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    evs <- readUntil recCfg Event.isRootUnwatched w
+                    any Event.isEventsLost evs `shouldBe` True
+                    unwatched evs `shouldBe` [(sub, sub)]
+                    let file = sub </> "file"
+                    createFile file
+                    evs1 <- readUntil recCfg (isCreatedAt file) w
+                    createdRoots file evs1 `shouldBe` [root]
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -747,6 +793,9 @@ watchTests =
                 removeWhileReading
                 closeWhileReading
             describe "failures" removeFailRetry
+            describe "queue overflow" $ do
+                overflowRemove
+                overflowRemoveShared
             describe "recursive mode robustness" $ do
                 recFailIfExists
                 recDirReplacedByFile

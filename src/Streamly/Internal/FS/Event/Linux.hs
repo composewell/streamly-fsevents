@@ -631,8 +631,9 @@ data WdEntry =
       WdPaths [WatchPath]
     -- | A private watch used as a marker in the event queue. When its
     -- IN_IGNORED event is read, the listed paths, which were removed from a
-    -- shared watch descriptor, report 'isRootUnwatched'.
-    | WdMarker [(Int, PathRep)]
+    -- shared watch descriptor, report 'isRootUnwatched', and the listed
+    -- markers are removed from the map.
+    | WdMarker [Int] [(Int, PathRep)]
 
 -- | The state of the fd of a watch.
 data FdState = FdState
@@ -892,7 +893,7 @@ markRemoved p m =
     isRemoving wp = not (wpRemoved wp) && p (wpRep wp)
     setRemoved wp = if isRemoving wp then wp {wpRemoved = True} else wp
 
-    step acc _ e@(WdMarker _) = (acc, e)
+    step acc _ e@(WdMarker _ _) = (acc, e)
     step acc@(wds, shared) wd (WdPaths wps) =
         let removing = filter isRemoving wps
             wps1 = map setRemoved wps
@@ -926,8 +927,8 @@ unmarkRemoved paths m0 = foldl step m0 paths
 -- @\/proc\/self\/fd@, the user cannot add the pipe to the watch, therefore,
 -- the watch descriptor is not shared with any user path.
 addRemovalMarker ::
-    CInt -> IORef (IntMap WdEntry) -> [(Int, PathRep)] -> IO ()
-addRemovalMarker fd wdMapRef paths =
+    CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
+addRemovalMarker fd wdMapRef markers paths =
     allocaArray 2 $ \fds -> do
         throwErrnoIfMinus1_ err $ c_pipe2 fds o_CLOEXEC
         rfd <- peekElemOff fds 0
@@ -939,7 +940,9 @@ addRemovalMarker fd wdMapRef paths =
                     $ c_inotify_add_watch fd pathPtr (CUInt iN_ACCESS)
             -- The marker must be in the map before its IN_IGNORED is read.
             atomicModifyIORef' wdMapRef
-                $ \m -> (Map.insert (fromIntegral wd) (WdMarker paths) m, ())
+                $ \m ->
+                    let e = WdMarker markers paths
+                     in (Map.insert (fromIntegral wd) e m, ())
             throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
 
     where
@@ -976,7 +979,7 @@ unwatchPaths (Watch fd lock wdMapRef) desc p =
         -- the map, they would keep reporting the events, and a retry would
         -- find them already removed.
         when (not (null shared))
-            $ addRemovalMarker fd wdMapRef shared
+            $ addRemovalMarker fd wdMapRef [] shared
                 `onException` atomicModifyIORef' wdMapRef
                     (\m -> (unmarkRemoved shared m, ()))
 
@@ -1102,11 +1105,13 @@ foreign import capi
 -- the paths that were still in the map.
 removeMarker ::
        Int
+    -> [Int]
     -> [(Int, PathRep)]
     -> IntMap WdEntry
     -> (IntMap WdEntry, [(Int, PathRep)])
-removeMarker marker paths m0 =
-    let (m1, removed) = foldl step (Map.delete marker m0, []) paths
+removeMarker marker markers paths m0 =
+    let m = foldr Map.delete m0 (marker : markers)
+        (m1, removed) = foldl step (m, []) paths
      in (m1, reverse removed)
 
     where
@@ -1122,6 +1127,46 @@ removeMarker marker paths m0 =
     update wd [] m = Map.delete wd m
     update wd wps m = Map.insert wd (WdPaths wps) m
 
+-- | The removed paths whose IN_IGNORED event is not read yet. Returns the
+-- watch descriptors of the markers, and the paths listed in the markers and
+-- the paths of the watch descriptors whose paths are all removed.
+pendingRemovals :: IntMap WdEntry -> ([Int], [(Int, PathRep)])
+pendingRemovals m =
+    ( [wd | (wd, WdMarker _ _) <- entries]
+    , [p | (_, WdMarker _ ps) <- entries, p <- ps]
+        ++ [ (wd, wpRep wp)
+           | (wd, WdPaths wps) <- entries
+           , all wpRemoved wps
+           , wp <- wps
+           ]
+    )
+
+    where
+
+    entries = Map.toList m
+
+-- | The kernel drops the events that do not fit in the event queue,
+-- including the IN_IGNORED events of the removed watches and of the markers,
+-- and queues an IN_Q_OVERFLOW event instead. The removed paths would stay in
+-- the map forever, and the removed paths of a shared watch descriptor would
+-- keep reporting its events.
+--
+-- Queue a marker listing the removed paths and the markers whose IN_IGNORED
+-- event has not been read. The IN_IGNORED events of these were generated
+-- before the new marker, the queue is in order, if one of them is not read
+-- before the IN_IGNORED event of the new marker, it was dropped. If the new
+-- marker is dropped too, the next IN_Q_OVERFLOW event queues another one.
+--
+-- Failing to queue the marker, for example, when the process is out of fds,
+-- is ignored, the next IN_Q_OVERFLOW event tries again.
+syncRemovals :: Watch -> IO ()
+syncRemovals (Watch fd lock wdMapRef) =
+    withMVar lock $ \st -> when (not (fsClosed st)) $ do
+        (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
+        when (not (null markers && null paths))
+            $ addRemovalMarker fd wdMapRef markers paths
+                `catchIOError` \_ -> return ()
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
@@ -1131,7 +1176,9 @@ removeMarker marker paths m0 =
 -- the map are dropped.
 --
 -- The IN_IGNORED event of a marker reports 'isRootUnwatched' for the paths
--- listed in the marker, and removes the paths from the map.
+-- listed in the marker, and removes the paths and the listed markers from the
+-- map. An IN_Q_OVERFLOW event queues a marker for the removals whose
+-- IN_IGNORED event may have been dropped.
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
@@ -1171,7 +1218,9 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     -- subdirectory added under a recursive root. Marker entries are skipped,
     -- they are not watched paths.
     if eflags .&. iN_Q_OVERFLOW /= 0
-    then return
+    then do
+        PR.fromEffect $ syncRemovals wt
+        return
             [ mkEvent (fromIntegral wd) (wpRep wp)
             | (wd, WdPaths wps) <- Map.toList wdm
             , wp <- wps
@@ -1180,12 +1229,12 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     else
         case Map.lookup (fromIntegral ewd) wdm of
             Nothing -> return []
-            Just (WdMarker paths)
+            Just (WdMarker markers paths)
                 | isIgnored -> do
                     removed <-
                         PR.fromEffect
                             $ atomicModifyIORef' wdMapRef
-                            $ removeMarker (fromIntegral ewd) paths
+                            $ removeMarker (fromIntegral ewd) markers paths
                     return
                         [ mkEvent (fromIntegral wd) prep
                         | (wd, prep) <- removed
