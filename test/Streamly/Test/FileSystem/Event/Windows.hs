@@ -151,11 +151,38 @@ reservedName =
     , [("aux.c", Event.isCreated)]
     )
 
+-- | When the open of one root fails, the watch kills the workers of the other
+-- roots, which are blocked in a read with no changes occurring. The exception
+-- must be raised without waiting for a change in the other roots.
+--
+-- If the exception arrives before the other workers start their reads the
+-- test passes even if the reads are not interruptible. The missing root is
+-- the last one so that the other workers are likely to be reading by then.
+missingRoot :: Spec
+missingRoot =
+    it "raises an exception for a missing root while the others are idle" $
+        withRoot $ \root -> do
+            let dirs = fmap (\i -> root </> ("dir" ++ show i)) [1 .. 3 :: Int]
+            mapM_ createDirectory dirs
+            paths <- mapM Path.fromString (dirs ++ [root </> "missing"])
+            let watcher =
+                    case paths of
+                        p : ps -> Event.watch (p :| ps)
+                        [] -> error "missingRoot: no paths"
+            -- try must be outside timeout, it would catch the exception that
+            -- timeout throws.
+            r <- try $ timeout 10000000 $ Stream.drain watcher
+            case r of
+                Left (_ :: SomeException) -> return ()
+                Right Nothing -> expectationFailure "timed out"
+                Right (Just ()) -> expectationFailure "the stream ended"
+
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
         handleClosedOnGC
         eventsLost
+        missingRoot
 
 -- TODO Test isModified event for parent directories when a file is created or
 -- deleted.
