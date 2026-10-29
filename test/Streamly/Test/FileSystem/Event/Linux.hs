@@ -9,6 +9,7 @@
 module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Exception (bracket)
+import Data.List (isPrefixOf)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
@@ -19,7 +20,7 @@ import System.Directory
     , setOwnerExecutable
     , setPermissions
     )
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO
     (IOMode(AppendMode, WriteMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
@@ -397,6 +398,82 @@ recSubdirSelfEvents =
             pathsOf Event.isMovedFrom evs `shouldBe` [dir1]
             pathsOf Event.isDeleted evs `shouldBe` [dir2]
 
+isUnwatchedAt :: FilePath -> Event -> Bool
+isUnwatchedAt path ev = Event.isRootUnwatched ev && getAbsPath ev == path
+
+-- | @dir@ or a path under it.
+isUnder :: FilePath -> FilePath -> Bool
+isUnder dir path = path == dir || (dir ++ "/") `isPrefixOf` path
+
+-- | Move @root/dir@, containing @sub@, out of the tree. The watches of @dir@
+-- and @sub@ are removed in the ascending order of their watch descriptors,
+-- the isRootUnwatched event of @sub@ is the last. Returns the events up to
+-- that event.
+recMoveOut :: Event.Config -> IO [Event]
+recMoveOut cfg =
+    withRoot cfg $ \root w -> do
+        let dir = root </> "dir"
+            sub = dir </> "sub"
+            out = takeDirectory root </> "out"
+            sentinel = root </> "sentinel"
+        createDirectory dir
+        createDirectory sub
+        renameDirectory dir out
+        evs <- readUntil cfg (isUnwatchedAt sub) w
+        unwatched evs `shouldBe` [(root, dir), (root, sub)]
+        createFile (out </> "sub" </> "file")
+        createFile sentinel
+        evs1 <- readUntil cfg (isCreatedAt sentinel) w
+        filter (isUnder dir) (map getAbsPath evs1) `shouldBe` []
+        return evs
+
+recMoveOutSpec :: Spec
+recMoveOutSpec =
+    it "removes a directory moved out of the tree"
+        $ () <$ recMoveOut recCfg
+
+-- The kernel watch generates IN_MOVED_FROM to remove the moved directory,
+-- the event is not reported.
+recMoveOutUnrequested :: Spec
+recMoveOutUnrequested =
+    it "removes a moved directory when the move events are disabled" $ do
+        let cfg = Event.setMovedFrom False $ Event.setMovedTo False recCfg
+        evs <- recMoveOut cfg
+        pathsOf Event.isMoved evs `shouldBe` []
+
+recMoveIn :: Spec
+recMoveIn =
+    it "adds a directory moved into the tree"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+                file = dir </> "sub" </> "file"
+            createDirectory src
+            createDirectory (src </> "sub")
+            renameDirectory src dir
+            _ <- readUntil recCfg
+                (\ev -> Event.isMovedTo ev && getAbsPath ev == dir) w
+            createFile file
+            evs <- readUntil recCfg (isCreatedAt file) w
+            pathsOf Event.isCreated evs `shouldBe` [file]
+
+-- IN_MOVED_TO of dir2 is queued before the IN_IGNORED events of dir1, dir2
+-- is watched when the isRootUnwatched event of dir1/sub is read.
+recRenameWithin :: Spec
+recRenameWithin =
+    it "reports the new path of a directory renamed within the tree"
+        $ withRoot recCfg $ \root w -> do
+            let dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+                file = dir2 </> "sub" </> "file"
+            createDirectory dir1
+            createDirectory (dir1 </> "sub")
+            renameDirectory dir1 dir2
+            _ <- readUntil recCfg (isUnwatchedAt (dir1 </> "sub")) w
+            createFile file
+            evs <- readUntil recCfg (isCreatedAt file) w
+            filter (isUnder dir1) (map getAbsPath evs) `shouldBe` []
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -414,6 +491,10 @@ watchTests =
             describe "watch descriptors" largeWd
             describe "recursive mode" $ do
                 recSubdirSelfEvents
+                recMoveOutSpec
+                recMoveOutUnrequested
+                recMoveIn
+                recRenameWithin
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified

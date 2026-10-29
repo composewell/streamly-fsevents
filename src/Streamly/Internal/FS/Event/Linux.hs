@@ -159,8 +159,10 @@ where
 import Control.Exception (finally)
 import Control.Monad (when)
 import Data.Bits ((.|.), (.&.), complement)
+import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List (isPrefixOf)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (isNothing)
 #if !(MIN_VERSION_base(4,13,0))
@@ -191,7 +193,7 @@ import Streamly.Internal.FileSystem.Path (Path)
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as FL
-import qualified Streamly.Data.Array as A (createOf)
+import qualified Streamly.Data.Array as A (createOf, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Unfold as UF
 import qualified Streamly.FileSystem.Handle as FH
@@ -236,6 +238,14 @@ setFlag mask status cfg@Config{..} =
 
 -- | Watch the whole directory tree recursively instead of watching just one
 -- level of directory.
+--
+-- A directory created in or moved into the tree is added to the watch. A
+-- directory moved out of the tree is removed from the watch, its paths
+-- report 'isRootUnwatched'. A directory renamed within the tree is removed
+-- and added again with the new path.
+--
+-- The kernel watch always generates the create and move events in recursive
+-- mode, they are reported only if enabled in the 'Config'.
 --
 -- /default: False/
 --
@@ -593,6 +603,18 @@ defaultConfig =
         , createFlags = 0
         }
 
+-- | The events that the kernel watch must generate in recursive mode, to add
+-- and remove the watches of the subdirectories.
+recursiveEvents :: Word32
+recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO
+
+-- | The flags of the kernel watch.
+watchFlags :: Config -> Word32
+watchFlags Config{..} =
+    if watchRec
+    then createFlags .|. recursiveEvents
+    else createFlags
+
 -------------------------------------------------------------------------------
 -- Path representation for events
 -------------------------------------------------------------------------------
@@ -628,6 +650,19 @@ eqPath p1 p2 = Path.toArray p1 == Path.toArray p2
 eqPathRep :: PathRep -> PathRep -> Bool
 eqPathRep (r1, s1) (r2, s2) =
     eqPath r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
+
+-- | @isInSubtree dir prep@ is 'True' if @prep@ is the subdirectory @dir@ of a
+-- root or a path under it, via the same root.
+isInSubtree :: PathRep -> PathRep -> Bool
+isInSubtree (r1, Just s1) (r2, Just s2) =
+    eqPath r1 r2 && (b2 == b1 || (b1 ++ [sep]) `isPrefixOf` b2)
+
+    where
+
+    sep = fromIntegral (ord '/')
+    b1 = A.toList (Path.toArray s1)
+    b2 = A.toList (Path.toArray s2)
+isInSubtree _ _ = False
 
 -------------------------------------------------------------------------------
 -- Open an event stream
@@ -793,7 +828,7 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- ignoring errors when reading a directory.
     wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
-                c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
+                c_inotify_add_watch (fdFD fd) pathPtr (CUInt (watchFlags cfg))
 
     -- We add the parent first so that we start getting events for any new
     -- creates and add the new subdirectories on creates while we are adding
@@ -837,18 +872,20 @@ foreign import ccall unsafe "unistd.h pipe" c_pipe :: Ptr CInt -> IO CInt
 
 foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
 
--- | Mark the paths of a root as removed. Returns the watch descriptors whose
--- paths are now all removed, and the removed paths of the other watch
--- descriptors, both in the ascending order of watch descriptors.
+-- | Mark the paths that satisfy the predicate as removed. Returns the watch
+-- descriptors whose paths are now all removed, and the removed paths of the
+-- other watch descriptors, both in the ascending order of watch descriptors.
 markRemoved ::
-    Path -> IntMap WdEntry -> (IntMap WdEntry, ([Int], [(Int, PathRep)]))
-markRemoved root m =
+       (PathRep -> Bool)
+    -> IntMap WdEntry
+    -> (IntMap WdEntry, ([Int], [(Int, PathRep)]))
+markRemoved p m =
     let ((wds, shared), m1) = Map.mapAccumWithKey step ([], []) m
      in (m1, (reverse wds, reverse shared))
 
     where
 
-    isRemoving wp = not (wpRemoved wp) && eqPath (getRepRoot (wpRep wp)) root
+    isRemoving wp = not (wpRemoved wp) && p (wpRep wp)
     setRemoved wp = if isRemoving wp then wp {wpRemoved = True} else wp
 
     step acc _ e@(WdMarker _) = (acc, e)
@@ -885,7 +922,41 @@ addRemovalMarker fd wdMapRef paths =
 
     where
 
-    err = "removeFromWatch: marker " ++ show (map fst paths)
+    err = "unwatchPaths: marker " ++ show (map fst paths)
+
+-- | Remove the paths that satisfy the predicate from the watch. The string
+-- describes the paths in the exception message.
+--
+-- The events already queued for the paths are reported, followed by an
+-- 'isRootUnwatched' event for each path.
+--
+-- Removing a path that shares the directory with another path requires
+-- @\/proc@ to be mounted, throw an exception if it is not.
+unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
+unwatchPaths (Watch handle wdMapRef) desc p = do
+    fd <- handleToFd handle
+    -- The paths stay in the map until their 'isRootUnwatched' event is read,
+    -- so that the events already queued for the removed paths, including
+    -- 'isRootUnwatched', report the paths.
+    --
+    -- If all the paths of a watch descriptor are removed we remove the
+    -- kernel watch, the kernel queues an IN_IGNORED event for it. Otherwise,
+    -- the kernel watch is still needed for the other paths, we queue a
+    -- marker event instead.
+    (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
+    mapM_ (rmWatch (fdFD fd)) wds
+    when (not (null shared)) $ addRemovalMarker (fdFD fd) wdMapRef shared
+
+    where
+
+    -- EINVAL means that the kernel has already removed the watch, for
+    -- example, when the directory was deleted.
+    rmWatch fd wd = do
+        let err = "unwatchPaths: " ++ desc
+        r <- c_inotify_rm_watch fd (fromIntegral wd)
+        when (r == -1) $ do
+            errno <- getErrno
+            when (errno /= eINVAL) $ throwErrno err
 
 -- | Remove an absolute root path from a 'Watch', if a path was moved after
 -- adding you need to provide the original path which was used to add the
@@ -901,30 +972,8 @@ addRemovalMarker fd wdMapRef paths =
 -- /Pre-release/
 --
 removeFromWatch :: Watch -> Path -> IO ()
-removeFromWatch (Watch handle wdMapRef) root = do
-    fd <- handleToFd handle
-    -- The paths stay in the map until their 'isRootUnwatched' event is read,
-    -- so that the events already queued for the removed root, including
-    -- 'isRootUnwatched', report the root.
-    --
-    -- If all the paths of a watch descriptor are removed we remove the
-    -- kernel watch, the kernel queues an IN_IGNORED event for it. Otherwise,
-    -- the kernel watch is still needed for the other paths, we queue a
-    -- marker event instead.
-    (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved root)
-    mapM_ (rmWatch (fdFD fd)) wds
-    when (not (null shared)) $ addRemovalMarker (fdFD fd) wdMapRef shared
-
-    where
-
-    -- EINVAL means that the kernel has already removed the watch, for
-    -- example, when the root was deleted.
-    rmWatch fd wd = do
-        let err = "removeFromWatch: " ++ show (Path.toString root)
-        r <- c_inotify_rm_watch fd (fromIntegral wd)
-        when (r == -1) $ do
-            errno <- getErrno
-            when (errno /= eINVAL) $ throwErrno err
+removeFromWatch wt root =
+    unwatchPaths wt (show (Path.toString root)) (eqPath root . getRepRoot)
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -1086,30 +1135,47 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                 let addName wp =
                         wp {wpRep = maybe id (flip addSub) mpth (wpRep wp)}
                     wps1 = map addName wps
-                -- Check for "ISDIR" first because it is less likely
-                let isDirCreate =
-                        eflags .&. iN_ISDIR /= 0 && eflags .&. iN_CREATE /= 0
-                -- Do not add the new directories of a removed root.
-                when (watchRec cfg && isDirCreate)
+                    -- Do not add or remove the directories of a removed
+                    -- root.
+                    live = map wpRep $ filter (not . wpRemoved) wps1
+                    -- Check for "ISDIR" first because it is less likely
+                    isDirEv = eflags .&. iN_ISDIR /= 0
+                    isDirAdded =
+                        isDirEv && eflags .&. (iN_CREATE .|. iN_MOVED_TO) /= 0
+                    isDirMovedOut = isDirEv && eflags .&. iN_MOVED_FROM /= 0
+                -- A directory renamed within the tree is removed on
+                -- IN_MOVED_FROM and added again on IN_MOVED_TO.
+                when (watchRec cfg && isDirMovedOut)
                     $ PR.fromEffect
-                    $ mapM_ (addToWatch cfg wt . wpRep)
-                    $ filter (not . wpRemoved) wps1
+                    $ mapM_
+                        (\prep ->
+                            unwatchPaths wt
+                                (show (Path.toString (combinePathRep prep)))
+                                (isInSubtree prep)
+                        )
+                        live
+                when (watchRec cfg && isDirAdded)
+                    $ PR.fromEffect
+                    $ mapM_ (addToWatch cfg wt) live
                 when isIgnored
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
                     $ \m -> (Map.delete (fromIntegral ewd) m, ())
-                -- XXX Handle IN_DELETE, IN_MOVED_FROM, IN_MOVED_TO
-                -- What if a large dir tree gets moved in to our hierarchy? Do
-                -- we get a single event for the top level dir in this case?
-                --
                 -- The parent of a subdirectory reports its deletion and move
                 -- as IN_DELETE and IN_MOVED_FROM, the IN_DELETE_SELF and
                 -- IN_MOVE_SELF events are reported for the roots only.
                 let isSelfEvent =
                         eflags .&. (iN_DELETE_SELF .|. iN_MOVE_SELF) /= 0
+                    -- The events added by 'watchFlags' only.
+                    unrequested =
+                        recursiveEvents .&. complement (createFlags cfg)
+                    isUnrequested = eflags .&. unrequested /= 0
                     isReported wp =
                         not isSelfEvent || isNothing (getRepSub (wpRep wp))
-                return [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
+                if isUnrequested
+                then return []
+                else return
+                        [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
 
     where
 

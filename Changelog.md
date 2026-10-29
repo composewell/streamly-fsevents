@@ -48,6 +48,12 @@
 - **Breaking:** Linux: in recursive mode, `isRootDeleted` and `isRootMoved`
   are reported for the watch roots only. A subdirectory reported them in
   addition to the `isDeleted` or `isMovedFrom` event reported by its parent.
+- Linux: in recursive mode, remove the watch of a directory moved out of the
+  tree, and add a directory moved into the tree. A directory renamed within
+  the tree is watched with the new path. Earlier, a directory moved out
+  kept reporting events with its old path, a directory moved in was not
+  watched. The create and move events needed for this are generated even if
+  they are disabled in the `Config`, they are not reported.
 
 ## 0.1.1
 
