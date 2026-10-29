@@ -112,17 +112,22 @@ withTwoRoots action =
             Event.closeWatch
             (action root1 root2)
 
--- | Read the events from the watch up to and including the first
--- 'Event.isRootUnwatched' event. Throw an exception if it does not occur
+-- | Read the events from the watch, using @cfg@, up to and including the first
+-- event that satisfies the predicate. Throw an exception if it does not occur
 -- within 10 seconds.
-readUntilUnwatched :: Event.Watch -> IO [Event]
-readUntilUnwatched w = do
+readUntil :: Event.Config -> (Event -> Bool) -> Event.Watch -> IO [Event]
+readUntil cfg p w = do
     r <- timeout 10000000
         $ Stream.toList
-        $ Stream.takeEndBy Event.isRootUnwatched
+        $ Stream.takeEndBy p
         $ Stream.trace (putStrLn . Event.showEvent)
-        $ Event.watchToStream watchCfg w
-    maybe (error "readUntilUnwatched: timed out") return r
+        $ Event.watchToStream cfg w
+    maybe (error "readUntil: timed out") return r
+
+-- | Read the events from the watch up to and including the first
+-- 'Event.isRootUnwatched' event.
+readUntilUnwatched :: Event.Watch -> IO [Event]
+readUntilUnwatched = readUntil watchCfg Event.isRootUnwatched
 
 getRoot :: Event -> FilePath
 getRoot = Path.toString . Event.getRoot
@@ -178,15 +183,115 @@ removeDeleted =
             shouldEndUnwatched evs root1
             Event.removeFromWatch w =<< Path.fromString root1
 
+-------------------------------------------------------------------------------
+-- Overlapping roots tests
+-------------------------------------------------------------------------------
+
+recCfg :: Event.Config
+recCfg = Event.setRecursiveMode True watchCfg
+
+-- | Open a recursive watch on the directory @root@ and its subdirectory
+-- @root/sub@, both as roots. The directory @sub@ is watched via both the
+-- roots, the two roots share the watch descriptor of @sub@.
+withNestedRoots :: (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withNestedRoots action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "root"
+            sub = root </> "sub"
+        createDirectory root
+        createDirectory sub
+        roots <- mapM Path.fromString [root, sub]
+        bracket
+            (Event.openWatch recCfg (NonEmpty.fromList roots))
+            Event.closeWatch
+            (action root sub)
+
+createFile :: FilePath -> IO ()
+createFile file = openFile file WriteMode >>= hClose
+
+isCreatedAt :: FilePath -> Event -> Bool
+isCreatedAt file ev = Event.isCreated ev && getAbsPath ev == file
+
+-- | The roots of the create events of @file@.
+createdRoots :: FilePath -> [Event] -> [FilePath]
+createdRoots file = map getRoot . filter (isCreatedAt file)
+
+-- | The roots and absolute paths of the isRootUnwatched events.
+unwatched :: [Event] -> [(FilePath, FilePath)]
+unwatched evs =
+    [(getRoot ev, getAbsPath ev) | ev <- evs, Event.isRootUnwatched ev]
+
+-- The roots are reported in the order in which they were added.
+overlapFanOut :: Spec
+overlapFanOut =
+    it "events of a shared directory are reported for both the roots"
+        $ withNestedRoots $ \root sub w -> do
+            let file = sub </> "file"
+            createFile file
+            evs <- readUntil recCfg
+                (\ev -> isCreatedAt file ev && getRoot ev == sub) w
+            createdRoots file evs `shouldBe` [root, sub]
+
+-- The watch descriptor of sub is still used by root, removeFromWatch queues a
+-- marker event instead of removing the kernel watch.
+overlapRemoveInner :: Spec
+overlapRemoveInner =
+    it "removing the inner root keeps the outer root watching"
+        $ withNestedRoots $ \root sub w -> do
+            Event.removeFromWatch w =<< Path.fromString sub
+            evs <- readUntil recCfg Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(sub, sub)]
+            let file1 = sub </> "file1"
+                file2 = root </> "file2"
+            createFile file1
+            createFile file2
+            evs1 <- readUntil recCfg (isCreatedAt file2) w
+            createdRoots file1 evs1 `shouldBe` [root]
+            filter (== sub) (map getRoot evs1) `shouldBe` []
+
+-- The watch descriptor of root is removed from the kernel, the watch
+-- descriptor of sub is still used by sub.
+overlapRemoveOuter :: Spec
+overlapRemoveOuter =
+    it "removing the outer root keeps the inner root watching"
+        $ withNestedRoots $ \root sub w -> do
+            Event.removeFromWatch w =<< Path.fromString root
+            evs <- readUntil recCfg
+                (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
+            unwatched evs `shouldBe` [(root, root), (root, sub)]
+            let file = sub </> "file"
+            createFile file
+            evs1 <- readUntil recCfg (isCreatedAt file) w
+            createdRoots file evs1 `shouldBe` [sub]
+            filter (== root) (map getRoot evs1) `shouldBe` []
+
+-- After removing sub, removing root removes all the paths of the watch
+-- descriptor of sub, the kernel watch is removed.
+overlapRemoveBoth :: Spec
+overlapRemoveBoth =
+    it "removing both the roots reports isRootUnwatched for each path"
+        $ withNestedRoots $ \root sub w -> do
+            Event.removeFromWatch w =<< Path.fromString sub
+            Event.removeFromWatch w =<< Path.fromString root
+            evs <- readUntil recCfg
+                (\ev -> Event.isRootUnwatched ev && getRoot ev == root
+                    && getAbsPath ev == sub) w
+            unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
+
 removeTests :: IO ()
 removeTests =
     hspec
         $ describe moduleName
-        $ describe "removeFromWatch"
         $ do
-            removeQueuedEvents
-            removeTwice
-            removeDeleted
+            describe "removeFromWatch" $ do
+                removeQueuedEvents
+                removeTwice
+                removeDeleted
+            describe "overlapping roots" $ do
+                overlapFanOut
+                overlapRemoveInner
+                overlapRemoveOuter
+                overlapRemoveBoth
 
 main :: IO ()
 main = do

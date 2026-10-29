@@ -155,6 +155,7 @@ module Streamly.Internal.FS.Event.Linux
     )
 where
 
+import Control.Exception (finally)
 import Control.Monad (when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.IntMap.Lazy (IntMap)
@@ -165,11 +166,15 @@ import Data.Maybe (isNothing)
 import Data.Semigroup (Semigroup(..))
 #endif
 import Data.Word (Word8, Word32)
-import Foreign.C.Error (eINVAL, getErrno, throwErrno, throwErrnoIfMinus1)
-import Foreign.C.String (CString)
+import Foreign.C.Error
+    ( eINVAL, getErrno, throwErrno, throwErrnoIfMinus1
+    , throwErrnoIfMinus1_
+    )
+import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CUInt(..))
+import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr)
-import Foreign.Storable (peek, peekByteOff, sizeOf)
+import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
 import GHC.IO.Device (IODeviceType(Stream))
 import GHC.IO.FD (fdFD, FD(..))
 import GHC.IO.Handle.FD (mkHandleFromFD)
@@ -589,9 +594,36 @@ getRepRoot = fst
 getRepSub :: PathRep -> Maybe Path
 getRepSub = snd
 
+-- XXX Path is currently not guaranteed to be normalized.
+-- See: https://github.com/composewell/streamly/issues/2888
+eqPath :: Path -> Path -> Bool
+eqPath p1 p2 = Path.toArray p1 == Path.toArray p2
+
+eqPathRep :: PathRep -> PathRep -> Bool
+eqPathRep (r1, s1) (r2, s2) =
+    eqPath r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
+
 -------------------------------------------------------------------------------
 -- Open an event stream
 -------------------------------------------------------------------------------
+
+-- | A path added to the watch. The same inode can be added via more than one
+-- root, for example, a recursive root and a root inside it. All the paths
+-- added for an inode share the same watch descriptor.
+data WatchPath = WatchPath
+    { wpRep :: PathRep
+    -- | 'removeFromWatch' was called for the root, the path reports the
+    -- events until its 'isRootUnwatched' event.
+    , wpRemoved :: Bool
+    }
+
+data WdEntry =
+    -- | The paths watched via the watch descriptor, in the order added.
+      WdPaths [WatchPath]
+    -- | A private watch used as a marker in the event queue. When its
+    -- IN_IGNORED event is read, the listed paths, which were removed from a
+    -- shared watch descriptor, report 'isRootUnwatched'.
+    | WdMarker [(Int, PathRep)]
 
 -- | A handle for a watch.
 data Watch =
@@ -599,7 +631,7 @@ data Watch =
         Handle                  -- File handle for the watch
         (IORef
             (IntMap             -- Key is the watch descriptor
-                PathRep
+                WdEntry
             )
         )
 
@@ -670,15 +702,32 @@ foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
         :: CInt -> CString -> CUInt -> IO CInt
 
+-- Returns 'False' if the path is already being watched.
+insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
+insertPath wd prep m =
+    case Map.lookup wd m of
+        Just (WdPaths wps)
+            | any isSame wps -> (m, False)
+            | otherwise -> (Map.insert wd (WdPaths (wps ++ [new])) m, True)
+        _ -> (Map.insert wd (WdPaths [new]) m, True)
+
+    where
+
+    new = WatchPath {wpRep = prep, wpRemoved = False}
+    isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
+
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
 -- an absolute path and @subpath@ must be relative to @root@.
+--
+-- If the same directory is added via two different roots, for example, a
+-- recursive root and a root inside it, its events are reported once for each
+-- root.
 --
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
 addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
-    -- XXX do not add if the path is already added
     -- XXX if the watch is added by the scan and not via an event we can
     -- generate a create event assuming that the create may have been lost. We
     -- can also mark in the map that this entry was added by the scan. So if an
@@ -723,8 +772,21 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- We add the parent first so that we start getting events for any new
     -- creates and add the new subdirectories on creates while we are adding
     -- the children.
-    atomicModifyIORef' wdMapRef
-        $ \m -> (Map.insert (fromIntegral wd) prep m, ())
+    --
+    -- A directory created while its parent is being scanned is added twice,
+    -- once by the scan and once on its create event. The second add finds the
+    -- path already watched and does not scan the directory again.
+    --
+    -- The map update must be atomic because more than one thread modifies
+    -- the map. 'addToWatch' and 'removeFromWatch' can be called from any
+    -- thread while the thread reading the event stream adds subdirectories
+    -- on create events and removes watch descriptors on IN_IGNORED events. A
+    -- separate readIORef and writeIORef could lose an update made by another
+    -- thread in between. 'insertPath' also checks whether the path is already
+    -- watched and inserts it in the same step, so when a scan and a create
+    -- event in different threads add the same directory, only one of them
+    -- gets 'isNew' as 'True' and scans the directory.
+    isNew <- atomicModifyIORef' wdMapRef $ insertPath (fromIntegral wd) prep
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
@@ -737,7 +799,7 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- to "/" separated by byte arrays.
     -- XXX Need a FileSystem.Stat module to remove this
     pathIsDir <- doesDirectoryExist (Path.toString absPath)
-    when (watchRec && pathIsDir) $ do
+    when (isNew && watchRec && pathIsDir) $ do
         let f = addToWatch cfg watch0 . addSub prep
             in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
 
@@ -745,34 +807,98 @@ foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
         :: CInt -> CInt -> IO CInt
 
+foreign import ccall unsafe "unistd.h pipe" c_pipe :: Ptr CInt -> IO CInt
+
+foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
+
+-- | Mark the paths of a root as removed. Returns the watch descriptors whose
+-- paths are now all removed, and the removed paths of the other watch
+-- descriptors, both in the ascending order of watch descriptors.
+markRemoved ::
+    Path -> IntMap WdEntry -> (IntMap WdEntry, ([Int], [(Int, PathRep)]))
+markRemoved root m =
+    let ((wds, shared), m1) = Map.mapAccumWithKey step ([], []) m
+     in (m1, (reverse wds, reverse shared))
+
+    where
+
+    isRemoving wp = not (wpRemoved wp) && eqPath (getRepRoot (wpRep wp)) root
+    setRemoved wp = if isRemoving wp then wp {wpRemoved = True} else wp
+
+    step acc _ e@(WdMarker _) = (acc, e)
+    step acc@(wds, shared) wd (WdPaths wps) =
+        let removing = filter isRemoving wps
+            wps1 = map setRemoved wps
+            shared1 = reverse [(wd, wpRep wp) | wp <- removing] ++ shared
+         in if null removing
+            then (acc, WdPaths wps)
+            else if all wpRemoved wps1
+            then ((wd : wds, shared), WdPaths wps1)
+            else ((wds, shared1), WdPaths wps1)
+
+-- | Queue a marker IN_IGNORED event after the events already queued, by
+-- adding and removing a watch on a private pipe. The pipe is watched via
+-- @\/proc\/self\/fd@, the user cannot add the pipe to the watch, therefore,
+-- the watch descriptor is not shared with any user path.
+addRemovalMarker ::
+    CInt -> IORef (IntMap WdEntry) -> [(Int, PathRep)] -> IO ()
+addRemovalMarker fd wdMapRef paths =
+    allocaArray 2 $ \fds -> do
+        throwErrnoIfMinus1_ err $ c_pipe fds
+        rfd <- peekElemOff fds 0
+        wfd <- peekElemOff fds 1
+        let path = "/proc/self/fd/" ++ show rfd
+        flip finally (c_close rfd >> c_close wfd) $ do
+            wd <- withCString path $ \pathPtr ->
+                throwErrnoIfMinus1 err
+                    $ c_inotify_add_watch fd pathPtr (CUInt iN_ACCESS)
+            -- The marker must be in the map before its IN_IGNORED is read.
+            atomicModifyIORef' wdMapRef
+                $ \m -> (Map.insert (fromIntegral wd) (WdMarker paths) m, ())
+            throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
+
+    where
+
+    err = "removeFromWatch: marker " ++ show (map fst paths)
+
 -- | Remove an absolute root path from a 'Watch', if a path was moved after
 -- adding you need to provide the original path which was used to add the
 -- Watch.
+--
+-- The events already queued for the root are reported, followed by an
+-- 'isRootUnwatched' event for each path watched under the root. A directory
+-- that is also watched via another root remains watched for that root.
+--
+-- Removing a root that shares a directory with another root requires
+-- @\/proc@ to be mounted, throw an exception if it is not.
 --
 -- /Pre-release/
 --
 removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch (Watch handle wdMapRef) root = do
     fd <- handleToFd handle
-    -- The watch descriptors stay in the map until the kernel reports
-    -- 'isRootUnwatched' for them, so that the events already queued for the
-    -- removed root, including 'isRootUnwatched', report the root. EINVAL
-    -- means that the kernel has already removed the watch, for example, when
-    -- this root was removed earlier or the root was deleted.
-    wdMap <- readIORef wdMapRef
-    mapM_ (step fd) (Map.toList wdMap)
+    -- The paths stay in the map until their 'isRootUnwatched' event is read,
+    -- so that the events already queued for the removed root, including
+    -- 'isRootUnwatched', report the root.
+    --
+    -- If all the paths of a watch descriptor are removed we remove the
+    -- kernel watch, the kernel queues an IN_IGNORED event for it. Otherwise,
+    -- the kernel watch is still needed for the other paths, we queue a
+    -- marker event instead.
+    (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved root)
+    mapM_ (rmWatch (fdFD fd)) wds
+    when (not (null shared)) $ addRemovalMarker (fdFD fd) wdMapRef shared
 
     where
 
-    step fd (wd, v) =
-        -- XXX Path is currently not guaranteed to be normalized.
-        -- See: https://github.com/composewell/streamly/issues/2888
-        when (Path.toArray (getRepRoot v) == Path.toArray root) $ do
-            let err = "removeFromWatch: " ++ show (Path.toString root)
-            r <- c_inotify_rm_watch (fdFD fd) (fromIntegral wd)
-            when (r == -1) $ do
-                errno <- getErrno
-                when (errno /= eINVAL) $ throwErrno err
+    -- EINVAL means that the kernel has already removed the watch, for
+    -- example, when the root was deleted.
+    rmWatch fd wd = do
+        let err = "removeFromWatch: " ++ show (Path.toString root)
+        r <- c_inotify_rm_watch fd (fromIntegral wd)
+        when (r == -1) $ do
+            errno <- getErrno
+            when (errno /= eINVAL) $ throwErrno err
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -813,8 +939,8 @@ data Event = Event
    { eventWd :: CInt
    , eventFlags :: Word32
    , eventCookie :: Word32
+   , eventRoot :: Path
    , eventRelPath :: Maybe Path
-   , eventMap :: IntMap PathRep
    }
 
 -- The inotify event struct from the man page/header file:
@@ -834,16 +960,40 @@ foreign import capi
 foreign import capi
     "sys/inotify.h value IN_IGNORED" iN_IGNORED :: Word32
 
+-- | Remove a marker and the removed paths listed in it from the map. Returns
+-- the paths that were still in the map.
+removeMarker ::
+       Int
+    -> [(Int, PathRep)]
+    -> IntMap WdEntry
+    -> (IntMap WdEntry, [(Int, PathRep)])
+removeMarker marker paths m0 =
+    let (m1, removed) = foldl step (Map.delete marker m0, []) paths
+     in (m1, reverse removed)
+
+    where
+
+    step (m, acc) (wd, prep) =
+        let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) prep
+         in case Map.lookup wd m of
+                Just (WdPaths wps)
+                    | (xs, _ : ys) <- break isMatch wps ->
+                        (update wd (xs ++ ys) m, (wd, prep) : acc)
+                _ -> (m, acc)
+
+    update wd [] m = Map.delete wd m
+    update wd wps m = Map.insert wd (WdPaths wps) m
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
--- The overflow event has an invalid watch descriptor (-1), it is expanded to
--- one event per watch root. A root entry in the map is the one without a sub
--- path.
---
--- An IN_IGNORED event removes its watch descriptor from the map, the event
+-- An event is reported once for each path of its watch descriptor. An
+-- IN_IGNORED event removes its watch descriptor from the map, the event
 -- itself still reports the root. Events for a watch descriptor that is not in
 -- the map are dropped.
+--
+-- The IN_IGNORED event of a marker reports 'isRootUnwatched' for the paths
+-- listed in the marker, and removes the paths from the map.
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
@@ -869,30 +1019,56 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
             return $ Just (Path.unsafeFromArray pth)
         else return Nothing
     wdm <- PR.fromEffect $ readIORef wdMapRef
-    let mkEvent wd rel =
+    let mkEvent wd (root, rel) =
             Event
                 { eventWd = wd
                 , eventFlags = eflags
                 , eventCookie = cookie
+                , eventRoot = root
                 , eventRelPath = rel
-                , eventMap = wdm
                 }
+        isIgnored = eflags .&. iN_IGNORED /= 0
+    -- The kernel event queue overflowed and events were dropped. The overflow
+    -- event is not tied to a watch, its wd is -1. Report one overflow event
+    -- per watch root, so that the consumer knows that events may be missing
+    -- for every root.
+    -- The roots are the paths without a sub path; a path with a sub path is a
+    -- subdirectory added under a recursive root. Marker entries are skipped,
+    -- they are not watched paths.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then return
-            [ mkEvent (fromIntegral wd) Nothing
-            | (wd, p) <- Map.toList wdm, isNothing (getRepSub p)
+            [ mkEvent (fromIntegral wd) (wpRep wp)
+            | (wd, WdPaths wps) <- Map.toList wdm
+            , wp <- wps
+            , isNothing (getRepSub (wpRep wp))
             ]
     else
         case Map.lookup (fromIntegral ewd) wdm of
             Nothing -> return []
-            Just prep -> do
-                let prep1 = maybe prep (addSub prep) mpth
+            Just (WdMarker paths)
+                | isIgnored -> do
+                    removed <-
+                        PR.fromEffect
+                            $ atomicModifyIORef' wdMapRef
+                            $ removeMarker (fromIntegral ewd) paths
+                    return
+                        [ mkEvent (fromIntegral wd) prep
+                        | (wd, prep) <- removed
+                        ]
+                | otherwise -> return []
+            Just (WdPaths wps) -> do
+                let addName wp =
+                        wp {wpRep = maybe id (flip addSub) mpth (wpRep wp)}
+                    wps1 = map addName wps
                 -- Check for "ISDIR" first because it is less likely
                 let isDirCreate =
                         eflags .&. iN_ISDIR /= 0 && eflags .&. iN_CREATE /= 0
+                -- Do not add the new directories of a removed root.
                 when (watchRec cfg && isDirCreate)
-                    $ PR.fromEffect $ addToWatch cfg wt prep1
-                when (eflags .&. iN_IGNORED /= 0)
+                    $ PR.fromEffect
+                    $ mapM_ (addToWatch cfg wt . wpRep)
+                    $ filter (not . wpRemoved) wps1
+                when isIgnored
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
                     $ \m -> (Map.delete (fromIntegral ewd) m, ())
@@ -900,7 +1076,7 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                 -- IN_MOVED_FROM, IN_MOVED_TO
                 -- What if a large dir tree gets moved in to our hierarchy? Do
                 -- we get a single event for the top level dir in this case?
-                return [mkEvent (fromIntegral ewd) (getRepSub prep1)]
+                return [mkEvent (fromIntegral ewd) (wpRep wp) | wp <- wps1]
 
     where
 
@@ -1003,8 +1179,10 @@ watch = watchWith id
 -- Examine event stream
 -------------------------------------------------------------------------------
 
--- XXX Should we return a Maybe here instead of erroring out?
 -- | Get the watch root corresponding to the 'Event'.
+--
+-- If a directory is watched via more than one root, for example, a recursive
+-- root and a root inside it, its events are reported once for each root.
 --
 -- Note that if a path was moved after adding to the watch, this will give the
 -- original path and not the new path after moving.
@@ -1014,15 +1192,7 @@ watch = watchWith id
 -- /Pre-release/
 --
 getRoot :: Event -> Path
-getRoot Event{..} =
-    if eventWd >= 1
-    then
-        case Map.lookup (fromIntegral eventWd) eventMap of
-            Just prep -> getRepRoot prep
-            Nothing ->
-                error $ "Bug: getRoot: No path found corresponding to the "
-                    ++ "watch descriptor " ++ show eventWd
-    else error $ "getRoot: ewd = " ++ show eventWd
+getRoot = eventRoot
 
 -- | Get the file system object path for which the event is generated, relative
 -- to the watched root. Returns 'Nothing' if the event is for the watch root
