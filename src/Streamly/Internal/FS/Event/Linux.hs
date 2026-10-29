@@ -209,7 +209,8 @@ import qualified Streamly.Internal.Data.Array as A
     )
 import qualified Streamly.Internal.Data.MutArray as MArray
     (byteLength, unsafeCreateWithPtr')
-import qualified Streamly.Internal.FileSystem.DirIO as Dir (readDirs)
+import qualified Streamly.Internal.FileSystem.DirIO as Dir
+    (ignoreMissing, readDirs)
 import qualified Streamly.Internal.Data.Parser as PR
     (takeEQ, fromEffect, fromFold)
 
@@ -807,10 +808,17 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     -- XXX readDirs currently uses paths as String, we need to convert it
     -- to "/" separated by byte arrays.
     -- XXX Need a FileSystem.Stat module to remove this
+    --
+    -- On a file system that does not report the entry type in readdir
+    -- (DT_UNKNOWN), readDirs calls lstat on each entry, an entry deleted
+    -- after readdir fails with ENOENT. 'ignoreMissing' skips the entry,
+    -- otherwise the exception would stop the scan of the remaining entries,
+    -- and 'addSubdirToWatch' would ignore it silently.
     pathIsDir <- doesDirectoryExist (Path.toString absPath)
     when (isNew && watchRec && pathIsDir) $ do
         let f = addSubdirToWatch cfg watch0 . addSub prep
-            in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
+            in S.fold (FL.drainMapM f)
+                $ Dir.readDirs (Dir.ignoreMissing True) absPath
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
