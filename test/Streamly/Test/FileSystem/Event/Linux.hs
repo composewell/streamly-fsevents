@@ -657,6 +657,34 @@ removeFailRetry =
                     evs <- readUntil recCfg Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
 
+-------------------------------------------------------------------------------
+-- Recursive mode robustness tests
+-------------------------------------------------------------------------------
+
+-- | @dir@ is a proper prefix of the path.
+isStrictlyUnder :: FilePath -> FilePath -> Bool
+isStrictlyUnder dir path = (dir ++ "/") `isPrefixOf` path
+
+-- A subdirectory created while its parent is scanned is added by the scan and
+-- on its create event, the second add finds the existing watch.
+recFailIfExists :: Spec
+recFailIfExists =
+    it "FailIfExists does not fail when a subdirectory is added twice" $ do
+        let cfg = Event.setWhenExists Event.FailIfExists recCfg
+        withRoot cfg $ \root w -> do
+            let sentinel = root </> "sentinel"
+                mkTree i = do
+                    let dir = root </> ("dir" ++ show i)
+                    createDirectory dir
+                    mapM_ (\j -> createDirectory (dir </> show j))
+                        [1 .. 50 :: Int]
+                ops = mapM_ mkTree [1 .. 20 :: Int] >> createFile sentinel
+            done <- newEmptyMVar
+            bracket (forkIO (ops `finally` putMVar done ())) killThread
+                $ \_ -> do
+                    _ <- readUntil cfg (isCreatedAt sentinel) w
+                    takeMVar done
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -686,6 +714,7 @@ watchTests =
                 removeWhileReading
                 closeWhileReading
             describe "failures" removeFailRetry
+            describe "recursive mode robustness" recFailIfExists
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified

@@ -313,6 +313,10 @@ data WhenExists =
 -- | When adding a new path to the watch, specify what to do if a watch already
 -- exists on that path.
 --
+-- In recursive mode, 'FailIfExists' applies to the paths added by
+-- 'openWatch' and 'addToWatch', the subdirectories under them are added with
+-- 'AddIfExists'.
+--
 -- /default: AddIfExists/
 setWhenExists :: WhenExists -> Config -> Config
 setWhenExists val =
@@ -812,11 +816,23 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
 -- deleted or moved before its watch is added. Its parent reports the deletion
 -- or the move. The watch may be closed by another thread while the event
 -- stream adds a subdirectory.
+--
+-- 'FailIfExists' applies to the paths added by the user, a subdirectory is
+-- added with 'AddIfExists' instead. A directory created while its parent is
+-- scanned is added twice, by the scan and on its create event, the second
+-- add would fail with EEXIST.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wt prep =
-    addToWatch cfg wt prep `catchIOError` \e -> do
+    addToWatch subCfg wt prep `catchIOError` \e -> do
         closed <- isWatchClosed wt
         if isDoesNotExistError e || closed then return () else ioError e
+
+    where
+
+    subCfg =
+        if createFlags cfg .&. iN_MASK_CREATE /= 0
+        then setWhenExists AddIfExists cfg
+        else cfg
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
