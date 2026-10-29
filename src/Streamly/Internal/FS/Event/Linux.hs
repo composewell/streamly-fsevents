@@ -561,12 +561,29 @@ defaultConfig =
 recursiveEvents :: Word32
 recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO
 
+-- | The events that the kernel watch must generate in all modes.
+--
+-- FreeBSD 15.0 and 15.1 do not generate IN_IGNORED for a deleted object, and
+-- do not remove its watch, unless the watch has IN_DELETE_SELF. The deleted
+-- path would never report 'isRootUnwatched' and would stay in the map.
+alwaysEvents :: Word32
+#if defined(CABAL_OS_FREEBSD)
+alwaysEvents = iN_DELETE_SELF
+#else
+alwaysEvents = 0
+#endif
+
+-- | The events added by 'watchFlags', reported only if enabled in the
+-- 'Config'.
+internalEvents :: Word32
+internalEvents = recursiveEvents .|. alwaysEvents
+
 -- | The flags of the kernel watch.
 watchFlags :: Config -> Word32
 watchFlags Config{..} =
     if watchRec
-    then createFlags .|. recursiveEvents
-    else createFlags
+    then createFlags .|. alwaysEvents .|. recursiveEvents
+    else createFlags .|. alwaysEvents
 
 -------------------------------------------------------------------------------
 -- Path representation for events
@@ -1341,7 +1358,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                         eflags .&. (iN_DELETE_SELF .|. iN_MOVE_SELF) /= 0
                     -- The events added by 'watchFlags' only.
                     unrequested =
-                        recursiveEvents .&. complement (createFlags cfg)
+                        internalEvents .&. complement (createFlags cfg)
                     isUnrequested = eflags .&. unrequested /= 0
                     isReported wp =
                         not isSelfEvent || isNothing (getRepSub (wpRep wp))
