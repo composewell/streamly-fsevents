@@ -156,7 +156,7 @@ module Streamly.Internal.FS.Event.Linux
     )
 where
 
-import Control.Exception (finally)
+import Control.Exception (finally, onException)
 import Control.Monad (when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
@@ -191,6 +191,7 @@ import GHC.IO.Handle.FD (handleToFd)
 import Streamly.Internal.Data.Array (byteLength)
 import Streamly.Internal.FileSystem.Path (Path)
 
+import qualified Control.Exception as Exception (mask)
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as FL
@@ -917,24 +918,35 @@ removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch wt root =
     unwatchPaths wt (show (Path.toString root)) (eqPath root . getRepRoot)
 
--- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
--- monitoring the paths for file system events. Returns a 'Watch' handle which
--- can then be used to read the event stream or to close the watch.
---
--- /Pre-release/
---
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch cfg paths = do
-    w <- createWatch
-    mapM_ (\root -> addToWatch cfg w (root, Nothing)) $ NonEmpty.toList paths
-    return w
-
 -- | Close a 'Watch' handle.
 --
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
 closeWatch (Watch h _) = hClose h
+
+-- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
+-- monitoring the paths for file system events. Returns a 'Watch' handle which
+-- can then be used to read the event stream or to close the watch.
+--
+-- If adding a path fails, the watch is closed and the exception is rethrown.
+--
+-- /Pre-release/
+--
+openWatch :: Config -> NonEmpty Path -> IO Watch
+openWatch cfg paths =
+    -- The handle is not returned to the caller if adding a path fails, the
+    -- caller cannot close it. 'mask' ensures that an async exception cannot
+    -- arrive between creating the watch and installing the handler.
+    Exception.mask $ \restore -> do
+        w <- createWatch
+        restore (mapM_ (add w) (NonEmpty.toList paths))
+            `onException` closeWatch w
+        return w
+
+    where
+
+    add w root = addToWatch cfg w (root, Nothing)
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle

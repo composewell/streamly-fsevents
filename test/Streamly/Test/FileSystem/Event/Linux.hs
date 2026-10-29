@@ -8,12 +8,15 @@
 --
 module Streamly.Test.FileSystem.Event.Linux (main) where
 
-import Control.Exception (bracket)
+import Control.Exception (IOException, bracket, try)
+import Control.Monad (filterM)
 import Data.List (isPrefixOf)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
     , getPermissions
+    , getSymbolicLinkTarget
+    , listDirectory
     , removeDirectory
     , removeFile
     , renameDirectory
@@ -482,6 +485,42 @@ recRenameWithin =
             evs <- readUntil recCfg (isCreatedAt file) w
             filter (isUnder dir1) (map getAbsPath evs) `shouldBe` []
 
+-------------------------------------------------------------------------------
+-- Resource tests
+-------------------------------------------------------------------------------
+
+-- | The inotify file descriptors of the process.
+inotifyFds :: IO [FilePath]
+inotifyFds = do
+    fds <- listDirectory "/proc/self/fd"
+    filterM isInotify fds
+
+    where
+
+    isInotify fd = do
+        r <- try (getSymbolicLinkTarget ("/proc/self/fd" </> fd))
+        return $ case r of
+            Left (_ :: IOException) -> False
+            Right target -> target == "anon_inode:inotify"
+
+-- The second root does not exist, adding it fails after the inotify fd is
+-- created and the first root is added.
+openWatchNoLeak :: Spec
+openWatchNoLeak =
+    it "openWatch closes the inotify fd when adding a path fails"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let root = fp </> "root"
+            createDirectory root
+            roots <- mapM Path.fromString [root, fp </> "missing"]
+            fds <- inotifyFds
+            r <- try (Event.openWatch watchCfg (NonEmpty.fromList roots))
+            case r of
+                Left (_ :: IOException) -> return ()
+                Right w -> do
+                    Event.closeWatch w
+                    expectationFailure "openWatch did not fail"
+            inotifyFds `shouldReturn` fds
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -503,6 +542,7 @@ watchTests =
                 recMoveOutUnrequested
                 recMoveIn
                 recRenameWithin
+            describe "resources" openWatchNoLeak
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
