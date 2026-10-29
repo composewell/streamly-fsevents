@@ -34,6 +34,31 @@
 - Linux: report the queue overflow event (`isEventsLost`) once per watch
   root; `getRoot` and `getAbsPath` raised an exception on it earlier.
 - Linux: fix `setWhenExists FailIfExists`, adding a watch failed with it.
+- Linux: close the inotify fd when starting a watch fails, e.g. on a
+  missing path; the fd leaked until garbage collection.
+- Linux: create the inotify fd close-on-exec; a child process kept the
+  watch alive after it was closed.
+- Linux: in recursive mode with `FailIfExists`, fix an `EEXIST` exception
+  when a subdirectory is created while its parent is being scanned. The
+  setting now applies to the watch roots only.
+- Linux: in recursive mode, do not watch a file, or follow a symbolic link,
+  that replaced a new directory before its create event was read.
+- Linux: in recursive mode, do not skip the remaining subdirectories when an
+  entry is deleted during a scan, on file systems that do not report the
+  entry type.
+- Linux: in recursive mode, scan the tree again after a queue overflow; a
+  directory created during the overflow was never watched.
+- Linux: after a queue overflow, report `isRootUnwatched` for the roots
+  removed with `removeFromWatch`; the event was lost, and a removed root
+  sharing a directory with another root kept reporting its events.
+- Linux: a failed `removeFromWatch` of a root sharing a directory with
+  another root can be retried; the root kept reporting events and the retry
+  did nothing.
+- Linux, internal module: `addToWatch`, `removeFromWatch` and `closeWatch`
+  no longer block while another thread waits for events. `closeWatch` ends
+  the event stream; with the non-threaded RTS it ends at the next event.
+  `addToWatch` on a closed watch raises an exception, `removeFromWatch`
+  does nothing.
 - macOS: fix a link failure of `setFullHistory`. `setFullHistory`,
   `isCloned`, `isHardLink` and `isLastHardLink` are always exported; when
   the SDK lacks the flag, the setter is a no-op and the predicates return
