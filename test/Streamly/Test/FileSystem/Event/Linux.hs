@@ -8,7 +8,10 @@
 --
 module Streamly.Test.FileSystem.Event.Linux (main) where
 
-import Control.Exception (IOException, bracket, try)
+import Control.Concurrent
+    (forkIO, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay)
+import Control.Exception
+    (IOException, SomeException, bracket, throwIO, try)
 import Control.Monad (filterM)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
@@ -541,6 +544,81 @@ cloexecWatch =
             null flags `shouldBe` False
             filter (\f -> f .&. 0o2000000 == 0) flags `shouldBe` []
 
+-------------------------------------------------------------------------------
+-- Concurrency tests
+-------------------------------------------------------------------------------
+
+-- | Run the action while another thread reads the events of the watch up to
+-- and including the first event that satisfies the predicate. Return the
+-- result of the action and the events read.
+whileReading ::
+    Event.Config -> (Event -> Bool) -> Event.Watch -> IO a -> IO (a, [Event])
+whileReading cfg p w action = do
+    mv <- newEmptyMVar
+    bracket
+        (forkIO (try (readUntil cfg p w) >>= putMVar mv))
+        killThread
+        $ \_ -> do
+            -- Let the reader block in read
+            threadDelay 200000
+            r <- action
+            evs <- takeMVar mv
+            either (\(e :: SomeException) -> throwIO e) (return . (r,)) evs
+
+-- The reader thread is blocked reading the watch fd.
+addWhileReading :: Spec
+addWhileReading =
+    it "addToWatch does not block while another thread reads the events"
+        $ withRoot watchCfg $ \root w -> do
+            let root2 = takeDirectory root </> "root2"
+                file = root2 </> "file"
+            createDirectory root2
+            p <- Path.fromString root2
+            (r, evs) <- whileReading watchCfg (isCreatedAt file) w $ do
+                r <- timeout 2000000 $ Event.addToWatch watchCfg w (p, Nothing)
+                -- Unblock the reader
+                createFile file
+                return r
+            r `shouldBe` Just ()
+            createdRoots file evs `shouldBe` [root2]
+
+removeWhileReading :: Spec
+removeWhileReading =
+    it "removeFromWatch does not block while another thread reads the events"
+        $ withRoot watchCfg $ \root w -> do
+            p <- Path.fromString root
+            (r, evs) <- whileReading watchCfg Event.isRootUnwatched w $ do
+                r <- timeout 2000000 $ Event.removeFromWatch w p
+                -- Unblock the reader if removeFromWatch did not
+                createFile (root </> "file")
+                return r
+            r `shouldBe` Just ()
+            unwatched evs `shouldBe` [(root, root)]
+
+-- The reader thread is blocked reading the watch fd. The stream ends when
+-- the watch is closed.
+closeWhileReading :: Spec
+closeWhileReading =
+    it "closeWatch does not block while another thread reads the events"
+        $ withRoot watchCfg $ \_ w -> do
+            mv <- newEmptyMVar
+            let reader = Stream.drain (Event.watchToStream watchCfg w)
+            bracket
+                (forkIO (try reader >>= putMVar mv))
+                killThread
+                $ \_ -> do
+                    threadDelay 200000
+                    timeout 2000000 (Event.closeWatch w)
+                        `shouldReturn` Just ()
+                    -- The stream ends without an exception
+                    r <- timeout 2000000 (takeMVar mv)
+                    fmap (either (\(_ :: SomeException) -> False) ok) r
+                        `shouldBe` Just True
+
+    where
+
+    ok () = True
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -565,6 +643,10 @@ watchTests =
             describe "resources" $ do
                 openWatchNoLeak
                 cloexecWatch
+            describe "concurrency" $ do
+                addWhileReading
+                removeWhileReading
+                closeWhileReading
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
