@@ -312,11 +312,49 @@ cleanup_pipe:
  * Stop a watch event loop
  *****************************************************************************/
 
+static void noop(void *ctx) {
+    (void)ctx;
+}
+
+/*
+ * The read end of the pipe must be closed before calling this, so that a
+ * callback blocked writing to a full pipe fails with EPIPE.
+ */
 void destroyWatch(struct watch* w) {
-    /* Stop and invalidate the event stream */
-    FSEventStreamFlushSync(w->eventStream);
+    /*
+     * Stop and invalidate operations do not wait for a callback running
+     * on the queue, it may run after they return.
+     */
     FSEventStreamStop(w->eventStream);
     FSEventStreamInvalidate(w->eventStream);
+
+    /*
+     * A write to a full pipe stays blocked as long as the read end is open
+     * in any process. Closing our read fd does not close the read end if
+     * a child process holds a copy of it. The read fd has FD_CLOEXEC, but
+     * a child can still hold a copy if it forked before FD_CLOEXEC was set
+     * on the fd (pipe and fcntl are separate calls), or if it forked
+     * without exec.
+     *
+     * Replacing the write fd with /dev/null wakes up the blocked write.
+     * The remaining writes of the callback go to /dev/null and complete,
+     * and the callback returns.
+     *
+     * We use dup2 instead of close. The callback writes to the fd number
+     * in w->writefd. Close would free that number, and a file or socket
+     * opened by another thread could get the same number. The remaining
+     * writes of the callback would then put event data into that file or
+     * socket. dup2 keeps the number allocated to /dev/null until the close
+     * below, which runs after the callback has finished.
+     */
+    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devnull >= 0) {
+        dup2(devnull, w->writefd);
+        close(devnull);
+    }
+
+    /* Wait for the callback running on the serial queue, if any */
+    dispatch_sync_f(w->queue, NULL, noop);
     dispatch_release(w->queue);
     FSEventStreamRelease(w->eventStream);
     close(w->writefd);

@@ -16,13 +16,20 @@ import Control.Monad (forM, forever, void)
 import Data.Either (lefts)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
+import Foreign.C.Types (CUInt(..))
+import System.Directory (listDirectory)
+import System.Exit (ExitCode(ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performMajorGC)
+import System.Posix.Process
+    (exitImmediately, forkProcess, getProcessStatus)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(..), ResourceLimits(..)
     , getResourceLimit, setResourceLimit)
-import System.Posix.Signals (Handler(Default, Ignore), installHandler, sigPIPE)
+import System.Posix.Signals
+    ( Handler(Default, Ignore), installHandler, sigKILL, sigPIPE
+    , signalProcess)
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -145,6 +152,60 @@ closeWithSigPipe =
             writeIORef stop True
             takeMVar writerDone
 
+foreign import ccall unsafe "unistd.h sleep" c_sleep :: CUInt -> IO CUInt
+
+-- | Number of open fds of this process.
+countFds :: IO Int
+countFds = length <$> listDirectory "/dev/fd"
+
+-- | Close a watch while its callback is blocked writing to the full pipe
+-- and a child process holds the read end of the pipe, so that the write
+-- does not fail when the watch closes the read end. The child is created
+-- by fork without exec, it inherits the fds even if they are close-on-exec.
+-- Closing the watch must not hang; when it is done, the two fds of the
+-- pipe are closed.
+--
+-- As in 'closeWithSigPipe', the consumer stops reading after the first
+-- event and the watch is closed by the GC.
+closeWithReader :: Spec
+closeWithReader =
+    it "closing a watch does not hang when a child holds the pipe" $
+        withSystemTempDirectory "fsevent_dir" $ \dir -> do
+            root <- Path.fromString dir
+            started <- newEmptyMVar
+            stop <- newIORef False
+            writerDone <- newEmptyMVar
+            watcherDone <- newEmptyMVar
+            let block ev =
+                    putMVar started () >> threadDelay 60000000 >> return ev
+                write i = do
+                    writeFile (dir </> show (i `mod` 1000 :: Int)) ""
+                    done <- readIORef stop
+                    if done then putMVar writerDone () else write (i + 1)
+            fds <- countFds
+            _ <- forkIO $ write 0
+            watcher <-
+                flip forkFinally (const (putMVar watcherDone ()))
+                    $ Stream.drain $ Stream.mapM block
+                    $ Event.watch (NonEmpty.fromList [root])
+            takeMVar started
+            child <- forkProcess $ c_sleep 30 >> exitImmediately ExitSuccess
+            threadDelay 1000000
+            killThread watcher
+            takeMVar watcherDone
+            writeIORef stop True
+            takeMVar writerDone
+            performMajorGC
+            let waitClosed n = do
+                    k <- countFds
+                    if k <= fds || n <= (0 :: Int)
+                    then return k
+                    else threadDelay 100000 >> waitClosed (n - 1)
+            k <- waitClosed 50
+            signalProcess sigKILL child
+            _ <- getProcessStatus True False child
+            k `shouldBe` fds
+
 -- TODO:
 -- Creation/deletion/move of hard links
 -- Deletion of last hard link
@@ -232,4 +293,5 @@ main = do
 
     hspec $ describe moduleName $ describe "robustness" $ do
         closeWithSigPipe
+        closeWithReader
         manyWatches
