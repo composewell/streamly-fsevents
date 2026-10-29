@@ -213,6 +213,12 @@ int createWatch
       return -1;
     }
 
+    /* Do not leak the pipe to child processes */
+    if (fcntl(pfds[0], F_SETFD, FD_CLOEXEC)
+            || fcntl(pfds[1], F_SETFD, FD_CLOEXEC)) {
+      goto cleanup_pipe;
+    }
+
     /*
      * The read end is closed before the stream is stopped, the callback may
      * write to the pipe after that. Return EPIPE instead of raising SIGPIPE,
