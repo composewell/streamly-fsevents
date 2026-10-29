@@ -738,10 +738,15 @@ getRoot Event{..} = fromMaybe eventPath eventRoot
 getRelPath :: Event -> Maybe Path
 getRelPath Event{..} = eventRelPath
 
--- | Get the absolute file system object path for which the event is generated.
+-- | Get the file system object path for which the event is generated, the
+-- 'getRoot' path joined with the 'getRelPath' path.
 --
--- When the watch root is a symlink, the absolute path returned is via the
--- original symlink and not through the resolved path.
+-- The path is absolute when the watch root was supplied as an absolute path.
+-- For a relative watch root it is relative, to the current directory at the
+-- time the watch was started.
+--
+-- When the watch root is a symlink, the path returned is via the original
+-- symlink and not through the resolved path.
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
