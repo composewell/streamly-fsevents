@@ -10,6 +10,7 @@
 #if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFILEEVENTS
 
 #include <CoreServices/CoreServices.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <FS/Event/Darwin.h>
@@ -210,6 +211,15 @@ int createWatch
     int pfds[2];
     if (pipe (pfds)) {
       return -1;
+    }
+
+    /*
+     * The read end is closed before the stream is stopped, the callback may
+     * write to the pipe after that. Return EPIPE instead of raising SIGPIPE,
+     * which terminates the process unless it is ignored.
+     */
+    if (fcntl(pfds[1], F_SETNOSIGPIPE, 1)) {
+      goto cleanup_pipe;
     }
 
     /*

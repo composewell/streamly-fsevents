@@ -14,12 +14,15 @@ import Control.Concurrent
 import Control.Exception (IOException, try)
 import Control.Monad (forM, forever, void)
 import Data.Either (lefts)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Mem (performMajorGC)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(..), ResourceLimits(..)
     , getResourceLimit, setResourceLimit)
+import System.Posix.Signals (Handler(Default, Ignore), installHandler, sigPIPE)
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -98,6 +101,49 @@ manyWatches =
                     $ "watches failed to start: " ++ show (length (lefts xs))
             Nothing -> return ()
         r `shouldSatisfy` isJust
+
+-- | Close a watch while its callback is blocked writing to the full pipe,
+-- with SIGPIPE set to its default action, which terminates the process.
+-- The write fails when the read end is closed, it must not raise SIGPIPE.
+--
+-- The consumer stops reading after the first event, so that the pipe fills
+-- up. The exception that stops the consumer arrives outside the bracket of
+-- the stream, the watch is closed by the GC.
+--
+-- The RTS sends SIGPIPE to an OS thread to interrupt an interruptible
+-- foreign call, e.g. the open(2) in 'writeFile', when an exception is
+-- thrown to the Haskell thread making the call. Therefore, the writer
+-- thread is stopped with a flag, after SIGPIPE is ignored again.
+closeWithSigPipe :: Spec
+closeWithSigPipe =
+    it "closing a watch does not raise SIGPIPE" $
+        withSystemTempDirectory "fsevent_dir" $ \dir -> do
+            root <- Path.fromString dir
+            started <- newEmptyMVar
+            stop <- newIORef False
+            writerDone <- newEmptyMVar
+            watcherDone <- newEmptyMVar
+            let block ev =
+                    putMVar started () >> threadDelay 60000000 >> return ev
+                write i = do
+                    writeFile (dir </> show (i `mod` 1000 :: Int)) ""
+                    done <- readIORef stop
+                    if done then putMVar writerDone () else write (i + 1)
+            _ <- installHandler sigPIPE Default Nothing
+            _ <- forkIO $ write 0
+            watcher <-
+                flip forkFinally (const (putMVar watcherDone ()))
+                    $ Stream.drain $ Stream.mapM block
+                    $ Event.watch (NonEmpty.fromList [root])
+            takeMVar started
+            threadDelay 1000000
+            killThread watcher
+            takeMVar watcherDone
+            performMajorGC
+            threadDelay 1000000
+            _ <- installHandler sigPIPE Ignore Nothing
+            writeIORef stop True
+            takeMVar writerDone
 
 -- TODO:
 -- Creation/deletion/move of hard links
@@ -185,4 +231,5 @@ main = do
     runRec FileType fileRootTests
 
     hspec $ describe moduleName $ describe "robustness" $ do
+        closeWithSigPipe
         manyWatches
