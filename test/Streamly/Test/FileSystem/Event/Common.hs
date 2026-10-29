@@ -82,6 +82,9 @@ import qualified Streamly.Internal.FS.Event.Darwin as Event
 #elif defined(FILESYSTEM_EVENT_WINDOWS)
 import Streamly.Internal.FS.Event.Windows (Event)
 import qualified Streamly.Internal.FS.Event.Windows as Event
+#elif defined(FILESYSTEM_EVENT_FREEBSD)
+import Streamly.Internal.FS.Event.FreeBSD (Event)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Event
 #else
 import Streamly.Internal.FS.Event (Event)
 import qualified Streamly.Internal.FS.Event as Event
@@ -211,7 +214,7 @@ dirEvent, fileEvent :: (Event -> Bool) -> Event -> Bool
 #if defined(FILESYSTEM_EVENT_DARWIN)
 dirEvent f ev = Event.isDir ev && f ev
 fileEvent f ev = Event.isFile ev && f ev
-#elif defined(FILESYSTEM_EVENT_LINUX)
+#elif defined(FILESYSTEM_EVENT_LINUX) || defined(FILESYSTEM_EVENT_FREEBSD)
 dirEvent f ev = Event.isDir ev && f ev
 fileEvent f ev = not (Event.isDir ev) && f ev
 #else

@@ -15,14 +15,26 @@ import Control.Exception
 import Control.Monad (filterM)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+import Foreign.C.Error (throwErrnoIfMinus1_)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt(..), CSize(..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Storable (peek, poke, sizeOf)
+import Streamly.Internal.FS.Event.FreeBSD (Event)
+#else
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
+#endif
 import System.Directory
     ( createDirectory
     , createDirectoryLink
     , getPermissions
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
     , getSymbolicLinkTarget
     , listDirectory
+#endif
     , removeDirectory
     , removeFile
     , renameDirectory
@@ -31,9 +43,12 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory)
 import System.IO
-    ( IOMode(AppendMode, ReadMode, WriteMode), hClose, hFlush, hPutStr
+    ( IOMode(AppendMode, WriteMode), hClose, hFlush, hPutStr
     , openFile
     )
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+import System.IO (IOMode(ReadMode))
+#endif
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -44,14 +59,22 @@ import qualified Data.List as List
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Internal.Data.Stream as Stream
 import qualified Streamly.Internal.FileSystem.Path as Path
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Event
+#else
 import qualified Streamly.Internal.FS.Event.Linux as Event
+#endif
 
 import Streamly.Test.FileSystem.Event.Common
 
 #define DEVBUILD
 
 moduleName :: String
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+moduleName = "FS.Event.FreeBSD"
+#else
 moduleName = "FS.Event.Linux"
+#endif
 
 dirTouchEvents :: String -> [([Char], Event -> Bool)]
 dirTouchEvents dir =
@@ -60,18 +83,26 @@ dirTouchEvents dir =
     , (dir, dirEvent Event.isNonWriteClosed)
     ]
 
+-- | The link count change of a deleted directory. FreeBSD does not report it.
+dirDelAttrsEvents :: String -> [([Char], Event -> Bool)]
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+dirDelAttrsEvents _ = []
+#else
+dirDelAttrsEvents dir = [(dir, dirEvent Event.isAttrsModified)]
+#endif
+
 dirDelEvents :: String -> [([Char], Event -> Bool)]
 dirDelEvents dir =
       (dir, dirEvent Event.isDeleted)
-    : (dir, dirEvent Event.isAttrsModified)
-    : dirTouchEvents dir
+    : dirDelAttrsEvents dir
+    ++ dirTouchEvents dir
 
 rootDirDelEvents :: String -> [([Char], Event -> Bool)]
 rootDirDelEvents root =
       (root, Event.isRootUnwatched)
     : (root, Event.isRootDeleted)
-    : (root, dirEvent Event.isAttrsModified)
-    : dirTouchEvents root
+    : dirDelAttrsEvents root
+    ++ dirTouchEvents root
 
 dirMoveEvents :: [Char] -> [Char] -> [([Char], Event -> Bool)]
 dirMoveEvents src dst =
@@ -497,6 +528,20 @@ recRenameWithin =
 -- Resource tests
 -------------------------------------------------------------------------------
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+foreign import capi "fcntl.h fcntl" c_fcntl :: CInt -> CInt -> IO CInt
+
+foreign import capi "fcntl.h value F_GETFD" f_GETFD :: CInt
+
+foreign import capi "fcntl.h value FD_CLOEXEC" fD_CLOEXEC :: CInt
+
+-- | The open file descriptors of the process below 1024. FreeBSD has no
+-- @\/proc\/self\/fd@ to find the inotify file descriptors, the file
+-- descriptors opened by a watch are found by comparing the lists before and
+-- after opening it.
+inotifyFds :: IO [CInt]
+inotifyFds = filterM (\fd -> (/= -1) <$> c_fcntl fd f_GETFD) [0 .. 1023]
+#else
 -- | The inotify file descriptors of the process.
 inotifyFds :: IO [FilePath]
 inotifyFds = do
@@ -510,6 +555,7 @@ inotifyFds = do
         return $ case r of
             Left (_ :: IOException) -> False
             Right target -> target == "anon_inode:inotify"
+#endif
 
 -- The second root does not exist, adding it fails after the inotify fd is
 -- created and the first root is added.
@@ -529,6 +575,17 @@ openWatchNoLeak =
                     expectationFailure "openWatch did not fail"
             inotifyFds `shouldReturn` fds
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+cloexecWatch :: Spec
+cloexecWatch =
+    it "the inotify fd is close-on-exec" $ do
+        fds0 <- inotifyFds
+        withRoot watchCfg $ \_ _ -> do
+            fds <- filter (`notElem` fds0) <$> inotifyFds
+            flags <- mapM (\fd -> c_fcntl fd f_GETFD) fds
+            null flags `shouldBe` False
+            filter (\f -> f .&. fD_CLOEXEC == 0) flags `shouldBe` []
+#else
 -- | The flags of a file descriptor from @\/proc\/self\/fdinfo@.
 fdFlags :: FilePath -> IO Integer
 fdFlags fd = do
@@ -546,6 +603,7 @@ cloexecWatch =
             flags <- mapM fdFlags fds
             null flags `shouldBe` False
             filter (\f -> f .&. 0o2000000 == 0) flags `shouldBe` []
+#endif
 
 -------------------------------------------------------------------------------
 -- Concurrency tests
@@ -626,6 +684,27 @@ closeWhileReading =
 -- Failure tests
 -------------------------------------------------------------------------------
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+-- The marker of the shared watch descriptor of sub needs a watch on / or
+-- /dev, the add fails when the watch already watches both.
+removeFailRetry :: Spec
+removeFailRetry =
+    it "removeFromWatch can be retried after it fails"
+        $ withNestedRoots $ \_ sub w -> do
+            p <- Path.fromString sub
+            slash <- Path.fromString "/"
+            dev <- Path.fromString "/dev"
+            Event.addToWatch watchCfg w (slash, Nothing)
+            Event.addToWatch watchCfg w (dev, Nothing)
+            r <- try (Event.removeFromWatch w p)
+            case r of
+                Right () -> expectationFailure "removeFromWatch did not fail"
+                Left (_ :: IOException) -> do
+                    Event.removeFromWatch w dev
+                    Event.removeFromWatch w p
+                    evs <- readUntil watchCfg (isUnwatchedAt sub) w
+                    unwatched evs `shouldBe` [("/dev", "/dev"), (sub, sub)]
+#else
 -- | Run the action with all the file descriptors of the process in use.
 -- Returns 'Nothing' if the limit is not reached in 100000 opens.
 withFdsExhausted :: IO a -> IO (Maybe a)
@@ -657,6 +736,7 @@ removeFailRetry =
                     Event.removeFromWatch w p
                     evs <- readUntil recCfg Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
+#endif
 
 -------------------------------------------------------------------------------
 -- Recursive mode robustness tests
@@ -718,12 +798,31 @@ recDirReplacedBySymlink =
                 createFile (out </> "sub" </> "file")
             filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+foreign import ccall unsafe "sysctlbyname" c_sysctlbyname
+    :: CString -> Ptr () -> Ptr CSize -> Ptr () -> CSize -> IO CInt
+#endif
+
+-- | The maximum number of events in the event queue of a watch.
+maxQueuedEvents :: IO Int
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+maxQueuedEvents =
+    withCString "vfs.inotify.max_queued_events" $ \name ->
+        alloca $ \valPtr -> alloca $ \lenPtr -> do
+            poke lenPtr (fromIntegral (sizeOf (0 :: CInt)))
+            throwErrnoIfMinus1_ "sysctlbyname"
+                $ c_sysctlbyname name (castPtr valPtr) lenPtr nullPtr 0
+            fromIntegral <$> (peek valPtr :: IO CInt)
+#else
+maxQueuedEvents = read <$> readFile "/proc/sys/fs/inotify/max_queued_events"
+#endif
+
 -- | Run the action after overflowing the event queue of the watch, by
 -- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
 -- the queue limit is more than 100000 events.
 withOverflow :: FilePath -> IO a -> IO (Maybe a)
 withOverflow dir action = do
-    limit <- read <$> readFile "/proc/sys/fs/inotify/max_queued_events"
+    limit <- maxQueuedEvents
     if limit > (100000 :: Int)
     then return Nothing
     else do
