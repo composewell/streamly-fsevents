@@ -213,9 +213,6 @@ import qualified Streamly.Internal.Data.Parser as PR
 
 -- | Watch configuration, used to specify the events of interest and the
 -- behavior of the watch.
---
--- /Pre-release/
---
 data Config = Config
     { watchRec :: Bool
     , createFlags :: Word32
@@ -249,9 +246,6 @@ setFlag mask status cfg@Config{..} =
 -- mode, they are reported only if enabled in the 'Config'.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 
@@ -265,9 +259,6 @@ foreign import capi
 -- link path rather than the resolved path.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setFollowSymLinks :: Bool -> Config -> Config
 setFollowSymLinks s = setFlag iN_DONT_FOLLOW (not s)
 
@@ -281,9 +272,6 @@ foreign import capi
 -- macOS does not report the events of an unlinked file.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setExcludeUnlinked :: Bool -> Config -> Config
 setExcludeUnlinked = setFlag iN_EXCL_UNLINK
 
@@ -311,9 +299,6 @@ foreign import capi
 
 -- | What to do if a watch already exists when 'openWatch' or 'addToWatch' is
 -- called for a path.
---
--- /Pre-release/
---
 data WhenExists =
       AddIfExists -- ^ Do not set an existing setting to 'False' only set to 'True'
     | ReplaceIfExists -- ^ Replace the existing settings with new settings
@@ -324,9 +309,6 @@ data WhenExists =
 -- exists on that path.
 --
 -- /default: AddIfExists/
---
--- /Pre-release/
---
 setWhenExists :: WhenExists -> Config -> Config
 setWhenExists val =
     -- inotify_add_watch fails with EINVAL if both IN_MASK_ADD and
@@ -343,9 +325,6 @@ foreign import capi
 -- | Watch the object only for one event and then remove it from the watch.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setOneShot :: Bool -> Config -> Config
 setOneShot = setFlag iN_ONESHOT
 
@@ -356,9 +335,6 @@ foreign import capi
 -- to ensure that the watched object is a directory.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setOnlyDir :: Bool -> Config -> Config
 setOnlyDir = setFlag iN_ONLYDIR
 
@@ -375,9 +351,6 @@ foreign import capi
 -- deletion of a subdirectory is reported as 'isDeleted'.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRootDeleted :: Bool -> Config -> Config
 setRootDeleted = setFlag iN_DELETE_SELF
 
@@ -390,9 +363,6 @@ foreign import capi
 -- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRootMoved :: Bool -> Config -> Config
 setRootMoved = setFlag iN_MOVE_SELF
 
@@ -401,9 +371,6 @@ setRootMoved = setFlag iN_MOVE_SELF
 -- In recursive mode, the events are reported for the watch roots only.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRootPathEvents :: Bool -> Config -> Config
 setRootPathEvents = setFlag (iN_DELETE_SELF .|. iN_MOVE_SELF)
 
@@ -417,9 +384,6 @@ foreign import capi
 -- generates 'isAttrsModified' but not 'isModified'.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setAttrsModified :: Bool -> Config -> Config
 setAttrsModified = setFlag iN_ATTRIB
 
@@ -429,9 +393,6 @@ foreign import capi
 -- | Report when a file is accessed.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setAccessed :: Bool -> Config -> Config
 setAccessed = setFlag iN_ACCESS
 
@@ -441,9 +402,6 @@ foreign import capi
 -- | Report when a file is opened.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setOpened :: Bool -> Config -> Config
 setOpened = setFlag iN_OPEN
 
@@ -453,9 +411,6 @@ foreign import capi
 -- | Report when a file that was opened for writes is closed.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setWriteClosed :: Bool -> Config -> Config
 setWriteClosed = setFlag iN_CLOSE_WRITE
 
@@ -465,9 +420,6 @@ foreign import capi
 -- | Report when a file that was opened for not writing is closed.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setNonWriteClosed :: Bool -> Config -> Config
 setNonWriteClosed = setFlag iN_CLOSE_NOWRITE
 
@@ -477,9 +429,6 @@ foreign import capi
 -- | Report when a file is created.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setCreated :: Bool -> Config -> Config
 setCreated = setFlag iN_CREATE
 
@@ -489,9 +438,6 @@ foreign import capi
 -- | Report when a file is deleted.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setDeleted :: Bool -> Config -> Config
 setDeleted = setFlag iN_DELETE
 
@@ -501,9 +447,6 @@ foreign import capi
 -- | Report the source of a move.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setMovedFrom :: Bool -> Config -> Config
 setMovedFrom = setFlag iN_MOVED_FROM
 
@@ -513,9 +456,6 @@ foreign import capi
 -- | Report the target of a move.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setMovedTo :: Bool -> Config -> Config
 setMovedTo = setFlag iN_MOVED_TO
 
@@ -525,9 +465,6 @@ foreign import capi
 -- | Report when a file is modified.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setModified :: Bool -> Config -> Config
 setModified = setFlag iN_MODIFY
 
@@ -545,9 +482,6 @@ setModified = setFlag iN_MODIFY
 -- * setMovedFrom
 -- * setMovedTo
 -- * setModified
---
--- /Pre-release/
---
 setAllEvents :: Bool -> Config -> Config
 setAllEvents s =
       setRootDeleted s
@@ -1008,16 +942,10 @@ closeWatch (Watch h _) = hClose h
 
 -- | Identifies the 'isMovedFrom' and 'isMovedTo' events of the same move
 -- operation, see 'getCookie'.
---
--- /Pre-release/
---
 newtype Cookie = Cookie Word32 deriving (Show, Eq)
 
 -- | An Event generated by the file system. Use the accessor functions to
 -- examine the event.
---
--- /Pre-release/
---
 data Event = Event
    { eventWd :: CInt
    , eventFlags :: Word32
@@ -1247,9 +1175,6 @@ watchToStream cfg wt@(Watch handle _) = do
 --      ('setFollowSymLinks' True . 'setExcludeUnlinked' False)
 --      [Path.fromString "dir"]
 -- @
---
--- /Pre-release/
---
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before after (watchToStream cfg)
 
@@ -1264,18 +1189,12 @@ watchWith f paths = S.bracketIO before after (watchToStream cfg)
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
 --
 -- See 'watchWith' for pitfalls and bugs when using recursive watch on Linux.
---
--- /Pre-release/
---
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = watchWith (setRecursiveMode True)
 
 -- | Same as 'watchWith' using defaultConfig and non-recursive mode.
 --
 -- >>> watch = watchWith id
---
--- /Pre-release/
---
 watch :: NonEmpty Path -> Stream IO Event
 watch = watchWith id
 
@@ -1292,9 +1211,6 @@ watch = watchWith id
 -- original path and not the new path after moving.
 --
 -- TBD: we can possibly update the watch root on a move self event.
---
--- /Pre-release/
---
 getRoot :: Event -> Path
 getRoot = eventRoot
 
@@ -1305,9 +1221,6 @@ getRoot = eventRoot
 -- | Get the file system object path for which the event is generated, relative
 -- to the watched root. Returns 'Nothing' if the event is for the watch root
 -- itself.
---
--- /Pre-release/
---
 getRelPath :: Event -> Maybe Path
 getRelPath Event{..} = eventRelPath
 
@@ -1315,9 +1228,6 @@ getRelPath Event{..} = eventRelPath
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
---
--- /Pre-release/
---
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
@@ -1328,9 +1238,6 @@ getAbsPath ev =
 -- | Cookie is set when a rename occurs. The cookie value can be used to
 -- connect the 'isMovedFrom' and 'isMovedTo' events, if both the events belong
 -- to the same move operation then they will have the same cookie value.
---
--- /Pre-release/
---
 getCookie :: Event -> Cookie
 getCookie Event{..} = Cookie eventCookie
 
@@ -1354,9 +1261,6 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 -- The kernel generates a single overflow event for all the watch roots. It is
 -- reported as one event per watch root, 'getRoot' returns the root and
 -- 'getRelPath' returns 'Nothing'.
---
--- /Pre-release/
---
 isEventsLost :: Event -> Bool
 isEventsLost = getFlag iN_Q_OVERFLOW
 
@@ -1373,9 +1277,6 @@ isEventsLost = getFlag iN_Q_OVERFLOW
 -- therefore, they will all generate this event.
 --
 -- /Occurs only for a watched path/
---
--- /Pre-release/
---
 isRootUnwatched :: Event -> Bool
 isRootUnwatched = getFlag iN_IGNORED
 
@@ -1389,9 +1290,6 @@ isRootUnwatched = getFlag iN_IGNORED
 -- deletion of a subdirectory is reported as 'isDeleted'.
 --
 -- /Occurs only for a watched path/
---
--- /Pre-release/
---
 isRootDeleted :: Event -> Bool
 isRootDeleted = getFlag iN_DELETE_SELF
 
@@ -1401,9 +1299,6 @@ isRootDeleted = getFlag iN_DELETE_SELF
 -- move of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
 --
 -- /Occurs only for a watched path/
---
--- /Pre-release/
---
 isRootMoved :: Event -> Bool
 isRootMoved = getFlag iN_MOVE_SELF
 
@@ -1415,9 +1310,6 @@ foreign import capi
 -- descriptor.
 --
 -- /Occurs only for a watched path/
---
--- /Pre-release/
---
 isRootUnmounted :: Event -> Bool
 isRootUnmounted = getFlag iN_UNMOUNT
 
@@ -1426,9 +1318,6 @@ isRootUnmounted = getFlag iN_UNMOUNT
 -- a change of path.
 --
 -- /Occurs only for a watched path/
---
--- /Pre-release/
---
 isRootPathEvent :: Event -> Bool
 isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 
@@ -1447,9 +1336,6 @@ isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 -- user/group ID (e.g., chown(2)).
 --
 -- /Can occur for watched path or a file inside it/
---
--- /Pre-release/
---
 isAttrsModified :: Event -> Bool
 isAttrsModified = getFlag iN_ATTRIB
 
@@ -1460,27 +1346,18 @@ isAttrsModified = getFlag iN_ATTRIB
 -- | File was accessed (e.g. read, execve).
 --
 -- /Occurs only for a file inside the watched directory/
---
--- /Pre-release/
---
 isAccessed :: Event -> Bool
 isAccessed = getFlag iN_ACCESS
 
 -- | File or directory was opened.
 --
 -- /Occurs only for a file inside the watched directory/
---
--- /Pre-release/
---
 isOpened :: Event -> Bool
 isOpened = getFlag iN_OPEN
 
 -- | File opened for writing was closed.
 --
 -- /Occurs only for a file inside the watched directory/
---
--- /Pre-release/
---
 isWriteClosed :: Event -> Bool
 isWriteClosed = getFlag iN_CLOSE_WRITE
 
@@ -1490,9 +1367,6 @@ isWriteClosed = getFlag iN_CLOSE_WRITE
 -- | File or directory opened for read but not write was closed.
 --
 -- /Can occur for watched path or a file inside it/
---
--- /Pre-release/
---
 isNonWriteClosed :: Event -> Bool
 isNonWriteClosed = getFlag iN_CLOSE_NOWRITE
 
@@ -1506,18 +1380,12 @@ isNonWriteClosed = getFlag iN_CLOSE_NOWRITE
 -- mkdir(2), link(2), symlink(2), bind(2) on a UNIX domain socket).
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isCreated :: Event -> Bool
 isCreated = getFlag iN_CREATE
 
 -- | File/directory deleted from watched directory.
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isDeleted :: Event -> Bool
 isDeleted = getFlag iN_DELETE
 
@@ -1528,9 +1396,6 @@ isDeleted = getFlag iN_DELETE
 -- monitored directory.
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isMovedFrom :: Event -> Bool
 isMovedFrom = getFlag iN_MOVED_FROM
 
@@ -1538,9 +1403,6 @@ isMovedFrom = getFlag iN_MOVED_FROM
 -- directory.
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isMovedTo :: Event -> Bool
 isMovedTo = getFlag iN_MOVED_TO
 
@@ -1550,9 +1412,6 @@ isMovedTo = getFlag iN_MOVED_TO
 -- >>> isMoved ev = isMovedFrom ev || isMovedTo ev
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isMoved :: Event -> Bool
 isMoved ev = isMovedFrom ev || isMovedTo ev
 
@@ -1560,9 +1419,6 @@ isMoved ev = isMovedFrom ev || isMovedTo ev
 -- monitored path. This event is generated only for files and not directories.
 --
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isModified :: Event -> Bool
 isModified = getFlag iN_MODIFY
 
@@ -1574,9 +1430,6 @@ foreign import capi
     "sys/inotify.h value IN_ISDIR" iN_ISDIR :: Word32
 
 -- | Determine whether the event is for a directory path.
---
--- /Pre-release/
---
 isDir :: Event -> Bool
 isDir = getFlag iN_ISDIR
 

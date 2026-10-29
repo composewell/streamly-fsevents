@@ -125,9 +125,6 @@ import qualified Streamly.Internal.FileSystem.Path as Path
 
 -- | Watch configuration, used to specify the events of interest and the
 -- behavior of the watch.
---
--- /Pre-release/
---
 data Config = Config
     { watchRec :: BOOL
     , createFlags :: DWORD
@@ -148,9 +145,6 @@ setFlag mask status cfg@Config{..} =
 -- | Set watch event on directory recursively.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 
@@ -161,9 +155,6 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- Changes include renaming, creating, or deleting a file.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setFileNameEvents :: Bool -> Config -> Config
 setFileNameEvents = setFlag fILE_NOTIFY_CHANGE_FILE_NAME
 
@@ -174,9 +165,6 @@ setFileNameEvents = setFlag fILE_NOTIFY_CHANGE_FILE_NAME
 -- Changes include creating or deleting a directory.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setDirNameEvents :: Bool -> Config -> Config
 setDirNameEvents = setFlag fILE_NOTIFY_CHANGE_DIR_NAME
 
@@ -184,9 +172,6 @@ setDirNameEvents = setFlag fILE_NOTIFY_CHANGE_DIR_NAME
 -- directory or subtree.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setAttrsModified :: Bool -> Config -> Config
 setAttrsModified = setFlag fILE_NOTIFY_CHANGE_ATTRIBUTES
 
@@ -199,9 +184,6 @@ setAttrsModified = setFlag fILE_NOTIFY_CHANGE_ATTRIBUTES
 -- detection occurs only when the cache is sufficiently flushed.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setSizeModified :: Bool -> Config -> Config
 setSizeModified = setFlag fILE_NOTIFY_CHANGE_SIZE
 
@@ -216,9 +198,6 @@ setSizeModified = setFlag fILE_NOTIFY_CHANGE_SIZE
 -- sufficiently flushed.
 --
 -- /default: True/
---
--- /Pre-release/
---
 setLastWriteTimeModified :: Bool -> Config -> Config
 setLastWriteTimeModified = setFlag fILE_NOTIFY_CHANGE_LAST_WRITE
 
@@ -226,9 +205,6 @@ setLastWriteTimeModified = setFlag fILE_NOTIFY_CHANGE_LAST_WRITE
 -- in the watched directory or subtree.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setSecurityModified :: Bool -> Config -> Config
 setSecurityModified = setFlag fILE_NOTIFY_CHANGE_SECURITY
 
@@ -240,9 +216,6 @@ setSecurityModified = setFlag fILE_NOTIFY_CHANGE_SECURITY
 -- * setSizeModified
 -- * setLastWriteTimeModified
 -- * setSecurityModified
---
--- /Pre-release/
---
 setAllEvents :: Bool -> Config -> Config
 setAllEvents s =
       setFileNameEvents s
@@ -451,9 +424,6 @@ closePathHandleStream =
 --  ('setAttrsModified' True . 'setLastWriteTimeModified' False)
 --  [Path.fromString "dir"]
 -- @
---
--- /Pre-release/
---
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths =
     S.bracketIO before after (S.parConcatMap (eager True) eventStreamAggr)
@@ -466,18 +436,12 @@ watchWith f paths =
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
---
--- /Pre-release/
---
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = watchWith (setRecursiveMode True)
 
 -- | Same as 'watchWith' using defaultConfig and non-recursive mode.
 --
 -- >>> watch = watchWith id
---
--- /Pre-release/
---
 watch :: NonEmpty Path -> Stream IO Event
 watch = watchWith id
 
@@ -488,16 +452,10 @@ getFlag mask Event{..} = eventFlags == mask
 -- to the watched root. Windows does not report events for the watch root
 -- itself, therefore, this is always a 'Just' value. The return type is
 -- 'Maybe' for consistency with the other platforms.
---
--- /Pre-release/
---
 getRelPath :: Event -> Maybe Path
 getRelPath Event{..} = Just eventRelPath
 
 -- | Get the watch root directory to which this event belongs.
---
--- /Pre-release/
---
 getRoot :: Event -> Path
 getRoot Event{..} = eventRootPath
 
@@ -505,9 +463,6 @@ getRoot Event{..} = eventRootPath
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
---
--- /Pre-release/
---
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
@@ -521,9 +476,6 @@ getAbsPath ev =
 -- link also generates this event.
 --
 -- /Occurs when either 'setFileNameEvents' or 'setDirNameEvents' is enabled/
---
--- /Pre-release/
---
 isCreated :: Event -> Bool
 isCreated = getFlag fILE_ACTION_ADDED
 
@@ -532,9 +484,6 @@ isCreated = getFlag fILE_ACTION_ADDED
 -- generated even when a hard link is deleted.
 --
 -- /Occurs when either 'setFileNameEvents' or 'setDirNameEvents' is enabled/
---
--- /Pre-release/
---
 isDeleted :: Event -> Bool
 isDeleted = getFlag fILE_ACTION_REMOVED
 
@@ -542,9 +491,6 @@ isDeleted = getFlag fILE_ACTION_REMOVED
 -- monitored directory.
 --
 -- /Occurs when either 'setFileNameEvents' or 'setDirNameEvents' is enabled/
---
--- /Pre-release/
---
 isMovedFrom :: Event -> Bool
 isMovedFrom = getFlag fILE_ACTION_RENAMED_OLD_NAME
 
@@ -552,9 +498,6 @@ isMovedFrom = getFlag fILE_ACTION_RENAMED_OLD_NAME
 -- directory.
 --
 -- /Occurs when either 'setFileNameEvents' or 'setDirNameEvents' is enabled/
---
--- /Pre-release/
---
 isMovedTo :: Event -> Bool
 isMovedTo = getFlag fILE_ACTION_RENAMED_NEW_NAME
 
@@ -565,9 +508,6 @@ isMovedTo = getFlag fILE_ACTION_RENAMED_NEW_NAME
 --
 -- /Occurs when either 'setFileNameEvents' or 'setDirNameEvents' is enabled/
 -- /Occurs only for an object inside the watched directory/
---
--- /Pre-release/
---
 isMoved :: Event -> Bool
 isMoved ev = isMovedFrom ev || isMovedTo ev
 
@@ -583,9 +523,6 @@ isMoved ev = isMovedFrom ev || isMovedTo ev
 -- directory inside it is created or renamed.
 --
 -- /Occurs when one of the @set*Modified@ events is enabled/
---
--- /Pre-release/
---
 isModified :: Event -> Bool
 isModified = getFlag fILE_ACTION_MODIFIED
 
@@ -593,9 +530,6 @@ isModified = getFlag fILE_ACTION_MODIFIED
 -- discarded, therefore, events are lost.  The user application must scan
 -- everything under the watched paths to know the current state of the file
 -- system tree.
---
--- /Pre-release/
---
 isEventsLost :: Event -> Bool
 isEventsLost Event{..} = totalBytes == 0
 

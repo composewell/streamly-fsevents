@@ -96,9 +96,6 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- occur in a new directory before its watch is added may be lost.
 --
 -- /default: False/
---
--- /Pre-release/
---
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode = Event.setRecursiveMode
 
@@ -118,9 +115,6 @@ setRecursiveMode = Event.setRecursiveMode
 -- @
 -- watchWith (setRecursiveMode True . Linux.setFollowSymLinks False) paths
 -- @
---
--- /Pre-release/
---
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith = Event.watchWith
 
@@ -161,9 +155,6 @@ watchWith = Event.watchWith
 -- The OS still generates and delivers those events to this process.
 --
 -- >>> watch = watchWith id
---
--- /Pre-release/
---
 watch :: NonEmpty Path -> Stream IO Event
 watch = Event.watch
 
@@ -172,9 +163,6 @@ watch = Event.watch
 -- the limitations on Linux.
 --
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
---
--- /Pre-release/
---
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = Event.watchRecursive
 
@@ -184,9 +172,6 @@ watchRecursive = Event.watchRecursive
 
 -- | Get the watch root to which the event belongs, as it was supplied to the
 -- watch API.
---
--- /Pre-release/
---
 getRoot :: Event -> Path
 getRoot = Event.getRoot
 
@@ -204,9 +189,6 @@ getRoot = Event.getRoot
 -- | Get the path of the file system object for which the event is generated,
 -- relative to the watch root. Returns 'Nothing' if the event is for the watch
 -- root itself.
---
--- /Pre-release/
---
 getRelPath :: Event -> Maybe Path
 getRelPath = Event.getRelPath
 
@@ -218,9 +200,6 @@ getRelPath = Event.getRelPath
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
---
--- /Pre-release/
---
 getAbsPath :: Event -> Path
 getAbsPath = Event.getAbsPath
 
@@ -232,9 +211,6 @@ getAbsPath = Event.getAbsPath
 -- macOS hard linking does not generate a create event, it generates an
 -- 'Streamly.Internal.FS.Event.Darwin.isAttrsModified' event on the directory
 -- instead. On Linux and Windows hard linking generates a create event.
---
--- /Pre-release/
---
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
 
@@ -251,9 +227,6 @@ isCreated = Event.isCreated
 --
 -- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
 -- Linux.
---
--- /Pre-release/
---
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
@@ -261,9 +234,6 @@ isDeleted = Event.isDeleted
 -- monitored path. This event is generated when an object is renamed within the
 -- watched directory or if it is moved out of or in the watched directory.
 -- Moving hard links is no different than other types of objects.
---
--- /Pre-release/
---
 isMoved :: Event -> Bool
 isMoved = Event.isMoved
 
@@ -277,9 +247,6 @@ isMoved = Event.isMoved
 -- On Linux and macOS this event is never generated for directories.  On
 -- Windows (in recursive watch mode) this event is generated for directories as
 -- well when an object is created in or deleted from the directory.
---
--- /Pre-release/
---
 isModified :: Event -> Bool
 isModified = Event.isModified
 
@@ -289,9 +256,6 @@ isModified = Event.isModified
 -- 'getRoot' returns the watch root whose events may have been lost. On
 -- Linux, where the kernel reports a single event for all the roots, one
 -- event is generated for each watch root.
---
--- /Pre-release/
---
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 

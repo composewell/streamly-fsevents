@@ -3,7 +3,7 @@
 -- Copyright   : (c) 2020 Composewell Technologies
 -- License     : BSD-3-Clause
 -- Maintainer  : streamly@composewell.com
--- Stability   : pre-release
+-- Stability   : released
 -- Portability : GHC
 --
 -- File system event notification API for Linux, using the inotify API. See
