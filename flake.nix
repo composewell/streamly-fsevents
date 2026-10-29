@@ -11,9 +11,8 @@
     basepkgs.nixpack.mkOutputs {
       inherit nixpkgs nixpkgs-darwin basepkgs;
       name = "streamly-fsevents";
-      sources = basepkgs.nixpack.lib.localSource "streamly-fsevents" ./.;
+      sources = import ./sources.nix;
       packages = basepkgs.nixpack.lib.devPackage "streamly-fsevents";
-      #sources = import ./sources.nix;
       #packages = import ./packages.nix;
     };
 }
