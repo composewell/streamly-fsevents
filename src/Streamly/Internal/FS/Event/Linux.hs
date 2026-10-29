@@ -360,6 +360,9 @@ foreign import capi
 
 -- | Report when the watched path itself gets deleted.
 --
+-- In recursive mode, the event is reported for the watch roots only, the
+-- deletion of a subdirectory is reported as 'isDeleted'.
+--
 -- /default: False/
 --
 -- /Pre-release/
@@ -372,6 +375,9 @@ foreign import capi
 
 -- | Report when the watched root path itself gets renamed.
 --
+-- In recursive mode, the event is reported for the watch roots only, the
+-- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
+--
 -- /default: False/
 --
 -- /Pre-release/
@@ -380,6 +386,8 @@ setRootMoved :: Bool -> Config -> Config
 setRootMoved = setFlag iN_MOVE_SELF
 
 -- | Report when the watched root path itself gets deleted or renamed.
+--
+-- In recursive mode, the events are reported for the watch roots only.
 --
 -- /default: False/
 --
@@ -1090,11 +1098,18 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
                     $ \m -> (Map.delete (fromIntegral ewd) m, ())
-                -- XXX Handle IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF,
-                -- IN_MOVED_FROM, IN_MOVED_TO
+                -- XXX Handle IN_DELETE, IN_MOVED_FROM, IN_MOVED_TO
                 -- What if a large dir tree gets moved in to our hierarchy? Do
                 -- we get a single event for the top level dir in this case?
-                return [mkEvent ewd (wpRep wp) | wp <- wps1]
+                --
+                -- The parent of a subdirectory reports its deletion and move
+                -- as IN_DELETE and IN_MOVED_FROM, the IN_DELETE_SELF and
+                -- IN_MOVE_SELF events are reported for the roots only.
+                let isSelfEvent =
+                        eflags .&. (iN_DELETE_SELF .|. iN_MOVE_SELF) /= 0
+                    isReported wp =
+                        not isSelfEvent || isNothing (getRepSub (wpRep wp))
+                return [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
 
     where
 
@@ -1295,8 +1310,8 @@ isRootUnwatched = getFlag iN_IGNORED
 -- In addition, an 'isRootUnwatched' event will subsequently be generated
 -- for the watch descriptor.
 --
--- Note that in recursive watch mode all the subdirectories are watch roots,
--- therefore, they will all generate this event.
+-- In recursive mode, the event is reported for the watch roots only, the
+-- deletion of a subdirectory is reported as 'isDeleted'.
 --
 -- /Occurs only for a watched path/
 --
@@ -1307,8 +1322,8 @@ isRootDeleted = getFlag iN_DELETE_SELF
 
 -- | Watched file/directory was itself moved within the file system.
 --
--- Note that in recursive watch mode all the subdirectories are watch roots,
--- therefore, they will all generate this event.
+-- In recursive mode, the event is reported for the watch roots only, the
+-- move of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
 --
 -- /Occurs only for a watched path/
 --

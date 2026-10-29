@@ -45,6 +45,9 @@
   the objects moved out of a watched directory as documented earlier.
 - Linux: enable `setAttrsModified` in `defaultConfig`, consistent with macOS.
   A `touch` or `chmod` of an existing file does not generate `isModified`.
+- **Breaking:** Linux: in recursive mode, `isRootDeleted` and `isRootMoved`
+  are reported for the watch roots only. A subdirectory reported them in
+  addition to the `isDeleted` or `isMovedFrom` event reported by its parent.
 
 ## 0.1.1
 

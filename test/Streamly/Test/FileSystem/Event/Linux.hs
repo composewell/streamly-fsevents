@@ -15,6 +15,7 @@ import System.Directory
     , getPermissions
     , removeDirectory
     , removeFile
+    , renameDirectory
     , setOwnerExecutable
     , setPermissions
     )
@@ -69,15 +70,14 @@ dirMoveEvents src dst =
     ]
 
 #ifdef DEVBUILD
--- In recursive mode all subdirectories are roots therefore they will generate
--- isRootMoved.
-rootDirMoveEvents :: [Char] -> [Char] -> [([Char], Event -> Bool)]
-rootDirMoveEvents root _ =
-      (root, Event.isRootMoved)
-    : dirTouchEvents root
-
+-- In recursive mode the watch of a subdirectory reports the touch events
+-- of the subdirectory scan, and isRootUnwatched when the subdirectory is
+-- deleted.
 recDirMoveEvents :: [Char] -> [Char] -> [([Char], Event -> Bool)]
-recDirMoveEvents src dst = dirMoveEvents src dst ++ rootDirMoveEvents src dst
+recDirMoveEvents src dst = dirMoveEvents src dst ++ dirTouchEvents src
+
+recDirDelEvents :: String -> [([Char], Event -> Bool)]
+recDirDelEvents dir = (dir, Event.isRootUnwatched) : dirDelEvents dir
 #endif
 
 fileTouchEvents :: String -> [([Char], Event -> Bool)]
@@ -361,8 +361,44 @@ defaultAttrsModified =
             evs <- readUntil Event.defaultConfig Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
 
-removeTests :: IO ()
-removeTests =
+-------------------------------------------------------------------------------
+-- Recursive mode tests
+-------------------------------------------------------------------------------
+
+isSelfEvent :: Event -> Bool
+isSelfEvent ev = Event.isRootDeleted ev || Event.isRootMoved ev
+
+-- | Run the file system action in a recursive watch of @root@ using @cfg@,
+-- then create a file @sentinel@ in @root@. Return the events up to the
+-- create event of @sentinel@.
+recEventsOf ::
+    Event.Config -> FilePath -> Event.Watch -> IO () -> IO [Event]
+recEventsOf cfg root w action = do
+    let sentinel = root </> "sentinel"
+    action
+    createFile sentinel
+    readUntil cfg (isCreatedAt sentinel) w
+
+-- The subdirectory watch generates IN_DELETE_SELF and IN_MOVE_SELF, the
+-- events are not reported.
+recSubdirSelfEvents :: Spec
+recSubdirSelfEvents =
+    it "does not report the root events of a subdirectory"
+        $ withRoot recCfg $ \root w -> do
+            let dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+                dir3 = root </> "dir3"
+            createDirectory dir1
+            createDirectory dir2
+            evs <- recEventsOf recCfg root w $ do
+                renameDirectory dir1 dir3
+                removeDirectory dir2
+            pathsOf isSelfEvent evs `shouldBe` []
+            pathsOf Event.isMovedFrom evs `shouldBe` [dir1]
+            pathsOf Event.isDeleted evs `shouldBe` [dir2]
+
+watchTests :: IO ()
+watchTests =
     hspec
         $ describe moduleName
         $ do
@@ -376,6 +412,8 @@ removeTests =
                 overlapRemoveOuter
                 overlapRemoveBoth
             describe "watch descriptors" largeWd
+            describe "recursive mode" $ do
+                recSubdirSelfEvents
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
@@ -449,11 +487,10 @@ main = do
         runRec = runTests moduleName "recursive" recw
 
 #ifdef DEVBUILD
-    -- In recursive mode all subdirectories are roots therefore they will
-    -- generate isRootDeleted/isRootUnwatched. Also, for subdirectories
-    -- multiple events are generated, once in the parent watch and once in the
-    -- self watch as a root of the watch. Therefore, additional touchEvents are
-    -- generated in this case.
+    -- In recursive mode all subdirectories are watched, they generate
+    -- isRootUnwatched. Also, for subdirectories multiple events are
+    -- generated, once in the parent watch and once in the self watch.
+    -- Therefore, additional touchEvents are generated in this case.
     --
     -- XXX We can possibly filter out the duplicate events either from the
     -- parent or self.
@@ -464,8 +501,8 @@ main = do
             : fileMove "subdir/file1" "subdir/file2" fileMoveEvents
             : dirMove "dir1" "dir2" recDirMoveEvents
             : dirMove "subdir/dir1" "subdir/dir2" recDirMoveEvents
-            : dirDelete "dir" (\d -> rootDirDelEvents d ++ dirDelEvents d)
-            : dirDelete "subdir/dir" (\d -> rootDirDelEvents d ++ dirDelEvents d)
+            : dirDelete "dir" recDirDelEvents
+            : dirDelete "subdir/dir" recDirDelEvents
             -- XXX Nested dir create misses the create event due to a race
             -- : dirCreateWithParent "subdir/dir" dirTouchEvents
             : dirCreate "subdir/dir"
@@ -508,4 +545,4 @@ main = do
 #endif
     runRec FileType fileRootTests
 
-    removeTests
+    watchTests
