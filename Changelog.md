@@ -63,6 +63,16 @@
   `isCloned`, `isHardLink` and `isLastHardLink` are always exported; when
   the SDK lacks the flag, the setter is a no-op and the predicates return
   `False`.
+- macOS: raise an exception when the event stream of a watch fails to
+  start, e.g. beyond 512 watches in a process; the watch reported no
+  events.
+- macOS: closing a watch no longer terminates the process with SIGPIPE
+  when SIGPIPE is not ignored.
+- macOS: closing a watch no longer hangs when a child process holds the
+  event pipe, and no longer frees the watch while its callback is running.
+- macOS: create the event pipe close-on-exec; child processes inherited it.
+- macOS: `setFullHistory` has no effect, a watch always starts from the
+  current time; the documentation said it reports all the past events.
 
 ### Enhancements
 
