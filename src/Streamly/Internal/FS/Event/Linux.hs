@@ -176,6 +176,9 @@ import Foreign.C.Error
     ( Errno(..), eAGAIN, eINTR, eINVAL, eNOTDIR, eWOULDBLOCK, getErrno
     , throwErrno, throwErrnoIfMinus1, throwErrnoIfMinus1_
     )
+#if defined(CABAL_OS_FREEBSD)
+import Foreign.C.Error (eNOENT)
+#endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
 #if !defined(CABAL_OS_FREEBSD)
@@ -741,9 +744,40 @@ withWatchFd op (Watch fd lock _) action =
 isWatchClosed :: Watch -> IO Bool
 isWatchClosed (Watch _ lock _) = fsClosed <$> readMVar lock
 
+#if defined(CABAL_OS_FREEBSD)
+-- On FreeBSD, adding a watch on a directory reads all its entries, the call
+-- may take long on a large directory.
+foreign import ccall safe
+    "sys/inotify.h inotify_add_watch" c_inotify_add_watch
+        :: CInt -> CString -> CUInt -> IO CInt
+#else
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
         :: CInt -> CString -> CUInt -> IO CInt
+#endif
+
+-- | Add a kernel watch for a path, returns -1 and sets errno on failure.
+--
+-- On FreeBSD, adding a watch on a directory looks up each entry of the
+-- directory, the call fails with ENOENT if an entry is deleted in between.
+-- The call is retried a few times on ENOENT, an object that does not exist
+-- fails all the retries.
+inotifyAddWatch :: CInt -> CString -> Word32 -> IO CInt
+#if defined(CABAL_OS_FREEBSD)
+inotifyAddWatch fd pathPtr flags = go (10 :: Int)
+
+    where
+
+    go n = do
+        wd <- c_inotify_add_watch fd pathPtr (CUInt flags)
+        if wd /= -1 || n == 0
+        then return wd
+        else do
+            errno <- getErrno
+            if errno == eNOENT then go (n - 1) else return wd
+#else
+inotifyAddWatch fd pathPtr flags = c_inotify_add_watch fd pathPtr (CUInt flags)
+#endif
 
 -- Returns 'False' if the path is already being watched.
 insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
@@ -810,7 +844,7 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     isNew <- withWatchFd "addToWatch" watch0 $ \fd -> do
         wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
-                c_inotify_add_watch fd pathPtr (CUInt (watchFlags cfg))
+                inotifyAddWatch fd pathPtr (watchFlags cfg)
 
         -- We add the parent first so that we start getting events for any
         -- new creates and add the new subdirectories on creates while we are
