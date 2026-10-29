@@ -318,7 +318,10 @@ peekFNI buf = do
     acti <- peekByteOff buf 4
     (fnle :: DWORD) <- peekByteOff buf 8
     fnam0 <- Array.fromPtrN (fromIntegral fnle) (buf `plusPtr` 12)
-    fnam <- Path.fromArray (Array.unsafeCast fnam0)
+    -- Path.fromArray rejects names that the file system can hold, e.g.
+    -- "aux.c" or "con", which can be created using a \\?\ path. The name is
+    -- reported by the system, do not validate it.
+    let fnam = Path.unsafeFromArray (Array.unsafeCast fnam0)
     return $ FILE_NOTIFY_INFORMATION neof acti fnam
 
 readChangeEvents ::
@@ -461,7 +464,10 @@ getRoot Event{..} = eventRootPath
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
-        Just relPath -> Path.join (getRoot ev) relPath
+        -- The path is relative to the root as reported by the system.
+        -- Path.join raises an exception if the path starts with a letter
+        -- and a colon, e.g. a stream "a:s" of a file named "a".
+        Just relPath -> Path.unsafeJoin (getRoot ev) relPath
         Nothing -> getRoot ev
 
 -- XXX need to document the exact semantics of these.

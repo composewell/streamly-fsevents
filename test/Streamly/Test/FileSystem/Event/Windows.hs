@@ -13,7 +13,7 @@ import Control.Concurrent
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
-import System.Directory (createDirectory, renameDirectory)
+import System.Directory (createDirectory, makeAbsolute, renameDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performMajorGC)
@@ -140,6 +140,18 @@ eventsLost =
                     Path.toString (Event.getRoot ev) `shouldBe` root
                     Path.toString (Event.getAbsPath ev) `shouldBe` root
 
+-- | "aux.c" is a reserved device name that Path.fromArray rejects. A \\?\ path
+-- bypasses the device name check of Windows and creates the file.
+reservedName :: TestDesc
+reservedName =
+    ( "file with a reserved name created (aux.c)"
+    , const (return ())
+    , \fp -> do
+        dir <- makeAbsolute fp
+        writeFile ("\\\\?\\" ++ dir </> "aux.c") ""
+    , [("aux.c", Event.isCreated)]
+    )
+
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
@@ -152,7 +164,7 @@ robustnessTests =
 main :: IO ()
 main = do
     let regularRootTests =
-            rootRenamed : commonTests
+            rootRenamed : reservedName : commonTests
         -- The following watch-root deletion test failed with a sharing
         -- violation when the directory handle was opened without
         -- FILE_SHARE_DELETE:
