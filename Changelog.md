@@ -53,6 +53,9 @@
 - Linux: in recursive mode with `setFollowSymLinks False`, the directory
   tree of the target of a symbolic link root is no longer watched.
 - macOS: fix a link failure of `setFullHistory`.
+- macOS: raise an exception when a watch fails to start.
+- macOS: fix SIGPIPE, a hang and a use after free when closing a watch.
+- macOS: do not leak the event pipe to child processes.
 
 ### Enhancements
 
