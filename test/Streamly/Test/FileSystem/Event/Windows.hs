@@ -10,12 +10,22 @@ module Streamly.Test.FileSystem.Event.Windows (main) where
 
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
-import Control.Monad (forM_)
+import Control.Exception (SomeException, throwIO, try)
+import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
 import System.Directory (createDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Mem (performMajorGC)
 import System.Timeout (timeout)
+import System.Win32.File
+    ( closeHandle
+    , createFile
+    , fILE_FLAG_BACKUP_SEMANTICS
+    , fILE_LIST_DIRECTORY
+    , fILE_SHARE_NONE
+    , oPEN_EXISTING
+    )
 import Test.Hspec
 
 import qualified Streamly.Data.Fold as Fold
@@ -79,6 +89,65 @@ eventPathTests :: IO ()
 eventPathTests =
     hspec $ describe moduleName $ describe "event paths" eventsLostPaths
 
+-------------------------------------------------------------------------------
+-- Robustness tests
+-------------------------------------------------------------------------------
+
+withRoot :: (FilePath -> IO a) -> IO a
+withRoot act =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "watch-root"
+        createDirectory root
+        act root
+
+-- | Run the action every 100 ms until it succeeds, at most @n@ times. Raise
+-- the exception of the last attempt if all the attempts fail.
+retrying :: Int -> IO () -> IO ()
+retrying n act = do
+    r <- try act
+    case r of
+        Right () -> return ()
+        Left (e :: SomeException) ->
+            if n <= 1
+            then throwIO e
+            else threadDelay 100000 >> retrying (n - 1) act
+
+-- | Open the directory with no sharing. Raises an exception if any other
+-- handle with data access to the directory is open.
+openExclusive :: FilePath -> IO ()
+openExclusive dir = do
+    h <- createFile dir
+        fILE_LIST_DIRECTORY
+        fILE_SHARE_NONE
+        Nothing
+        oPEN_EXISTING
+        fILE_FLAG_BACKUP_SEMANTICS
+        Nothing
+    closeHandle h
+
+-- | Run the watch until the first event and abandon the stream. The directory
+-- handle of the watch must be closed after the stream is garbage collected.
+handleClosedOnGC :: Spec
+handleClosedOnGC =
+    it "closes the directory handle after the stream is abandoned" $
+        withRoot $ \root -> do
+            p <- Path.fromString root
+            void $ forkIO $ do
+                threadDelay 500000
+                writeFile (root </> "file1") ""
+            r <- Stream.fold Fold.one (Event.watch (p :| []))
+            fmap (const ()) r `shouldBe` Just ()
+            performMajorGC
+            -- A worker blocked in a read is killed only after the read
+            -- returns, the next event makes the read return.
+            writeFile (root </> "file2") ""
+            retrying 50 (performMajorGC >> openExclusive root)
+
+robustnessTests :: Spec
+robustnessTests =
+    describe moduleName $ describe "robustness" $ do
+        handleClosedOnGC
+
 -- TODO Test isModified event for parent directories when a file is created or
 -- deleted.
 
@@ -116,3 +185,5 @@ main = do
     runRec SymLinkOrigPath (commonTests ++ recTests)
 
     eventPathTests
+
+    hspec robustnessTests
