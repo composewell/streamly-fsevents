@@ -2,60 +2,54 @@
 
 ## Unreleased
 
-- Add the platform specific modules `Streamly.FileSystem.Event.Darwin`,
-  `Streamly.FileSystem.Event.Linux` and `Streamly.FileSystem.Event.Windows`.
-  Earlier the platform specific APIs were available only from the internal
-  modules.
-- Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
-  and `getRelPath` to the portable module `Streamly.FileSystem.Event`.
-- Implement the non-recursive `watch` on macOS, it raised an exception
-  earlier.
-- Add `setRecursiveMode` to the macOS `Config`. **Breaking:** `watchWith` on
-  macOS is now non-recursive by default, consistent with Linux and Windows,
-  use `setRecursiveMode True` for the earlier behavior.
-- **Breaking:** `Streamly.FileSystem.Event.watch` on macOS is now
-  non-recursive, consistent with Linux and Windows, it watched recursively
-  earlier.
-- macOS: `setFullHistory`, `isCloned`, `isHardLink` and `isLastHardLink` are
-  always exported. When built with an SDK that does not have the
-  corresponding flag, the setter is a no-op and the predicates return
-  `False`. `setFullHistory` failed to link earlier.
-- Linux: the `FailIfExists` constructor of `WhenExists` is always available.
-- macOS: add `getRoot` and `getRelPath`.
-- **Breaking:** macOS: when a watch root is a symbolic link, `getAbsPath`
-  returns the path via the original symbolic link, consistent with Linux and
-  Windows. It returned the path via the resolved target earlier.
-- Linux: export the `Cookie` type returned by `getCookie`.
-- **Breaking:** Windows: `getRelPath` returns `Maybe Path`, consistent with
-  Linux.
-- Linux: fix `setWhenExists`, it set both `IN_MASK_ADD` and `IN_MASK_CREATE`
-  for `FailIfExists` after `defaultConfig`, adding a watch then failed.
-- Linux: report the queue overflow (`isEventsLost`) event once for each
-  watch root. `getRoot` and `getAbsPath` raised an exception on this event
-  because the kernel reports it without a watch descriptor.
-- Linux: fix an exception raised by the event stream or by `getRoot` for an
-  event whose watch was removed, for example an event read after
-  `removeFromWatch`. The watch descriptor is now removed when its
-  `isRootUnwatched` event is read, events for unknown watch descriptors are
-  dropped.
-- **Breaking:** Linux: rename `setUnwatchMoved` to `setExcludeUnlinked`, and
-  enable it in `defaultConfig`. `setUnwatchMoved` is kept in the internal
-  module as a deprecated alias. The setting maps to `IN_EXCL_UNLINK`, it
-  stops the events of a file after the file is unlinked, it does not affect
-  the objects moved out of a watched directory as documented earlier.
-- Linux: enable `setAttrsModified` in `defaultConfig`, consistent with macOS.
-  A `touch` or `chmod` of an existing file does not generate `isModified`.
-- **Breaking:** Linux: in recursive mode, `isRootDeleted` and `isRootMoved`
-  are reported for the watch roots only. A subdirectory reported them in
-  addition to the `isDeleted` or `isMovedFrom` event reported by its parent.
-- Linux: in recursive mode, remove the watch of a directory moved out of the
-  tree, and add a directory moved into the tree. A directory renamed within
-  the tree is watched with the new path. Earlier, a directory moved out
-  kept reporting events with its old path, a directory moved in was not
-  watched. The create and move events needed for this are generated even if
-  they are disabled in the `Config`, they are not reported.
+### Breaking Changes
+
+- macOS: `watch` and `watchWith` are now non-recursive by default,
+  consistent with Linux and Windows. Use `watchRecursive` or
+  `setRecursiveMode True` for recursive watching.
+- macOS: when a watch root is a symbolic link, `getAbsPath` returns the path
+  via the symbolic link instead of the resolved target, consistent with
+  Linux and Windows.
+- Windows: `getRelPath` returns `Maybe Path`, consistent with Linux.
+- Linux: rename `setUnwatchMoved` to `setExcludeUnlinked` and enable it by
+  default. The old name is a deprecated alias in the internal module. The
+  setting stops the events of a file after it is unlinked; contrary to the
+  earlier documentation, it has no effect on objects moved out of a watched
+  directory.
+- Linux: enable `setAttrsModified` by default, consistent with macOS. A
+  `touch` or `chmod` on an existing file reports `isAttrsModified`.
+- Linux: in recursive mode, `isRootDeleted` and `isRootMoved` are reported
+  for the watch roots only, not for subdirectories. The parent of a
+  subdirectory reports `isDeleted` or `isMovedFrom` for it.
+
+### Bug Fixes
+
+- Linux: in recursive mode, a directory moved out of the tree is no longer
+  watched, a directory moved into the tree is watched, and a directory
+  renamed within the tree reports events with its new path.
 - Linux: in recursive mode, fix an exception when a subdirectory is deleted
   or moved before its create event is read.
+- Linux: fix an exception raised by the event stream or by `getRoot` for
+  events arriving after `removeFromWatch`.
+- Linux: report the queue overflow event (`isEventsLost`) once per watch
+  root; `getRoot` and `getAbsPath` raised an exception on it earlier.
+- Linux: fix `setWhenExists FailIfExists`, adding a watch failed with it.
+- macOS: fix a link failure of `setFullHistory`. `setFullHistory`,
+  `isCloned`, `isHardLink` and `isLastHardLink` are always exported; when
+  the SDK lacks the flag, the setter is a no-op and the predicates return
+  `False`.
+
+### Enhancements
+
+- Add the public platform specific modules
+  `Streamly.FileSystem.Event.Darwin`, `Streamly.FileSystem.Event.Linux` and
+  `Streamly.FileSystem.Event.Windows`.
+- Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
+  and `getRelPath` to `Streamly.FileSystem.Event`.
+- macOS: support non-recursive `watch`, it raised an exception earlier.
+- macOS: add `setRecursiveMode`, `getRoot` and `getRelPath`.
+- Linux: `FailIfExists` is always available.
+- Linux: export the `Cookie` type.
 
 ## 0.1.1
 
