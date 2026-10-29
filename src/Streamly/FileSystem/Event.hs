@@ -47,6 +47,12 @@
 
 module Streamly.FileSystem.Event
     (
+    -- Design note: this module exports only the APIs available on all
+    -- platforms. Each platform specific module exports the complete API for
+    -- its platform, including these portable APIs. See "Portable vs Platform
+    -- Specific Modules" in docs/Developer/module-organization.md in the
+    -- streamly repository for the reasons.
+
     -- * Creating a Watch
 
     -- ** Configuration
