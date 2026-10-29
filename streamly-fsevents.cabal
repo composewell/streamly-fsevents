@@ -290,7 +290,9 @@ test-suite FileSystem.Event
     build-depends: Win32 >= 2.6 && < 2.15
   else
     build-depends: unix >= 2.7 && < 2.9
-  if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
+  if (os(linux) || os(freebsd)) && impl(ghc < 9.4)
+    buildable: False
+  if !(os(linux) || os(darwin) || os(windows) || os(freebsd))
     buildable: False
 
 test-suite FileSystem.Event.Behavior
@@ -325,6 +327,18 @@ test-suite FileSystem.Event.Linux
   ghc-options: -main-is Streamly.Test.FileSystem.Event.Linux
   build-depends: unix >= 2.7 && < 2.9
   if impl(ghc < 9.4) || !os(linux)
+    buildable: False
+
+-- The FreeBSD test-suite reuses the Linux test-suite source.
+test-suite FileSystem.Event.FreeBSD
+  import: test-options
+  type: exitcode-stdio-1.0
+  main-is: Streamly/Test/FileSystem/Event/Linux.hs
+  other-modules: Streamly.Test.FileSystem.Event.Common
+  cpp-options: -DFILESYSTEM_EVENT_FREEBSD
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.Linux
+  build-depends: unix >= 2.7 && < 2.9
+  if impl(ghc < 9.4) || !os(freebsd)
     buildable: False
 
 test-suite FileSystem.Event.LargeTree
