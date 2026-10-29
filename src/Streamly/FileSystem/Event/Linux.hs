@@ -28,7 +28,7 @@ module Streamly.FileSystem.Event.Linux
       Config
     , setRecursiveMode
     , setFollowSymLinks
-    , setUnwatchMoved
+    , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
     , WhenExists (..)

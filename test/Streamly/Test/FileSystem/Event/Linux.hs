@@ -10,9 +10,10 @@ module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Exception (bracket)
 import Streamly.Internal.FS.Event.Linux (Event)
-import System.Directory (createDirectory, removeDirectory)
+import System.Directory (createDirectory, removeDirectory, removeFile)
 import System.FilePath ((</>))
-import System.IO (IOMode(WriteMode), hClose, openFile)
+import System.IO
+    (IOMode(AppendMode, WriteMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -301,6 +302,46 @@ largeWd =
                     map getAbsPath (filter Event.isCreated evs)
                         `shouldBe` [file]
 
+-------------------------------------------------------------------------------
+-- Default config tests
+-------------------------------------------------------------------------------
+
+-- | Open a watch on the directory @root@ in a temporary directory using
+-- @cfg@, run the action with the root path and the watch, and close the
+-- watch.
+withRoot :: Event.Config -> (FilePath -> Event.Watch -> IO a) -> IO a
+withRoot cfg action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "root"
+        createDirectory root
+        r <- Path.fromString root
+        bracket
+            (Event.openWatch cfg (r NonEmpty.:| []))
+            Event.closeWatch
+            (action root)
+
+-- | The paths of the events that satisfy the predicate.
+pathsOf :: (Event -> Bool) -> [Event] -> [FilePath]
+pathsOf p = map getAbsPath . filter p
+
+-- The write to the unlinked file generates IN_MODIFY without IN_EXCL_UNLINK.
+-- WriteMode truncates the file before the unlink, generating IN_MODIFY,
+-- AppendMode does not truncate.
+defaultExcludeUnlinked :: Spec
+defaultExcludeUnlinked =
+    it "does not report the events of an unlinked file"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            let file = root </> "file"
+                sentinel = root </> "sentinel"
+            h <- openFile file AppendMode
+            removeFile file
+            hPutStr h "x"
+            hFlush h
+            hClose h
+            createFile sentinel
+            evs <- readUntil Event.defaultConfig (isCreatedAt sentinel) w
+            pathsOf Event.isModified evs `shouldBe` []
+
 removeTests :: IO ()
 removeTests =
     hspec
@@ -316,6 +357,8 @@ removeTests =
                 overlapRemoveOuter
                 overlapRemoveBoth
             describe "watch descriptors" largeWd
+            describe "defaultConfig" $ do
+                defaultExcludeUnlinked
 
 main :: IO ()
 main = do

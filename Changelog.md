@@ -38,6 +38,11 @@
   `removeFromWatch`. The watch descriptor is now removed when its
   `isRootUnwatched` event is read, events for unknown watch descriptors are
   dropped.
+- **Breaking:** Linux: rename `setUnwatchMoved` to `setExcludeUnlinked`, and
+  enable it in `defaultConfig`. `setUnwatchMoved` is kept in the internal
+  module as a deprecated alias. The setting maps to `IN_EXCL_UNLINK`, it
+  stops the events of a file after the file is unlinked, it does not affect
+  the objects moved out of a watched directory as documented earlier.
 
 ## 0.1.1
 

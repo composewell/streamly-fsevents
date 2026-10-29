@@ -69,6 +69,7 @@ module Streamly.Internal.FS.Event.Linux
     -- ** Watch Behavior
     , setRecursiveMode
     , setFollowSymLinks
+    , setExcludeUnlinked
     , setUnwatchMoved
     , setOneShot
     , setOnlyDir
@@ -262,15 +263,26 @@ setFollowSymLinks s = setFlag iN_DONT_FOLLOW (not s)
 foreign import capi
     "sys/inotify.h value IN_EXCL_UNLINK" iN_EXCL_UNLINK :: Word32
 
--- | If an object moves out of the directory being watched then stop watching
--- it.
+-- | Do not report the events of a file after it is unlinked from the watched
+-- directory. A process can keep a file open after the file is deleted, its
+-- reads and writes generate events, the events have the deleted path.
 --
--- /default: False/
+-- macOS does not report the events of an unlinked file.
+--
+-- /default: True/
 --
 -- /Pre-release/
 --
+setExcludeUnlinked :: Bool -> Config -> Config
+setExcludeUnlinked = setFlag iN_EXCL_UNLINK
+
+-- | Same as 'setExcludeUnlinked'.
+--
+-- /Pre-release/
+--
+{-# DEPRECATED setUnwatchMoved "Use setExcludeUnlinked" #-}
 setUnwatchMoved :: Bool -> Config -> Config
-setUnwatchMoved = setFlag iN_EXCL_UNLINK
+setUnwatchMoved = setExcludeUnlinked
 
 #if HAVE_DECL_IN_MASK_CREATE
 foreign import capi
@@ -539,7 +551,7 @@ setAllEvents s =
 -- | The default configuration settings are:
 --
 -- * 'setFollowSymLinks' 'True'
--- * 'setUnwatchMoved' 'False'
+-- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
 -- * 'setWhenExists' 'AddIfExists'
@@ -557,6 +569,7 @@ setAllEvents s =
 defaultConfig :: Config
 defaultConfig =
       setWhenExists AddIfExists
+    $ setExcludeUnlinked True
     $ setCreated True
     $ setDeleted True
     $ setMovedFrom True
@@ -1140,7 +1153,7 @@ watchToStream cfg wt@(Watch handle _) = do
 --
 -- @
 -- watchWith
---      ('setFollowSymLinks' True . 'setUnwatchMoved' False)
+--      ('setFollowSymLinks' True . 'setExcludeUnlinked' False)
 --      [Path.fromString "dir"]
 -- @
 --

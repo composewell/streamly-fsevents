@@ -131,9 +131,10 @@ watchWith = Event.watchWith
 -- case instead of the path, which is not the case for macOS.
 --
 -- To make the behavior same for all platforms, for the Linux case we will have
--- to stop watching the inode if it moves from under the path
--- (setUnwatchMoved).  And on macOS we can stop watching  a path if the inode
--- under it changes i.e. just filter out events for that path.
+-- to stop watching the inode if it moves from under the path, on the
+-- IN_MOVE_SELF event of the root, no inotify flag does that.  And on macOS we
+-- can stop watching  a path if the inode under it changes i.e. just filter out
+-- events for that path.
 --
 -- Also, to make the behavior of Linux same as macOS we need to set
 -- setFollowSymLinks on Linux.
