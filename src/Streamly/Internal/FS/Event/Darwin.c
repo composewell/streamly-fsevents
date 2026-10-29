@@ -314,11 +314,37 @@ cleanup_pipe:
  * Stop a watch event loop
  *****************************************************************************/
 
+static void noop(void *ctx) {
+    (void)ctx;
+}
+
+/*
+ * The read end of the pipe must be closed before calling this, so that a
+ * callback blocked writing to a full pipe fails with EPIPE.
+ */
 void destroyWatch(struct watch* w) {
-    /* Stop and invalidate the event stream */
-    FSEventStreamFlushSync(w->eventStream);
+    /*
+     * Stop and invalidate do not wait for a callback running on the queue,
+     * it may run after they return.
+     */
     FSEventStreamStop(w->eventStream);
     FSEventStreamInvalidate(w->eventStream);
+
+    /*
+     * A callback may still be blocked writing to a full pipe when the read
+     * end is open in another process, e.g. a child that inherited it.
+     * Replacing the write end with /dev/null wakes up the write. Unlike
+     * close, dup2 keeps the fd number allocated, the callback cannot write
+     * to a file opened later with the same number.
+     */
+    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devnull >= 0) {
+        dup2(devnull, w->writefd);
+        close(devnull);
+    }
+
+    /* Wait for the callback running on the serial queue, if any */
+    dispatch_sync_f(w->queue, NULL, noop);
     dispatch_release(w->queue);
     FSEventStreamRelease(w->eventStream);
     close(w->writefd);
