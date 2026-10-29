@@ -73,6 +73,20 @@
 - macOS: create the event pipe close-on-exec; child processes inherited it.
 - macOS: `setFullHistory` has no effect, a watch always starts from the
   current time; the documentation said it reports all the past events.
+- Windows: close the directory handles of a watch when it ends; they
+  leaked until the process exited.
+- Windows: the watched directory can be deleted or renamed while it is
+  watched; it failed with a sharing violation.
+- Windows: report `isEventsLost` when the system buffer overflows; the
+  watch raised an exception or read an empty buffer. `getRelPath` returns
+  `Nothing` for this event.
+- Windows: do not end the watch with an `InvalidPath` exception on names
+  such as `aux.c` or `con` that the file system can hold.
+- Windows: a watch with a root that fails no longer waits for a change in
+  the other roots before raising the exception. The threaded RTS is
+  required for the watch to work concurrently with other threads.
+- Windows: `showEvent` no longer raises an error on a name with an
+  unpaired UTF-16 surrogate.
 
 ### Enhancements
 
