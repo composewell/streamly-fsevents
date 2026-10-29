@@ -48,6 +48,12 @@
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
 --
+-- /Threaded RTS:/ Each watch root is read by a thread blocked in a
+-- ReadDirectoryChangesW foreign call. Use the threaded RTS. With the
+-- non-threaded RTS the call blocks all the Haskell threads until a change
+-- occurs under that root, and a stopped watch is cleaned up only after the
+-- next change.
+--
 -- = Platform differences
 --
 -- For reference documentation see:

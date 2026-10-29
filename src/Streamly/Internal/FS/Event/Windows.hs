@@ -1,3 +1,5 @@
+{-# LANGUAGE InterruptibleFFI #-}
+
 -- Some code snippets are adapted from the fsnotify package.
 -- http://hackage.haskell.org/package/fsnotify-0.3.0.1/
 --
@@ -273,7 +275,12 @@ openDirHandle dir = do
 -- Note that this API uses UTF-16 for file system paths:
 -- 1. https://docs.microsoft.com/en-us/windows/win32/intl/unicode-in-the-windows-api
 -- 2. https://docs.microsoft.com/en-us/windows/win32/intl/unicode
-foreign import ccall safe
+--
+-- The call blocks until a change occurs. It is interruptible so that an
+-- exception thrown to the calling thread, e.g. when the stream is stopped,
+-- does not wait for the next change: the RTS cancels the call with
+-- CancelSynchronousIo and the call fails with ERROR_OPERATION_ABORTED.
+foreign import ccall interruptible
     "windows.h ReadDirectoryChangesW" c_ReadDirectoryChangesW ::
            HANDLE
         -> LPVOID
