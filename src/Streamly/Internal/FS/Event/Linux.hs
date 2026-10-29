@@ -156,8 +156,10 @@ module Streamly.Internal.FS.Event.Linux
     )
 where
 
+import Control.Concurrent.MVar
+    (MVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (finally, onException)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
@@ -170,40 +172,42 @@ import Data.Semigroup (Semigroup(..))
 #endif
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
-    ( eINVAL, getErrno, throwErrno, throwErrnoIfMinus1
-    , throwErrnoIfMinus1_
+    ( eAGAIN, eINTR, eINVAL, eWOULDBLOCK, getErrno, throwErrno
+    , throwErrnoIfMinus1, throwErrnoIfMinus1_
     )
 import Foreign.C.String (CString, withCString)
-import Foreign.C.Types (CInt(..), CUInt(..))
+import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
-import GHC.IO.Device (IODeviceType(Stream))
-import GHC.IO.FD (fdFD, FD(..))
-import GHC.IO.Handle.FD (mkHandleFromFD)
+import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
+import Streamly.Data.Array (Array)
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Parser (Parser)
 import System.Directory (doesDirectoryExist)
-import System.IO (Handle, hClose, IOMode(ReadMode))
-import System.IO.Error (catchIOError, isDoesNotExistError)
-import GHC.IO.Handle.FD (handleToFd)
+import System.IO.Error
+    ( catchIOError, illegalOperationErrorType, isDoesNotExistError
+    , mkIOError
+    )
+import System.Posix.Types (CSsize(..), Fd(..))
 
-import Streamly.Internal.Data.Array (byteLength)
+import Streamly.Internal.Data.Array (byteLength, unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
 
 import qualified Control.Exception as Exception (mask)
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as FL
-import qualified Streamly.Data.Array as A (createOf, toList)
+import qualified Streamly.Data.Array as A (createOf, reader, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Unfold as UF
-import qualified Streamly.FileSystem.Handle as FH
 import qualified Streamly.Internal.FileSystem.Path as Path
 
 import qualified Streamly.Internal.Data.Array as A
     ( asCStringUnsafe, unsafePinnedAsPtr
     )
+import qualified Streamly.Internal.Data.MutArray as MArray
+    (byteLength, unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.DirIO as Dir (readDirs)
 import qualified Streamly.Internal.Data.Parser as PR
     (takeEQ, fromEffect, fromFold)
@@ -623,9 +627,19 @@ data WdEntry =
     | WdMarker [(Int, PathRep)]
 
 -- | A handle for a watch.
+--
+-- The fd is not wrapped in a 'System.IO.Handle'. A thread blocked reading a
+-- 'System.IO.Handle' holds the lock of the handle until the read returns,
+-- the other operations on the handle, including 'System.IO.hClose', wait for
+-- the lock.
 data Watch =
     Watch
-        Handle                  -- File handle for the watch
+        CInt                    -- The inotify fd
+        -- 'True' if the watch is closed. The lock is held during a system call
+        -- on the fd, 'closeWatch' cannot close the fd, and the fd number
+        -- cannot be reused, while the system call is in progress. The system
+        -- calls made with the lock held must not block.
+        (MVar Bool)
         (IORef
             (IntMap             -- Key is the watch descriptor
                 WdEntry
@@ -638,12 +652,14 @@ data Watch =
 
 newtype WD = WD CInt deriving Show
 
--- XXX Use IN_NONBLOCK?
 foreign import ccall unsafe
     "sys/inotify.h inotify_init1" c_inotify_init1 :: CInt -> IO CInt
 
 foreign import capi
     "sys/inotify.h value IN_CLOEXEC" iN_CLOEXEC :: CInt
+
+foreign import capi
+    "sys/inotify.h value IN_NONBLOCK" iN_NONBLOCK :: CInt
 
 -- | Create a 'Watch' handle. 'addToWatch' can be used to add paths being
 -- monitored by this watch.
@@ -655,51 +671,33 @@ createWatch = do
     -- The fd must not be inherited by child processes. An inherited fd
     -- keeps the inotify instance and its watches alive after 'closeWatch',
     -- and counts against the max_user_instances limit.
-    rawfd <- throwErrnoIfMinus1 "createWatch" $ c_inotify_init1 iN_CLOEXEC
-    -- We cannot use fdToHandle because it calls fdStat, and fdStat raises an
-    -- "unknown file type" exception for the inotify fd. The inotify fd is an
-    -- anonymous inode and its st_mode has no file type bits.
     --
-    -- mkFD calls fdStat only when its stat argument is Nothing, and locks the
-    -- fd only when the fd type is RegularFile. Locking a regular file leads to
-    -- a "resource busy" error in some test cases.
-    --
-    -- XXX "mkFD rawfd ReadMode (Just (Stream, 0, 0)) False False" neither
-    -- calls fdStat nor locks the fd, we can use it instead of constructing
-    -- the FD below.
-    let fd =
-            FD
-                { fdFD = rawfd
-#if !defined(mingw32_HOST_OS)
-                , fdIsNonBlocking = 0
-#else
-                , fdIsSocket_ = 0
-#endif
-              }
-
-    -- XXX Do we need non-blocking IO?
-    -- With non-blocking IO it fails because GHC-9.10 uses fdStat in
-    -- FD.setNonBlockingMode to determine the fd type which fails for the
-    -- inotify fd. However, without non-blocking IO "select" has a limitation on
-    -- the number of FDs being watched (1024).
-    --
-    -- XXX Since base-4.20.1 (GHC 9.10.2) setNonBlockingMode uses
-    -- statGetType_maybe which does not fail for an unknown file type, so
-    -- non-blocking IO may work with newer GHC versions.
-
-    -- mkHandleFromFD does not lock the fd. The fd type Stream is used because
-    -- statGetType has no type for an anonymous inode, and the inotify fd is
-    -- read like a stream, it is not seekable.
-    h <-
-        mkHandleFromFD
-           fd
-           Stream
-           ("<createWatch fd: " ++ show fd ++ ">")
-           ReadMode
-           False    -- use non-blocking IO
-           Nothing -- TextEncoding (binary)
+    -- The fd is non-blocking, 'readEvents' waits for it to become readable
+    -- via the GHC IO manager.
+    fd <-
+        throwErrnoIfMinus1 "createWatch"
+            $ c_inotify_init1 (iN_CLOEXEC .|. iN_NONBLOCK)
+    lock <- newMVar False
     emptyMapRef <- newIORef Map.empty
-    return $ Watch h emptyMapRef
+    return $ Watch fd lock emptyMapRef
+
+-- | Run an action on the fd of a watch, holding the lock of the watch. The
+-- action must not block. Throw an exception if the watch is closed. The
+-- string is the name of the operation, used in the exception message.
+withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
+withWatchFd op (Watch fd lock _) action =
+    withMVar lock $ \closed ->
+        if closed
+        then ioError
+                $ mkIOError
+                    illegalOperationErrorType
+                    (op ++ ": the watch is closed")
+                    Nothing
+                    Nothing
+        else action fd
+
+isWatchClosed :: Watch -> IO Bool
+isWatchClosed (Watch _ lock _) = readMVar lock
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -730,7 +728,7 @@ insertPath wd prep m =
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
+addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     -- XXX if the watch is added by the scan and not via an event we can
     -- generate a create event assuming that the create may have been lost. We
     -- can also mark in the map that this entry was added by the scan. So if an
@@ -754,8 +752,6 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     --        "root = " ++ Path.toString root ++ " sub = " ++ Path.toString sub
     -- putStrLn $ showPathRep prep ++ " absPath = " ++ Path.toString absPath
 
-    fd <- handleToFd handle
-
     -- A subdirectory may be deleted or moved before its watch is added,
     -- 'addSubdirToWatch' ignores the error in that case.
     --
@@ -766,28 +762,34 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
     -- inotify_add_watch fails with EACCES and we throw an exception. We could
     -- add a config option to ignore such errors, like the options for
     -- ignoring errors when reading a directory.
-    wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
+    --
+    -- The watch descriptor is inserted in the map with the lock held, so that
+    -- the watch cannot be closed in between.
+    isNew <- withWatchFd "addToWatch" watch0 $ \fd -> do
+        wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
-                c_inotify_add_watch (fdFD fd) pathPtr (CUInt (watchFlags cfg))
+                c_inotify_add_watch fd pathPtr (CUInt (watchFlags cfg))
 
-    -- We add the parent first so that we start getting events for any new
-    -- creates and add the new subdirectories on creates while we are adding
-    -- the children.
-    --
-    -- A directory created while its parent is being scanned is added twice,
-    -- once by the scan and once on its create event. The second add finds the
-    -- path already watched and does not scan the directory again.
-    --
-    -- The map update must be atomic because more than one thread modifies
-    -- the map. 'addToWatch' and 'removeFromWatch' can be called from any
-    -- thread while the thread reading the event stream adds subdirectories
-    -- on create events and removes watch descriptors on IN_IGNORED events. A
-    -- separate readIORef and writeIORef could lose an update made by another
-    -- thread in between. 'insertPath' also checks whether the path is already
-    -- watched and inserts it in the same step, so when a scan and a create
-    -- event in different threads add the same directory, only one of them
-    -- gets 'isNew' as 'True' and scans the directory.
-    isNew <- atomicModifyIORef' wdMapRef $ insertPath (fromIntegral wd) prep
+        -- We add the parent first so that we start getting events for any
+        -- new creates and add the new subdirectories on creates while we are
+        -- adding the children.
+        --
+        -- A directory created while its parent is being scanned is added
+        -- twice, once by the scan and once on its create event. The second
+        -- add finds the path already watched and does not scan the directory
+        -- again.
+        --
+        -- The map update must be atomic because more than one thread
+        -- modifies the map. 'addToWatch' and 'removeFromWatch' can be called
+        -- from any thread while the thread reading the event stream adds
+        -- subdirectories on create events and removes watch descriptors on
+        -- IN_IGNORED events. A separate readIORef and writeIORef could lose
+        -- an update made by another thread in between. 'insertPath' also
+        -- checks whether the path is already watched and inserts it in the
+        -- same step, so when a scan and a create event in different threads
+        -- add the same directory, only one of them gets 'isNew' as 'True' and
+        -- scans the directory.
+        atomicModifyIORef' wdMapRef $ insertPath (fromIntegral wd) prep
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
@@ -805,13 +807,16 @@ addToWatch cfg@Config{..} watch0@(Watch handle wdMapRef) prep = do
             in S.fold (FL.drainMapM f) $ Dir.readDirs id absPath
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
--- exist. Used to add the subdirectories found by the scan or reported by
--- IN_CREATE or IN_MOVED_TO, a subdirectory may be deleted or moved before its
--- watch is added. Its parent reports the deletion or the move.
+-- exist or if the watch is closed. Used to add the subdirectories found by
+-- the scan or reported by IN_CREATE or IN_MOVED_TO, a subdirectory may be
+-- deleted or moved before its watch is added. Its parent reports the deletion
+-- or the move. The watch may be closed by another thread while the event
+-- stream adds a subdirectory.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wt prep =
-    addToWatch cfg wt prep `catchIOError` \e ->
-        if isDoesNotExistError e then return () else ioError e
+    addToWatch cfg wt prep `catchIOError` \e -> do
+        closed <- isWatchClosed wt
+        if isDoesNotExistError e || closed then return () else ioError e
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -884,26 +889,29 @@ addRemovalMarker fd wdMapRef paths =
 --
 -- Removing a path that shares the directory with another path requires
 -- @\/proc@ to be mounted, throw an exception if it is not.
+--
+-- Does nothing if the watch is closed, closing the watch removes all the
+-- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths (Watch handle wdMapRef) desc p = do
-    fd <- handleToFd handle
-    -- The paths stay in the map until their 'isRootUnwatched' event is read,
-    -- so that the events already queued for the removed paths, including
-    -- 'isRootUnwatched', report the paths.
-    --
-    -- If all the paths of a watch descriptor are removed we remove the
-    -- kernel watch, the kernel queues an IN_IGNORED event for it. Otherwise,
-    -- the kernel watch is still needed for the other paths, we queue a
-    -- marker event instead.
-    (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
-    mapM_ (rmWatch (fdFD fd)) wds
-    when (not (null shared)) $ addRemovalMarker (fdFD fd) wdMapRef shared
+unwatchPaths (Watch fd lock wdMapRef) desc p =
+    withMVar lock $ \closed -> when (not closed) $ do
+        -- The paths stay in the map until their 'isRootUnwatched' event is
+        -- read, so that the events already queued for the removed paths,
+        -- including 'isRootUnwatched', report the paths.
+        --
+        -- If all the paths of a watch descriptor are removed we remove the
+        -- kernel watch, the kernel queues an IN_IGNORED event for it.
+        -- Otherwise, the kernel watch is still needed for the other paths, we
+        -- queue a marker event instead.
+        (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
+        mapM_ rmWatch wds
+        when (not (null shared)) $ addRemovalMarker fd wdMapRef shared
 
     where
 
     -- EINVAL means that the kernel has already removed the watch, for
     -- example, when the directory was deleted.
-    rmWatch fd wd = do
+    rmWatch wd = do
         let err = "unwatchPaths: " ++ desc
         r <- c_inotify_rm_watch fd (fromIntegral wd)
         when (r == -1) $ do
@@ -927,12 +935,19 @@ removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch wt root =
     unwatchPaths wt (show (Path.toString root)) (eqPath root . getRepRoot)
 
--- | Close a 'Watch' handle.
+-- | Close a 'Watch' handle. The event streams of the watch end, a thread
+-- waiting for events in 'watchToStream' is woken up. Closing a closed watch
+-- does nothing.
 --
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
-closeWatch (Watch h _) = hClose h
+closeWatch (Watch fd lock _) =
+    modifyMVar_ lock $ \closed -> do
+        -- closeFdWith wakes up the threads waiting for the fd to become
+        -- readable. The kernel releases the fd even if close fails.
+        when (not closed) $ closeFdWith (\_ -> void (c_close fd)) (Fd fd)
+        return True
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -1029,7 +1044,7 @@ removeMarker marker paths m0 =
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
-readOneEvent cfg  wt@(Watch _ wdMapRef) = do
+readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
     (ewd, eflags, cookie, pathLen) <- PR.fromEffect $ A.unsafePinnedAsPtr arr readHeader
@@ -1141,28 +1156,71 @@ readOneEvent cfg  wt@(Watch _ wdMapRef) = do
         pathLen :: Word32 <- peekByteOff ptr (len + 8)
         return (ewd, eflags, cookie, fromIntegral pathLen)
 
+foreign import ccall unsafe "unistd.h read"
+    c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
+
+-- | Read the events available on the fd of a watch, wait for the events if
+-- none is available. Returns 'Nothing' if the watch is closed.
+readEvents :: Watch -> IO (Maybe (Array Word8))
+readEvents (Watch fd lock _) = loop
+
+    where
+
+    -- As per the inotify man page, a buffer of size
+    --
+    --          sizeof(struct inotify_event) + NAME_MAX + 1
+    --
+    -- is sufficient to read at least one event. A smaller buffer fails with
+    -- EINVAL.
+    bufSize = 32 * 1024
+
+    -- Returns 0 if no event is available.
+    readFd p = do
+        n <- c_read fd p (fromIntegral bufSize)
+        if n >= 0
+        then return (fromIntegral n)
+        else do
+            errno <- getErrno
+            if errno == eAGAIN || errno == eWOULDBLOCK || errno == eINTR
+            then return 0
+            else throwErrno "watchToStream"
+
+    -- The wait is registered with the IO manager with the lock held, if
+    -- 'closeWatch' closes the fd after that, the wait raises an exception.
+    -- If the fd were closed before the registration, the registration could
+    -- wait on a reused fd number.
+    loop = do
+        r <- withMVar lock $ \closed ->
+            if closed
+            then return Nothing
+            else do
+                arr <- MArray.unsafeCreateWithPtr' bufSize readFd
+                if MArray.byteLength arr /= 0
+                then return $ Just $ Right $ unsafeFreezeWithShrink arr
+                else Just . Left <$> threadWaitReadSTM (Fd fd)
+        case r of
+            Nothing -> return Nothing
+            Just (Right arr) -> return (Just arr)
+            Just (Left (wait, unregister)) -> do
+                -- The next iteration returns 'Nothing' if the exception is
+                -- due to 'closeWatch'.
+                atomically wait `catchIOError` (\_ -> return ())
+                    `onException` unregister
+                loop
+
 -- | Read the events from a 'Watch' as a stream. The 'Config' must be the one
 -- used to open the watch. The stream does not close the watch, use
--- 'closeWatch' to close it.
+-- 'closeWatch' to close it. The stream ends when the watch is closed.
 --
 -- /Pre-release/
 --
 watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wt@(Watch handle _) = do
-    -- Do not use too small a buffer. As per inotify man page:
-    --
-    -- The behavior when the buffer given to read(2) is too small to return
-    -- information about the next event depends on the kernel version: in
-    -- kernels before 2.6.21, read(2) returns 0; since kernel 2.6.21, read(2)
-    -- fails with the error EINVAL.  Specifying a buffer of size
-    --
-    --          sizeof(struct inotify_event) + NAME_MAX + 1
-    --
-    -- will be sufficient to read at least one event.
+watchToStream cfg wt =
     S.unfoldEach UF.fromList
         $ S.catRights
         $ S.parseMany (readOneEvent cfg wt)
-        $ S.unfold FH.reader handle
+        $ S.unfoldEach A.reader
+        $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wt) ()
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
