@@ -71,6 +71,11 @@ flag limit-build-mem
   manual: True
   default: False
 
+flag threaded
+  description: Build the tests with the threaded RTS
+  manual: True
+  default: True
+
 -------------------------------------------------------------------------------
 -- Common stanzas
 -------------------------------------------------------------------------------
@@ -173,8 +178,9 @@ common optimization-options
 
 
 common threading-options
-  ghc-options:  -threaded
-                -with-rtsopts=-N
+  if flag(threaded)
+    ghc-options:  -threaded
+                  -with-rtsopts=-N
 
 -- We need optimization options here to optimize internal (non-inlined)
 -- versions of functions. Also, we have some benchmarking inspection tests
