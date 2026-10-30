@@ -726,6 +726,8 @@ getRelPath Event{..} = eventRelPath
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
+--
+-- If the event is for the watch root then this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of

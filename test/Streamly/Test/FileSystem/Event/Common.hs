@@ -18,6 +18,7 @@ module Streamly.Test.FileSystem.Event.Common
     -- * Event predicates
     , dirEvent
     , fileEvent
+    , rootEvent
 
     -- * Tests
     , dirCreate
@@ -218,6 +219,14 @@ fileEvent f ev = not (Event.isDir ev) && f ev
 dirEvent = id
 fileEvent = id
 #endif
+
+-- | An event for the watch root itself: 'getRelPath' is 'Nothing' and
+-- 'getAbsPath' is the same as 'getRoot'.
+rootEvent :: (Event -> Bool) -> Event -> Bool
+rootEvent f ev =
+       f ev
+    && null (Event.getRelPath ev)
+    && Path.toString (Event.getAbsPath ev) == Path.toString (Event.getRoot ev)
 
 -- XXX Tests for root as a regular file instead of dir?
 -- XXX Add symlink and hardlink tests

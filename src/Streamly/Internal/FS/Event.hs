@@ -172,6 +172,9 @@ watchRecursive = Event.watchRecursive
 
 -- | Get the watch root to which the event belongs, as it was supplied to the
 -- watch API.
+--
+-- For an 'isEventsLost' event, this is the watch root whose events may have
+-- been lost.
 getRoot :: Event -> Path
 getRoot = Event.getRoot
 
@@ -188,18 +191,24 @@ getRoot = Event.getRoot
 
 -- | Get the path of the file system object for which the event is generated,
 -- relative to the watch root. Returns 'Nothing' if the event is for the watch
--- root itself.
+-- root itself, or if it is an 'isEventsLost' event for the whole watch root.
 getRelPath :: Event -> Maybe Path
 getRelPath = Event.getRelPath
 
 -- XXX Ensure that on all paltforms the path has same conventions. That is do
 -- not have a trailing path separator on one platfrom and not on another.
---
+
 -- | Get the absolute path of the file system object for which the event is
 -- generated.
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
+--
+-- If the event is for the watch root then this is the same as 'getRoot'.
+--
+-- For an 'isEventsLost' event, this gives the path whose tree has to be
+-- scanned again. On macOS, it may be a subdirectory of the watch root, on
+-- other platforms it is the watch root.
 getAbsPath :: Event -> Path
 getAbsPath = Event.getAbsPath
 
@@ -253,9 +262,11 @@ isModified = Event.isModified
 -- | An event that indicates that some events before this may have been lost,
 -- therefore, we need to take some recovery action.
 --
--- 'getRoot' returns the watch root whose events may have been lost. On
--- Linux, where the kernel reports a single event for all the roots, one
--- event is generated for each watch root.
+-- On Linux, where the kernel reports a single event for all the roots, one
+-- 'isEventsLost' event is generated for each watch root. The tree under the
+-- path returned by 'getAbsPath' has to be scanned again to know its current
+-- state. This path is the watch root, except on macOS, where it may be a
+-- subdirectory of the watch root.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 

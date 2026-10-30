@@ -16,7 +16,7 @@ import Control.Exception
     (IOException, SomeException, bracket, finally, throwIO, try)
 import Control.Monad (filterM, when)
 import Data.Bits ((.&.))
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sort)
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
@@ -75,7 +75,7 @@ dirDelEvents dir =
 rootDirDelEvents :: String -> [([Char], Event -> Bool)]
 rootDirDelEvents root =
       (root, Event.isRootUnwatched)
-    : (root, Event.isRootDeleted)
+    : (root, rootEvent Event.isRootDeleted)
     : (root, dirEvent Event.isAttrsModified)
     : dirTouchEvents root
 
@@ -825,6 +825,57 @@ overflowRecCreate =
                     evs <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs `shouldBe` [root]
 
+-------------------------------------------------------------------------------
+-- Event path tests
+-------------------------------------------------------------------------------
+
+getRelPath :: Event -> Maybe FilePath
+getRelPath = fmap Path.toString . Event.getRelPath
+
+-- | The events whose 'getRelPath' is 'Nothing' must have 'getAbsPath' equal
+-- to 'getRoot'.
+shouldHaveRootPaths :: [Event] -> Expectation
+shouldHaveRootPaths evs =
+    map getAbsPath rootEvs `shouldBe` map getRoot rootEvs
+
+    where
+
+    rootEvs = filter ((== Nothing) . getRelPath) evs
+
+rootEventPaths :: Spec
+rootEventPaths =
+    it "getRelPath is Nothing and getAbsPath is getRoot for the root"
+        $ withRoot watchCfg $ \root w -> do
+            let file = root </> "file"
+            createFile file
+            removeFile file
+            removeDirectory root
+            evs <- readUntilUnwatched w
+            map getRelPath (filter (isCreatedAt file) evs)
+                `shouldBe` [Just "file"]
+            map getRelPath (filter Event.isRootDeleted evs)
+                `shouldBe` [Nothing]
+            shouldHaveRootPaths evs
+
+-- The overflow events are not traced, the queue holds thousands of events.
+overflowPaths :: Spec
+overflowPaths =
+    it "reports isEventsLost for each root with the root as its path"
+        $ withTwoRoots $ \root1 root2 w -> do
+            r <- withOverflow root1 (return ())
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    r1 <- timeout 10000000
+                        $ Stream.toList
+                        $ Stream.take 2
+                        $ Stream.filter Event.isEventsLost
+                        $ Event.watchToStream watchCfg w
+                    evs <- maybe (error "overflowPaths: timed out") return r1
+                    sort (map getRoot evs) `shouldBe` [root1, root2]
+                    map getRelPath evs `shouldBe` [Nothing, Nothing]
+                    shouldHaveRootPaths evs
+
 watchTests :: IO ()
 watchTests =
     hspec
@@ -859,6 +910,9 @@ watchTests =
                 overflowRemove
                 overflowRemoveShared
                 overflowRecCreate
+            describe "event paths" $ do
+                rootEventPaths
+                overflowPaths
             describe "recursive mode robustness" $ do
                 recSubdirAddedTwice
                 recDirReplacedByFile
@@ -922,7 +976,7 @@ main = do
     let fileRootTests =
             [ fileDelete "" (\path ->
                 [ (path, Event.isAttrsModified)
-                , (path, Event.isRootDeleted)
+                , (path, rootEvent Event.isRootDeleted)
                 , (path, Event.isRootUnwatched)
                 ])
             , rootFileMove "moved" (\path -> [(path, Event.isRootMoved)])

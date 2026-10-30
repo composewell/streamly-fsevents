@@ -1504,6 +1504,10 @@ watch = watchWith id
 -- If a directory is watched via more than one root, for example, a recursive
 -- root and a root inside it, its events are reported once for each root.
 --
+-- For an 'isEventsLost' event, this is the watch root whose events may have
+-- been lost. The kernel generates a single overflow event for all the watch
+-- roots, it is reported as one 'isEventsLost' event for each watch root.
+--
 -- Note that if a path was moved after adding to the watch, this will give the
 -- original path and not the new path after moving.
 --
@@ -1517,7 +1521,7 @@ getRoot = eventRoot
 
 -- | Get the file system object path for which the event is generated, relative
 -- to the watched root. Returns 'Nothing' if the event is for the watch root
--- itself.
+-- itself, or if it is an 'isEventsLost' event.
 getRelPath :: Event -> Maybe Path
 getRelPath Event{..} = eventRelPath
 
@@ -1525,6 +1529,8 @@ getRelPath Event{..} = eventRelPath
 --
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
+--
+-- If the event is for the watch root this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
 getAbsPath ev =
     case getRelPath ev of
@@ -1554,10 +1560,6 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 -- | Event queue overflowed and we may have lost some events. The user
 -- application must scan everything under the watched paths to know the
 -- current state.
---
--- The kernel generates a single overflow event for all the watch roots. It is
--- reported as one event per watch root, 'getRoot' returns the root and
--- 'getRelPath' returns 'Nothing'.
 --
 -- In recursive mode, the watched directories are scanned again on an
 -- overflow, the subdirectories whose create or move events were lost are

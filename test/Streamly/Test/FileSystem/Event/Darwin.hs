@@ -42,7 +42,7 @@ main = do
               dirDelete "" (\dir ->
                 [ (dir, dirEvent Event.isDeleted)
                 , (dir, dirEvent Event.isSecurityModified)
-                , (dir, Event.isRootPathEvent)
+                , (dir, rootEvent Event.isRootPathEvent)
                 ]
                 )
             -- The watch root create event always seems to come even though the
@@ -52,18 +52,18 @@ main = do
             -- it fails intermittently.
             -- : dirCreate "" (\dir -> [(dir, dirEvent Event.isCreated)])
             : rootDirMove "moved" (\src ->
-                [ (src, Event.isRootPathEvent)
+                [ (src, rootEvent Event.isRootPathEvent)
                 , (src, Event.isMoved)
                 ])
             : []
 
     let fileRootTests =
             [ fileDelete "" (\path ->
-                [ (path, Event.isRootPathEvent)
+                [ (path, rootEvent Event.isRootPathEvent)
                 , (path, Event.isDeleted)
                 ])
             , rootFileMove "moved" (\path ->
-                [(path, Event.isRootPathEvent)
+                [(path, rootEvent Event.isRootPathEvent)
                 , (path, Event.isMoved)
                 ])
             , fileModify "" (const [])
