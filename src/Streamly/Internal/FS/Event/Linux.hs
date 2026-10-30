@@ -813,8 +813,27 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     -- A subdirectory may be deleted or moved before its watch is added,
     -- 'addSubdirToWatch' ignores the error in that case.
     --
-    -- XXX The file may have even got deleted and then recreated which we will
-    -- never get to know, document this.
+    -- NOTE: A subdirectory is added when its IN_CREATE or IN_MOVED_TO event
+    -- is read, not when it is created. inotify_add_watch resolves the path at
+    -- that time, if the directory was deleted or moved and another directory
+    -- was created at the same path, the new directory is watched. The later
+    -- events of the parent bring the map to the final state:
+    --
+    -- * mkdir d, rmdir d, mkdir d: the first IN_CREATE watches the second d.
+    --   IN_DELETE does not change the map. The second IN_CREATE finds the
+    --   path already watched and does not scan it again.
+    -- * mkdir d, mv d e, mkdir d: the first IN_CREATE watches the second d.
+    --   IN_MOVED_FROM of d removes the watch of the second d, the second
+    --   IN_CREATE adds it again with a new watch descriptor and scans it
+    --   again. No watch covers the second d in between.
+    -- * mkdir d, mv d e, mv f d, where f is watched: IN_CREATE of d finds
+    --   the watch descriptor of f and adds d as its second path. Until the
+    --   marker queued by IN_MOVED_FROM of d, the events in f are reported
+    --   twice, under f and under d.
+    --
+    -- The events in a directory before its watch is added are not reported.
+    -- The scan adds its subdirectories but does not generate events for
+    -- them or for the files in it.
     --
     -- XXX If the caller does not have permission to read the path,
     -- inotify_add_watch fails with EACCES and we throw an exception. We could

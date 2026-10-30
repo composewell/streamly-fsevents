@@ -761,6 +761,84 @@ recDirReplacedBySymlink =
                 createFile (out </> "sub" </> "file")
             filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
 
+-- | Run the action in a recursive watch of @root@, then create a file @sync@
+-- in @root@ and read the events up to its create event. The action runs
+-- before the events are read, so its directories are added after all of its
+-- changes are done.
+recEventsBeforeAdd :: FilePath -> Event.Watch -> IO () -> IO [Event]
+recEventsBeforeAdd root w action = do
+    let sync = root </> "sync"
+    action
+    createFile sync
+    readUntil recCfg (isCreatedAt sync) w
+
+-- The first create event adds the second directory, the second create event
+-- finds it already watched.
+recDirRecreated :: Spec
+recDirRecreated =
+    it "watches a directory deleted and created again before its create event"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                file = dir </> "sub" </> "file"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                removeDirectory dir
+                createDirectory dir
+                createDirectory (dir </> "sub")
+            pathsOf (dirEvent Event.isCreated) evs `shouldBe` [dir, dir]
+            pathsOf (dirEvent Event.isDeleted) evs `shouldBe` [dir]
+            evs1 <- recEventsOf recCfg root w (createFile file)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [file, root </> "sentinel"]
+
+-- The move event of the first directory removes the watch of the second
+-- directory, the second create event adds it again.
+recDirMovedAndRecreated :: Spec
+recDirMovedAndRecreated =
+    it "watches a directory moved and created again before its create event"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                file = dir </> "sub" </> "file"
+                file1 = dir1 </> "sub" </> "file"
+            _ <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createDirectory (dir </> "sub")
+                renameDirectory dir dir1
+                createDirectory dir
+                createDirectory (dir </> "sub")
+            evs <- recEventsOf recCfg root w $ do
+                createFile file
+                createFile file1
+            pathsOf Event.isCreated evs
+                `shouldBe` [file, file1, root </> "sentinel"]
+
+-- The create event of dir finds the watch of dir2, moved to dir. The later
+-- move events remove dir2 and add it again as dir.
+recDirReplacedByWatched :: Spec
+recDirReplacedByWatched =
+    it "watches a directory moved to the path of a created directory"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+                file = dir </> "sub" </> "file"
+            createDirectory dir2
+            createDirectory (dir2 </> "sub")
+            waitWatched recCfg w dir2
+            _ <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                renameDirectory dir dir1
+                renameDirectory dir2 dir
+            evs <- recEventsOf recCfg root w (createFile file)
+            pathsOf Event.isCreated evs
+                `shouldBe` [file, root </> "sentinel"]
+            -- The scans and the removals made while reading the events of
+            -- the action queue events with the paths under dir2, check only
+            -- the events of the file.
+            filter (== dir2 </> "sub" </> "file") (map getAbsPath evs)
+                `shouldBe` []
+
 -- | Run the action after overflowing the event queue of the watch, by
 -- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
 -- the queue limit is more than 100000 events.
@@ -917,6 +995,9 @@ watchTests =
                 recSubdirAddedTwice
                 recDirReplacedByFile
                 recDirReplacedBySymlink
+                recDirRecreated
+                recDirMovedAndRecreated
+                recDirReplacedByWatched
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
