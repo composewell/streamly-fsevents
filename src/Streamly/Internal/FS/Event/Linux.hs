@@ -54,6 +54,16 @@
 --
 -- 4. On Linux 'watch' fails if a path does not exist, on macOS it does
 -- not fail.
+--
+-- 5. On Linux the reads and writes of an open file after it is unlinked
+-- generate events unless 'setExcludeUnlinked' is 'True', on macOS they do
+-- not generate events.
+--
+-- 6. On Linux metadata change events are reported only if
+-- 'setAttrsModified' is 'True', on macOS they are always reported. macOS
+-- has separate flags for different kinds of metadata change.
+--
+-- 7. On Linux a hard link generates 'isCreated', on macOS it does not.
 
 #include "config.h"
 
@@ -251,8 +261,18 @@ setFlag mask status cfg@Config{..} =
 -- and added again with the new path. A symbolic link to a directory in the
 -- tree is not followed.
 --
--- The kernel watch always generates the create and move events in recursive
--- mode, they are reported only if enabled in the 'Config'.
+-- A new directory is added when its create or move event is read from the
+-- stream, not when it is created. The events in the directory before it is
+-- added are not reported, its subdirectories are found by scanning it. If
+-- the path has been reused by then, the directory found at the path is
+-- watched. If an already watched directory is moved to that path, its events
+-- may be reported under both the old and the new path until the move event
+-- is read.
+--
+-- In recursive mode the kernel watch always requests the create, moved-from
+-- and moved-to events, because they are needed to add and remove the
+-- watches of subdirectories. These events are reported only if they are
+-- enabled with 'setCreated', 'setMovedFrom' and 'setMovedTo'.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
@@ -275,10 +295,10 @@ foreign import capi
     "sys/inotify.h value IN_EXCL_UNLINK" iN_EXCL_UNLINK :: Word32
 
 -- | Do not report the events of a file after it is unlinked from the watched
--- directory. A process can keep a file open after the file is deleted, its
--- reads and writes generate events, the events have the deleted path.
---
--- macOS does not report the events of an unlinked file.
+-- directory. A process can keep a file open after the file is deleted and
+-- continue to read and write it. When this setting is 'False', those reads
+-- and writes are reported as events with the deleted path. When it is
+-- 'True', they are not reported.
 --
 -- /default: True/
 setExcludeUnlinked :: Bool -> Config -> Config
@@ -375,8 +395,8 @@ foreign import capi
 -- | Report when the metadata e.g. owner, permission modes, modifications times
 -- of an object changes.
 --
--- macOS reports the metadata changes. On Linux, @touch@ on an existing file
--- generates 'isAttrsModified' but not 'isModified'.
+-- When this setting is 'True', @touch@ on an existing file generates
+-- 'isAttrsModified' but not 'isModified'.
 --
 -- /default: True/
 setAttrsModified :: Bool -> Config -> Config
@@ -620,9 +640,16 @@ isInSubtree _ _ = False
 -- Open an event stream
 -------------------------------------------------------------------------------
 
--- | A path added to the watch. The same inode can be added via more than one
--- root, for example, a recursive root and a root inside it. All the paths
--- added for an inode share the same watch descriptor.
+-- | A path added to the watch. The kernel identifies a watch by inode, all
+-- the paths added for an inode share the same watch descriptor. An inode can
+-- be added via more than one path, for example:
+--
+-- * a recursive root and a root inside it
+-- * two overlapping recursive roots
+-- * a symlink followed to a watched directory
+-- * a bind mount of a watched directory
+-- * two hard links to the same file, added as roots
+-- * a root added again before its removal is complete
 data WatchPath = WatchPath
     { wpRep :: PathRep
     -- | 'removeFromWatch' was called for the root, the path reports the
@@ -630,13 +657,16 @@ data WatchPath = WatchPath
     , wpRemoved :: Bool
     }
 
+-- | The map entry of a watch descriptor. A user watch descriptor and a
+-- marker watch descriptor are different watch descriptors, see
+-- 'addRemovalMarker' for markers.
 data WdEntry =
-    -- | The paths watched via the watch descriptor, in the order added.
+    -- | Entry for a user watch descriptor: the paths watched via it, in the
+    -- order added.
       WdPaths [WatchPath]
-    -- | A private watch used as a marker in the event queue. When its
-    -- IN_IGNORED event is read, the listed paths, which were removed from a
-    -- shared watch descriptor, report 'isRootUnwatched', and the listed
-    -- markers are removed from the map.
+    -- | Entry for a marker watch descriptor: the watch descriptors of older
+    -- markers, and the removed paths, as (user watch descriptor, path), to
+    -- be reported 'isRootUnwatched' when its IN_IGNORED event is read.
     | WdMarker [Int] [(Int, PathRep)]
 
 -- | The state of the fd of a watch.
@@ -928,14 +958,28 @@ unmarkRemoved paths m0 = foldl step m0 paths
                          in Map.insert wd (WdPaths (xs ++ wp1 : ys)) m
                 _ -> m
 
--- | Queue a marker IN_IGNORED event after the events already queued, by
--- adding and removing a watch on a private pipe. The pipe is watched via
--- @\/proc\/self\/fd@, the user cannot add the pipe to the watch, therefore,
--- the watch descriptor is not shared with any user path.
+-- | When multiple paths are being watched through the same wd and we remove
+-- only one path we cannot remove the wd but we still need to identify the
+-- point in the event queue up to which we need to report the events for the
+-- path being removed.
+--
+-- To do that we force queue an IN_IGNORED event by creating and immediately
+-- deleting a watch. All the watch descriptors of an inotify fd share one event
+-- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
+-- we know that's the end point we were looking for.
+--
 addRemovalMarker ::
     CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
 addRemovalMarker fd wdMapRef markers paths =
     allocaArray 2 $ \fds -> do
+        -- For the marker event we need an inode that no user path can use,
+        -- otherwise it may share the watch descriptor of a user watch. A temp
+        -- file could be watched by the user. We use a pipe for this purpose,
+        -- no path in a mounted file system reaches a pipe, and each pipe is a
+        -- new inode, so each marker gets its own watch descriptor. Closing the
+        -- pipe frees the inode, there is no file to clean up.
+        -- inotify_add_watch takes a path, we use the pipe path at
+        -- @\/proc\/self\/fd@ to add to the watch.
         throwErrnoIfMinus1_ err $ c_pipe2 fds o_CLOEXEC
         rfd <- peekElemOff fds 0
         wfd <- peekElemOff fds 1
@@ -971,9 +1015,12 @@ addRemovalMarker fd wdMapRef markers paths =
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
 unwatchPaths (Watch fd lock wdMapRef) desc p =
     withMVar lock $ \st -> when (not (fsClosed st)) $ do
+        -- A watch descriptor can be shared by more than one path, see
+        -- 'WatchPath' for the cases.
+        --
         -- Only when all the paths of a watch descriptor are removed we remove
         -- the kernel watch. Otherwise, the kernel watch is still needed for
-        -- the other paths, we queue a marker event instead.
+        -- the other paths.
         --
         (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
 
@@ -983,10 +1030,16 @@ unwatchPaths (Watch fd lock wdMapRef) desc p =
         -- removed path, including IN_IGNORED, reports the path.
         mapM_ rmWatch wds
 
-        -- If the kernel watch is still needed for the other paths, we queue a
-        -- marker event instead. If the marker is not queued the paths would
-        -- never be removed from the map, they would keep reporting the events,
-        -- and a retry would find them already removed.
+        -- If the kernel watch is still needed for the other paths, we do not
+        -- remove the watch, therefore, no IN_IGNORED event will arrive for it.
+        -- But we still need to read and report all the events queued on this
+        -- wd till this moment, for our current that is being removed. To do so
+        -- we add another watch to our inotify instance and immediately delete
+        -- that watch, this will force an IN_IGNORED event for that watch which
+        -- will arrive after all the events queued till now. By identifying the
+        -- wd of that marker watch we can issue an end-of-watch event for our
+        -- path being remove from the shared wd.
+        --
         when (not (null shared))
             $ addRemovalMarker fd wdMapRef [] shared
                 `onException` atomicModifyIORef' wdMapRef
@@ -1452,6 +1505,11 @@ watchToStream cfg wt =
 -- /Non-existing Paths:/ the API fails if a watch is started on a non-exsting
 -- path.
 --
+-- /Overlapping Paths:/ a path listed more than once is watched once, its
+-- events are reported once. If two different paths reach the same file or
+-- directory, for example, a recursive root and a root inside it, its events
+-- are reported once for each path.
+--
 -- /Performance:/ Note that recursive watch on a large directory tree could be
 -- expensive. When starting a watch, the whole tree must be read and watches
 -- are started on each directory in the tree. The initial time to start the
@@ -1629,8 +1687,6 @@ isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 -- Metadata change Events
 -------------------------------------------------------------------------------
 
--- macOS has multiple APIs for metadata change for different metadata.
---
 -- | Determine whether the event indicates inode metadata change for an object
 -- contained within the monitored path.
 --
@@ -1678,8 +1734,6 @@ isNonWriteClosed = getFlag iN_CLOSE_NOWRITE
 -- CRUD Events
 -------------------------------------------------------------------------------
 
--- On macOS this is not generated on hard linking but on Linux it is.
---
 -- | File/directory created in watched directory (e.g., open(2) O_CREAT,
 -- mkdir(2), link(2), symlink(2), bind(2) on a UNIX domain socket).
 --
