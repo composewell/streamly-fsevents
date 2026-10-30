@@ -203,7 +203,7 @@ import System.IO.Error
     )
 import System.Posix.Types (CSsize(..), Fd(..))
 
-import Streamly.Internal.Data.Array (byteLength, unsafeFreezeWithShrink)
+import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
 
 import qualified Control.Exception as Exception (mask, uninterruptibleMask_)
@@ -216,14 +216,14 @@ import qualified Streamly.Data.Unfold as UF
 import qualified Streamly.Internal.FileSystem.Path as Path
 
 import qualified Streamly.Internal.Data.Array as A
-    ( asCStringUnsafe, unsafePinnedAsPtr
+    ( asCStringUnsafe, breakEndBy_, unsafePinnedAsPtr
     )
 import qualified Streamly.Internal.Data.MutArray as MArray
     (byteLength, unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.DirIO as Dir
     (ignoreMissing, readDirs)
 import qualified Streamly.Internal.Data.Parser as PR
-    (takeEQ, fromEffect, fromFold)
+    (takeEQ, fromEffect)
 
 -------------------------------------------------------------------------------
 -- Subscription to events
@@ -1302,15 +1302,9 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     mpth <-
         if pathLen /= 0
         then do
-            -- XXX takeEndBy_ drops the separator so assumes a null
-            -- terminated path, we should use a takeWhile nested inside a
-            -- takeP
-            pth <-
-                PR.fromFold
-                    $ FL.takeEndBy_ (== 0)
-                    $ FL.take pathLen (A.createOf pathLen)
-            let remaining = pathLen - byteLength pth - 1
-            when (remaining /= 0) $ PR.takeEQ remaining FL.drain
+            arr1 <- PR.takeEQ pathLen (A.createOf pathLen)
+            -- The name is null terminated and null padded to pathLen bytes.
+            let pth = fst (A.breakEndBy_ (== 0) arr1)
             return $ Just (Path.unsafeFromArray pth)
         else return Nothing
     wdm <- PR.fromEffect $ readIORef wdMapRef
