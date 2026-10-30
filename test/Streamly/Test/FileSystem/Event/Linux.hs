@@ -10,7 +10,7 @@ module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Concurrent
     ( forkIO, killThread, newEmptyMVar, putMVar, rtsSupportsBoundThreads
-    , takeMVar, threadDelay
+    , takeMVar, threadDelay, tryTakeMVar
     )
 import Control.Exception
     (IOException, SomeException, bracket, finally, throwIO, try)
@@ -625,12 +625,11 @@ removeWhileReading =
             unwatched evs `shouldBe` [(root, root)]
 
 -- The reader thread is blocked reading the watch fd. The stream ends when
--- the watch is closed. With the non-threaded RTS, the reader wakes up on the
--- next event after the close.
+-- the watch is closed, without any file system event.
 closeWhileReading :: Spec
 closeWhileReading =
     it "closeWatch does not block while another thread reads the events"
-        $ withRoot watchCfg $ \root w -> do
+        $ withRoot watchCfg $ \_ w -> do
             mv <- newEmptyMVar
             let reader = Stream.drain (Event.watchToStream watchCfg w)
             bracket
@@ -640,8 +639,6 @@ closeWhileReading =
                     threadDelay 200000
                     timeout 2000000 (Event.closeWatch w)
                         `shouldReturn` Just ()
-                    when (not rtsSupportsBoundThreads)
-                        $ createFile (root </> "file")
                     -- The stream ends without an exception
                     r <- timeout 2000000 (takeMVar mv)
                     fmap (either (\(_ :: SomeException) -> False) ok) r
@@ -701,6 +698,42 @@ removeFailRetry =
                     Event.removeFromWatch w p
                     evs <- readUntil recCfg Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
+
+-- The reader thread is blocked reading the watch fd. With the non-threaded
+-- RTS, closeWatch needs a pipe to wake up the reader, the pipe fails with
+-- EMFILE, and the reader wakes up on the next event.
+closeFailFallback :: Spec
+closeFailFallback =
+    it "closeWatch ends the stream without a free fd"
+        $ withRoot watchCfg $ \root w -> do
+            mv <- newEmptyMVar
+            let reader = Stream.drain (Event.watchToStream watchCfg w)
+            bracket
+                (forkIO (try reader >>= putMVar mv))
+                killThread
+                $ \_ -> do
+                    threadDelay 200000
+                    r <- withFdsExhausted
+                            (timeout 2000000 (Event.closeWatch w))
+                    case r of
+                        Nothing ->
+                            pendingWith "the open file limit is too high"
+                        Just c -> do
+                            c `shouldBe` Just ()
+                            when (not rtsSupportsBoundThreads) $ do
+                                threadDelay 200000
+                                done <- tryTakeMVar mv
+                                fmap (const ()) done `shouldBe` Nothing
+                            createFile (root </> "file")
+                            -- The stream ends without an exception
+                            res <- timeout 2000000 (takeMVar mv)
+                            fmap (either (\(_ :: SomeException) -> False) ok)
+                                res
+                                `shouldBe` Just True
+
+    where
+
+    ok () = True
 
 -------------------------------------------------------------------------------
 -- Recursive mode robustness tests
@@ -983,7 +1016,9 @@ watchTests =
                 addWhileReading
                 removeWhileReading
                 closeWhileReading
-            describe "failures" removeFailRetry
+            describe "failures" $ do
+                removeFailRetry
+                closeFailFallback
             describe "queue overflow" $ do
                 overflowRemove
                 overflowRemoveShared

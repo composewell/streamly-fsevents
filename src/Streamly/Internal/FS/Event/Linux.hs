@@ -669,6 +669,29 @@ data WdEntry =
     -- be reported 'isRootUnwatched' when its IN_IGNORED event is read.
     | WdMarker [Int] [(Int, PathRep)]
 
+-- NOTE: Waiting for events and closing the watch:
+--
+-- * User level: GHC Handle takes a lock during handle operations e.g. reads or
+--   a read and a close in different threads. The lock protects the shared
+--   Handle state changed by these operations e.g. read buffer. If a read is
+--   blocked indefinitely other handle operations will block as well until a
+--   read occurs. Specifically for inotify fd, a read can block indefinitely,
+--   so other operations like add/remove/close watch cannot proceed from other
+--   threads. Solution: We do not use a Handle. We hold the lock of the watch
+--   only during non-blocking system calls, never while waiting.
+-- * Kernel level: close(2) system call does not wake up a thread blocked in
+--   read(2) on the fd. An inotify fd has no other way to wake up the reader,
+--   unlike shutdown(2) on a socket or closing the write end of a pipe.
+--   Solution: we keep the fd non-blocking, and 'readEvents' waits for it to
+--   become readable via the RTS.
+-- * Threaded RTS: 'closeFdWith' closes the fd and wakes up the threads
+--   waiting for it in the IO manager.
+-- * Non-threaded RTS: the threads wait in select, select fails with EBADF
+--   if a waited fd is closed, and the RTS terminates the program.
+--   Solution: 'closeWatch' does not close the fd while a thread waits, it
+--   forces an IN_IGNORED event to wake up the waiting threads, the last one
+--   closes the fd.
+
 -- | The state of the fd of a watch.
 data FdState = FdState
     { fsClosed :: !Bool -- ^ 'closeWatch' was called
@@ -680,23 +703,15 @@ data FdState = FdState
 
 -- | A handle for a watch.
 --
--- The fd is not wrapped in a 'System.IO.Handle'. A thread blocked reading a
--- 'System.IO.Handle' holds the lock of the handle until the read returns,
--- the other operations on the handle, including 'System.IO.hClose', wait for
--- the lock.
 data Watch =
     Watch
-        CInt                    -- The inotify fd
-        -- The lock is held during a system call on the fd, 'closeWatch'
-        -- cannot close the fd, and the fd number cannot be reused, while the
-        -- system call is in progress. The system calls made with the lock
-        -- held must not block.
+        CInt -- The inotify fd
+        -- Lock: held during a system call on the fd, 'closeWatch' cannot close
+        -- the fd, and the fd number cannot be reused, while the system call is
+        -- in progress. The system calls made with the lock held must not
+        -- block.
         (MVar FdState)
-        (IORef
-            (IntMap             -- Key is the watch descriptor
-                WdEntry
-            )
-        )
+        (IORef (IntMap WdEntry)) -- Map key is the watch descriptor
 
 -- Instead of using the watch descriptor we can provide APIs that use the path
 -- itself to identify the watch. That will require us to maintain a map from wd
@@ -977,19 +992,15 @@ unmarkRemoved paths m0 = foldl step m0 paths
                          in Map.insert wd (WdPaths (xs ++ wp1 : ys)) m
                 _ -> m
 
--- | When multiple paths are being watched through the same wd and we remove
--- only one path we cannot remove the wd but we still need to identify the
--- point in the event queue up to which we need to report the events for the
--- path being removed.
+-- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
+-- removing it. The action is run with the watch descriptor after adding the
+-- watch and before removing it. The string is used in the exception
+-- messages.
 --
--- To do that we force queue an IN_IGNORED event by creating and immediately
--- deleting a watch. All the watch descriptors of an inotify fd share one event
--- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
--- we know that's the end point we were looking for.
---
-addRemovalMarker ::
-    CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
-addRemovalMarker fd wdMapRef markers paths =
+-- Requires @\/proc@ to be mounted and a free fd for a pipe, throw an
+-- exception if not.
+queueIgnored :: String -> CInt -> (CInt -> IO ()) -> IO ()
+queueIgnored err fd action =
     allocaArray 2 $ \fds -> do
         -- For the marker event we need an inode that no user path can use,
         -- otherwise it may share the watch descriptor of a user watch. A temp
@@ -1007,12 +1018,28 @@ addRemovalMarker fd wdMapRef markers paths =
             wd <- withCString path $ \pathPtr ->
                 throwErrnoIfMinus1 err
                     $ c_inotify_add_watch fd pathPtr (CUInt iN_ACCESS)
-            -- The marker must be in the map before its IN_IGNORED is read.
-            atomicModifyIORef' wdMapRef
-                $ \m ->
-                    let e = WdMarker markers paths
-                     in (Map.insert (fromIntegral wd) e m, ())
+            action wd
             throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
+
+-- | When multiple paths are being watched through the same wd and we remove
+-- only one path we cannot remove the wd but we still need to identify the
+-- point in the event queue up to which we need to report the events for the
+-- path being removed.
+--
+-- To do that we force queue an IN_IGNORED event by creating and immediately
+-- deleting a watch. All the watch descriptors of an inotify fd share one event
+-- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
+-- we know that's the end point we were looking for.
+--
+addRemovalMarker ::
+    CInt -> IORef (IntMap WdEntry) -> [Int] -> [(Int, PathRep)] -> IO ()
+addRemovalMarker fd wdMapRef markers paths =
+    queueIgnored err fd $ \wd ->
+        -- The marker must be in the map before its IN_IGNORED is read.
+        atomicModifyIORef' wdMapRef
+            $ \m ->
+                let e = WdMarker markers paths
+                 in (Map.insert (fromIntegral wd) e m, ())
 
     where
 
@@ -1112,9 +1139,11 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- events of the watch using 'watchToStream'. The call does not wait for an
 -- event.
 --
--- With the non-threaded RTS, a thread waiting for events wakes up when the
--- next event arrives, its stream ends then. The fd is closed when no thread
--- is waiting for events.
+-- With the non-threaded RTS, the fd is closed when no thread is waiting for
+-- events. To wake up the waiting threads, 'closeWatch' queues an event, which
+-- requires @\/proc@ to be mounted and a free fd for a pipe. If the event
+-- cannot be queued, the waiting threads wake up when the next event arrives,
+-- their streams end then.
 --
 -- /Pre-release/
 --
@@ -1130,7 +1159,12 @@ closeWatch (Watch fd lock _) =
         then do
             closeInotifyFd fd
             return st {fsClosed = True, fsFdOpen = False}
-        else return st {fsClosed = True}
+        else do
+            -- The waiting threads find the watch closed and do not read the
+            -- event.
+            queueIgnored "closeWatch" fd (\_ -> return ())
+                `catchIOError` \_ -> return ()
+            return st {fsClosed = True}
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
