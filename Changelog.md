@@ -12,32 +12,26 @@
   Linux and Windows.
 - Windows: `getRelPath` returns `Maybe Path`, consistent with Linux.
 - Linux: rename `setUnwatchMoved` to `setExcludeUnlinked` and enable it by
-  default. The old name is a deprecated alias in the internal module. The
-  setting stops the events of a file after it is unlinked; contrary to the
-  earlier documentation, it has no effect on objects moved out of a watched
-  directory.
-- Linux: enable `setAttrsModified` by default, consistent with macOS. A
-  `touch` or `chmod` on an existing file reports `isAttrsModified`.
+  default. The documentation of the earlier function was incorrect.
+- Linux: enable `setAttrsModified` by default, consistent with macOS.
 - Linux: in recursive mode, `isRootDeleted` and `isRootMoved` are reported
-  for the watch roots only, not for subdirectories. The parent of a
-  subdirectory reports `isDeleted` or `isMovedFrom` for it.
+  for the watch roots only, not for subdirectories.
 
 ### Bug Fixes
 
-- Linux: in recursive mode, a directory moved out of the tree is no longer
-  watched, a directory moved into the tree is watched, and a directory
-  renamed within the tree reports events with its new path.
-- Linux: in recursive mode, fix an exception when a subdirectory is deleted
-  or moved before its create event is read.
-- Linux: fix an exception raised by the event stream or by `getRoot` for
-  events arriving after `removeFromWatch`.
-- Linux: report the queue overflow event (`isEventsLost`) once per watch
-  root; `getRoot` and `getAbsPath` raised an exception on it earlier.
-- Linux: fix `setWhenExists FailIfExists`, adding a watch failed with it.
-- macOS: fix a link failure of `setFullHistory`. `setFullHistory`,
-  `isCloned`, `isHardLink` and `isLastHardLink` are always exported; when
-  the SDK lacks the flag, the setter is a no-op and the predicates return
-  `False`.
+- Linux: in recursive mode, fix the watching of subdirectories that are
+  created, deleted, moved or renamed while the tree is watched. A directory
+  moved into the tree is now watched, one moved out is no longer watched,
+  and one renamed within the tree reports its new path. A subdirectory
+  changing quickly after its creation no longer raises an exception or
+  causes the wrong object, or no object, to be watched.
+- Linux: fix the handling of an event queue overflow. The overflow event,
+  `isEventsLost`, is reported once per watch root, and `getRoot` and
+  `getAbsPath` no longer raise an exception on it. In recursive mode, the
+  tree is scanned again, so that a directory created during the overflow is
+  watched.
+- Linux: close fd promptly on failure, make the fd close-on-exec.
+- macOS: fix a link failure of `setFullHistory`.
 
 ### Enhancements
 
@@ -46,10 +40,13 @@
   `Streamly.FileSystem.Event.Windows`.
 - Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
   and `getRelPath` to `Streamly.FileSystem.Event`.
+- Linux: `addToWatch`, `removeFromWatch` and `closeWatch` in
+  `Streamly.Internal.FS.Event.Linux` no longer wait for the next event.
+  Earlier they could block indefinitely on a watched tree with no activity.
+  They can be called from any thread while another thread reads the events;
+  `closeWatch` ends that thread's event stream.
 - macOS: support non-recursive `watch`, it raised an exception earlier.
 - macOS: add `setRecursiveMode`, `getRoot` and `getRelPath`.
-- Linux: `FailIfExists` is always available.
-- Linux: export the `Cookie` type.
 
 ## 0.1.1
 
