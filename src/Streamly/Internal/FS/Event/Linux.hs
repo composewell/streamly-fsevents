@@ -170,7 +170,7 @@ import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (finally, onException)
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
@@ -196,7 +196,6 @@ import GHC.IO.Exception (IOException(ioe_errno))
 import Streamly.Data.Array (Array)
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Parser (Parser)
-import System.Directory (doesDirectoryExist)
 import System.IO.Error
     ( catchIOError, illegalOperationErrorType, isDoesNotExistError
     , mkIOError
@@ -897,21 +896,20 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
 addSubdirs :: Config -> Watch -> PathRep -> IO ()
 addSubdirs cfg wt prep = do
     let absPath = combinePathRep prep
-    -- XXX Are the following comments obselete?
-    -- XXX readDirs currently uses paths as String, we need to convert it
-    -- to "/" separated by byte arrays.
-    -- XXX Need a FileSystem.Stat module to remove this
+    -- The errors ignored:
     --
-    -- On a file system that does not report the entry type in readdir
-    -- (DT_UNKNOWN), readDirs calls lstat on each entry, an entry deleted
-    -- after readdir fails with ENOENT. 'ignoreMissing' skips the entry,
-    -- otherwise the exception would stop the scan of the remaining entries,
-    -- and 'addSubdirToWatch' would ignore it silently.
-    pathIsDir <- doesDirectoryExist (Path.toString absPath)
-    when pathIsDir $ do
-        let f = addSubdirToWatch cfg wt . addSub prep
-            in S.fold (FL.drainMapM f)
-                $ Dir.readDirs (Dir.ignoreMissing True) absPath
+    -- * ENOENT from lstat of a DT_UNKNOWN entry deleted after readdir
+    --   returns it, 'ignoreMissing' skips the entry.
+    -- * ENOENT from opendir of absPath, absPath was deleted. The watch on
+    --   absPath reports the deletion.
+    -- * ENOTDIR from opendir of absPath, absPath is not a directory. A root
+    --   added without 'setOnlyDir' may be a file, and a directory may be
+    --   replaced by a file after its watch is added.
+    let f = addSubdirToWatch cfg wt . addSub prep
+    S.fold (FL.drainMapM f) (Dir.readDirs (Dir.ignoreMissing True) absPath)
+        `catchIOError` \e ->
+            let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
+             in unless (isDoesNotExistError e || notDir) (ioError e)
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
