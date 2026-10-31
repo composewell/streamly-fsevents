@@ -88,12 +88,8 @@ dirMoveEvents src dst =
     ]
 
 #ifdef DEVBUILD
--- In recursive mode the watch of a subdirectory reports the touch events
--- of the subdirectory scan, and isRootUnwatched when the subdirectory is
--- deleted.
-recDirMoveEvents :: [Char] -> [Char] -> [([Char], Event -> Bool)]
-recDirMoveEvents src dst = dirMoveEvents src dst ++ dirTouchEvents src
-
+-- In recursive mode the watch of a subdirectory reports isRootUnwatched when
+-- the subdirectory is deleted.
 recDirDelEvents :: String -> [([Char], Event -> Bool)]
 recDirDelEvents dir = (dir, Event.isRootUnwatched) : dirDelEvents dir
 #endif
@@ -1007,6 +1003,43 @@ overflowRemoveShared =
                     evs1 <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs1 `shouldBe` [root]
 
+-- The scan at the start of a watch lists root and sub.
+recStartScanSilent :: Spec
+recStartScanSilent =
+    it "the start of a recursive watch reports no events of its scan"
+        $ withSystemTempDirectory "fsevent_dir" $ \dir -> do
+            let root = dir </> "root"
+                sentinel = root </> "sentinel"
+            createDirectory root
+            createDirectory (root </> "sub")
+            p <- Path.fromString root
+            bracket
+                (Event.openWatch recCfg (p NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    createFile sentinel
+                    evs <- readUntil recCfg (isCreatedAt sentinel) w
+                    map getAbsPath evs `shouldBe` [sentinel]
+
+-- The events not requested during the scan are requested after it.
+recTouchAfterScan :: Spec
+recTouchAfterScan =
+    it "a directory in the tree reports open events after the watch starts"
+        $ withSystemTempDirectory "fsevent_dir" $ \dir -> do
+            let root = dir </> "root"
+                sub = root </> "sub"
+            createDirectory root
+            createDirectory sub
+            p <- Path.fromString root
+            bracket
+                (Event.openWatch recCfg (p NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    _ <- listDirectory sub
+                    evs <- readUntil recCfg (\ev ->
+                        getAbsPath ev == sub && Event.isNonWriteClosed ev) w
+                    pathsOf Event.isOpened evs `shouldContain` [sub]
+
 -- The kernel drops the create event of the directory when the queue is full.
 overflowRecCreate :: Spec
 overflowRecCreate =
@@ -1127,6 +1160,9 @@ watchTests =
                 recScanDisabled
                 recScanCreatedDisabled
                 recScanNotOnMove
+            describe "recursive mode scan of a tree" $ do
+                recStartScanSilent
+                recTouchAfterScan
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
@@ -1212,8 +1248,8 @@ main = do
             -- : fileCreateWithParent "subdir/file" fileTouchEvents
               fileCreate "subdir/file" fileTouchEvents
             : fileMove "subdir/file1" "subdir/file2" fileMoveEvents
-            : dirMove "dir1" "dir2" recDirMoveEvents
-            : dirMove "subdir/dir1" "subdir/dir2" recDirMoveEvents
+            : dirMove "dir1" "dir2" dirMoveEvents
+            : dirMove "subdir/dir1" "subdir/dir2" dirMoveEvents
             : dirDelete "dir" recDirDelEvents
             : dirDelete "subdir/dir" recDirDelEvents
             -- XXX Nested dir create misses the create event due to a race

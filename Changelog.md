@@ -30,6 +30,9 @@
   `getAbsPath` no longer raise an exception on it. In recursive mode, the
   tree is scanned again, so that a directory created during the overflow is
   watched.
+- Linux: in recursive mode, adding a tree no longer reports the open, access
+  and close events of its own scan. These events overflowed the event queue
+  at the start of a watch on a large tree.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
 - macOS: fix a link failure of `setFullHistory`.
 
