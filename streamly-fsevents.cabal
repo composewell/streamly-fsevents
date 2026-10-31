@@ -274,6 +274,14 @@ test-suite FileSystem.Event
   if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
     buildable: False
 
+test-suite FileSystem.Event.Behavior
+  import: test-options
+  type: exitcode-stdio-1.0
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.Behavior
+  main-is: Streamly/Test/FileSystem/Event/Behavior.hs
+  if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
+    buildable: False
+
 test-suite FileSystem.Event.Darwin
   import: test-options
   type: exitcode-stdio-1.0
