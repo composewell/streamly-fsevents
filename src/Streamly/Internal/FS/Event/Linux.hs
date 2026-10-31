@@ -693,11 +693,11 @@ data WdEntry =
 
 -- | The state of the fd of a watch.
 data FdState = FdState
-    { fsClosed :: !Bool -- ^ 'closeWatch' was called
+    { fsWatchClosed :: !Bool -- ^ 'closeWatch' was called
     , fsFdOpen :: !Bool -- ^ The fd is not closed yet
     -- | The threads waiting for the fd to become readable, counted in the
     -- non-threaded RTS only.
-    , fsWaiters :: !Int
+    , fsFdWaiters :: !Int
     }
 
 -- | A handle for a watch.
@@ -745,7 +745,7 @@ createWatch = do
             $ c_inotify_init1 (iN_CLOEXEC .|. iN_NONBLOCK)
     lock <-
         newMVar
-            FdState {fsClosed = False, fsFdOpen = True, fsWaiters = 0}
+            FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef Map.empty
     return $ Watch fd lock emptyMapRef
 
@@ -755,7 +755,7 @@ createWatch = do
 withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
 withWatchFd op (Watch fd lock _) action =
     withMVar lock $ \st ->
-        if fsClosed st
+        if fsWatchClosed st
         then ioError
                 $ mkIOError
                     illegalOperationErrorType
@@ -764,8 +764,14 @@ withWatchFd op (Watch fd lock _) action =
                     Nothing
         else action fd
 
+-- | Run an action holding the lock of the watch, do nothing if the watch is
+-- closed. The action must not block. See 'withWatchFd'.
+whenWatchOpen :: Watch -> IO () -> IO ()
+whenWatchOpen (Watch _ lock _) action =
+    withMVar lock $ \st -> unless (fsWatchClosed st) action
+
 isWatchClosed :: Watch -> IO Bool
-isWatchClosed (Watch _ lock _) = fsClosed <$> readMVar lock
+isWatchClosed (Watch _ lock _) = fsWatchClosed <$> readMVar lock
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -1057,8 +1063,8 @@ addRemovalMarker fd wdMapRef markers paths =
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths (Watch fd lock wdMapRef) desc p =
-    withMVar lock $ \st -> when (not (fsClosed st)) $ do
+unwatchPaths wt@(Watch fd _ wdMapRef) desc p =
+    whenWatchOpen wt $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
         --
@@ -1148,21 +1154,21 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 closeWatch :: Watch -> IO ()
 closeWatch (Watch fd lock _) =
     modifyMVar_ lock $ \st ->
-        if fsClosed st
+        if fsWatchClosed st
         then return st
         -- The non-threaded RTS waits for the fds in select, select fails
         -- with EBADF if a waited fd is closed, and the RTS terminates the
         -- program. The last waiting thread closes the fd.
-        else if rtsSupportsBoundThreads || fsWaiters st == 0
+        else if rtsSupportsBoundThreads || fsFdWaiters st == 0
         then do
             closeInotifyFd fd
-            return st {fsClosed = True, fsFdOpen = False}
+            return st {fsWatchClosed = True, fsFdOpen = False}
         else do
             -- The waiting threads find the watch closed and do not read the
             -- event.
             queueIgnored "closeWatch" fd (\_ -> return ())
                 `catchIOError` \_ -> return ()
-            return st {fsClosed = True}
+            return st {fsWatchClosed = True}
 
 -- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
@@ -1284,8 +1290,8 @@ pendingRemovals m =
 -- Failing to queue the marker, for example, when the process is out of fds,
 -- is ignored, the next IN_Q_OVERFLOW event tries again.
 syncRemovals :: Watch -> IO ()
-syncRemovals (Watch fd lock wdMapRef) =
-    withMVar lock $ \st -> when (not (fsClosed st)) $ do
+syncRemovals wt@(Watch fd _ wdMapRef) =
+    whenWatchOpen wt $ do
         (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
         when (not (null markers && null paths))
             $ addRemovalMarker fd wdMapRef markers paths
@@ -1489,11 +1495,14 @@ readEvents (Watch fd lock _) = loop
                     restore (threadWaitRead (Fd fd))
                         `finally` Exception.uninterruptibleMask_
                             (modifyMVar_ lock unregisterNonTh)
-            return (st {fsWaiters = fsWaiters st + 1}, Just (Left waitNonTh))
+            return
+                ( st {fsFdWaiters = fsFdWaiters st + 1}
+                , Just (Left waitNonTh)
+                )
 
     unregisterNonTh st = do
-        let st1 = st {fsWaiters = fsWaiters st - 1}
-        if fsClosed st1 && fsFdOpen st1 && fsWaiters st1 == 0
+        let st1 = st {fsFdWaiters = fsFdWaiters st - 1}
+        if fsWatchClosed st1 && fsFdOpen st1 && fsFdWaiters st1 == 0
         then do
             closeInotifyFd fd
             return st1 {fsFdOpen = False}
@@ -1504,7 +1513,7 @@ readEvents (Watch fd lock _) = loop
     loop = do
         r <- Exception.mask $ \restore -> do
             r <- modifyMVar lock $ \st ->
-                if fsClosed st
+                if fsWatchClosed st
                 then return (st, Nothing)
                 else do
                     arr <- MArray.unsafeCreateWithPtr' bufSize readFd
