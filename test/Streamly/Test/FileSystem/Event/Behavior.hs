@@ -19,11 +19,11 @@ import Control.Concurrent
     , tryPutMVar, tryReadMVar
     )
 import Control.Exception (IOException, SomeException, evaluate, try)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (isPrefixOf)
+import Data.List (group, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import System.Exit (exitFailure)
 import System.Directory
@@ -53,7 +53,7 @@ moduleName = "FS.Event.Behavior"
 data Outcome =
       Yes
     | No
-    | Refused -- ^ The OS refused the file system operation.
+    | Exception -- ^ The file system operation raised an exception.
     | Failed String -- ^ The test could not determine the outcome.
     deriving (Eq, Show)
 
@@ -73,6 +73,9 @@ data Behavior = Behavior
     , laterOps :: Paths -> IO ()
     , check :: Paths -> [Event] -> Bool
     , expected :: Outcome
+    -- | The outcome depends on a race, it is printed but does not fail the
+    -- test when it differs from 'expected'.
+    , racy :: Bool
     }
 
 -- | The arguments are the outcomes on Linux, macOS and Windows.
@@ -101,6 +104,17 @@ isNamed name ev = takeFileName (absPath ev) == name
 createdNamed :: String -> [Event] -> Bool
 createdNamed name = any (\ev -> isNamed name ev && Event.isCreated ev)
 
+-- | Whether a path whose name starts with "file" has two 'Event.isCreated'
+-- events.
+fileCreatedTwice :: [Event] -> Bool
+fileCreatedTwice =
+    any ((> 1) . length) . group . sort . map absPath . filter isFileCreate
+
+    where
+
+    isFileCreate ev =
+        Event.isCreated ev && "file" `isPrefixOf` takeFileName (absPath ev)
+
 behaviors :: [Behavior]
 behaviors =
     [ base
@@ -117,11 +131,21 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , base
+        { title = "file deleted after its create is read reports isCreated"
+        , ops = \p -> do
+            let file = watchRoot p </> "file"
+            createFile file
+            settle
+            removeFile file
+        , check = const fileCreatedTwice
+        , expected = onPlatform No Yes No
+        }
+    , base
         { title = "deleted root reports isDeleted for the root"
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
-        , expected = onPlatform No Yes Refused
+        , expected = onPlatform No Yes Exception
         }
     , base
         { title = "root deleted and created again is watched"
@@ -132,19 +156,19 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Refused
+        , expected = onPlatform No Yes Exception
         }
     , base
         { title = "renamed root is watched"
         , ops = renameRootAndCreate
         , check = const (createdNamed "file")
-        , expected = onPlatform Yes No Refused
+        , expected = onPlatform Yes No Exception
         }
     , base
         { title = "events of a renamed root use the old path"
         , ops = renameRootAndCreate
         , check = \p -> any ((== watchRoot p </> "file") . absPath)
-        , expected = onPlatform Yes No Refused
+        , expected = onPlatform Yes No Exception
         }
     , base
         { title = "dir created in a renamed recursive root is watched"
@@ -156,10 +180,36 @@ behaviors =
             settle
             createFile (renamedRoot p </> "dir" </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No No Refused
+        , expected = onPlatform No No Exception
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    -- The consumer reads the events while the files are created. On Linux,
+    -- some of the files are created after the watch of a directory is added
+    -- and before the scan of the directory reads them.
+    , base
+        { title = "file created in a new dir can report isCreated twice"
+        , config = Event.setRecursiveMode True
+        , ops = \p -> forM_ [1 .. 20 :: Int] $ \i -> do
+            let dir = watchRoot p </> ("dir" ++ show i)
+            createDirectory dir
+            forM_ [1 .. 200 :: Int] $ \j ->
+                createFile (dir </> ("file" ++ show j))
+        , check = const fileCreatedTwice
+        , expected = onPlatform Yes Yes No
+        , racy = True
+        }
+    , base
+        { title = "file created in a moved in dir before its read is reported"
+        , config = Event.setRecursiveMode True
+        , paused = True
+        , ops = \p -> do
+            createDirectory (renamedRoot p)
+            renameDirectory (renamedRoot p) (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir/file")
         , check = const (createdNamed "file")
         , expected = onPlatform No Yes Yes
         }
@@ -181,7 +231,8 @@ behaviors =
             , ops = const (return ())
             , laterOps = const (return ())
             , check = \_ _ -> False
-            , expected = Refused
+            , expected = Exception
+            , racy = False
             }
 
     newDir =
@@ -272,7 +323,7 @@ runBehavior Behavior{..} =
             Nothing -> error "the stream did not end"
             Just (Left e) -> error (show (e :: SomeException))
             Just (Right xs)
-                | isLeft r1 -> Refused
+                | isLeft r1 -> Exception
                 | check paths xs -> Yes
                 | otherwise -> No
 
@@ -296,7 +347,7 @@ main = do
     let spec b = it (title b) $ do
             outcome <- behaviorOutcome b
             modifyIORef' resultsRef ((b, outcome) :)
-            outcome `shouldBe` expected b
+            unless (racy b) $ outcome `shouldBe` expected b
     summary <- hspecResult $ describe moduleName $ mapM_ spec behaviors
 
     results <- reverse <$> readIORef resultsRef

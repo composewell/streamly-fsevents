@@ -805,6 +805,94 @@ recEventsBeforeAdd root w action = do
     createFile sync
     readUntil recCfg (isCreatedAt sync) w
 
+-- | The paths of the 'Event.isScanEvent' events that satisfy the predicate.
+scannedPaths :: (Event -> Bool) -> [Event] -> [FilePath]
+scannedPaths p =
+    pathsOf (\ev -> Event.isScanEvent ev && Event.isCreated ev && p ev)
+
+-- The events of a new directory before its watch is added are recovered by a
+-- scan, the watch is added first, so the later events are reported as usual.
+recScanNewDir :: Spec
+recScanNewDir =
+    it "reports the entries of a directory created before its watch is added"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                file = dir </> "file"
+                file1 = sub </> "file1"
+                link = dir </> "link"
+                later = sub </> "later"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createDirectory sub
+                createFile file
+                createFile file1
+                createDirectoryLink sub link
+            sort (scannedPaths (const True) evs)
+                `shouldBe` sort [sub, file, file1, link]
+            scannedPaths Event.isDir evs `shouldBe` [sub]
+            pathsOf
+                (\ev -> Event.isCreated ev && not (Event.isScanEvent ev))
+                evs
+                `shouldBe` [dir, root </> "sync"]
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+recScanDisabled :: Spec
+recScanDisabled =
+    it "does not report the entries of a new directory when disabled" $ do
+        let cfg = Event.setScanNewDirs False recCfg
+        withRoot cfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                later = sub </> "later"
+                sync = root </> "sync"
+            createDirectory dir
+            createDirectory sub
+            createFile (dir </> "file")
+            createFile sync
+            evs <- readUntil cfg (isCreatedAt sync) w
+            pathsOf Event.isCreated evs `shouldBe` [dir, sync]
+            evs1 <- recEventsOf cfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+-- The kernel watch generates IN_CREATE to add the new directory, the event
+-- is not reported.
+recScanCreatedDisabled :: Spec
+recScanCreatedDisabled =
+    it "does not report the scan when the create events are disabled" $ do
+        let cfg = Event.setCreated False recCfg
+        withRoot cfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                later = sub </> "later"
+            createDirectory dir
+            createDirectory sub
+            createFile (dir </> "file")
+            writeFile (root </> "sync") "x"
+            evs <- readUntil cfg Event.isModified w
+            pathsOf Event.isScanEvent evs `shouldBe` []
+            writeFile later "x"
+            evs1 <- readUntil cfg Event.isModified w
+            pathsOf Event.isModified evs1 `shouldBe` [later]
+
+-- A move reports one event, the contents of a moved directory are not new.
+recScanNotOnMove :: Spec
+recScanNotOnMove =
+    it "does not report the entries of a directory moved in or renamed"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+                dir1 = root </> "dir1"
+            createDirectory src
+            createFile (src </> "file")
+            evs <- recEventsBeforeAdd root w $ do
+                renameDirectory src dir
+                renameDirectory dir dir1
+            pathsOf Event.isScanEvent evs `shouldBe` []
+
 -- The first create event adds the second directory, the second create event
 -- finds it already watched.
 recDirRecreated :: Spec
@@ -818,7 +906,8 @@ recDirRecreated =
                 removeDirectory dir
                 createDirectory dir
                 createDirectory (dir </> "sub")
-            pathsOf (dirEvent Event.isCreated) evs `shouldBe` [dir, dir]
+            pathsOf (dirEvent Event.isCreated) evs
+                `shouldBe` [dir, dir </> "sub", dir]
             pathsOf (dirEvent Event.isDeleted) evs `shouldBe` [dir]
             evs1 <- recEventsOf recCfg root w (createFile file)
             pathsOf Event.isCreated evs1
@@ -1033,6 +1122,11 @@ watchTests =
                 recDirRecreated
                 recDirMovedAndRecreated
                 recDirReplacedByWatched
+            describe "recursive mode scan of new directories" $ do
+                recScanNewDir
+                recScanDisabled
+                recScanCreatedDisabled
+                recScanNotOnMove
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified

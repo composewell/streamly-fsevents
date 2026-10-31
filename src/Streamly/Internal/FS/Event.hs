@@ -85,18 +85,27 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- | Watch the whole directory tree under a watch root recursively instead of
 -- watching only the watch root directory.
 --
--- macOS and Windows watch a directory tree natively. Linux inotify watches
--- only one directory, a recursive watch adds a watch for each directory in
--- the tree, and adds a watch for a new directory when its create or move
--- event is read from the stream:
+-- macOS and Windows watch a directory tree natively.
+--
+-- Linux inotify watches only one directory. A recursive watch on Linux adds a
+-- watch for each directory in the tree, and adds a watch for a new directory
+-- when its create or move event is read from the stream. The following
+-- behavior applies only to Linux:
 --
 -- * Starting a watch on a large tree takes time and memory proportional to
--- the number of directories in the tree.
--- * The events in a new directory before its watch is added are not reported.
--- For example, @mkdir -p a\/b; touch a\/b\/f@ may report only the creation of
--- @a@. A slow consumer of the stream makes this more likely. To find
--- everything in a new directory, scan the directory when its create or move
--- event is received.
+-- the number of directories in the tree. Each directory uses one inotify
+-- watch. If the number of watches exceeds the limit in
+-- @\/proc\/sys\/fs\/inotify\/max_user_watches@, the watch API or the event
+-- stream raises an exception.
+-- * A directory created in the tree is scanned after its watch is added, and
+-- each entry found is reported as an 'isCreated' event. For example, @mkdir -p
+-- a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and @a\/b\/f@. An entry created
+-- during the scan may be reported twice. Other events before the watch is
+-- added are not reported, for example, a file created and deleted.
+-- * A directory moved into the tree or renamed within it is not reported that
+-- way. Events in it before its watch is added are not reported. To find
+-- everything in such a directory, scan the directory when its move event is
+-- received.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config

@@ -35,6 +35,9 @@
 
 ### Enhancements
 
+- Linux: in recursive mode, a newly created directory is scanned to report
+  the entries created before its watch was added, as `isCreated` events.
+  See `setScanNewDirs` and `isScanEvent`.
 - Add the public platform specific modules
   `Streamly.FileSystem.Event.Darwin`, `Streamly.FileSystem.Event.Linux` and
   `Streamly.FileSystem.Event.Windows`.

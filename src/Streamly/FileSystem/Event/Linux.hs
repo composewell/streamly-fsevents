@@ -41,6 +41,7 @@ module Streamly.FileSystem.Event.Linux
     -- ** Configuration
       Config
     , setRecursiveMode
+    , setScanNewDirs
     , setFollowSymLinks
     , setExcludeUnlinked
     , setOneShot
@@ -109,6 +110,7 @@ module Streamly.FileSystem.Event.Linux
 
     -- ** Item Path info
     , isDir
+    , isScanEvent
 
     -- ** Exception Conditions
     , isEventsLost

@@ -78,6 +78,7 @@ module Streamly.Internal.FS.Event.Linux
 
     -- ** Watch Behavior
     , setRecursiveMode
+    , setScanNewDirs
     , setFollowSymLinks
     , setExcludeUnlinked
     , setUnwatchMoved
@@ -157,6 +158,7 @@ module Streamly.Internal.FS.Event.Linux
 
     -- ** Item Path info
     , isDir
+    , isScanEvent
 
     -- ** Exception Conditions
     , isEventsLost
@@ -220,7 +222,7 @@ import qualified Streamly.Internal.Data.Array as A
 import qualified Streamly.Internal.Data.MutArray as MArray
     (byteLength, unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.DirIO as Dir
-    (ignoreMissing, readDirs)
+    (ignoreMissing, readDirs, readEither)
 import qualified Streamly.Internal.Data.Parser as PR
     (takeEQ, fromEffect)
 
@@ -232,6 +234,7 @@ import qualified Streamly.Internal.Data.Parser as PR
 -- behavior of the watch.
 data Config = Config
     { watchRec :: Bool
+    , scanNewDirs :: Bool
     , createFlags :: Word32
     }
 
@@ -261,12 +264,18 @@ setFlag mask status cfg@Config{..} =
 -- tree is not followed.
 --
 -- A new directory is added when its create or move event is read from the
--- stream, not when it is created. The events in the directory before it is
--- added are not reported. Its subdirectories are found by scanning it and are
--- added without generating events. If the path has been reused by then, the
+-- stream, not when it is created. If the path has been reused by then, the
 -- directory found at the path is watched. If an already watched directory is
 -- moved to that path, its events may be reported under both the old and the
 -- new path until the move event is read.
+--
+-- A directory created in the tree is scanned after its watch is added, see
+-- 'setScanNewDirs'. A directory moved into the tree or renamed within it is
+-- not reported that way, its subdirectories are added without generating
+-- events and the events in it before it is added are not reported. A rename
+-- within the tree is not a creation of its contents, and a directory moved
+-- in has one move event on all platforms. To find the entries in such a
+-- directory, scan it when its 'isMovedTo' event is received.
 --
 -- Each directory in the tree uses one inotify watch. If the number of watches
 -- exceeds the limit in @\/proc\/sys\/fs\/inotify\/max_user_watches@, the watch
@@ -280,6 +289,38 @@ setFlag mask status cfg@Config{..} =
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
+
+-- | In recursive mode, report the entries found in a directory created in the
+-- tree. Applies only if 'setCreated' is enabled.
+--
+-- A directory is not watched until after its create event is read. Without
+-- this setting the entries created in it by then are not reported. With this
+-- setting the directory is scanned after its watch is added, the scan goes
+-- into its subdirectories, and an event for which 'isCreated' and
+-- 'isScanEvent' are true is reported for each entry found. These events follow
+-- the create event of the directory. For example,
+-- @mkdir -p a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and @a\/b\/f@.
+--
+-- The scan reports the state of the directory, not its history. Every entry
+-- present when the scan reads it is reported. An entry created and deleted
+-- before the scan is not reported, a modification before the scan is not
+-- reported separately.
+--
+-- An entry created after the watch is added and before the scan reads it is
+-- reported twice, by the scan and by the kernel. See 'isScanEvent' for
+-- removing the duplicates.
+--
+-- The scan runs while the stream is being read, a scan of a large tree delays
+-- reading the kernel event queue. All the entries found are collected in
+-- memory before they are reported.
+--
+-- A directory added by the scan at the start of the watch or after an
+-- 'isEventsLost' event does not report its entries. 'isEventsLost' requires
+-- the application to scan the tree anyway.
+--
+-- /default: True/
+setScanNewDirs :: Bool -> Config -> Config
+setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 
 foreign import capi
     "sys/inotify.h value IN_DONT_FOLLOW" iN_DONT_FOLLOW :: Word32
@@ -524,6 +565,7 @@ setAllEvents s =
 --
 -- | The default configuration settings are:
 --
+-- * 'setScanNewDirs' 'True'
 -- * 'setFollowSymLinks' 'True'
 -- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
@@ -551,6 +593,7 @@ defaultConfig =
     $ setAttrsModified True
     $ Config
         { watchRec = False
+        , scanNewDirs = True
         , createFlags = 0
         }
 
@@ -795,6 +838,40 @@ insertPath wd prep m =
     new = WatchPath {wpRep = prep, wpRemoved = False}
     isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
 
+-- | Add the watch of a path, without scanning it. Returns 'False' if the path
+-- is already being watched.
+addPath :: Config -> Watch -> PathRep -> IO Bool
+addPath cfg watch0@(Watch _ _ wdMapRef) prep = do
+    let absPath = combinePathRep prep
+
+    -- The watch descriptor is inserted in the map with the lock held, so that
+    -- the watch cannot be closed in between.
+    withWatchFd "addToWatch" watch0 $ \fd -> do
+        wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
+            throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
+                c_inotify_add_watch fd pathPtr (CUInt (watchFlags cfg))
+
+        -- We add the parent first so that we start getting events for any
+        -- new creates and add the new subdirectories on creates while we are
+        -- adding the children.
+        --
+        -- A directory created while its parent is being scanned is added
+        -- twice, once by the scan and once on its create event. The second
+        -- add finds the path already watched and does not scan the directory
+        -- again.
+        --
+        -- The map update must be atomic because more than one thread
+        -- modifies the map. 'addToWatch' and 'removeFromWatch' can be called
+        -- from any thread while the thread reading the event stream adds
+        -- subdirectories on create events and removes watch descriptors on
+        -- IN_IGNORED events. A separate readIORef and writeIORef could lose
+        -- an update made by another thread in between. 'insertPath' also
+        -- checks whether the path is already watched and inserts it in the
+        -- same step, so when a scan and a create event in different threads
+        -- add the same directory, only one of them gets 'isNew' as 'True' and
+        -- scans the directory.
+        atomicModifyIORef' wdMapRef $ insertPath (fromIntegral wd) prep
+
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
 -- an absolute path and @subpath@ must be relative to @root@.
@@ -810,25 +887,7 @@ insertPath wd prep m =
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
-    -- XXX if the watch is added by the scan and not via an event we can
-    -- generate a create event assuming that the create may have been lost. We
-    -- can also mark in the map that this entry was added by the scan. So if an
-    -- actual create event later comes and tries to add this again then we can
-    -- ignore that and drop the create event to avoid duplicate create, because
-    -- we have already emitted it.
-    --
-    -- When a directory is added by the scan we should also emit create events
-    -- for files that may have got added to the dir. However, such create
-    -- events may get duplicated because of a race between the scan generated
-    -- versus real events.
-    --
-    -- Or we may distinguish between scan generated events and real events so
-    -- that the application can assume that other events may been lost and
-    -- handle it. For example, if it is a dir create the application can read
-    -- the dir to scan the files in it.
-    --
-    let absPath = combinePathRep prep
+addToWatch cfg@Config{..} watch0 prep = do
     --    showPathRep (root, Nothing) = "root = " ++ Path.toString root
     --    showPathRep (root, Just sub) =
     --        "root = " ++ Path.toString root ++ " sub = " ++ Path.toString sub
@@ -855,49 +914,19 @@ addToWatch cfg@Config{..} watch0@(Watch _ _ wdMapRef) prep = do
     --   marker queued by IN_MOVED_FROM of d, the events in f are reported
     --   twice, under f and under d.
     --
-    -- The events in a directory before its watch is added are not reported.
-    -- The scan adds its subdirectories but does not generate events for
-    -- them or for the files in it.
+    -- 'addNewDir' reports the entries of a created directory. This scan adds
+    -- the subdirectories only, it is used for the roots, for the directories
+    -- moved in and after an overflow.
     --
     -- XXX If the caller does not have permission to read the path,
     -- inotify_add_watch fails with EACCES and we throw an exception. We could
     -- add a config option to ignore such errors, like the options for
     -- ignoring errors when reading a directory.
     --
-    -- The watch descriptor is inserted in the map with the lock held, so that
-    -- the watch cannot be closed in between.
-    isNew <- withWatchFd "addToWatch" watch0 $ \fd -> do
-        wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
-            throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
-                c_inotify_add_watch fd pathPtr (CUInt (watchFlags cfg))
-
-        -- We add the parent first so that we start getting events for any
-        -- new creates and add the new subdirectories on creates while we are
-        -- adding the children.
-        --
-        -- A directory created while its parent is being scanned is added
-        -- twice, once by the scan and once on its create event. The second
-        -- add finds the path already watched and does not scan the directory
-        -- again.
-        --
-        -- The map update must be atomic because more than one thread
-        -- modifies the map. 'addToWatch' and 'removeFromWatch' can be called
-        -- from any thread while the thread reading the event stream adds
-        -- subdirectories on create events and removes watch descriptors on
-        -- IN_IGNORED events. A separate readIORef and writeIORef could lose
-        -- an update made by another thread in between. 'insertPath' also
-        -- checks whether the path is already watched and inserts it in the
-        -- same step, so when a scan and a create event in different threads
-        -- add the same directory, only one of them gets 'isNew' as 'True' and
-        -- scans the directory.
-        atomicModifyIORef' wdMapRef $ insertPath (fromIntegral wd) prep
+    isNew <- addPath cfg watch0 prep
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
-    --
-    -- XXX Ensure that we generate events that we may have missed while we were
-    -- adding the dirs. That may generate spurious events though.
-    --
     when (isNew && watchRec) $ addSubdirs cfg watch0 prep
 
 -- | Add the subdirectories of a path to the watch, if the path is a
@@ -933,16 +962,59 @@ addSubdirs cfg wt prep = do
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wt prep =
-    addToWatch subCfg wt prep `catchIOError` \e -> do
+    ignoreSubdirError wt () (addToWatch (subdirConfig cfg) wt prep)
+
+subdirConfig :: Config -> Config
+subdirConfig = setOnlyDir True . setFollowSymLinks False
+
+-- | Return the default value if the action fails because the subdirectory
+-- does not exist, is not a directory, or if the watch is closed.
+ignoreSubdirError :: Watch -> a -> IO a -> IO a
+ignoreSubdirError wt def action =
+    action `catchIOError` \e -> do
         closed <- isWatchClosed wt
         let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
         if isDoesNotExistError e || notDir || closed
-        then return ()
+        then return def
         else ioError e
+
+-- | An entry found by 'addNewDir'.
+data ScannedEntry = ScannedEntry
+    { seIsDir :: Bool
+    , sePath :: PathRep
+    }
+
+-- | Add a directory reported by IN_CREATE and return the entries in it. The
+-- watch is added before the directory is read, an entry created later is
+-- either found by the scan or reported by the kernel, or both.
+--
+-- A directory already watched returns no entries, the scan that added it
+-- returned them, or it is the scan of a root or of an overflow.
+addNewDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
+addNewDir cfg wt prep = do
+    isNew <- ignoreSubdirError wt False (addPath (subdirConfig cfg) wt prep)
+    if isNew
+    then do
+        entries <-
+            S.fold FL.toList (Dir.readEither (Dir.ignoreMissing True) absPath)
+                `catchIOError` \e ->
+                    let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
+                     in if isDoesNotExistError e || notDir
+                        then return []
+                        else ioError e
+        concat <$> mapM addEntry entries
+    else return []
 
     where
 
-    subCfg = setOnlyDir True $ setFollowSymLinks False cfg
+    absPath = combinePathRep prep
+
+    addEntry (Left dir) = do
+        let path = addSub prep dir
+        rest <- addNewDir cfg wt path
+        return (ScannedEntry True path : rest)
+    addEntry (Right file) =
+        return [ScannedEntry False (addSub prep file)]
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -1213,6 +1285,7 @@ data Event = Event
    , eventCookie :: Word32
    , eventRoot :: Path
    , eventRelPath :: Maybe Path
+   , eventScanned :: Bool
    }
 
 -- The inotify event struct from the man page/header file:
@@ -1357,6 +1430,14 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                 , eventCookie = cookie
                 , eventRoot = root
                 , eventRelPath = rel
+                , eventScanned = False
+                }
+        mkScanned ScannedEntry{..} =
+            (mkEvent ewd sePath)
+                { eventFlags =
+                    if seIsDir then iN_CREATE .|. iN_ISDIR else iN_CREATE
+                , eventCookie = 0
+                , eventScanned = True
                 }
         isIgnored = eflags .&. iN_IGNORED /= 0
     -- The kernel event queue overflowed and events were dropped. The overflow
@@ -1399,9 +1480,12 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                     live = map wpRep $ filter (not . wpRemoved) wps1
                     -- Check for "ISDIR" first because it is less likely
                     isDirEv = eflags .&. iN_ISDIR /= 0
-                    isDirAdded =
-                        isDirEv && eflags .&. (iN_CREATE .|. iN_MOVED_TO) /= 0
+                    isDirCreated = isDirEv && eflags .&. iN_CREATE /= 0
+                    isDirMovedIn = isDirEv && eflags .&. iN_MOVED_TO /= 0
                     isDirMovedOut = isDirEv && eflags .&. iN_MOVED_FROM /= 0
+                    reportScan =
+                           scanNewDirs cfg
+                        && createFlags cfg .&. iN_CREATE /= 0
                 -- A directory renamed within the tree is removed on
                 -- IN_MOVED_FROM and added again on IN_MOVED_TO.
                 when (watchRec cfg && isDirMovedOut)
@@ -1413,9 +1497,16 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                                 (isInSubtree prep)
                         )
                         live
-                when (watchRec cfg && isDirAdded)
+                when (watchRec cfg
+                        && (isDirMovedIn || (isDirCreated && not reportScan)))
                     $ PR.fromEffect
                     $ mapM_ (addSubdirToWatch cfg wt) live
+                scanned <-
+                    if watchRec cfg && isDirCreated && reportScan
+                    then
+                        PR.fromEffect
+                            $ concat <$> mapM (addNewDir cfg wt) live
+                    else return []
                 when isIgnored
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
@@ -1434,7 +1525,8 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                 if isUnrequested
                 then return []
                 else return
-                        [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
+                        $ [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
+                        ++ map mkScanned scanned
 
     where
 
@@ -1849,6 +1941,19 @@ foreign import capi
 isDir :: Event -> Bool
 isDir = getFlag iN_ISDIR
 
+-- | Determine whether the event was generated by a scan of a directory
+-- instead of the kernel, see 'setScanNewDirs'. 'isCreated' is true for such an
+-- event. Such an event says that the entry exists and was not reported by the
+-- kernel before the scan.
+--
+-- An entry created while its directory is being scanned is reported by the
+-- scan and by the kernel. The event from the scan comes first. The duplicates
+-- can be removed by a scan of the output stream: remember the paths of the
+-- 'isScanEvent' events, drop an 'isCreated' event for a remembered path, and
+-- forget a path on its 'isDeleted' or 'isMovedFrom' event.
+isScanEvent :: Event -> Bool
+isScanEvent = eventScanned
+
 -------------------------------------------------------------------------------
 -- Debugging
 -------------------------------------------------------------------------------
@@ -1884,6 +1989,7 @@ showEvent ev@Event{..} =
     ++ showev isMovedTo "MovedTo"
 
     ++ showev isDir "Dir"
+    ++ showev isScanEvent "Scanned"
     ++ "\n"
 
         where showev f str = if f ev then "\n" ++ str else ""
