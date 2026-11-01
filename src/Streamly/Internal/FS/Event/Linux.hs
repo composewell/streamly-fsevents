@@ -5,35 +5,6 @@
 -- Maintainer  : streamly@composewell.com
 -- Stability   : experimental
 -- Portability : GHC
---
--- =Overview
---
--- Use 'watch' or 'watchRecursive' with a list of file system paths you want
--- to watch as argument. It returns a stream of 'Event' representing the file system events
--- occurring under the watched paths.
---
--- @
--- Stream.mapM_ (putStrLn . 'showEvent') $ 'watch' [Path.fromString "dir"]
--- @
---
--- 'Event' is an opaque type. Accessor functions (e.g. 'showEvent' above)
--- provided in this module are used to determine the attributes of the event.
---
--- Identical successive events may be coalesced into a single event.
---
--- =Design notes
---
--- For reference documentation see:
---
--- * <https://man7.org/linux/man-pages/man7/inotify.7.html inotify man page>
---
--- We try to keep the macOS\/Linux/Windows event handling APIs and defaults
--- semantically and syntactically as close as possible.
---
--- = Platform differences
---
--- See @docs\/platform-differences.md@ in this package for the differences
--- between the Linux, macOS and Windows APIs.
 
 #include "config.h"
 
@@ -2093,27 +2064,6 @@ watchToStream cfg wt =
 -- path is a directory, the whole directory tree under it is watched
 -- recursively. Monitoring starts from the current time onwards.
 --
--- /Non-existing Paths:/ the API fails if a watch is started on a non-exsting
--- path.
---
--- /Overlapping Paths:/ a path listed more than once is watched once, its
--- events are reported once. If two different paths reach the same file or
--- directory, for example, a recursive root and a root inside it, its events
--- are reported once for each path.
---
--- /Performance:/ Note that recursive watch on a large directory tree could be
--- expensive. When starting a watch, the whole tree must be read and watches
--- are started on each directory in the tree. The initial time to start the
--- watch as well as the memory required is proportional to the number of
--- directories in the tree.
---
--- /Bugs:/ When new directories are created under the tree they are added to
--- the watch on receiving the directory create event. However, the creation of
--- a dir and adding a watch for it is not atomic.  The implementation takes
--- care of this and makes sure that watches are added for all directories.
--- However, In the mean time, the directory may have received more events which
--- may get lost.  Handling of any such lost events is yet to be implemented.
---
 -- See the Linux __inotify__ man page for more details.
 --
 -- @
@@ -2134,7 +2084,8 @@ watchWith f paths = S.bracketIO before after (watchToStream cfg)
 --
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
 --
--- See 'watchWith' for pitfalls and bugs when using recursive watch on Linux.
+-- See "Streamly.FileSystem.Event.Linux" for the performance and limitations of
+-- a recursive watch on Linux.
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = watchWith (setRecursiveMode True)
 

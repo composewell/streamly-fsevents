@@ -13,14 +13,70 @@
 -- "Streamly.FileSystem.Event", the functions in this module can be used with
 -- the portable API as well.
 --
--- A watch is attached to the path of a watch root. If a watch root is deleted
--- and created again, the new object at the path is watched. If a watch root is
--- renamed, the renamed object is no longer watched.
+-- = Overview
+--
+-- Use 'watch' or 'watchRecursive' with a non-empty list of file system paths
+-- you want to watch as argument. It returns a stream of 'Event' representing
+-- the file system events occurring under the watched paths.
+--
+-- @
+-- path <- Path.fromString "path"
+-- Stream.mapM_ (putStrLn . Path.toString . 'getAbsPath')
+--     $ 'watchRecursive' (path :| [])
+-- @
+--
+-- 'Event' is an opaque type. Accessor functions (e.g. 'getAbsPath' above)
+-- provided in this module are used to determine the attributes of the event.
+--
+-- = Watch Behavior
+--
+-- /Watch root:/ A watch is attached to the path of a watch root. From the
+-- observed behavior, macOS watches the path, whatever object the path points
+-- to at any given point of time.
+--
+-- /Watch root deletion:/ If the watch root is deleted and then recreated,
+-- the newly created file or directory is automatically watched.
+--
+-- /Watch root moved:/ If the watch root is moved to a new path, the object
+-- will no longer be watched unless the new path is also being watched and was
+-- pointing to an existing file at the time of starting the watch (see notes
+-- about non-existing paths below).
+--
+-- /Symbolic link watch root:/ If the path name to be watched is a symbolic
+-- link then the target of the link is watched instead of the symbolic link
+-- itself. It is equivalent to as if the target of the symbolic link itself was
+-- directly added to the watch API. That is, the symbolic link is resolved at
+-- the time of adding the watch. However, the paths in the events are reported
+-- via the original symbolic link, see 'getAbsPath'.
+--
+-- Note that if a watched path is deleted and recreated as a symbolic link
+-- pointing to another path then the symbolic link file itself is watched, it
+-- won't be resolved. The symbolic link resolution happens only at the time of
+-- adding the watch.
+--
+-- /Non-existing Paths:/ If a watch is started on a non-existing path then the
+-- path is watched when it is created later (tested on macOS 26). The macOS
+-- API does not fail for a non-existing path.
+--
+-- If a non-existing path is watched with 'setRootPathEvents' then an
+-- 'isRootPathEvent' event is reported if the path is created later and the
+-- "path" field in the event is set to the dirname of the path rather than the
+-- full absolute path. This is the observed behavior on macOS 10.15.1.
+--
+-- = Platform differences
 --
 -- For reference documentation see:
 --
 -- * "<https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html Apple FS Events Programming Guide>"
 -- * "<https://developer.apple.com/documentation/coreservices/file_system_events?language=objc Apple FS Events Reference>"
+--
+-- We try to keep the macOS\/Linux\/Windows event handling APIs and defaults
+-- semantically and syntactically as close as possible.
+--
+-- See @docs\/platform-differences.md@ in this package for the differences
+-- between the Linux, macOS and Windows APIs.
+
+-- XXX Write behavior tests for all the points in Watch Behavior above.
 
 #include <config.h>
 

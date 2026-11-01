@@ -13,7 +13,26 @@
 -- "Streamly.FileSystem.Event", the functions in this module can be used with
 -- the portable API as well.
 --
--- An inotify watch is attached to the inode of a watch root, not to its path:
+-- = Overview
+--
+-- Use 'watch' or 'watchRecursive' with a non-empty list of file system paths
+-- you want to watch as argument. It returns a stream of 'Event' representing
+-- the file system events occurring under the watched paths.
+--
+-- @
+-- path <- Path.fromString "dir"
+-- Stream.mapM_ (putStrLn . Path.toString . 'getAbsPath')
+--     $ 'watch' (path :| [])
+-- @
+--
+-- 'Event' is an opaque type. Accessor functions (e.g. 'getAbsPath' above)
+-- provided in this module are used to determine the attributes of the event.
+--
+-- = Watch Behavior
+--
+-- An inotify watch is attached to the inode of a watch root, not to its path.
+--
+-- /Watch root:/
 --
 -- * If a watch root is deleted, its watch ends with an 'isRootUnwatched'
 -- event. A new object created at the same path is not watched.
@@ -27,9 +46,43 @@
 -- file deleted and created again in a watched directory reports 'isDeleted'
 -- and 'isCreated', and its later events are reported.
 --
+-- /Non-existing Paths:/ An exception is raised if a watch is started on a
+-- non-existing path.
+--
+-- /Overlapping Paths:/ A path listed more than once is watched once, its
+-- events are reported once. If two different paths reach the same file or
+-- directory, for example, a recursive root and a root inside it, its events
+-- are reported once for each path.
+--
+-- /Coalescing:/ Identical successive events may be coalesced into a single
+-- event.
+--
+-- /Performance:/ Note that recursive watch on a large directory tree could be
+-- expensive. When starting a watch, the whole tree must be read and watches
+-- are started on each directory in the tree. The initial time to start the
+-- watch as well as the memory required is proportional to the number of
+-- directories in the tree.
+--
+-- /Limitations:/ When new directories are created under the tree they are
+-- added to the watch on receiving the directory create event. The creation of
+-- a directory and adding a watch for it is not atomic. The implementation
+-- makes sure that watches are added for all directories, but the directory may
+-- change before its watch is added. Entries created in the directory in that
+-- period are found by a scan, see 'setScanNewDirs'. Other events in that
+-- period, for example, a modification or a deletion of an entry, are lost.
+-- inotify provides no way to avoid this loss.
+--
+-- = Platform differences
+--
 -- For reference documentation see:
 --
 -- * <https://man7.org/linux/man-pages/man7/inotify.7.html inotify man page>
+--
+-- We try to keep the macOS\/Linux\/Windows event handling APIs and defaults
+-- semantically and syntactically as close as possible.
+--
+-- See @docs\/platform-differences.md@ in this package for the differences
+-- between the Linux, macOS and Windows APIs.
 
 module Streamly.FileSystem.Event.Linux
     (
