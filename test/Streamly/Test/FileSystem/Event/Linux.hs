@@ -387,6 +387,27 @@ defaultExcludeUnlinked =
             evs <- readUntil Event.defaultConfig (isCreatedAt sentinel) w
             pathsOf Event.isModified evs `shouldBe` []
 
+-- No activity follows the operation on the root. 'readUntil' raises an
+-- exception on a timeout if the event is held back until a later event.
+lastRootEvent :: Spec
+lastRootEvent =
+    describe "last event for the root is reported without a later event" $ do
+        it "metadata change of the root"
+            $ withRoot Event.defaultConfig $ \root w -> do
+                perms <- getPermissions root
+                setPermissions root (setOwnerExecutable True perms)
+                evs <- readUntil Event.defaultConfig Event.isAttrsModified w
+                pathsOf Event.isAttrsModified evs `shouldBe` [root]
+        it "rename of the root"
+            $ withRoot movedCfg $ \root w -> do
+                renameDirectory root (root ++ "-moved")
+                evs <- readUntil movedCfg Event.isRootMoved w
+                pathsOf Event.isRootMoved evs `shouldBe` [root]
+
+    where
+
+    movedCfg = Event.setRootPathEvents True Event.defaultConfig
+
 -- chmod generates IN_ATTRIB only.
 defaultAttrsModified :: Spec
 defaultAttrsModified =
@@ -1436,6 +1457,7 @@ watchTests =
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
+                lastRootEvent
 
 main :: IO ()
 main = do
