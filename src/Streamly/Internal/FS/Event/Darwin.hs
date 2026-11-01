@@ -32,7 +32,8 @@
 -- =BUGS
 --
 -- XXX Check the behavior for Windows/Linux where applicable. Mention these in
--- the common module so that users are aware of the portability issues.
+-- docs/platform-differences.md so that users are aware of the portability
+-- issues.
 --
 -- There may be some idiosyncrasies in event reporting.
 --

@@ -35,35 +35,10 @@
 -- When testing on Linux Kernel version @5.3.0-53-generic #47-Ubuntu@, the last
 -- event for the root path seems to be delayed until one more event occurs.
 --
--- = Differences between macOS and Linux APIs:
+-- = Platform differences
 --
--- 1. macOS watch is based on the path provided to it, if the path is
--- deleted and recreated it will still be watched, if the path moves to another
--- path it won't be watched anymore. Whereas Linux watch is based on a handle
--- to the path, if the path is deleted and recreated it won't be watched, if
--- the path moves to another it can still be watched (though this is
--- configurable).
---
--- 2. macOS watches the directory hierarchy recursively, Linux watches only one
--- level of dir, recursive watch has to be built in user space by watching for
--- create events and adding the new directories to the watch. Not sure how this
--- will scale for too many paths.
---
--- 3. In macOS the path of the subject of the event is absolute, in Linux the
--- path is the name of the object inside the dir being watched.
---
--- 4. On Linux 'watch' fails if a path does not exist, on macOS it does
--- not fail.
---
--- 5. On Linux the reads and writes of an open file after it is unlinked
--- generate events unless 'setExcludeUnlinked' is 'True', on macOS they do
--- not generate events.
---
--- 6. On Linux metadata change events are reported only if
--- 'setAttrsModified' is 'True', on macOS they are always reported. macOS
--- has separate flags for different kinds of metadata change.
---
--- 7. On Linux a hard link generates 'isCreated', on macOS it does not.
+-- See @docs\/platform-differences.md@ in this package for the differences
+-- between the Linux, macOS and Windows APIs.
 
 #include "config.h"
 

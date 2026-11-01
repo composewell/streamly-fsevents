@@ -14,7 +14,7 @@
 --
 -- See @docs\/platform-differences.md@ in this package for the differences that
 -- a portable program has to handle, for example, when a watch root is deleted
--- or renamed. See 'setRecursiveMode' and 'watch' for details.
+-- or renamed.
 --
 -- For platform-specific APIs, see:
 --

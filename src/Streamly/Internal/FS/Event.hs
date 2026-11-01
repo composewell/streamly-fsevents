@@ -85,31 +85,8 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- | Watch the whole directory tree under a watch root recursively instead of
 -- watching only the watch root directory.
 --
--- macOS and Windows watch a directory tree natively.
---
--- Linux inotify watches only one directory. A recursive watch on Linux adds a
--- watch for each directory in the tree, and adds a watch for a new directory
--- when its create or move event is read from the stream. The following
--- behavior applies only to Linux:
---
--- * Starting a watch on a large tree takes time and memory proportional to
--- the number of directories in the tree. Each directory uses one inotify
--- watch. If the number of watches exceeds the limit in
--- @\/proc\/sys\/fs\/inotify\/max_user_watches@, the watch API or the event
--- stream raises an exception.
--- * A directory created in the tree is scanned after its watch is added, and
--- each entry found is reported as an 'isCreated' event. For example, @mkdir -p
--- a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and @a\/b\/f@. An entry created
--- during the scan may be reported twice. Other events before the watch is
--- added are not reported, for example, a file created and deleted.
--- * A directory moved into the tree or renamed within it is not reported that
--- way. Events in it before its watch is added are not reported. To find
--- everything in such a directory, scan the directory when its move event is
--- received.
--- * A directory whose create or move event is lost in an 'isEventsLost'
--- overflow is added by restarting the watch, unless the Linux specific
--- @setRestartOnOverflow@ is disabled. The restart lists all the directories of
--- the tree.
+-- See @docs\/platform-differences.md@ in this package for the differences in
+-- a recursive watch on each platform.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
@@ -157,31 +134,22 @@ watchWith = Event.watchWith
 -- for file system events.  Monitoring starts from the current time onwards.
 --
 -- If a watch root is a symbolic link then the target of the link is watched.
--- Fails if the watched path does not exist. If the user does not have
--- permissions (read and execute?) on the watch root then no events are
--- generated.
 --
 -- Do not rename, or delete and create again, a watch root in a portable
--- program, the result depends on the platform. On Linux the watch stays with
--- the renamed directory and ends when the directory is deleted. On macOS the
--- watch stays with the path. On Windows the watch root cannot be renamed or
--- deleted while it is watched.
+-- program, the result depends on the platform. See
+-- @docs\/platform-differences.md@ in this package, which also describes
+-- watching a path that does not exist or a path without permissions.
 --
 -- This API watches for changes in the watch root directory only, any changes
 -- in the subdirectories of the watch root are not watched. Use
 -- 'watchRecursive' to watch the whole directory tree.
---
--- On macOS FSEvents can only watch a directory tree recursively, the events
--- for paths more than one level below a watch root are dropped by this API.
--- The OS still generates and delivers those events to this process.
 --
 -- >>> watch = watchWith id
 watch :: NonEmpty Path -> Stream IO Event
 watch = Event.watch
 
 -- | Like 'watch' except that if a watched path is a directory the whole
--- directory tree under it is watched recursively. See 'setRecursiveMode' for
--- the limitations on Linux.
+-- directory tree under it is watched recursively. See 'setRecursiveMode'.
 --
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
 watchRecursive :: NonEmpty Path -> Stream IO Event
@@ -225,8 +193,7 @@ getRelPath = Event.getRelPath
 -- If the event is for the watch root then this is the same as 'getRoot'.
 --
 -- For an 'isEventsLost' event, this gives the path whose tree has to be
--- scanned again. On macOS, it may be a subdirectory of the watch root, on
--- other platforms it is the watch root.
+-- scanned again.
 getAbsPath :: Event -> Path
 getAbsPath = Event.getAbsPath
 
@@ -234,10 +201,8 @@ getAbsPath = Event.getAbsPath
 -- monitored path. This event is generated when any file system object is
 -- created.
 --
--- For hard links the behavior is different on different operating systems. On
--- macOS hard linking does not generate a create event, it generates an
--- 'Streamly.Internal.FS.Event.Darwin.isAttrsModified' event on the directory
--- instead. On Linux and Windows hard linking generates a create event.
+-- Creating a hard link does not generate this event on all platforms. See
+-- @docs\/platform-differences.md@ in this package.
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
 
@@ -245,12 +210,10 @@ isCreated = Event.isCreated
 -- macOS?
 --
 -- | Determine whether the event indicates deletion of an object within the
--- monitored path. On Linux and Windows hard link deletion generates a delete
--- event.
+-- monitored path.
 --
--- On Linux and Windows, this event does not occur when the watch root itself
--- is deleted. On macOS it occurs on deleting the watch root when it is not a
--- symbolic link.
+-- Whether this event occurs when the watch root itself is deleted depends on
+-- the platform. See @docs\/platform-differences.md@ in this package.
 --
 -- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
 -- Linux.
@@ -271,20 +234,17 @@ isMoved = Event.isMoved
 -- monitored path. This event is generated on file modification on all
 -- platforms.
 --
--- On Linux and macOS this event is never generated for directories.  On
--- Windows (in recursive watch mode) this event is generated for directories as
--- well when an object is created in or deleted from the directory.
+-- Whether this event occurs for directories depends on the platform. See
+-- @docs\/platform-differences.md@ in this package.
 isModified :: Event -> Bool
 isModified = Event.isModified
 
 -- | An event that indicates that some events before this may have been lost,
 -- therefore, we need to take some recovery action.
 --
--- On Linux, where the kernel reports a single event for all the roots, one
--- 'isEventsLost' event is generated for each watch root. The tree under the
--- path returned by 'getAbsPath' has to be scanned again to know its current
--- state. This path is the watch root, except on macOS, where it may be a
--- subdirectory of the watch root.
+-- The tree under the path returned by 'getAbsPath' has to be scanned again to
+-- know its current state. See @docs\/platform-differences.md@ in this package
+-- for the path reported on each platform.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 
