@@ -92,6 +92,7 @@ module Streamly.FileSystem.Event.Windows
     , getRoot
     , getRelPath
     , getAbsPath
+    , showEvent
 
     -- ** Item CRUD events
     , isCreated

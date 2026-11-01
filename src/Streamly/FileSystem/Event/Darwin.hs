@@ -117,6 +117,7 @@ module Streamly.FileSystem.Event.Darwin
     , getRoot
     , getRelPath
     , getAbsPath
+    , showEvent
 
     -- ** Root Level Events
     -- | Events that belong to the root path as a whole and not to specific

@@ -2351,6 +2351,9 @@ isScanEvent = eventScanned
 -------------------------------------------------------------------------------
 
 -- | Convert an 'Event' record to a String representation.
+--
+-- The format of the output is for debugging only, it cannot be relied upon and
+-- can change at any time.
 showEvent :: Event -> String
 showEvent ev@Event{..} =
        "--------------------------"

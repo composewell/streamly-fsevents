@@ -253,7 +253,7 @@ isEventsLost = Event.isEventsLost
 -- of this function may be different on different platforms because it may
 -- contain platform specific details.
 --
--- /Internal/
---
+-- The format of the output is for debugging only, it cannot be relied upon and
+-- can change at any time.
 showEvent :: Event -> String
 showEvent = Event.showEvent

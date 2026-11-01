@@ -132,6 +132,7 @@ module Streamly.FileSystem.Event.Linux
     , getRoot
     , getRelPath
     , getAbsPath
+    , showEvent
     , Cookie
     , getCookie
 

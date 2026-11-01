@@ -51,6 +51,8 @@
   `Streamly.FileSystem.Event.Windows`.
 - Add `Config`, `setRecursiveMode`, `watchWith`, `watchRecursive`, `getRoot`
   and `getRelPath` to `Streamly.FileSystem.Event`.
+- Add `showEvent` to `Streamly.FileSystem.Event` and the platform specific
+  modules, for debugging. Its output format can change at any time.
 - Linux: `addToWatch`, `removeFromWatch` and `closeWatch` in
   `Streamly.Internal.FS.Event.Linux` no longer wait for the next event.
   Earlier they could block indefinitely on a watched tree with no activity.
