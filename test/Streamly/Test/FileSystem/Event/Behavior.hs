@@ -11,28 +11,43 @@
 -- including when an assertion fails. The tables in
 -- docs/platform-differences.md record the results printed on each platform in
 -- the CI logs.
+--
+-- An outcome that is not known on a platform is not asserted there, it is
+-- recorded from the CI logs.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where
 
 import Control.Concurrent
-    ( MVar, forkIO, killThread, newEmptyMVar, putMVar, readMVar, takeMVar
-    , threadDelay, tryPutMVar, tryReadMVar
+    ( MVar, forkIO, isEmptyMVar, killThread, newEmptyMVar, putMVar, readMVar
+    , takeMVar, threadDelay, tryPutMVar, tryReadMVar
     )
-import Control.Exception (IOException, SomeException, evaluate, try)
+import Control.Exception
+    (IOException, SomeException, evaluate, finally, fromException, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (group, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
+import Data.Maybe (isJust)
 import System.Exit (exitFailure)
 import System.Directory
-    ( createDirectory, createDirectoryIfMissing, removeFile
-    , removePathForcibly, renameDirectory
+    ( createDirectory, createDirectoryIfMissing, createDirectoryLink
+    , getPermissions, listDirectory, removeDirectory, removeDirectoryLink
+    , removeFile, removePathForcibly, renameDirectory, renameFile
+    , setOwnerWritable, setPermissions
+#if !defined(CABAL_OS_WINDOWS)
+    , emptyPermissions, setOwnerReadable, setOwnerSearchable
+#endif
     )
 import System.FilePath ((</>), takeFileName)
+import System.IO (IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (readProcess)
 import System.Timeout (timeout)
+#if defined(CABAL_OS_WINDOWS)
+import System.Win32.HardLink (createHardLink)
+#endif
 import Streamly.Internal.FS.Event (Config, Event)
 
 import qualified Streamly.Data.Fold as Fold
@@ -40,6 +55,10 @@ import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Internal.FS.Event as Event
 #if defined(CABAL_OS_LINUX)
 import qualified Streamly.Internal.FS.Event.Linux as Linux
+#elif defined(CABAL_OS_DARWIN)
+import qualified Streamly.Internal.FS.Event.Darwin as Darwin
+#else
+import qualified Streamly.Internal.FS.Event.Windows as Windows
 #endif
 import qualified Streamly.Internal.FileSystem.Path as Path
 
@@ -57,6 +76,7 @@ data Outcome =
       Yes
     | No
     | Exception -- ^ The file system operation raised an exception.
+    | WatchException -- ^ The watch raised an exception.
     | Failed String -- ^ The test could not determine the outcome.
     | Skipped String -- ^ The test does not apply in this environment.
     deriving (Eq, Show)
@@ -70,6 +90,12 @@ data Paths = Paths
 data Behavior = Behavior
     { title :: String
     , config :: Config -> Config
+    -- | Run before the watch starts.
+    , setup :: Paths -> IO ()
+    -- | Run after the watch ends, whatever the outcome.
+    , cleanup :: Paths -> IO ()
+    -- | After 'setup', the reason if the behavior cannot be tested here.
+    , skip :: Paths -> IO (Maybe String)
     -- | Run 'ops' while the consumer of the stream is not reading it.
     , paused :: Bool
     , ops :: Paths -> IO ()
@@ -77,8 +103,9 @@ data Behavior = Behavior
     , laterOps :: Paths -> IO ()
     , check :: Paths -> [Event] -> Bool
     , expected :: Outcome
-    -- | The outcome depends on a race, it is printed but does not fail the
-    -- test when it differs from 'expected'.
+    -- | The outcome depends on a race or on the OS version, or it is not known
+    -- on this platform. It is printed but does not fail the test when it
+    -- differs from 'expected'.
     , racy :: Bool
     }
 
@@ -119,11 +146,65 @@ fileCreatedTwice =
     isFileCreate ev =
         Event.isCreated ev && "file" `isPrefixOf` takeFileName (absPath ev)
 
+-- | Remove the permission to list a directory, keep the permission to create
+-- a file in it.
+denyRead :: FilePath -> IO ()
+-- | Undo 'denyRead'.
+allowRead :: FilePath -> IO ()
+-- | @hardLink source link@
+hardLink :: FilePath -> FilePath -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+denyRead path = void $ readProcess "icacls" [path, "/deny", everyone] ""
+
+    where
+
+    everyone = "*S-1-1-0:(OI)(CI)(RX)"
+
+allowRead path =
+    void $ readProcess "icacls" [path, "/remove:d", "*S-1-1-0"] ""
+
+hardLink = createHardLink
+#else
+denyRead path =
+    setPermissions path
+        $ setOwnerWritable True $ setOwnerSearchable True emptyPermissions
+
+allowRead path = do
+    perms <- getPermissions path
+    setPermissions path (setOwnerReadable True perms)
+
+hardLink source link = void $ readProcess "ln" [source, link] ""
+#endif
+
+-- | Change the metadata of a file, without changing its contents.
+changeMetadata :: FilePath -> IO ()
+changeMetadata path = do
+    perms <- getPermissions path
+    setPermissions path (setOwnerWritable False perms)
+
+-- | The setting for the metadata change events, if the platform has one.
+setAttrs :: Bool -> Config -> Config
+-- | Whether the event reports a metadata change.
+metadataChanged :: Event -> Bool
+#if defined(CABAL_OS_LINUX)
+setAttrs = Linux.setAttrsModified
+metadataChanged = Linux.isAttrsModified
+#elif defined(CABAL_OS_DARWIN)
+setAttrs _ = id
+metadataChanged ev = Darwin.isSecurityModified ev || Darwin.isAttrsModified ev
+#else
+setAttrs = Windows.setAttrsModified
+metadataChanged = Event.isModified
+#endif
+
 base :: Behavior
 base =
     Behavior
         { title = ""
         , config = id
+        , setup = const (return ())
+        , cleanup = const (return ())
+        , skip = const (return Nothing)
         , paused = False
         , ops = const (return ())
         , laterOps = const (return ())
@@ -236,9 +317,200 @@ behaviors =
         , check = const (createdNamed "later")
         , expected = onPlatform Yes Yes Yes
         }
+    , base
+        { title = "root created after the start of the watch is watched"
+        , setup = removeDirectory . watchRoot
+        , ops = \p -> do
+            createDirectory (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    , base
+        { title = "root without read permission is watched"
+        , setup = denyRead . watchRoot
+        , cleanup = allowRead . watchRoot
+        , skip = rootStillReadable
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    , base
+        { title = "regular file as a root is watched"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createFile (watchRoot p)
+            settle
+        , ops = \p -> appendFile (watchRoot p) "x"
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isModified ev)
+        , expected = onPlatform Yes Yes WatchException
+        , racy = onWindows
+        }
+    , base
+        { title = "deleted symbolic link root reports isDeleted for the root"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (renamedRoot p)
+            createDirectoryLink (renamedRoot p) (watchRoot p)
+            settle
+        , ops = removeDirectoryLink . watchRoot
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
+        , expected = onPlatform No No No
+        }
+    , base
+        { title = "non-recursive watch reports a file created in a subdir"
+        , setup = withDir
+        , ops = \p -> createFile (watchRoot p </> "dir/file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform No No No
+        }
+    , base
+        { title = "rename reports isMoved for the source and the destination"
+        , setup = withFile
+        , ops = \p ->
+            renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
+        , check = \_ evs ->
+            let moved name = any (\ev -> isNamed name ev && Event.isMoved ev)
+             in moved "file" evs && moved "moved" evs
+        , expected = onPlatform Yes Yes Yes
+        }
+    , dirChange
+        { title =
+            "recursive watch reports isModified for a dir when a file is"
+                ++ " created in it"
+        , config = Event.setRecursiveMode True
+        , expected = onPlatform No No No
+        }
+    -- On Windows the outcome is Yes on Windows Server 2025 and No on Windows
+    -- Server 2012 R2.
+    , dirChange
+        { title =
+            "recursive watch reports isModified for a dir when a file is"
+                ++ " deleted from it"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir/file")
+            settle
+        , ops = \p -> removeFile (watchRoot p </> "dir/file")
+        , expected = onPlatform No No No
+        , racy = onWindows
+        }
+    , dirChange
+        { title =
+            "non-recursive watch reports isModified for a dir when a file"
+                ++ " is created in it"
+        , expected = onPlatform No No No
+        }
+    , deletedOpenFile
+        { title = "write to an open file after its deletion is reported"
+        , expected = onPlatform No Yes Exception
+        , racy = onWindows
+        }
+#if defined(CABAL_OS_LINUX)
+    , deletedOpenFile
+        { title = "write to a deleted file, setExcludeUnlinked False"
+        , config = Linux.setExcludeUnlinked False
+        , expected = Yes
+        }
+#endif
+    , metadataChange
+        { title = "metadata change is reported by default"
+        , expected = onPlatform Yes Yes No
+        }
+    , metadataChange
+        { title = "metadata change is reported with the setting disabled"
+        , config = setAttrs False
+        , expected = onPlatform No Yes No
+        }
+    , metadataChange
+        { title = "metadata change is reported with the setting enabled"
+        , config = setAttrs True
+        , expected = onPlatform Yes Yes Yes
+        }
+    , hardLinkCreate
+        { title = "creating a hard link reports isCreated"
+        , check = const (createdNamed "link")
+        , expected = onPlatform Yes Yes Yes
+        }
+    , hardLinkCreate
+        { title = "creating a hard link reports a metadata change on the dir"
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && metadataChanged ev)
+        , expected = onPlatform No Yes No
+        }
+    , base
+        { title = "deleting a hard link reports isDeleted"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            hardLink (watchRoot p </> "file") (watchRoot p </> "link")
+            settle
+        , ops = \p -> removeFile (watchRoot p </> "link")
+        , check = \_ ->
+            any (\ev -> isNamed "link" ev && Event.isDeleted ev)
+        , expected = onPlatform Yes Yes Yes
+        }
     ]
 
     where
+
+    onWindows = platformName == "Windows"
+
+    withDir p = do
+        createDirectory (watchRoot p </> "dir")
+        settle
+
+    withFile p = do
+        createFile (watchRoot p </> "file")
+        settle
+
+    rootStillReadable p = do
+        r <- try (listDirectory (watchRoot p))
+        return $ case r of
+            Left (_ :: IOException) -> Nothing
+            Right _ -> Just "the permission was not removed"
+
+    dirChange =
+        base
+            { setup = withDir
+            , ops = \p -> createFile (watchRoot p </> "dir/file")
+            , check = \_ ->
+                any (\ev -> isNamed "dir" ev && Event.isModified ev)
+            }
+
+    -- AppendMode does not truncate the file, the write is the only change to
+    -- its contents.
+    deletedOpenFile =
+        base
+            { setup = withFile
+            , ops = \p -> do
+                let file = watchRoot p </> "file"
+                h <- openFile file AppendMode
+                removeFile file
+                hPutStr h "x"
+                hFlush h
+                hClose h
+            , check = \_ ->
+                any (\ev -> isNamed "file" ev && Event.isModified ev)
+            }
+
+    metadataChange =
+        base
+            { setup = withFile
+            , ops = \p -> changeMetadata (watchRoot p </> "file")
+            , check = \_ ->
+                any (\ev -> isNamed "file" ev && metadataChanged ev)
+            }
+
+    hardLinkCreate =
+        base
+            { setup = withFile
+            , ops = \p ->
+                hardLink (watchRoot p </> "file") (watchRoot p </> "link")
+            }
 
     newDir =
         base
@@ -266,76 +538,97 @@ settle :: IO ()
 settle = threadDelay 1000000
 
 -- | Create marker files in the control root until the consumer reads one.
--- The watch has started when it is read.
-waitStarted :: FilePath -> MVar () -> IO ()
-waitStarted control started = go (0 :: Int)
+-- The watch has started when it is read. Stop if the consumer has ended, it
+-- can end with an exception before the watch starts.
+waitStarted :: MVar a -> FilePath -> MVar () -> IO ()
+waitStarted finished control started = go (0 :: Int)
 
     where
 
     go n = do
-        when (n >= 100) $ error "waitStarted: the watch did not start"
-        createFile (control </> ("started" ++ show n))
-        threadDelay 100000
-        r <- tryReadMVar started
-        maybe (go (n + 1)) return r
+        ended <- not <$> isEmptyMVar finished
+        unless ended $ do
+            when (n >= 100) $ error "waitStarted: the watch did not start"
+            createFile (control </> ("started" ++ show n))
+            threadDelay 100000
+            r <- tryReadMVar started
+            maybe (go (n + 1)) return r
+
+-- | Watch the root and the control root, run the operations of the behavior
+-- and check the events.
+runWatch :: Behavior -> Paths -> FilePath -> IO Outcome
+runWatch Behavior{..} paths control = do
+    let root = watchRoot paths
+    started <- newEmptyMVar
+    blocked <- newEmptyMVar
+    resume <- newEmptyMVar
+    result <- newEmptyMVar
+
+    -- The control root stays in place when a behavior changes the watch
+    -- root. Its stop file ends the stream in all cases.
+    let observe ev = do
+            when ("started" `isPrefixOf` takeFileName (absPath ev))
+                $ void $ tryPutMVar started ()
+            when (isNamed "blocked" ev) $ do
+                void $ tryPutMVar blocked ()
+                readMVar resume
+            return ev
+        consumer = do
+            rootPath <- Path.fromString root
+            controlPath <- Path.fromString control
+            Event.watchWith config (rootPath :| [controlPath])
+                & Stream.mapM observe
+                & Stream.takeWhile (not . isNamed "stop")
+                & Stream.fold Fold.toList
+        runOps = do
+            when paused $ do
+                createFile (root </> "blocked")
+                readMVar blocked
+            r <- tryIO (ops paths)
+            putMVar resume ()
+            settle
+            r1 <- if isLeft r then return r else tryIO (laterOps paths)
+            settle
+            return r1
+
+    void $ forkIO (try consumer >>= putMVar result)
+    waitStarted result control started
+
+    ended <- not <$> isEmptyMVar result
+    r1 <- if ended then return (Right ()) else runOps
+    createFile (control </> "stop")
+
+    evs <- timeout 30000000 (takeMVar result)
+    return $ case evs of
+        Nothing -> error "the stream did not end"
+        Just (Left e)
+            | isIOException e -> WatchException
+            | otherwise -> error (show e)
+        Just (Right xs)
+            | isLeft r1 -> Exception
+            | check paths xs -> Yes
+            | otherwise -> No
+
+    where
+
+    tryIO :: IO () -> IO (Either IOException ())
+    tryIO = try
+
+    isIOException :: SomeException -> Bool
+    isIOException e = isJust (fromException e :: Maybe IOException)
 
 runBehavior :: Behavior -> IO Outcome
-runBehavior Behavior{..} =
+runBehavior b =
     withSystemTempDirectory "fsevent_behavior" $ \dir -> do
         let root = dir </> "root"
             control = dir </> "control"
             paths = Paths {watchRoot = root, renamedRoot = dir </> "renamed"}
         createDirectory root
         createDirectory control
-
-        started <- newEmptyMVar
-        blocked <- newEmptyMVar
-        resume <- newEmptyMVar
-        result <- newEmptyMVar
-
-        -- The control root stays in place when a behavior changes the watch
-        -- root. Its stop file ends the stream in all cases.
-        let observe ev = do
-                when ("started" `isPrefixOf` takeFileName (absPath ev))
-                    $ void $ tryPutMVar started ()
-                when (isNamed "blocked" ev) $ do
-                    void $ tryPutMVar blocked ()
-                    readMVar resume
-                return ev
-            consumer = do
-                rootPath <- Path.fromString root
-                controlPath <- Path.fromString control
-                Event.watchWith config (rootPath :| [controlPath])
-                    & Stream.mapM observe
-                    & Stream.takeWhile (not . isNamed "stop")
-                    & Stream.fold Fold.toList
-
-        void $ forkIO (try consumer >>= putMVar result)
-        waitStarted control started
-
-        when paused $ do
-            createFile (root </> "blocked")
-            readMVar blocked
-        r <- tryIO (ops paths)
-        putMVar resume ()
-        settle
-        r1 <- if isLeft r then return r else tryIO (laterOps paths)
-        settle
-        createFile (control </> "stop")
-
-        evs <- timeout 30000000 (takeMVar result)
-        return $ case evs of
-            Nothing -> error "the stream did not end"
-            Just (Left e) -> error (show (e :: SomeException))
-            Just (Right xs)
-                | isLeft r1 -> Exception
-                | check paths xs -> Yes
-                | otherwise -> No
-
-    where
-
-    tryIO :: IO () -> IO (Either IOException ())
-    tryIO = try
+        setup b paths
+        flip finally (cleanup b paths) $ do
+            reason <- skip b paths
+            maybe (runWatch b paths control) (return . Skipped) reason
 
 -------------------------------------------------------------------------------
 -- Overflow stress test
@@ -448,7 +741,7 @@ runOverflow Stress{..}
                     & Stream.fold
                         (Fold.drainMapM (observe started blocked resume lost))
         tid <- forkIO (try consumer >>= putMVar finished)
-        waitStarted root started
+        waitStarted finished root started
 
         when burst $ do
             createFile (root </> "blocked")
