@@ -207,8 +207,8 @@ setFlag mask status cfg@Config{..} =
 -- A directory created in or moved into the tree is added to the watch. A
 -- directory moved out of the tree is removed from the watch, its paths
 -- report 'isRootUnwatched'. A directory renamed within the tree keeps its
--- watch, and so do the directories under it. A symbolic link to a directory in
--- the tree is not followed.
+-- watch, and so do the directories under it. A symbolic link inside the tree
+-- is not followed, whatever the value of 'setFollowSymLinks'.
 --
 -- A new directory is added when its create or move event is read from the
 -- stream, which is some time after it was actually created. If the path has
@@ -333,7 +333,8 @@ foreign import capi
     "sys/inotify.h value IN_DONT_FOLLOW" iN_DONT_FOLLOW :: Word32
 
 -- | If the pathname to be watched is a symbolic link then watch the target of
--- the symbolic link instead of the symbolic link itself.
+-- the symbolic link instead of the symbolic link itself. Applies to the watch
+-- roots only.
 --
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
