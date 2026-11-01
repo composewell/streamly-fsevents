@@ -9,11 +9,13 @@
 module Streamly.Test.FileSystem.Event.Linux (main) where
 
 import Control.Concurrent
-    ( forkIO, killThread, newEmptyMVar, putMVar, rtsSupportsBoundThreads
-    , takeMVar, threadDelay, tryTakeMVar
+    ( MVar, ThreadId, forkIO, killThread, newEmptyMVar, putMVar
+    , rtsSupportsBoundThreads, takeMVar, threadDelay, tryPutMVar, tryTakeMVar
     )
 import Control.Exception
-    (IOException, SomeException, bracket, finally, throwIO, try)
+    ( AsyncException(ThreadKilled), IOException, SomeException, bracket
+    , finally, fromException, mask, throwIO, try
+    )
 import Control.Monad (filterM, when)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf, sort)
@@ -37,6 +39,7 @@ import System.IO
     , openFile
     )
 import System.IO.Temp (withSystemTempDirectory)
+import System.Mem (performGC)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(ResourceLimit)
     , ResourceLimits(softLimit), getResourceLimit, setResourceLimit
@@ -48,6 +51,7 @@ import Test.Hspec
 import qualified Data.List as List
 #endif
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Streamly.Internal.Data.Fold as Fold
 import qualified Streamly.Internal.Data.Stream as Stream
 import qualified Streamly.Internal.FileSystem.Path as Path
 import qualified Streamly.Internal.FS.Event.Linux as Event
@@ -568,6 +572,156 @@ cloexecWatch =
             flags <- mapM fdFlags fds
             null flags `shouldBe` False
             filter (\f -> f .&. 0o2000000 == 0) flags `shouldBe` []
+
+-------------------------------------------------------------------------------
+-- Async exception tests
+-------------------------------------------------------------------------------
+
+-- | Run the action in a new thread, return the thread and an 'MVar' with its
+-- result. The thread starts masked, so that an exception thrown to it right
+-- after the fork is reported in the result.
+forkResult :: IO () -> IO (ThreadId, MVar (Either SomeException ()))
+forkResult action = do
+    result <- newEmptyMVar
+    tid <-
+        mask $ \restore ->
+            forkIO (try (restore action) >>= putMVar result)
+    return (tid, result)
+
+-- | The thread must end within 5 seconds, killed by 'killThread'. Any other
+-- exception fails the test, for example, reaching an inotify limit.
+shouldBeKilled :: MVar (Either SomeException ()) -> Expectation
+shouldBeKilled result = do
+    r <- timeout 5000000 (takeMVar result)
+    case r of
+        Nothing -> expectationFailure "the thread did not end"
+        Just (Right ()) -> expectationFailure "the thread was not killed"
+        Just (Left e) ->
+            when (fromException e /= Just ThreadKilled) $ throwIO e
+
+-- | Run the action until it returns 'True', at most 50 times, 100 ms apart.
+retryUntil :: IO Bool -> IO Bool
+retryUntil action = go (50 :: Int)
+
+    where
+
+    go 0 = return False
+    go n = do
+        ok <- action
+        if ok
+        then return True
+        else threadDelay 100000 >> go (n - 1)
+
+-- | The number of inotify fds must reach @n@ without a garbage collection.
+waitFdCount :: Int -> IO ()
+waitFdCount n =
+    retryUntil ((== n) . length <$> inotifyFds) >>= (`shouldBe` True)
+
+-- | The number of inotify fds must return to @n@ after garbage collection.
+gcFdCount :: Int -> IO ()
+gcFdCount n =
+    retryUntil (performGC >> (== n) . length <$> inotifyFds)
+        >>= (`shouldBe` True)
+
+-- | A recursive watch stream of the path.
+recStream :: FilePath -> IO (Stream.Stream IO Event)
+recStream root = do
+    p <- Path.fromString root
+    return $ Event.watchWith (Event.setRecursiveMode True) (p NonEmpty.:| [])
+
+-- | An exception raised in the stream closes the watch without a garbage
+-- collection.
+killWaitingReader :: Spec
+killWaitingReader =
+    it "killing a thread waiting for events closes the watch at once"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            n <- length <$> inotifyFds
+            stream <- recStream fp
+            (tid, result) <- forkResult (Stream.fold Fold.drain stream)
+            waitFdCount (n + 1)
+            -- Let the reader block in the wait for events
+            threadDelay 200000
+            killThread tid
+            shouldBeKilled result
+            length <$> inotifyFds `shouldReturn` n
+
+-- | The scan of the tree runs in the masked allocation of the bracket. The
+-- exception can be delivered when the allocation ends, outside the stream,
+-- the watch is then closed by the garbage collection.
+killStartingWatch :: Spec
+killStartingWatch =
+    it "killing a thread during the start of a watch closes the watch"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            mapM_
+                (\i -> createDirectory (fp </> show i))
+                [1 .. 2000 :: Int]
+            n <- length <$> inotifyFds
+            stream <- recStream fp
+            let kill delay = do
+                    (tid, result) <-
+                        forkResult (Stream.fold Fold.drain stream)
+                    threadDelay delay
+                    killThread tid
+                    shouldBeKilled result
+                    gcFdCount n
+            mapM_ kill [0, 100, 1000, 5000, 20000, 50000]
+
+-- | The delays cover the allocation, the first read and the wait. The garbage
+-- collections keep the number of unclosed watches below the
+-- max_user_instances limit.
+killRepeatedly :: Spec
+killRepeatedly =
+    it "killing a thread at any point leaves no fd and no blocked thread"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            createDirectory (fp </> "sub")
+            n <- length <$> inotifyFds
+            stream <- recStream fp
+            let kill i = do
+                    (tid, result) <-
+                        forkResult (Stream.fold Fold.drain stream)
+                    when (i `mod` 3 /= 0) $ threadDelay (i `mod` 400)
+                    killThread tid
+                    shouldBeKilled result
+                    when (i `mod` 50 == 0) performGC
+            mapM_ kill [1 .. 2000 :: Int]
+            gcFdCount n
+
+-- | The consumer runs outside the stream, the stream does not see the
+-- exception. The watch is closed by the garbage collection.
+killConsumer :: Spec
+killConsumer =
+    it "killing a thread in the consumer closes the watch on GC"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            n <- length <$> inotifyFds
+            stream <- recStream fp
+            consuming <- newEmptyMVar
+            let consume _ = do
+                    _ <- tryPutMVar consuming ()
+                    threadDelay 60000000
+            (tid, result) <-
+                forkResult (Stream.fold (Fold.drainMapM consume) stream)
+            waitFdCount (n + 1)
+            createFile (fp </> "file")
+            timeout 5000000 (takeMVar consuming) `shouldReturn` Just ()
+            killThread tid
+            shouldBeKilled result
+            gcFdCount n
+
+-- | 'Stream.take' stops without draining the stream, the bracket of the
+-- stream does not see the end. The watch is closed by the garbage collection.
+abandonStream :: Spec
+abandonStream =
+    it "a stream abandoned by the consumer closes the watch on GC"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            n <- length <$> inotifyFds
+            stream <- recStream fp
+            (_, result) <-
+                forkResult (Stream.fold Fold.drain (Stream.take 1 stream))
+            waitFdCount (n + 1)
+            createFile (fp </> "file")
+            r <- timeout 5000000 (takeMVar result)
+            fmap (either (const False) (const True)) r `shouldBe` Just True
+            gcFdCount n
 
 -------------------------------------------------------------------------------
 -- Concurrency tests
@@ -1240,6 +1394,12 @@ watchTests =
             describe "resources" $ do
                 openWatchNoLeak
                 cloexecWatch
+            describe "async exceptions" $ do
+                killWaitingReader
+                killStartingWatch
+                killRepeatedly
+                killConsumer
+                abandonStream
             describe "concurrency" $ do
                 addWhileReading
                 removeWhileReading
