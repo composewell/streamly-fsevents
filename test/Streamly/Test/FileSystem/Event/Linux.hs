@@ -1403,6 +1403,29 @@ recScanCreatedRenamedTwice =
                 renameDirectory dir1 dir2
             scannedPaths (const True) evs `shouldBe` [dir2 </> "file"]
 
+-- XXX Known bug, file is not reported. The create event of the first dir adds
+-- the second dir, no scan fails. The move event finds that dir1 is not the
+-- watched directory and adds dir1 without a scan. This test records the
+-- current behavior, a fix must change it to expect file in the scanned paths.
+recScanCreatedRenamedPathReused :: Spec
+recScanCreatedRenamedPathReused =
+    it "does not report a renamed new directory if its old path is reused"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                later = dir1 </> "later"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createFile (dir </> "file")
+                renameDirectory dir dir1
+                createDirectory dir
+            pathsOf (\ev -> Event.isCreated ev && not (Event.isDir ev)) evs
+                `shouldBe` [root </> "sync"]
+            pathsOf Event.isScanEvent evs `shouldBe` []
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
 recScanCreatedThenMovedOut :: Spec
 recScanCreatedThenMovedOut =
     it "does not report the entries of a new directory moved out of the tree"
@@ -1852,6 +1875,7 @@ watchTests =
                 recScanNotOnMove
                 recScanCreatedThenRenamed
                 recScanCreatedRenamedTwice
+                recScanCreatedRenamedPathReused
                 recScanCreatedThenMovedOut
                 recScanCreatedRenamedDisabled
                 recScanNotOnMoveToMissedPath

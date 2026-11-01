@@ -282,6 +282,11 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- example, @mkdir a; touch a\/f; mv a b@ reports @a@, the move of @a@ to @b@
 -- and @b\/f@.
 --
+-- If another directory is created at the old path before the create event is
+-- read, the new path is not scanned. For example, the entry @f@ in
+-- @mkdir a; touch a\/f; mv a b; mkdir a@ is not reported. Scan the directory
+-- when its 'isMovedTo' event is received to find the entries in it.
+--
 -- The scan reports the state of the directory, not its history. Every entry
 -- present when the scan reads it is reported. An entry created and deleted
 -- before the scan is not reported, a modification before the scan is not
@@ -1147,6 +1152,10 @@ data ScannedEntry = ScannedEntry
 -- from the list, the entries of its directory are not reported. A scan of a
 -- path that succeeds or a directory moved to the path removes the entry of the
 -- path, the directory at the path is no longer the directory recorded.
+--
+-- XXX mkdir a; touch a/f; mv a b; mkdir a: IN_CREATE of a adds the second a,
+-- no scan fails and nothing is recorded. On IN_MOVED_TO of b, 'renameDir'
+-- finds that b is not the watched directory and adds b without reporting f.
 
 -- | The maximum length of the list of 'MissedDir' in a 'Watch'. The entries
 -- are needed only for the duration of the events of a rename, which are close
