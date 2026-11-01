@@ -478,6 +478,35 @@ behaviors =
             any (\ev -> isNamed "link" ev && Event.isDeleted ev)
         , expected = onPlatform Yes Yes Yes
         }
+    -- On Linux, the kernel merges the second write into the first because the
+    -- first is the last event in the queue and it has not been read.
+    , base
+        { title = "two writes to a file before the read report one isModified"
+        , setup = withFile
+        , paused = True
+        , ops = \p -> do
+            let file = watchRoot p </> "file"
+            appendFile file "x"
+            appendFile file "y"
+        , check = \_ evs ->
+            let modified ev = isNamed "file" ev && Event.isModified ev
+             in length (filter modified evs) == 1
+        , expected = onPlatform Yes Yes No
+        , racy = notLinux
+        }
+    , base
+        { title = "one event reports isCreated and isDeleted for a file"
+        , paused = True
+        , ops = \p -> do
+            let file = watchRoot p </> "file"
+            createFile file
+            removeFile file
+        , check = \_ ->
+            any (\ev ->
+                isNamed "file" ev && Event.isCreated ev && Event.isDeleted ev)
+        , expected = onPlatform No Yes No
+        , racy = notLinux
+        }
     ]
 
     where
