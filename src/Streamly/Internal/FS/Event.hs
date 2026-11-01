@@ -11,9 +11,6 @@
 -- modules of the same name in the @streamly@ package, which provides
 -- @Streamly.Internal.FileSystem.Event@ and its platform specific modules.
 
--- XXX Need to ensure that the signatures of the exported APIs are same on all
--- platforms.
-
 module Streamly.Internal.FS.Event
     (
     -- * Creating a Watch
