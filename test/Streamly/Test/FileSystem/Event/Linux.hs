@@ -1366,6 +1366,89 @@ recScanNotOnMove =
                 renameDirectory dir dir1
             pathsOf Event.isScanEvent evs `shouldBe` []
 
+-- The scan on the create event of dir fails, the path no longer exists. The
+-- directory is scanned at its new path.
+recScanCreatedThenRenamed :: Spec
+recScanCreatedThenRenamed =
+    it "reports the entries of a directory renamed before its create event"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                sub = dir1 </> "sub"
+                file = sub </> "file"
+                later = sub </> "later"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createDirectory (dir </> "sub")
+                createFile (dir </> "sub" </> "file")
+                renameDirectory dir dir1
+            sort (scannedPaths (const True) evs) `shouldBe` sort [sub, file]
+            scannedPaths Event.isDir evs `shouldBe` [sub]
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+-- The scan at each intermediate path fails.
+recScanCreatedRenamedTwice :: Spec
+recScanCreatedRenamedTwice =
+    it "reports the entries of a directory renamed twice before its events"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createFile (dir </> "file")
+                renameDirectory dir dir1
+                renameDirectory dir1 dir2
+            scannedPaths (const True) evs `shouldBe` [dir2 </> "file"]
+
+recScanCreatedThenMovedOut :: Spec
+recScanCreatedThenMovedOut =
+    it "does not report the entries of a new directory moved out of the tree"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                out = takeDirectory root </> "out"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                createFile (dir </> "file")
+                renameDirectory dir out
+            pathsOf Event.isScanEvent evs `shouldBe` []
+
+recScanCreatedRenamedDisabled :: Spec
+recScanCreatedRenamedDisabled =
+    it "setScanNewDirs False does not report a renamed new directory"
+        $ withRoot cfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+            evs <- recEventsOf cfg root w $ do
+                createDirectory dir
+                createFile (dir </> "file")
+                renameDirectory dir dir1
+            pathsOf Event.isScanEvent evs `shouldBe` []
+
+    where
+
+    cfg = Event.setScanNewDirs False recCfg
+
+-- dir is recorded by its failed scan, the directory moved to the same path is
+-- a different directory.
+recScanNotOnMoveToMissedPath :: Spec
+recScanNotOnMoveToMissedPath =
+    it "does not report a directory moved in at a path whose scan failed"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+                dir1 = root </> "dir1"
+            createDirectory src
+            createFile (src </> "file")
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                removeDirectory dir
+                renameDirectory src dir
+                renameDirectory dir dir1
+            pathsOf Event.isScanEvent evs `shouldBe` []
+
 -- The first create event adds the second directory, the second create event
 -- finds it already watched.
 recDirRecreated :: Spec
@@ -1767,6 +1850,11 @@ watchTests =
                 recScanNewDirSilent
                 recTouchAfterNewDirScan
                 recScanNotOnMove
+                recScanCreatedThenRenamed
+                recScanCreatedRenamedTwice
+                recScanCreatedThenMovedOut
+                recScanCreatedRenamedDisabled
+                recScanNotOnMoveToMissedPath
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan

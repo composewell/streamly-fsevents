@@ -118,7 +118,13 @@ import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef
-    (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+    ( IORef
+    , atomicModifyIORef'
+    , atomicWriteIORef
+    , modifyIORef'
+    , newIORef
+    , readIORef
+    )
 import Data.List (find, isPrefixOf)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (isJust, isNothing)
@@ -232,10 +238,11 @@ setFlag mask status cfg@Config{..} =
 -- not scanned, a rename within the tree is not a creation of its contents, and
 -- a directory moved in has one move event on all platforms. The subdirectories
 -- of a directory moved in are added without generating events, and the events
--- in it before it is added are not reported. A subdirectory of a renamed
--- directory that is not watched when the 'isMovedTo' event is read is added,
--- and reports its entries the same way as a directory created in the tree,
--- before its own create event.
+-- in it before it is added are not reported. A directory created in the tree
+-- and renamed before its create event is read is scanned at its new path. A
+-- subdirectory of a renamed directory that is not watched when the 'isMovedTo'
+-- event is read is added, and reports its entries the same way as a directory
+-- created in the tree, before its own create event.
 --
 -- The scan that adds a tree, including the scan of a new directory, does not
 -- report the open, access and close events that it generates. These events
@@ -269,6 +276,11 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- 'isScanEvent' are true is reported for each entry found. These events follow
 -- the create event of the directory. For example,
 -- @mkdir -p a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and @a\/b\/f@.
+--
+-- A directory renamed within the tree before its create event is read is
+-- scanned at its new path, the events found follow its 'isMovedTo' event. For
+-- example, @mkdir a; touch a\/f; mv a b@ reports @a@, the move of @a@ to @b@
+-- and @b\/f@.
 --
 -- The scan reports the state of the directory, not its history. Every entry
 -- present when the scan reads it is reported. An entry created and deleted
@@ -797,6 +809,14 @@ data FdState = FdState
     , fsFdWaiters :: !Int
     }
 
+-- | A directory reported by IN_CREATE that no longer existed at the path when
+-- its watch was added, see the NOTE above 'recordMissedDir'.
+data MissedDir = MissedDir
+    { mdPath :: PathRep
+    -- | The cookie of the IN_MOVED_FROM event read for the path.
+    , mdCookie :: Maybe Word32
+    }
+
 -- | A handle for a watch.
 --
 data Watch =
@@ -808,6 +828,7 @@ data Watch =
         -- block.
         (MVar FdState)
         (IORef (IntMap WdEntry)) -- Map key is the watch descriptor
+        (IORef [MissedDir]) -- Latest first, see 'recordMissedDir'
 
 -- Instead of using the watch descriptor we can provide APIs that use the path
 -- itself to identify the watch. That will require us to maintain a map from wd
@@ -844,13 +865,14 @@ createWatch = do
         newMVar
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef Map.empty
-    return $ Watch fd lock emptyMapRef
+    missedRef <- newIORef []
+    return $ Watch fd lock emptyMapRef missedRef
 
 -- | Run an action on the fd of a watch, holding the lock of the watch. The
 -- action must not block. Throw an exception if the watch is closed. The
 -- string is the name of the operation, used in the exception message.
 withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
-withWatchFd op (Watch fd lock _) action =
+withWatchFd op (Watch fd lock _ _) action =
     withMVar lock $ \st ->
         if fsWatchClosed st
         then ioError
@@ -864,11 +886,11 @@ withWatchFd op (Watch fd lock _) action =
 -- | Run an action holding the lock of the watch, do nothing if the watch is
 -- closed. The action must not block. See 'withWatchFd'.
 whenWatchOpen :: Watch -> IO () -> IO ()
-whenWatchOpen (Watch _ lock _) action =
+whenWatchOpen (Watch _ lock _ _) action =
     withMVar lock $ \st -> unless (fsWatchClosed st) action
 
 isWatchClosed :: Watch -> IO Bool
-isWatchClosed (Watch _ lock _) = fsWatchClosed <$> readMVar lock
+isWatchClosed (Watch _ lock _ _) = fsWatchClosed <$> readMVar lock
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -892,7 +914,7 @@ insertPath wd prep m =
 -- Returns the watch descriptor, and 'False' if the path is already being
 -- watched.
 addPathWith :: Word32 -> Watch -> PathRep -> IO (Int, Bool)
-addPathWith flags watch0@(Watch _ _ wdMapRef) prep = do
+addPathWith flags watch0@(Watch _ _ wdMapRef _) prep = do
     let absPath = combinePathRep prep
 
     -- The watch descriptor is inserted in the map with the lock held, so that
@@ -943,7 +965,7 @@ foreign import ccall unsafe
 --   directory with its new path.
 -- * If the path is now another directory in the map, it has the same flags.
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
-updateWatch flags wt@(Watch _ _ wdMapRef) wd prep =
+updateWatch flags wt@(Watch _ _ wdMapRef _) wd prep =
     withWatchFd "addToWatch" wt $ \fd -> do
         r <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
             try
@@ -1105,27 +1127,101 @@ data ScannedEntry = ScannedEntry
     , sePath :: PathRep
     }
 
+-- NOTE: A directory created and renamed before its create event is read:
+--
+-- mkdir a; touch a/f; mv a b. On IN_CREATE of a the path no longer exists and
+-- the scan of a fails. IN_MOVED_FROM of a finds no watch and records no cookie
+-- in the map, so IN_MOVED_TO of b looks the same as a directory moved in,
+-- whose entries are not reported. A directory moved in and renamed in the same
+-- period has the same two move events, and its entries are not reported
+-- either. The difference between the two is the failed scan.
+--
+-- The failed scan records the path. IN_MOVED_FROM of the path adds its cookie,
+-- and IN_MOVED_TO with the cookie scans the new path as a new directory. If
+-- that scan fails too, the new path is recorded, this handles any number of
+-- renames.
+--
+-- No event removes an entry in all the cases: IN_DELETE may not be requested,
+-- and a directory moved out of the tree has no IN_MOVED_TO. The list is
+-- limited to 'maxMissedDirs' entries for this reason. If an entry is dropped
+-- from the list, the entries of its directory are not reported. A scan of a
+-- path that succeeds or a directory moved to the path removes the entry of the
+-- path, the directory at the path is no longer the directory recorded.
+
+-- | The maximum length of the list of 'MissedDir' in a 'Watch'. The entries
+-- are needed only for the duration of the events of a rename, which are close
+-- to each other in the queue.
+maxMissedDirs :: Int
+maxMissedDirs = 1024
+
+missedDirsRef :: Watch -> IORef [MissedDir]
+missedDirsRef (Watch _ _ _ ref) = ref
+
+-- | A path without a cookie, the IN_MOVED_FROM event of the path is not read
+-- yet.
+isMissedAt :: PathRep -> MissedDir -> Bool
+isMissedAt prep md = isNothing (mdCookie md) && eqPathRep (mdPath md) prep
+
+-- | Remove the record of a path, a directory now exists at the path.
+forgetMissedDir :: Watch -> PathRep -> IO ()
+forgetMissedDir wt prep =
+    atomicModifyIORef' (missedDirsRef wt)
+        $ \l -> (filter (not . isMissedAt prep) l, ())
+
+-- | Record a directory for which the scan on IN_CREATE failed.
+recordMissedDir :: Watch -> PathRep -> IO ()
+recordMissedDir wt prep =
+    atomicModifyIORef' (missedDirsRef wt) $ \l ->
+        let old = filter (not . isMissedAt prep) l
+         in (take maxMissedDirs (MissedDir prep Nothing : old), ())
+
+-- | Add the cookie of IN_MOVED_FROM to the records of the paths.
+markMissedMoved :: Word32 -> [PathRep] -> [MissedDir] -> [MissedDir]
+markMissedMoved cookie paths = map step
+
+    where
+
+    step md
+        | any (`isMissedAt` md) paths = md {mdCookie = Just cookie}
+        | otherwise = md
+
+-- | Remove a cookie from the list. Returns the paths that had it.
+takeMissedMoved :: Word32 -> [MissedDir] -> ([MissedDir], [PathRep])
+takeMissedMoved cookie l =
+    ( filter (not . isMatch) l
+    , [mdPath md | md <- l, isMatch md]
+    )
+
+    where
+
+    isMatch md = mdCookie md == Just cookie
+
 -- | Add a directory reported by IN_CREATE and return the entries in it. The
 -- watch is added before the directory is read, an entry created later is
 -- either found by the scan or reported by the kernel, or both.
 --
 -- A directory already watched returns no entries, the scan that added it
--- returned them, or it is the scan of a root or of an overflow.
+-- returned them, or it is the scan of a root or of an overflow. A directory
+-- that cannot be added is recorded, see 'recordMissedDir'.
 addNewDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
 addNewDir cfg wt prep = do
-    (wd, isNew) <-
-        ignoreSubdirError wt (0, False)
-            $ addPathWith (scanFlags subCfg) wt prep
-    if isNew
-    then do
-        found <- listEntries prep >>= fmap concat . mapM addEntry
-        -- The directory and the tree under it have been listed.
-        when (scanFlags subCfg /= watchFlags subCfg)
-            $ void
-            $ ignoreSubdirError wt False
-            $ updateWatch (watchFlags subCfg) wt wd prep
-        return found
-    else return []
+    added <-
+        ignoreSubdirError wt Nothing
+            $ Just <$> addPathWith (scanFlags subCfg) wt prep
+    case added of
+        Nothing -> [] <$ recordMissedDir wt prep
+        Just (wd, isNew) -> do
+            forgetMissedDir wt prep
+            if isNew
+            then do
+                found <- listEntries prep >>= fmap concat . mapM addEntry
+                -- The directory and the tree under it have been listed.
+                when (scanFlags subCfg /= watchFlags subCfg)
+                    $ void
+                    $ ignoreSubdirError wt False
+                    $ updateWatch (watchFlags subCfg) wt wd prep
+                return found
+            else return []
 
     where
 
@@ -1257,7 +1353,7 @@ addRemovalMarker fd wdMapRef markers paths =
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths wt@(Watch fd _ wdMapRef) desc p =
+unwatchPaths wt@(Watch fd _ wdMapRef _) desc p =
     whenWatchOpen wt $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
@@ -1346,7 +1442,7 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
-closeWatch (Watch fd lock _) =
+closeWatch (Watch fd lock _ _) =
     modifyMVar_ lock $ \st ->
         if fsWatchClosed st
         then return st
@@ -1485,7 +1581,7 @@ pendingRemovals m =
 -- Failing to queue the marker, for example, when the process is out of fds,
 -- is ignored, the next IN_Q_OVERFLOW event tries again.
 syncRemovals :: Watch -> IO ()
-syncRemovals wt@(Watch fd _ wdMapRef) =
+syncRemovals wt@(Watch fd _ wdMapRef _) =
     whenWatchOpen wt $ do
         (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
         when (not (null markers && null paths))
@@ -1530,7 +1626,7 @@ pathKey = Path.toArray . combinePathRep
 -- reached by the old path. Failing to remove a path is ignored, like in
 -- 'syncRemovals', the next overflow tries again.
 restartTree :: Config -> Watch -> IO ()
-restartTree cfg wt@(Watch _ _ wdMapRef) = do
+restartTree cfg wt@(Watch _ _ wdMapRef _) = do
     m <- readIORef wdMapRef
     seen <- newIORef Set.empty
     roots <-
@@ -1738,7 +1834,7 @@ rescanDir cfg0 wt = go cfg0 False
 -- the NOTE above. Returns the entries found in the subdirectories that were
 -- not watched.
 renameDir :: Config -> Watch -> (Int, PathRep) -> PathRep -> IO [ScannedEntry]
-renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
+renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
     same <-
         ignoreSubdirError wt False
             $ updateWatch (watchFlags subCfg) wt wd to
@@ -1758,16 +1854,22 @@ renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
 -- | Handle IN_MOVED_TO of a directory that reports the given paths. A path
 -- whose root has a path with the cookie is a rename within that root, the
 -- other paths are moved in. A path with the cookie whose root does not have a
--- new path is moved out of that root. Returns the entries found by the
--- renames.
+-- new path is moved out of that root. A path whose root has a 'MissedDir' with
+-- the cookie is a new directory renamed before it could be added. Returns the
+-- entries found by the renames and the new directories.
 movedInDir :: Config -> Watch -> Word32 -> [PathRep] -> IO [ScannedEntry]
-movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
+movedInDir cfg wt@(Watch _ _ wdMapRef _) cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
+    missed <- atomicModifyIORef' (missedDirsRef wt) (takeMissedMoved cookie)
     let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
         moveTo to =
             case find (isSameRoot to . snd) froms of
                 Just from -> renameDir cfg wt from to
-                Nothing -> [] <$ addSubdirToWatch cfg wt to
+                Nothing
+                    | any (isSameRoot to) missed -> addNewDir cfg wt to
+                    | otherwise -> do
+                        forgetMissedDir wt to
+                        [] <$ addSubdirToWatch cfg wt to
         isMovedOut from = not (any (isSameRoot from) paths)
     mapM_ (unwatchSubtree wt) (filter isMovedOut (map snd froms))
     concat <$> mapM moveTo paths
@@ -1778,7 +1880,7 @@ movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
 -- the directory as a directory moved in. Failing to remove a path is ignored,
 -- like in 'syncRemovals'.
 unwatchMoved :: Watch -> IO ()
-unwatchMoved wt@(Watch _ _ wdMapRef) = do
+unwatchMoved wt@(Watch _ _ wdMapRef _) = do
     paths <- atomicModifyIORef' wdMapRef takeAll
     mapM_ (unwatchSubtree wt) paths `catchIOError` \_ -> return ()
 
@@ -1811,7 +1913,7 @@ unwatchMoved wt@(Watch _ _ wdMapRef) = do
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
-readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
+readOneEvent cfg  wt@(Watch _ _ wdMapRef _) = do
     -- XXX the header format is implicit in the code, this could be bug prone.
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
@@ -1852,6 +1954,8 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
         PR.fromEffect $ unwatchMoved wt
+        -- 'isEventsLost' requires the application to scan the tree anyway.
+        PR.fromEffect $ atomicWriteIORef (missedDirsRef wt) []
         when (watchRec cfg && restartOnOverflow cfg)
             $ PR.fromEffect
             $ restartTree cfg wt
@@ -1894,8 +1998,11 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                 -- See the NOTE above 'clearMoved'.
                 when (watchRec cfg && isDirMovedOut)
                     $ PR.fromEffect
-                    $ atomicModifyIORef' wdMapRef
-                    $ \m -> (markMoved cookie live m, ())
+                    $ do
+                        atomicModifyIORef' wdMapRef
+                            $ \m -> (markMoved cookie live m, ())
+                        atomicModifyIORef' (missedDirsRef wt)
+                            $ \l -> (markMissedMoved cookie live l, ())
                 -- Assumes that IN_MOVED_TO is queued before IN_MOVE_SELF, see
                 -- the IMPORTANT note above 'clearMoved'.
                 when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
@@ -1957,7 +2064,7 @@ foreign import ccall unsafe "unistd.h read"
 -- | Read the events available on the fd of a watch, wait for the events if
 -- none is available. Returns 'Nothing' if the watch is closed.
 readEvents :: Watch -> IO (Maybe (Array Word8))
-readEvents (Watch fd lock _) = loop
+readEvents (Watch fd lock _ _) = loop
 
     where
 
