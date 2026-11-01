@@ -27,9 +27,9 @@
   causes the wrong object, or no object, to be watched.
 - Linux: fix the handling of an event queue overflow. The overflow event,
   `isEventsLost`, is reported once per watch root, and `getRoot` and
-  `getAbsPath` no longer raise an exception on it. In recursive mode, the
-  tree is scanned again, so that a directory created during the overflow is
-  watched.
+  `getAbsPath` no longer raise an exception on it. In recursive mode,
+  `setRestartOnOverflow` adds the tree again, so that a directory created
+  during the overflow is watched.
 - Linux: in recursive mode, adding a tree no longer reports the open, access
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
@@ -41,6 +41,8 @@
 - Linux: in recursive mode, a newly created directory is scanned to report
   the entries created before its watch was added, as `isCreated` events.
   See `setScanNewDirs` and `isScanEvent`.
+- Linux: add `setRestartOnOverflow`, enabled by default, to restart a
+  recursive watch automatically after an event queue overflow.
 - Add the public platform specific modules
   `Streamly.FileSystem.Event.Darwin`, `Streamly.FileSystem.Event.Linux` and
   `Streamly.FileSystem.Event.Windows`.

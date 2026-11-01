@@ -106,6 +106,10 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- way. Events in it before its watch is added are not reported. To find
 -- everything in such a directory, scan the directory when its move event is
 -- received.
+-- * A directory whose create or move event is lost in an 'isEventsLost'
+-- overflow is added by restarting the watch, unless the Linux specific
+-- @setRestartOnOverflow@ is disabled. The restart lists all the directories of
+-- the tree.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
