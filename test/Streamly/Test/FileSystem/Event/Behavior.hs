@@ -285,6 +285,31 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- On Linux, the scan reports the file, not the changes made to it before
+    -- the watch of the directory is added.
+    , newDir
+        { title = "file modified in a new dir before it is read is reported"
+        , ops = \p -> do
+            let file = watchRoot p </> "dir/file"
+            createDirectory (watchRoot p </> "dir")
+            createFile file
+            appendFile file "x"
+        , check = \_ ->
+            any (\ev -> isNamed "file" ev && Event.isModified ev)
+        , expected = onPlatform No Yes Yes
+        , racy = notLinux
+        }
+    , newDir
+        { title = "file deleted in a new dir before it is read is reported"
+        , ops = \p -> do
+            let file = watchRoot p </> "dir/file"
+            createDirectory (watchRoot p </> "dir")
+            createFile file
+            removeFile file
+        , check = \_ -> any (isNamed "file")
+        , expected = onPlatform No Yes Yes
+        , racy = notLinux
+        }
     -- The consumer reads the events while the files are created. On Linux,
     -- some of the files are created after the watch of a directory is added
     -- and before the scan of the directory reads them.
@@ -458,6 +483,8 @@ behaviors =
     where
 
     onWindows = platformName == "Windows"
+
+    notLinux = platformName /= "Linux"
 
     withDir p = do
         createDirectory (watchRoot p </> "dir")
