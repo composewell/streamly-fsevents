@@ -67,7 +67,6 @@
 
 #include "config.h"
 
-#if HAVE_DECL_IN_EXCL_UNLINK
 module Streamly.Internal.FS.Event.Linux
     (
     -- * Subscribing to events
@@ -385,14 +384,24 @@ foreign import capi
 setFollowSymLinks :: Bool -> Config -> Config
 setFollowSymLinks s = setFlag iN_DONT_FOLLOW (not s)
 
+#if HAVE_DECL_IN_EXCL_UNLINK
 foreign import capi
     "sys/inotify.h value IN_EXCL_UNLINK" iN_EXCL_UNLINK :: Word32
+#else
+#warning "IN_EXCL_UNLINK is not defined, setExcludeUnlinked has no effect."
+-- Linux kernels older than 2.6.36 do not have this flag.
+iN_EXCL_UNLINK :: Word32
+iN_EXCL_UNLINK = 0
+#endif
 
 -- | Do not report the events of a file after it is unlinked from the watched
 -- directory. A process can keep a file open after the file is deleted and
 -- continue to read and write it. When this setting is 'False', those reads
 -- and writes are reported as events with the deleted path. When it is
 -- 'True', they are not reported.
+--
+-- This setting has no effect if the kernel headers do not define
+-- @IN_EXCL_UNLINK@, that is, on Linux kernels older than 2.6.36.
 --
 -- /default: True/
 setExcludeUnlinked :: Bool -> Config -> Config
@@ -2172,7 +2181,3 @@ showEvent ev@Event{..} =
     ++ "\n"
 
         where showev f str = if f ev then "\n" ++ str else ""
-#else
-#warning "Disabling module Streamly.Internal.FS.Event.Linux. Does not support kernels older than 2.6.36."
-module Streamly.Internal.FS.Event.Linux () where
-#endif

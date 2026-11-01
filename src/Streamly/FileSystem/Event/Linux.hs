@@ -31,9 +31,6 @@
 --
 -- * <https://man7.org/linux/man-pages/man7/inotify.7.html inotify man page>
 
-#include "config.h"
-
-#if HAVE_DECL_IN_EXCL_UNLINK
 module Streamly.FileSystem.Event.Linux
     (
     -- * Creating a Watch
@@ -119,6 +116,3 @@ module Streamly.FileSystem.Event.Linux
 where
 
 import Streamly.Internal.FS.Event.Linux
-#else
-module Streamly.FileSystem.Event.Linux () where
-#endif
