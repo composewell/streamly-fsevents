@@ -13,6 +13,10 @@
 -- "Streamly.FileSystem.Event", the functions in this module can be used with
 -- the portable API as well.
 --
+-- A watch is attached to the path of a watch root. If a watch root is deleted
+-- and created again, the new object at the path is watched. If a watch root is
+-- renamed, the renamed object is no longer watched.
+--
 -- For reference documentation see:
 --
 -- * "<https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html Apple FS Events Programming Guide>"

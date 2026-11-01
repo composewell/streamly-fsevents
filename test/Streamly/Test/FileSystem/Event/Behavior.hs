@@ -8,8 +8,8 @@
 --
 -- Asserts the behaviors that differ across platforms. Each behavior has the
 -- expected outcome for each platform. The results are printed at the end,
--- including when an assertion fails. The table in the documentation of
--- "Streamly.FileSystem.Event" records the results printed on each platform in
+-- including when an assertion fails. The tables in
+-- docs/platform-differences.md record the results printed on each platform in
 -- the CI logs.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where

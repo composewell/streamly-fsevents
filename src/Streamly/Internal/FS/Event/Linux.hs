@@ -262,11 +262,15 @@ setFlag mask status cfg@Config{..} =
 --
 -- A new directory is added when its create or move event is read from the
 -- stream, not when it is created. The events in the directory before it is
--- added are not reported, its subdirectories are found by scanning it. If
--- the path has been reused by then, the directory found at the path is
--- watched. If an already watched directory is moved to that path, its events
--- may be reported under both the old and the new path until the move event
--- is read.
+-- added are not reported. Its subdirectories are found by scanning it and are
+-- added without generating events. If the path has been reused by then, the
+-- directory found at the path is watched. If an already watched directory is
+-- moved to that path, its events may be reported under both the old and the
+-- new path until the move event is read.
+--
+-- Each directory in the tree uses one inotify watch. If the number of watches
+-- exceeds the limit in @\/proc\/sys\/fs\/inotify\/max_user_watches@, the watch
+-- API or the event stream raises an exception.
 --
 -- In recursive mode the kernel watch always requests the create, moved-from
 -- and moved-to events, because they are needed to add and remove the

@@ -14,6 +14,9 @@
 -- "Streamly.FileSystem.Event", the functions in this module can be used with
 -- the portable API as well.
 --
+-- A watch keeps its watch root open, deleting the watch root fails with a
+-- permission error while it is watched.
+--
 -- For reference documentation see:
 --
 -- * <https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-file_notify_information file notify information>

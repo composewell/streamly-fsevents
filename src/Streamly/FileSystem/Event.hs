@@ -12,17 +12,9 @@
 -- across major platforms. In most cases, behavior is consistent across
 -- operating systems, but certain platform-specific idiosyncrasies remain.
 --
--- Recursive directory watching is native on macOS and Windows. On Linux,
--- inotify watches only one directory, recursive watching is emulated in user
--- space by adding a watch for each new directory, and events in a new
--- directory may be lost before its watch is added. See 'setRecursiveMode'.
---
--- On Linux, watches are tied to file handles. As a result:
---
--- * If a watched file is deleted and recreated, the new file is not watched.
--- * If a watched file is renamed, we can continue to monitor it.
---
--- On macOS, by contrast, watches are path-based.
+-- See @docs\/platform-differences.md@ in this package for the differences that
+-- a portable program has to handle, for example, when a watch root is deleted
+-- or renamed. See 'setRecursiveMode' and 'watch' for details.
 --
 -- For platform-specific APIs, see:
 --

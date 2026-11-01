@@ -87,13 +87,16 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 --
 -- macOS and Windows watch a directory tree natively. Linux inotify watches
 -- only one directory, a recursive watch adds a watch for each directory in
--- the tree, and adds a watch for a new directory when its create event is
--- received:
+-- the tree, and adds a watch for a new directory when its create or move
+-- event is read from the stream:
 --
 -- * Starting a watch on a large tree takes time and memory proportional to
 -- the number of directories in the tree.
--- * Creating a directory and adding a watch for it is not atomic, events that
--- occur in a new directory before its watch is added may be lost.
+-- * The events in a new directory before its watch is added are not reported.
+-- For example, @mkdir -p a\/b; touch a\/b\/f@ may report only the creation of
+-- @a@. A slow consumer of the stream makes this more likely. To find
+-- everything in a new directory, scan the directory when its create or move
+-- event is received.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
@@ -143,8 +146,13 @@ watchWith = Event.watchWith
 -- If a watch root is a symbolic link then the target of the link is watched.
 -- Fails if the watched path does not exist. If the user does not have
 -- permissions (read and execute?) on the watch root then no events are
--- generated.  No events are generated if the watch root itself is renamed or
--- deleted.
+-- generated.
+--
+-- Do not rename, or delete and create again, a watch root in a portable
+-- program, the result depends on the platform. On Linux the watch stays with
+-- the renamed directory and ends when the directory is deleted. On macOS the
+-- watch stays with the path. On Windows the watch root cannot be renamed or
+-- deleted while it is watched.
 --
 -- This API watches for changes in the watch root directory only, any changes
 -- in the subdirectories of the watch root are not watched. Use
