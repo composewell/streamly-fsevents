@@ -36,6 +36,29 @@
 --
 -- A platform specific module is available only on its platform, the Haddock
 -- documentation of the module is built only on that platform.
+--
+-- = Event Coalescing
+--
+-- More than one event predicate can be true for the same 'Event', because the
+-- operating system can coalesce several changes of a path into one event. For
+-- example, on macOS @touch x; rm x@ can report one event for which both
+-- 'isCreated' and 'isDeleted' are true. The event does not give the order of
+-- the changes, and @x@ may or may not exist after it.
+--
+-- A program must test every predicate it is interested in. A chain that stops
+-- at the first predicate that is true misses the other changes reported by the
+-- event:
+--
+-- @
+-- handle ev = do
+--     when ('isCreated' ev) (onCreate ev)
+--     when ('isDeleted' ev) (onDelete ev)
+-- @
+--
+-- A program that needs the current state of a path must read it from the file
+-- system. The number of events cannot be used to count changes on any
+-- platform. See @docs\/platform-differences.md@ in this package for what is
+-- coalesced on each platform.
 
 module Streamly.FileSystem.Event
     (

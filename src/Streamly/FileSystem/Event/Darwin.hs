@@ -63,6 +63,14 @@
 -- "path" field in the event is set to the dirname of the path rather than the
 -- full absolute path. This is the observed behavior on macOS 10.15.1.
 --
+-- /Coalescing:/ More than one event predicate can be true for the same event.
+-- FSEvents can coalesce several changes of a path into one event. For example,
+-- @touch x; rm x@ can report one event for which both 'isCreated' and
+-- 'isDeleted' are true, and @touch x; mv x y@ one event for which both
+-- 'isCreated' and 'isMoved' are true. The event does not give the order of the
+-- changes. A program must test every predicate it is interested in, and read
+-- the file system to find the current state of the path.
+--
 -- = Platform differences
 --
 -- For reference documentation see:
