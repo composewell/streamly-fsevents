@@ -24,6 +24,7 @@ import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
     , createDirectoryLink
+    , doesDirectoryExist
     , getPermissions
     , getSymbolicLinkTarget
     , listDirectory
@@ -141,14 +142,22 @@ withTwoRoots action =
 -- | Read the events from the watch, using @cfg@, up to and including the first
 -- event that satisfies the predicate. Throw an exception if it does not occur
 -- within 10 seconds.
-readUntil :: Event.Config -> (Event -> Bool) -> Event.Watch -> IO [Event]
-readUntil cfg p w = do
+-- | Like 'readUntil', the action is run on each event when it is received,
+-- before the next event is read.
+readUntilWith ::
+    Event.Config -> (Event -> IO ()) -> (Event -> Bool) -> Event.Watch
+    -> IO [Event]
+readUntilWith cfg action p w = do
     r <- timeout 10000000
         $ Stream.toList
         $ Stream.takeEndBy p
+        $ Stream.trace action
         $ Stream.trace (putStrLn . Event.showEvent)
         $ Event.watchToStream cfg w
     maybe (error "readUntil: timed out") return r
+
+readUntil :: Event.Config -> (Event -> Bool) -> Event.Watch -> IO [Event]
+readUntil cfg = readUntilWith cfg (const (return ()))
 
 -- | Read the events from the watch up to and including the first
 -- 'Event.isRootUnwatched' event.
@@ -522,8 +531,7 @@ recMoveIn =
             evs <- readUntil recCfg (isCreatedAt file) w
             pathsOf Event.isCreated evs `shouldBe` [file]
 
--- IN_MOVED_TO of dir2 is queued before the IN_IGNORED events of dir1, dir2
--- is watched when the isRootUnwatched event of dir1/sub is read.
+-- The watches of dir1 are kept, its paths are changed on IN_MOVED_TO.
 recRenameWithin :: Spec
 recRenameWithin =
     it "reports the new path of a directory renamed within the tree"
@@ -535,10 +543,185 @@ recRenameWithin =
             createDirectory (dir1 </> "sub")
             waitWatched recCfg w dir1
             renameDirectory dir1 dir2
-            _ <- readUntil recCfg (isUnwatchedAt (dir1 </> "sub")) w
+            _ <- readUntil recCfg
+                (\ev -> Event.isMovedTo ev && getAbsPath ev == dir2) w
             createFile file
             evs <- readUntil recCfg (isCreatedAt file) w
             filter (isUnder dir1) (map getAbsPath evs) `shouldBe` []
+
+-- | Run the test with a watched directory @dir1@ containing @sub@. The test
+-- gets the root, the watch and the paths @dir1@ and @dir2@.
+withRenameDirs ::
+    (FilePath -> Event.Watch -> FilePath -> FilePath -> IO a) -> IO a
+withRenameDirs action =
+    withRoot recCfg $ \root w -> do
+        let dir1 = root </> "dir1"
+        createDirectory dir1
+        createDirectory (dir1 </> "sub")
+        waitWatched recCfg w dir1
+        action root w dir1 (root </> "dir2")
+
+-- | The paths of all the entries under a directory.
+listTree :: FilePath -> IO [FilePath]
+listTree dir = do
+    entries <- map (dir </>) <$> listDirectory dir
+    dirs <- filterM doesDirectoryExist entries
+    (entries ++) . concat <$> mapM listTree dirs
+
+-- IN_MOVED_TO of dir2 is queued before the create events of the entries, the
+-- paths are changed when these events are read. The walk on IN_MOVED_TO finds
+-- x and reports f before the create event of x.
+recRenameCreateBeforeRead :: Spec
+recRenameCreateBeforeRead =
+    it "reports entries created after a rename under the new path"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            let later = dir2 </> "x" </> "later"
+            evs <- recEventsOf recCfg root w $ do
+                renameDirectory dir1 dir2
+                createDirectory (dir2 </> "x")
+                createFile (dir2 </> "x" </> "f")
+                createFile (dir2 </> "g")
+            pathsOf Event.isCreated evs
+                `shouldBe`
+                    [ dir2 </> "x" </> "f"
+                    , dir2 </> "x"
+                    , dir2 </> "g"
+                    , root </> "sentinel"
+                    ]
+            pathsOf Event.isScanEvent evs `shouldBe` [dir2 </> "x" </> "f"]
+            createFile later
+            evs1 <- readUntil recCfg (isCreatedAt later) w
+            pathsOf Event.isCreated evs1 `shouldBe` [later]
+
+-- The action runs after IN_MOVED_FROM is read and before IN_MOVED_TO is read.
+recRenameCreateInGap :: Spec
+recRenameCreateInGap =
+    it "reports entries created between the two move events"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            let sentinel = root </> "sentinel"
+                inGap ev =
+                    when (Event.isMovedFrom ev && getAbsPath ev == dir1) $ do
+                        createFile (dir2 </> "gap")
+                        createFile (dir2 </> "sub" </> "gap")
+                        createFile sentinel
+            renameDirectory dir1 dir2
+            evs <- readUntilWith recCfg inGap (isCreatedAt sentinel) w
+            pathsOf Event.isCreated evs
+                `shouldBe`
+                    [dir2 </> "gap", dir2 </> "sub" </> "gap", sentinel]
+
+-- This test fails if the kernel queues IN_MOVE_SELF before IN_MOVED_TO, see
+-- the IMPORTANT note above 'clearMoved' in the library.
+recRenameNoUnwatched :: Spec
+recRenameNoUnwatched =
+    it "does not report isRootUnwatched for a renamed directory"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            evs <- recEventsOf recCfg root w (renameDirectory dir1 dir2)
+            createFile (dir2 </> "sub" </> "file")
+            createFile (root </> "sentinel1")
+            evs1 <- readUntil recCfg (isCreatedAt (root </> "sentinel1")) w
+            unwatched (evs ++ evs1) `shouldBe` []
+
+-- The create event of x is read after the rename, the old path does not exist
+-- and x cannot be added. It reports the old path, the path at the time of the
+-- event. The walk on IN_MOVED_TO adds x and reports f under the new path.
+recRenameCreateBeforeRename :: Spec
+recRenameCreateBeforeRename =
+    it "reports entries of a directory created before the rename"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            let later = dir2 </> "x" </> "later"
+            evs <- recEventsOf recCfg root w $ do
+                createDirectory (dir1 </> "x")
+                createFile (dir1 </> "x" </> "f")
+                renameDirectory dir1 dir2
+            pathsOf Event.isCreated evs
+                `shouldBe`
+                    [ dir1 </> "x"
+                    , dir2 </> "x" </> "f"
+                    , root </> "sentinel"
+                    ]
+            createFile later
+            evs1 <- readUntil recCfg (isCreatedAt later) w
+            pathsOf Event.isCreated evs1 `shouldBe` [later]
+
+-- dir2 does not exist when the IN_MOVED_TO of the first rename is read, the
+-- paths of dir1 are removed and dir3 is added on the second IN_MOVED_TO. file
+-- is reported under the old path. This is the current behavior, a change that
+-- keeps the watches over two renames must change this test.
+recRenameTwice :: Spec
+recRenameTwice =
+    it "adds the directory again if it is renamed twice before the read"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            let dir3 = root </> "dir3"
+                later = dir3 </> "sub" </> "later"
+            evs <- recEventsOf recCfg root w $ do
+                renameDirectory dir1 dir2
+                renameDirectory dir2 dir3
+                createFile (dir3 </> "file")
+            pathsOf Event.isCreated evs
+                `shouldBe` [dir1 </> "file", root </> "sentinel"]
+            createFile later
+            evs1 <- readUntil recCfg (isCreatedAt later) w
+            pathsOf Event.isCreated evs1 `shouldBe` [later]
+
+-- The paths of dir1 are changed before its isMovedTo event is delivered.
+recRenameScanOnMovedTo :: Spec
+recRenameScanOnMovedTo =
+    it "a scan on isMovedTo finds all the entries of a renamed directory"
+        $ withRenameDirs $ \_ w dir1 dir2 -> do
+            let inGap ev =
+                    when (Event.isMovedFrom ev && getAbsPath ev == dir1)
+                        $ createFile (dir2 </> "gap")
+                isMovedToDir ev = Event.isMovedTo ev && getAbsPath ev == dir2
+            renameDirectory dir1 dir2
+            createDirectory (dir2 </> "x")
+            createFile (dir2 </> "x" </> "f")
+            _ <- readUntilWith recCfg inGap isMovedToDir w
+            entries <- listTree dir2
+            sort entries
+                `shouldBe`
+                    sort
+                        [ dir2 </> "sub"
+                        , dir2 </> "x"
+                        , dir2 </> "x" </> "f"
+                        , dir2 </> "gap"
+                        ]
+
+-- The second watch reports when the scan of dir opens sub, and dir is renamed
+-- during the scan. sub is listed with scanFlags, and watchFlags cannot be
+-- restored at the old path. The many subdirectories keep the scan running
+-- until the rename. The walk on IN_MOVED_TO restores the flags of sub. Without
+-- it sub reports no open events and the last read times out.
+recRenameDuringScan :: Spec
+recRenameDuringScan =
+    it "restores the event flags of a directory renamed during its scan"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                sub = dir </> "sub"
+                file = dir1 </> "sub" </> "file"
+            createDirectory dir
+            createDirectory sub
+            createFile (sub </> "file")
+            mapM_ (\i -> createDirectory (sub </> show i)) [1 .. 5000 :: Int]
+            subPath <- Path.fromString sub
+            done <- newEmptyMVar
+            bracket
+                (Event.openWatch watchCfg (subPath NonEmpty.:| []))
+                Event.closeWatch
+                $ \w1 -> do
+                    _ <- forkIO
+                        $ (do
+                            _ <- readUntil watchCfg Event.isOpened w1
+                            renameDirectory dir dir1
+                          ) `finally` putMVar done ()
+                    _ <- readUntil recCfg
+                        (\ev -> Event.isMovedTo ev && getAbsPath ev == dir1) w
+                    takeMVar done
+            openFile file ReadMode >>= hClose
+            evs <- readUntil recCfg
+                (\ev -> getAbsPath ev == file && Event.isNonWriteClosed ev) w
+            pathsOf Event.isOpened evs `shouldContain` [file]
 
 -------------------------------------------------------------------------------
 -- Resource tests
@@ -869,6 +1052,78 @@ removeFailRetry =
                     Event.removeFromWatch w p
                     evs <- readUntil recCfg Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
+
+-- IN_MOVE_SELF tells that the directory is moved out, no fd is needed.
+recMoveOutNoFd :: Spec
+recMoveOutNoFd =
+    it "removes a directory moved out of the tree without a free fd"
+        $ withRenameDirs $ \root w dir1 _ -> do
+            renameDirectory dir1 (takeDirectory root </> "out")
+            r <- withFdsExhausted
+                    $ readUntil recCfg (isUnwatchedAt (dir1 </> "sub")) w
+            when (null r) $ pendingWith "the open file limit is too high"
+
+-- The create event of d watches the second directory, it has no IN_MOVE_SELF
+-- event. Its path stays watched, and its cookie does not affect a later move.
+recDirMovedOutAndRecreated :: Spec
+recDirMovedOutAndRecreated =
+    it "keeps a directory created at the path of a directory moved out"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                out = takeDirectory root </> "out"
+                file = dir </> "file"
+                file1 = dir1 </> "file1"
+            _ <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                renameDirectory dir out
+                createDirectory dir
+            createFile file
+            evs <- readUntil recCfg (isCreatedAt file) w
+            pathsOf Event.isCreated evs `shouldBe` [file]
+            evs1 <- recEventsOf recCfg root w $ do
+                renameDirectory dir dir1
+                createFile file1
+            pathsOf Event.isCreated evs1
+                `shouldBe` [file1, root </> "sentinel"]
+            unwatched evs1 `shouldBe` []
+
+-- dir is renamed within the outer root and moved out of the inner root.
+recRenameOutOfInnerRoot :: Spec
+recRenameOutOfInnerRoot =
+    it "a move out of the inner root is a rename within the outer root"
+        $ withNestedRoots $ \root sub w -> do
+            let dir = sub </> "dir"
+                dir1 = root </> "dir1"
+                file = dir1 </> "file"
+            createDirectory dir
+            waitWatched recCfg w dir
+            renameDirectory dir dir1
+            evs <- readUntil recCfg (isUnwatchedAt dir) w
+            unwatched evs `shouldBe` [(sub, dir)]
+            createFile file
+            evs1 <- readUntil recCfg (isCreatedAt file) w
+            createdRoots file evs1 `shouldBe` [root]
+
+-- The scan events of a rename do not depend on its move events.
+recRenameMovedToDisabled :: Spec
+recRenameMovedToDisabled =
+    it "reports the entries found by a rename without setMovedTo"
+        $ withRoot cfg $ \root w -> do
+            let dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+                file = dir2 </> "x" </> "f"
+            createDirectory dir1
+            waitWatched cfg w dir1
+            evs <- recEventsOf cfg root w $ do
+                renameDirectory dir1 dir2
+                createDirectory (dir2 </> "x")
+                createFile file
+            pathsOf Event.isScanEvent evs `shouldBe` [file]
+
+    where
+
+    cfg = Event.setMovedTo False recCfg
 
 -- The reader thread is blocked reading the watch fd. With the non-threaded
 -- RTS, closeWatch needs a pipe to wake up the reader, the pipe fails with
@@ -1459,6 +1714,18 @@ watchTests =
                 recMoveOutUnrequested
                 recMoveIn
                 recRenameWithin
+            describe "recursive mode rename races" $ do
+                recRenameCreateBeforeRead
+                recRenameCreateInGap
+                recRenameNoUnwatched
+                recRenameCreateBeforeRename
+                recRenameTwice
+                recRenameScanOnMovedTo
+                recRenameDuringScan
+                recMoveOutNoFd
+                recDirMovedOutAndRecreated
+                recRenameOutOfInnerRoot
+                recRenameMovedToDisabled
             describe "resources" $ do
                 openWatchNoLeak
                 cloexecWatch

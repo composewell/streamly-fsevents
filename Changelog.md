@@ -41,6 +41,9 @@
 - Linux: in recursive mode, a newly created directory is scanned to report
   the entries created before its watch was added, as `isCreated` events.
   See `setScanNewDirs` and `isScanEvent`.
+- Linux: a directory renamed within a recursive watch keeps its watches, the
+  events generated during the rename are no longer lost and report the new
+  path.
 - Linux: add `setRestartOnOverflow`, enabled by default, to restart a
   recursive watch automatically after an event queue overflow.
 - Add the public platform specific modules

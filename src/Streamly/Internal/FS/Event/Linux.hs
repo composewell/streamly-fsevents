@@ -148,7 +148,7 @@ import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef
     (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
-import Data.List (isPrefixOf)
+import Data.List (find, isPrefixOf)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (isJust, isNothing)
 #if !(MIN_VERSION_base(4,13,0))
@@ -181,10 +181,12 @@ import Streamly.Internal.FileSystem.Path (Path)
 
 import qualified Control.Exception as Exception (mask, uninterruptibleMask_)
 import qualified Data.IntMap.Lazy as Map
+import qualified Data.IntMap.Strict as StrictMap (map)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Set as Set
 import qualified Streamly.Data.Fold as FL
-import qualified Streamly.Data.Array as A (createOf, reader, toList)
+import qualified Streamly.Data.Array as A
+    (createOf, fromList, reader, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Unfold as UF
 import qualified Streamly.Internal.FileSystem.Path as Path
@@ -233,23 +235,36 @@ setFlag mask status cfg@Config{..} =
 --
 -- A directory created in or moved into the tree is added to the watch. A
 -- directory moved out of the tree is removed from the watch, its paths
--- report 'isRootUnwatched'. A directory renamed within the tree is removed
--- and added again with the new path. A symbolic link to a directory in the
--- tree is not followed.
+-- report 'isRootUnwatched'. A directory renamed within the tree keeps its
+-- watch, and so do the directories under it. A symbolic link to a directory in
+-- the tree is not followed.
 --
 -- A new directory is added when its create or move event is read from the
--- stream, not when it is created. If the path has been reused by then, the
--- directory found at the path is watched. If an already watched directory is
--- moved to that path, its events may be reported under both the old and the
--- new path until the move event is read.
+-- stream, which is some time after it was actually created. If the path has
+-- been reused by then, the new directory found at the path is watched. If an
+-- already watched directory is moved to that path, its events may be reported
+-- under both the old and the new path until the move event is read.
 --
--- A directory created in the tree is scanned after its watch is added, see
+-- The paths of a renamed directory change when its 'isMovedTo' event is read.
+-- Its events generated after the rename are reported under the new path, the
+-- events generated before the rename report the old path. The watch is kept
+-- only if the path still refers to the watched directory when the 'isMovedTo'
+-- event is read. Otherwise, for example, if the directory was renamed again or
+-- the same path was used by another directory, the watch is removed and added
+-- again with the new path, and the events in between are not reported or are
+-- reported under the old path. Scan the directory when its 'isMovedTo' event
+-- is received to find the entries in such a directory.
+--
+-- A directory created in the tree is scanned after its watch is added, to add
+-- its entries that might have been missed, see
 -- 'setScanNewDirs'. A directory moved into the tree or renamed within it is
--- not reported that way, its subdirectories are added without generating
--- events and the events in it before it is added are not reported. A rename
--- within the tree is not a creation of its contents, and a directory moved
--- in has one move event on all platforms. To find the entries in such a
--- directory, scan it when its 'isMovedTo' event is received.
+-- not scanned, a rename within the tree is not a creation of its contents, and
+-- a directory moved in has one move event on all platforms. The subdirectories
+-- of a directory moved in are added without generating events, and the events
+-- in it before it is added are not reported. A subdirectory of a renamed
+-- directory that is not watched when the 'isMovedTo' event is read is added,
+-- and reports its entries the same way as a directory created in the tree,
+-- before its own create event.
 --
 -- The scan that adds a tree, including the scan of a new directory, does not
 -- report the open, access and close events that it generates. These events
@@ -264,10 +279,10 @@ setFlag mask status cfg@Config{..} =
 -- exceeds the limit in @\/proc\/sys\/fs\/inotify\/max_user_watches@, the watch
 -- API or the event stream raises an exception.
 --
--- In recursive mode the kernel watch always requests the create, moved-from
--- and moved-to events, because they are needed to add and remove the
--- watches of subdirectories. These events are reported only if they are
--- enabled with 'setCreated', 'setMovedFrom' and 'setMovedTo'.
+-- In recursive mode the kernel watch always requests the create, moved-from,
+-- moved-to and root-moved events, because they are needed to add and remove
+-- the watches of subdirectories. These events are reported only if they are
+-- enabled with 'setCreated', 'setMovedFrom', 'setMovedTo' and 'setRootMoved'.
 --
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
@@ -633,7 +648,7 @@ defaultConfig =
 -- | The events that the kernel watch must generate in recursive mode, to add
 -- and remove the watches of the subdirectories.
 recursiveEvents :: Word32
-recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO
+recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO .|. iN_MOVE_SELF
 
 -- | The flags of the kernel watch.
 --
@@ -761,6 +776,9 @@ data WatchPath = WatchPath
     -- | 'removeFromWatch' was called for the root, the path reports the
     -- events until its 'isRootUnwatched' event.
     , wpRemoved :: Bool
+    -- | The cookie of the IN_MOVED_FROM event read for the path, if its
+    -- IN_MOVED_TO or IN_MOVE_SELF event has not been read yet.
+    , wpMoveCookie :: Maybe Word32
     }
 
 -- | The map entry of a watch descriptor. A user watch descriptor and a
@@ -895,7 +913,7 @@ insertPath wd prep m =
 
     where
 
-    new = WatchPath {wpRep = prep, wpRemoved = False}
+    new = WatchPath {wpRep = prep, wpRemoved = False, wpMoveCookie = Nothing}
     isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
 
 -- | Add the watch of a path using the given flags, without scanning it.
@@ -1010,12 +1028,13 @@ addToWatch cfg@Config{..} watch0 prep = do
     --   IN_DELETE does not change the map. The second IN_CREATE finds the
     --   path already watched and does not scan it again.
     -- * mkdir d, mv d e, mkdir d: the first IN_CREATE watches the second d.
-    --   IN_MOVED_FROM of d removes the watch of the second d, the second
-    --   IN_CREATE adds it again with a new watch descriptor and scans it
-    --   again. No watch covers the second d in between.
+    --   IN_MOVED_TO of e finds that e is not the directory watched as d, and
+    --   removes the watch of the second d. The second IN_CREATE adds it again
+    --   with a new watch descriptor and scans it again. No watch covers the
+    --   second d in between.
     -- * mkdir d, mv d e, mv f d, where f is watched: IN_CREATE of d finds
     --   the watch descriptor of f and adds d as its second path. Until the
-    --   marker queued by IN_MOVED_FROM of d, the events in f are reported
+    --   marker queued by IN_MOVED_TO of e, the events in f are reported
     --   twice, under f and under d.
     --
     -- 'addNewDir' reports the entries of a created directory. This scan adds
@@ -1093,7 +1112,22 @@ ignoreSubdirError wt def action =
         then return def
         else ioError e
 
--- | An entry found by 'addNewDir'.
+-- | The entries of a directory, directories on the 'Left'. Returns an empty
+-- list if the path does not exist or is not a directory.
+listEntries :: PathRep -> IO [Either Path Path]
+listEntries prep =
+    S.fold FL.toList (Dir.readEither (Dir.ignoreMissing True) absPath)
+        `catchIOError` \e ->
+            let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
+             in if isDoesNotExistError e || notDir
+                then return []
+                else ioError e
+
+    where
+
+    absPath = combinePathRep prep
+
+-- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
     { seIsDir :: Bool
     , sePath :: PathRep
@@ -1112,14 +1146,7 @@ addNewDir cfg wt prep = do
             $ addPathWith (scanFlags subCfg) wt prep
     if isNew
     then do
-        entries <-
-            S.fold FL.toList (Dir.readEither (Dir.ignoreMissing True) absPath)
-                `catchIOError` \e ->
-                    let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
-                     in if isDoesNotExistError e || notDir
-                        then return []
-                        else ioError e
-        found <- concat <$> mapM addEntry entries
+        found <- listEntries prep >>= fmap concat . mapM addEntry
         -- The directory and the tree under it have been listed.
         when (scanFlags subCfg /= watchFlags subCfg)
             $ void
@@ -1130,7 +1157,6 @@ addNewDir cfg wt prep = do
 
     where
 
-    absPath = combinePathRep prep
     subCfg = subdirConfig cfg
 
     addEntry (Left dir) = do
@@ -1520,7 +1546,7 @@ pathKey = Path.toArray . combinePathRep
 
 -- | Add the tree of each watch root again, after an event queue overflow. A
 -- subdirectory is added on its IN_CREATE or IN_MOVED_TO event, and its path is
--- changed on IN_MOVED_FROM, these events are dropped when the queue overflows.
+-- changed on IN_MOVED_TO, these events are dropped when the queue overflows.
 --
 -- The tree is added in place, the watch descriptors are not removed. Removing
 -- a watch queues an IN_IGNORED event, the removal of a tree of more than
@@ -1559,6 +1585,243 @@ restartTree cfg wt@(Watch _ _ wdMapRef) = do
                 $ updateWatch (watchFlags cfg) wt wd prep
         when same $ ignoreSubdirError wt () (restartDir cfg wt seen prep)
         return same
+
+-- | Remove a directory and the tree under it from the watch.
+unwatchSubtree :: Watch -> PathRep -> IO ()
+unwatchSubtree wt prep =
+    unwatchPaths wt
+        (show (Path.toString (combinePathRep prep)))
+        (isInSubtree prep)
+
+-------------------------------------------------------------------------------
+-- IMPORTANT: Dependency on the order of the kernel events
+-------------------------------------------------------------------------------
+--
+-- A directory moved out of the tree is detected by assuming that rename(2)
+-- queues IN_MOVED_TO before IN_MOVE_SELF. An IN_MOVE_SELF event read for a
+-- path that still has a cookie is taken to mean that no IN_MOVED_TO event
+-- exists.
+--
+-- This order is not documented. inotify(7) lists the events of a rename in
+-- this order, but guarantees only that the events form an ordered queue. It
+-- does not state the position of IN_MOVE_SELF. The order was observed on Linux
+-- 6.12 only, the kernel source was not checked.
+--
+-- If a kernel queues IN_MOVE_SELF first, every rename within the tree is
+-- handled as a move out followed by a move in. The watches are removed and
+-- added again, the events generated in between are lost, and the moved paths
+-- report 'isRootUnwatched'. The set of watched paths remains correct. The test
+-- recRenameNoUnwatched fails in that case.
+
+-- NOTE: A directory renamed within the tree:
+--
+-- rename(2) generates IN_MOVED_FROM and IN_MOVED_TO on the parents, and then
+-- IN_MOVE_SELF on the directory, in that order. A directory moved out of the
+-- tree has no IN_MOVED_TO event. A watch belongs to an inode, the watches of
+-- the directory and of the tree under it are not affected by the rename. We
+-- keep these watches and change their paths in the map on IN_MOVED_TO.
+-- Removing the watches and adding them again would lose the events generated
+-- in between.
+--
+-- The kernel queues IN_MOVED_TO during the rename, before the events generated
+-- in the directory after the rename, these events are read after the map is
+-- changed and report the new path.
+--
+-- IN_MOVED_FROM records its cookie in the path, 'markMoved'. Other events can
+-- be queued between the three events of a rename. The next event of the
+-- directory decides:
+--
+-- * IN_MOVED_TO with the same cookie: the directory is renamed, the cookie is
+--   removed.
+-- * IN_MOVE_SELF of a path that still has a cookie: there was no IN_MOVED_TO,
+--   the directory was moved out, its paths are removed from the watch.
+-- * IN_Q_OVERFLOW: IN_MOVED_TO or IN_MOVE_SELF may have been dropped, the
+--   paths are removed from the watch, see 'unwatchMoved'.
+--
+-- A directory can be a different directory by the time IN_MOVED_TO is read,
+-- the watch of the old path may have been added after the rename, when the
+-- path was reused, see the NOTE in 'addToWatch'. 'updateWatch' checks that the
+-- new path refers to the watched directory. If it does not, or if the new path
+-- does not exist, the paths are removed and the new path is added.
+--
+-- A subdirectory can be unwatched after the paths are changed. Its create
+-- event was read when the old path no longer existed and it could not be
+-- added, or it is not read yet. 'rescanDir' adds such a subdirectory and
+-- returns its entries, nothing else reports the entries created in it before
+-- its watch is added. The walk also restores 'watchFlags' on a directory that
+-- was renamed while it was being listed, 'updateWatch' could not find its old
+-- path.
+--
+-- Alternative design: mark the parent when adding a subdirectory fails with
+-- ENOENT, and list only the marked directories on IN_MOVED_TO. A rename then
+-- costs no listing, and an entry is not reported before the create event of
+-- its directory. We do not use it because every path that can leave a
+-- directory unwatched, or with 'scanFlags', has to set the mark, a missed one
+-- leaves the subtree unwatched without any error. For example, with
+-- mkdir -p a/x/y the add of a/x on its IN_CREATE succeeds. If mv a b happens
+-- before a/x is listed, the listing fails with ENOENT and returns no entries,
+-- y is left unwatched although no add failed. The walk finds these directories
+-- whatever the cause, the cost is one listing per subdirectory on each rename.
+
+-- | Remove the cookie of the paths that satisfy the predicate.
+clearMoved :: (WatchPath -> Bool) -> IntMap WdEntry -> IntMap WdEntry
+clearMoved p = StrictMap.map step
+
+    where
+
+    step (WdPaths wps)
+        | any p wps =
+            WdPaths
+                [if p wp then wp {wpMoveCookie = Nothing} else wp | wp <- wps]
+    step e = e
+
+-- | Record the cookie of IN_MOVED_FROM in the paths of a directory. A path
+-- that is not watched has no entry and records nothing, no IN_MOVE_SELF event
+-- is generated for it.
+markMoved :: Word32 -> [PathRep] -> IntMap WdEntry -> IntMap WdEntry
+markMoved cookie paths = StrictMap.map step
+
+    where
+
+    isSource wp =
+        not (wpRemoved wp) && any (eqPathRep (wpRep wp)) paths
+
+    step (WdPaths wps)
+        | any isSource wps =
+            WdPaths
+                [ if isSource wp then wp {wpMoveCookie = Just cookie} else wp
+                | wp <- wps
+                ]
+    step e = e
+
+-- | Remove a cookie from the map. Returns the paths that had it, with their
+-- watch descriptors.
+takeMoved :: Word32 -> IntMap WdEntry -> (IntMap WdEntry, [(Int, PathRep)])
+takeMoved cookie m =
+    ( clearMoved isMatch m
+    , [ (wd, wpRep wp)
+      | (wd, WdPaths wps) <- Map.toList m
+      , wp <- wps
+      , isMatch wp
+      ]
+    )
+
+    where
+
+    isMatch wp = not (wpRemoved wp) && wpMoveCookie wp == Just cookie
+
+-- | @renamePaths from to@ changes the directory @from@ and the paths under it
+-- to @to@, in all the watch descriptors.
+renamePaths :: PathRep -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+renamePaths from to = StrictMap.map step
+
+    where
+
+    prefixLen = length (subBytes from)
+
+    subBytes = foldMap (A.toList . Path.toArray) . getRepSub
+
+    isMoving wp = not (wpRemoved wp) && isInSubtree from (wpRep wp)
+
+    newPath wp =
+        case drop (prefixLen + 1) (subBytes (wpRep wp)) of
+            [] -> wp {wpRep = to}
+            rest ->
+                wp {wpRep = addSub to (Path.unsafeFromArray (A.fromList rest))}
+
+    step (WdPaths wps)
+        | any isMoving wps =
+            WdPaths [if isMoving wp then newPath wp else wp | wp <- wps]
+    step e = e
+
+-- | Walk the tree of a renamed directory, add the subdirectories that are not
+-- watched and return the entries found in them. The watches are changed the
+-- same way as in 'restartDir', the listing generates no events on the watches
+-- of the tree. Listing the renamed directory generates the open, access and
+-- close events of its parent, which are reported if they are enabled.
+rescanDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
+rescanDir cfg0 wt = go cfg0 False
+
+    where
+
+    go cfg underNew prep = do
+        (wd, added) <-
+            addPathWith (scanFlags cfg .&. complement iN_MASK_ADD) wt prep
+        entries <- listEntries prep
+        let isNew = underNew || added
+            addEntry (Left dir) = do
+                let path = addSub prep dir
+                rest <-
+                    ignoreSubdirError wt []
+                        (go (subdirConfig cfg) isNew path)
+                return ([ScannedEntry True path | isNew] ++ rest)
+            addEntry (Right file) =
+                return [ScannedEntry False (addSub prep file) | isNew]
+        found <- concat <$> mapM addEntry entries
+        when (scanFlags cfg /= watchFlags cfg)
+            $ void $ updateWatch (watchFlags cfg) wt wd prep
+        return found
+
+-- | Handle the rename of the directory @from@ to @to@ under the same root, see
+-- the NOTE above. Returns the entries found in the subdirectories that were
+-- not watched.
+renameDir :: Config -> Watch -> (Int, PathRep) -> PathRep -> IO [ScannedEntry]
+renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
+    same <-
+        ignoreSubdirError wt False
+            $ updateWatch (watchFlags subCfg) wt wd to
+    if same
+    then do
+        atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
+        ignoreSubdirError wt [] (rescanDir subCfg wt to)
+    else do
+        unwatchSubtree wt from
+        addSubdirToWatch cfg wt to
+        return []
+
+    where
+
+    subCfg = subdirConfig cfg
+
+-- | Handle IN_MOVED_TO of a directory that reports the given paths. A path
+-- whose root has a path with the cookie is a rename within that root, the
+-- other paths are moved in. A path with the cookie whose root does not have a
+-- new path is moved out of that root. Returns the entries found by the
+-- renames.
+movedInDir :: Config -> Watch -> Word32 -> [PathRep] -> IO [ScannedEntry]
+movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
+    froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
+    let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
+        moveTo to =
+            case find (isSameRoot to . snd) froms of
+                Just from -> renameDir cfg wt from to
+                Nothing -> [] <$ addSubdirToWatch cfg wt to
+        isMovedOut from = not (any (isSameRoot from) paths)
+    mapM_ (unwatchSubtree wt) (filter isMovedOut (map snd froms))
+    concat <$> mapM moveTo paths
+
+-- | The IN_MOVED_TO and IN_MOVE_SELF events of a directory that reported
+-- IN_MOVED_FROM may be dropped when the event queue overflows. Remove the
+-- paths with a cookie from the watch, an IN_MOVED_TO event not dropped adds
+-- the directory as a directory moved in. Failing to remove a path is ignored,
+-- like in 'syncRemovals'.
+unwatchMoved :: Watch -> IO ()
+unwatchMoved wt@(Watch _ _ wdMapRef) = do
+    paths <- atomicModifyIORef' wdMapRef takeAll
+    mapM_ (unwatchSubtree wt) paths `catchIOError` \_ -> return ()
+
+    where
+
+    isPending wp = not (wpRemoved wp) && isJust (wpMoveCookie wp)
+
+    takeAll m =
+        ( clearMoved isPending m
+        , [ wpRep wp
+          | (_, WdPaths wps) <- Map.toList m
+          , wp <- wps
+          , isPending wp
+          ]
+        )
 
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
@@ -1616,6 +1879,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     -- they are not watched paths.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
+        PR.fromEffect $ unwatchMoved wt
         when (watchRec cfg && restartOnOverflow cfg)
             $ PR.fromEffect
             $ restartTree cfg wt
@@ -1655,19 +1919,22 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                     reportScan =
                            scanNewDirs cfg
                         && createFlags cfg .&. iN_CREATE /= 0
-                -- A directory renamed within the tree is removed on
-                -- IN_MOVED_FROM and added again on IN_MOVED_TO.
+                -- See the NOTE above 'clearMoved'.
                 when (watchRec cfg && isDirMovedOut)
                     $ PR.fromEffect
-                    $ mapM_
-                        (\prep ->
-                            unwatchPaths wt
-                                (show (Path.toString (combinePathRep prep)))
-                                (isInSubtree prep)
-                        )
-                        live
-                when (watchRec cfg
-                        && (isDirMovedIn || (isDirCreated && not reportScan)))
+                    $ atomicModifyIORef' wdMapRef
+                    $ \m -> (markMoved cookie live m, ())
+                -- Assumes that IN_MOVED_TO is queued before IN_MOVE_SELF, see
+                -- the IMPORTANT note above 'clearMoved'.
+                when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
+                    $ PR.fromEffect
+                    $ mapM_ (unwatchSubtree wt)
+                        [ wpRep wp
+                        | wp <- wps
+                        , not (wpRemoved wp)
+                        , isJust (wpMoveCookie wp)
+                        ]
+                when (watchRec cfg && isDirCreated && not reportScan)
                     $ PR.fromEffect
                     $ mapM_ (addSubdirToWatch cfg wt) live
                 scanned <-
@@ -1675,6 +1942,11 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                     then
                         PR.fromEffect
                             $ concat <$> mapM (addNewDir cfg wt) live
+                    else if watchRec cfg && isDirMovedIn
+                    then
+                        PR.fromEffect
+                            $ (\r -> if reportScan then r else [])
+                                <$> movedInDir cfg wt cookie live
                     else return []
                 when isIgnored
                     $ PR.fromEffect
@@ -1691,11 +1963,11 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                     isUnrequested = eflags .&. unrequested /= 0
                     isReported wp =
                         not isSelfEvent || isNothing (getRepSub (wpRep wp))
-                if isUnrequested
-                then return []
-                else return
-                        $ [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
-                        ++ map mkScanned scanned
+                    reported =
+                        [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
+                return
+                    $ (if isUnrequested then [] else reported)
+                    ++ map mkScanned scanned
 
     where
 
