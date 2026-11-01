@@ -1049,6 +1049,53 @@ recScanCreatedDisabled =
             evs1 <- readUntil cfg Event.isModified w
             pathsOf Event.isModified evs1 `shouldBe` [later]
 
+-- The listing of a new directory generates its events after the sentinel is
+-- queued, they are read with the second sentinel. The watch of root keeps its
+-- flags, it reports the listing of dir. dir does not report the listing of
+-- itself or of sub, and sub does not report its own.
+recScanNewDirSilent :: Spec
+recScanNewDirSilent =
+    it "the scan of a new directory is reported only by the parent watch"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                sentinel = root </> "sentinel"
+                sentinel1 = root </> "sentinel1"
+                isListing ev =
+                       Event.isOpened ev
+                    || Event.isAccessed ev
+                    || Event.isNonWriteClosed ev
+            createDirectory dir
+            createDirectory sub
+            createFile (sub </> "file")
+            createFile sentinel
+            evs <- readUntil recCfg (isCreatedAt sentinel) w
+            createFile sentinel1
+            evs1 <- readUntil recCfg (isCreatedAt sentinel1) w
+            filter (isUnder dir) (map getAbsPath evs) `shouldContain` [sub]
+            let listed = filter (isUnder dir) (pathsOf isListing (evs ++ evs1))
+            filter (/= dir) listed `shouldBe` []
+            -- open, one or two access events that the kernel may merge, close
+            length listed `shouldSatisfy` (`elem` [3, 4])
+
+-- The flags removed for the scan are restored after it.
+recTouchAfterNewDirScan :: Spec
+recTouchAfterNewDirScan =
+    it "a new directory reports open events after its scan"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                sentinel = root </> "sentinel"
+            createDirectory dir
+            createDirectory sub
+            evs <- recEventsOf recCfg root w (return ())
+            pathsOf Event.isScanEvent evs `shouldBe` [sub]
+            _ <- listDirectory sub
+            createFile sentinel
+            evs1 <- readUntil recCfg (\ev ->
+                getAbsPath ev == sub && Event.isNonWriteClosed ev) w
+            pathsOf Event.isOpened evs1 `shouldContain` [sub]
+
 -- A move reports one event, the contents of a moved directory are not new.
 recScanNotOnMove :: Spec
 recScanNotOnMove =
@@ -1450,6 +1497,8 @@ watchTests =
                 recScanNewDir
                 recScanDisabled
                 recScanCreatedDisabled
+                recScanNewDirSilent
+                recTouchAfterNewDirScan
                 recScanNotOnMove
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
