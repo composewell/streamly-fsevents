@@ -18,7 +18,7 @@ import Control.Exception
     )
 import Control.Monad (filterM, when)
 import Data.Bits ((.&.))
-import Data.List (isPrefixOf, sort)
+import Data.List (isPrefixOf, nub, sort)
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
@@ -646,8 +646,9 @@ recRenameCreateBeforeRename =
 
 -- dir2 does not exist when the IN_MOVED_TO of the first rename is read, the
 -- paths of dir1 are removed and dir3 is added on the second IN_MOVED_TO. file
--- is reported under the old path. This is the current behavior, a change that
--- keeps the watches over two renames must change this test.
+-- is reported under the old path, and by the scan of dir3 at the new path.
+-- This is the current behavior, a change that keeps the watches over two
+-- renames must change this test.
 recRenameTwice :: Spec
 recRenameTwice =
     it "adds the directory again if it is renamed twice before the read"
@@ -658,8 +659,13 @@ recRenameTwice =
                 renameDirectory dir1 dir2
                 renameDirectory dir2 dir3
                 createFile (dir3 </> "file")
-            pathsOf Event.isCreated evs
-                `shouldBe` [dir1 </> "file", root </> "sentinel"]
+            sort (pathsOf Event.isCreated evs)
+                `shouldBe` sort
+                    [ dir1 </> "file"
+                    , dir3 </> "file"
+                    , dir3 </> "sub"
+                    , root </> "sentinel"
+                    ]
             createFile later
             evs1 <- readUntil recCfg (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
@@ -1351,20 +1357,99 @@ recTouchAfterNewDirScan =
                 getAbsPath ev == sub && Event.isNonWriteClosed ev) w
             pathsOf Event.isOpened evs1 `shouldContain` [sub]
 
--- A move reports one event, the contents of a moved directory are not new.
-recScanNotOnMove :: Spec
-recScanNotOnMove =
-    it "does not report the entries of a directory moved in or renamed"
+-- | Create @root/dir@ containing a file and read its events.
+withWatchedNewDir :: (FilePath -> Event.Watch -> FilePath -> IO a) -> IO a
+withWatchedNewDir action =
+    withRoot recCfg $ \root w -> do
+        let dir = root </> "dir"
+            ready = root </> "ready"
+        createDirectory dir
+        createFile (dir </> "file")
+        createFile ready
+        _ <- readUntil recCfg (isCreatedAt ready) w
+        action root w dir
+
+recScanOnMoveIn :: Spec
+recScanOnMoveIn =
+    it "reports the entries of a directory moved in"
         $ withRoot recCfg $ \root w -> do
             let src = takeDirectory root </> "src"
                 dir = root </> "dir"
-                dir1 = root </> "dir1"
+                sub = dir </> "sub"
+                file = sub </> "file"
+                later = sub </> "later"
             createDirectory src
+            createDirectory (src </> "sub")
+            createFile (src </> "sub" </> "file")
+            evs <- recEventsBeforeAdd root w (renameDirectory src dir)
+            sort (scannedPaths (const True) evs) `shouldBe` sort [sub, file]
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+recScanOnMoveInDisabled :: Spec
+recScanOnMoveInDisabled =
+    it "setScanNewDirs False watches a directory moved in, without reporting"
+        $ withRoot cfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+                later = dir </> "sub" </> "later"
+            createDirectory src
+            createDirectory (src </> "sub")
             createFile (src </> "file")
-            evs <- recEventsBeforeAdd root w $ do
-                renameDirectory src dir
-                renameDirectory dir dir1
+            evs <- recEventsOf cfg root w (renameDirectory src dir)
             pathsOf Event.isScanEvent evs `shouldBe` []
+            createFile later
+            evs1 <- readUntil cfg (isCreatedAt later) w
+            pathsOf Event.isCreated evs1 `shouldBe` [later]
+
+    where
+
+    cfg = Event.setScanNewDirs False recCfg
+
+-- The rename keeps the watch, the entries are known to the consumer.
+recNoScanOnRename :: Spec
+recNoScanOnRename =
+    it "does not report the entries of a directory renamed within the tree"
+        $ withWatchedNewDir $ \root w dir -> do
+            evs <- recEventsBeforeAdd root w
+                (renameDirectory dir (root </> "dir1"))
+            pathsOf Event.isScanEvent evs `shouldBe` []
+
+recMoveScanEvent :: Spec
+recMoveScanEvent =
+    describe "isMoveScanEvent" $ do
+        it "is true for the entries found on a move"
+            $ withRoot recCfg $ \root w -> do
+                let dir = root </> "dir"
+                    dir1 = root </> "dir1"
+                evs <- recEventsBeforeAdd root w $ do
+                    createDirectory dir
+                    createFile (dir </> "file")
+                    renameDirectory dir dir1
+                pathsOf Event.isMoveScanEvent evs
+                    `shouldBe` [dir1 </> "file"]
+        it "is false for the entries of a new directory"
+            $ withRoot recCfg $ \root w -> do
+                let dir = root </> "dir"
+                evs <- recEventsBeforeAdd root w $ do
+                    createDirectory dir
+                    createFile (dir </> "file")
+                scannedPaths (const True) evs `shouldBe` [dir </> "file"]
+                pathsOf Event.isMoveScanEvent evs `shouldBe` []
+        -- The scan on the create event of dir finds the directory moved in.
+        it "is false for a directory moved in that a create event finds"
+            $ withRoot recCfg $ \root w -> do
+                let src = takeDirectory root </> "src"
+                    dir = root </> "dir"
+                createDirectory src
+                createFile (src </> "file")
+                evs <- recEventsBeforeAdd root w $ do
+                    createDirectory dir
+                    removeDirectory dir
+                    renameDirectory src dir
+                scannedPaths (const True) evs `shouldBe` [dir </> "file"]
+                pathsOf Event.isMoveScanEvent evs `shouldBe` []
 
 -- The scan on the create event of dir fails, the path no longer exists. The
 -- directory is scanned at its new path.
@@ -1422,10 +1507,11 @@ recScanCreatedRenamedPathReused =
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
--- The same events as above, except that dir is added by a move event.
-recScanNotOnMoveOldPathReused :: Spec
-recScanNotOnMoveOldPathReused =
-    it "does not report a directory moved in if its old path is reused"
+-- dir does not exist when its move event is read, dir1 is scanned on its
+-- move event.
+recScanMovedInRenamed :: Spec
+recScanMovedInRenamed =
+    it "reports the entries of a directory moved in and renamed"
         $ withRoot recCfg $ \root w -> do
             let src = takeDirectory root </> "src"
                 dir = root </> "dir"
@@ -1435,45 +1521,13 @@ recScanNotOnMoveOldPathReused =
             evs <- recEventsBeforeAdd root w $ do
                 renameDirectory src dir
                 renameDirectory dir dir1
-                createDirectory dir
-            pathsOf Event.isScanEvent evs `shouldBe` []
+            scannedPaths (const True) evs `shouldBe` [dir1 </> "file"]
 
--- | Create @root/dir@ containing a file and read its events.
-withWatchedNewDir :: (FilePath -> Event.Watch -> FilePath -> IO a) -> IO a
-withWatchedNewDir action =
-    withRoot recCfg $ \root w -> do
-        let dir = root </> "dir"
-            ready = root </> "ready"
-        createDirectory dir
-        createFile (dir </> "file")
-        createFile ready
-        _ <- readUntil recCfg (isCreatedAt ready) w
-        action root w dir
-
--- The path dir1 does not exist when the first move event is read, and dir
--- refers to the watched directory, the same as a reused path.
-recScanNotOnMoveAndBack :: Spec
-recScanNotOnMoveAndBack =
-    it "does not report a watched directory renamed away and back"
-        $ withWatchedNewDir $ \root w dir -> do
-            let dir1 = root </> "dir1"
-                later = dir </> "later"
-            evs <- recEventsBeforeAdd root w $ do
-                renameDirectory dir dir1
-                renameDirectory dir1 dir
-            pathsOf Event.isScanEvent evs `shouldBe` []
-            evs1 <- recEventsOf recCfg root w (createFile later)
-            pathsOf Event.isCreated evs1
-                `shouldBe` [later, root </> "sentinel"]
-
--- XXX Known bug, file is not reported. dir1 does not exist when the first move
--- event is read, the same as a watched directory renamed away and back, so
--- nothing is recorded and dir2 is handled as a directory moved in. See
--- dev/design.md. A fix must change this test to expect file in the scanned
--- paths.
+-- dir1 does not exist when its move event is read, dir2 is scanned on its move
+-- event.
 recScanCreatedPathReusedRenamed :: Spec
 recScanCreatedPathReusedRenamed =
-    it "does not report a new directory renamed again if its path is reused"
+    it "reports a new directory renamed again if its old path is reused"
         $ withRoot recCfg $ \root w -> do
             let dir = root </> "dir"
                 dir1 = root </> "dir1"
@@ -1484,13 +1538,27 @@ recScanCreatedPathReusedRenamed =
                 renameDirectory dir dir1
                 createDirectory dir
                 renameDirectory dir1 dir2
-            pathsOf Event.isScanEvent evs `shouldBe` []
+            scannedPaths (const True) evs `shouldBe` [dir2 </> "file"]
 
--- XXX Known bug, the entries of src, moved in, and of dir, watched earlier,
--- are reported as created. When the first move event is read the checks give
--- the same result as a reused path, and that scan sets wpCreated on dir1, so
--- the second move event scans dir. See dev/design.md. A fix must change this
--- test to expect no scanned paths.
+-- The watch of dir is removed on the first move event, dir1 does not exist by
+-- then. The second move event adds dir and scans it, the entry is reported
+-- again.
+recScanMovedAwayAndBack :: Spec
+recScanMovedAwayAndBack =
+    it "reports the entries again of a directory renamed away and back"
+        $ withWatchedNewDir $ \root w dir -> do
+            let dir1 = root </> "dir1"
+                later = dir </> "later"
+            evs <- recEventsBeforeAdd root w $ do
+                renameDirectory dir dir1
+                renameDirectory dir1 dir
+            scannedPaths (const True) evs `shouldBe` [dir </> "file"]
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+-- dir1 is scanned on the first and the last move event, a scan can report an
+-- entry more than once.
 recScanMovedInAfterMoveAndBack :: Spec
 recScanMovedInAfterMoveAndBack =
     it "reports a directory moved in after a rename away and back"
@@ -1503,7 +1571,7 @@ recScanMovedInAfterMoveAndBack =
                 renameDirectory dir dir1
                 renameDirectory dir1 dir
                 renameDirectory src dir1
-            sort (scannedPaths (const True) evs)
+            nub (sort (scannedPaths (const True) evs))
                 `shouldBe` sort [dir </> "file", dir1 </> "file"]
 
 -- | Check that a directory renamed from @a@ to @b@ to @c@ before the events
@@ -2000,18 +2068,20 @@ watchTests =
                 recScanCreatedDisabled
                 recScanNewDirSilent
                 recTouchAfterNewDirScan
-                recScanNotOnMove
+                recScanOnMoveIn
+                recScanOnMoveInDisabled
+                recNoScanOnRename
+                recMoveScanEvent
                 recScanCreatedThenRenamed
                 recScanCreatedRenamedTwice
                 recScanCreatedRenamedPathReused
-                recScanNotOnMoveOldPathReused
-                recScanNotOnMoveAndBack
-                recIntermediatePath
+                recScanMovedInRenamed
                 recScanCreatedPathReusedRenamed
+                recScanMovedAwayAndBack
                 recScanMovedInAfterMoveAndBack
+                recIntermediatePath
                 recScanCreatedThenMovedOut
                 recScanCreatedRenamedDisabled
-                recScanNotOnMoveToMissedPath
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan

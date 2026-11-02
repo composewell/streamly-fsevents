@@ -334,7 +334,18 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p </> "dir")
             createFile (watchRoot p </> "dir/file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Yes
+        , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title = "file already in a moved in dir is reported"
+        , config = Event.setRecursiveMode True
+        , paused = True
+        , ops = \p -> do
+            createDirectory (renamedRoot p)
+            createFile (renamedRoot p </> "file")
+            renameDirectory (renamedRoot p) (watchRoot p </> "dir")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes No No
         }
     , newDir
         { title = "subdir created in a new dir before it is read is watched"

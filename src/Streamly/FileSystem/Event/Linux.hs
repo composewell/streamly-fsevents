@@ -61,7 +61,8 @@
 -- expensive. When starting a watch, the whole tree must be read and watches
 -- are started on each directory in the tree. The initial time to start the
 -- watch as well as the memory required is proportional to the number of
--- directories in the tree.
+-- directories in the tree. A directory moved into the tree is read the same
+-- way when its move event is read, see 'setScanNewDirs'.
 --
 -- /Limitations:/ When new directories are created under the tree they are
 -- added to the watch on receiving the directory create event. The creation of
@@ -71,6 +72,10 @@
 -- period are found by a scan, see 'setScanNewDirs'. Other events in that
 -- period, for example, a modification or a deletion of an entry, are lost.
 -- inotify provides no way to avoid this loss.
+--
+-- A directory moved into the tree is handled the same way, its entries are
+-- reported by the scan even if they existed before the move. A move event does
+-- not show where a directory came from, see 'isMoveScanEvent'.
 --
 -- = Platform differences
 --
@@ -163,6 +168,7 @@ module Streamly.FileSystem.Event.Linux
     -- ** Item Path info
     , isDir
     , isScanEvent
+    , isMoveScanEvent
 
     -- ** Exception Conditions
     , isEventsLost

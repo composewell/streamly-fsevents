@@ -113,6 +113,9 @@ setFlag mask status cfg@Config{..} =
 
 -- | Set watch event on directory recursively.
 --
+-- The entries already in a directory moved into the tree are not reported.
+-- Scan the directory on its move event to find them.
+--
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}

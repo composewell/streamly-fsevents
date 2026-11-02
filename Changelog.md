@@ -33,18 +33,14 @@
 - Linux: in recursive mode, adding a tree no longer reports the open, access
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
-- Linux: in recursive mode, a directory created and renamed within the tree
-  before its create event is read now reports its entries at the new path,
-  also if another directory is created at the old path. Earlier these entries
-  were not reported.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
 - macOS: fix a link failure of `setFullHistory`.
 
 ### Enhancements
 
-- Linux: in recursive mode, a newly created directory is scanned to report
-  the entries created before its watch was added, as `isCreated` events.
-  See `setScanNewDirs` and `isScanEvent`.
+- Linux: in recursive mode, a newly created directory and a directory moved
+  into the tree are scanned to report their entries as `isCreated` events.
+  See `setScanNewDirs`, `isScanEvent` and `isMoveScanEvent`.
 - Linux: a directory renamed within a recursive watch keeps its watches, the
   events generated during the rename are no longer lost and report the new
   path.

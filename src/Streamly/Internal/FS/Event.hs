@@ -82,6 +82,11 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- | Watch the whole directory tree under a watch root recursively instead of
 -- watching only the watch root directory.
 --
+-- The entries already in a directory moved into the tree are reported as
+-- 'isCreated' events on Linux and are not reported on macOS and Windows. A
+-- portable program scans such a directory on its 'isMoved' event, and removes
+-- the duplicates on Linux.
+--
 -- See @docs\/platform-differences.md@ in this package for the differences in
 -- a recursive watch on each platform.
 --
@@ -200,6 +205,10 @@ getAbsPath = Event.getAbsPath
 --
 -- Creating a hard link does not generate this event on all platforms. See
 -- @docs\/platform-differences.md@ in this package.
+--
+-- In a recursive watch on Linux, this event is also generated for the entries
+-- of a directory moved into the tree, which may not be new. See
+-- 'setRecursiveMode'.
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
 
@@ -221,6 +230,10 @@ isDeleted = Event.isDeleted
 -- monitored path. This event is generated when an object is renamed within the
 -- watched directory or if it is moved out of or in the watched directory.
 -- Moving hard links is no different than other types of objects.
+--
+-- This event is reported for the moved directory, not for the entries in it.
+-- In a recursive watch, see 'setRecursiveMode' for the entries of a directory
+-- moved into the tree.
 isMoved :: Event -> Bool
 isMoved = Event.isMoved
 
