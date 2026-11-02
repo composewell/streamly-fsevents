@@ -282,9 +282,10 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- example, @mkdir a; touch a\/f; mv a b@ reports @a@, the move of @a@ to @b@
 -- and @b\/f@.
 --
--- If another directory is created at the old path before the create event is
--- read, the new path is not scanned. For example, the entry @f@ in
--- @mkdir a; touch a\/f; mv a b; mkdir a@ is not reported. Scan the directory
+-- The same applies if another directory is created at the old path, as in
+-- @mkdir a; touch a\/f; mv a b; mkdir a@. If that directory is renamed again
+-- before the first 'isMovedTo' event is read, its entries are not reported:
+-- @f@ in @mkdir a; touch a\/f; mv a b; mkdir a; mv b c@. Scan the directory
 -- when its 'isMovedTo' event is received to find the entries in it.
 --
 -- The scan reports the state of the directory, not its history. Every entry
@@ -768,6 +769,9 @@ data WatchPath = WatchPath
     -- | The cookie of the IN_MOVED_FROM event read for the path, if its
     -- IN_MOVED_TO or IN_MOVE_SELF event has not been read yet.
     , wpMoveCookie :: Maybe Word32
+    -- | The path was added by 'addNewDirWith', and not as a directory moved
+    -- in or found by the scan of a root. See 'renameDir'.
+    , wpCreated :: Bool
     }
 
 -- | The map entry of a watch descriptor. A user watch descriptor and a
@@ -912,7 +916,13 @@ insertPath wd prep m =
 
     where
 
-    new = WatchPath {wpRep = prep, wpRemoved = False, wpMoveCookie = Nothing}
+    new =
+        WatchPath
+            { wpRep = prep
+            , wpRemoved = False
+            , wpMoveCookie = Nothing
+            , wpCreated = False
+            }
     isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
 
 -- | Add the watch of a path using the given flags, without scanning it.
@@ -1153,15 +1163,17 @@ data ScannedEntry = ScannedEntry
 -- path that succeeds or a directory moved to the path removes the entry of the
 -- path, the directory at the path is no longer the directory recorded.
 --
--- XXX mkdir a; touch a/f; mv a b; mkdir a: IN_CREATE of a adds the second a,
--- no scan fails and nothing is recorded. On IN_MOVED_TO of b, 'renameDir'
--- finds that b is not the watched directory and adds b without reporting f.
+-- A scan does not fail if another directory is created at the old path, see
+-- 'renameDir'.
 
 -- | The maximum length of the list of 'MissedDir' in a 'Watch'. The entries
 -- are needed only for the duration of the events of a rename, which are close
 -- to each other in the queue.
 maxMissedDirs :: Int
 maxMissedDirs = 1024
+
+wdMapRefOf :: Watch -> IORef (IntMap WdEntry)
+wdMapRefOf (Watch _ _ ref _) = ref
 
 missedDirsRef :: Watch -> IORef [MissedDir]
 missedDirsRef (Watch _ _ _ ref) = ref
@@ -1205,24 +1217,40 @@ takeMissedMoved cookie l =
 
     isMatch md = mdCookie md == Just cookie
 
+-- | Set 'wpCreated' for a path of a watch descriptor.
+markCreated :: Int -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+markCreated wd prep = Map.adjust step wd
+
+    where
+
+    isPath wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
+
+    step (WdPaths wps) =
+        WdPaths [if isPath wp then wp {wpCreated = True} else wp | wp <- wps]
+    step e = e
+
 -- | Add a directory reported by IN_CREATE and return the entries in it. The
 -- watch is added before the directory is read, an entry created later is
 -- either found by the scan or reported by the kernel, or both.
 --
 -- A directory already watched returns no entries, the scan that added it
--- returned them, or it is the scan of a root or of an overflow. A directory
--- that cannot be added is recorded, see 'recordMissedDir'.
-addNewDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
-addNewDir cfg wt prep = do
+-- returned them, or it is the scan of a root or of an overflow.
+--
+-- The first argument specifies if a directory that cannot be added is
+-- recorded, see 'recordMissedDir'.
+addNewDirWith :: Bool -> Config -> Watch -> PathRep -> IO [ScannedEntry]
+addNewDirWith record cfg wt prep = do
     added <-
         ignoreSubdirError wt Nothing
             $ Just <$> addPathWith (scanFlags subCfg) wt prep
     case added of
-        Nothing -> [] <$ recordMissedDir wt prep
+        Nothing -> [] <$ when record (recordMissedDir wt prep)
         Just (wd, isNew) -> do
             forgetMissedDir wt prep
             if isNew
             then do
+                atomicModifyIORef' (wdMapRefOf wt)
+                    $ \m -> (markCreated wd prep m, ())
                 found <- listEntries prep >>= fmap concat . mapM addEntry
                 -- The directory and the tree under it have been listed.
                 when (scanFlags subCfg /= watchFlags subCfg)
@@ -1238,10 +1266,14 @@ addNewDir cfg wt prep = do
 
     addEntry (Left dir) = do
         let path = addSub prep dir
-        rest <- addNewDir cfg wt path
+        rest <- addNewDirWith True cfg wt path
         return (ScannedEntry True path : rest)
     addEntry (Right file) =
         return [ScannedEntry False (addSub prep file)]
+
+-- | 'addNewDirWith' that records a directory that cannot be added.
+addNewDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
+addNewDir = addNewDirWith True
 
 foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
@@ -1842,6 +1874,15 @@ rescanDir cfg0 wt = go cfg0 False
 -- | Handle the rename of the directory @from@ to @to@ under the same root, see
 -- the NOTE above. Returns the entries found in the subdirectories that were
 -- not watched.
+--
+-- With mkdir a; touch a/f; mv a b; mkdir a, IN_CREATE of a watches the second
+-- a and its scan succeeds. On IN_MOVED_TO of b the path b is not the watched
+-- directory. b is scanned as a new directory if the path was added by
+-- IN_CREATE ('wpCreated') and @from@ still refers to the watched directory.
+-- The first check excludes a directory moved in. The second check excludes a
+-- watched directory renamed twice, its path is gone. If the path @to@ does not
+-- exist nothing is recorded, a watched directory renamed away and back must
+-- not be reported as new. All the use cases are listed in @dev/design.md@.
 renameDir :: Config -> Watch -> (Int, PathRep) -> PathRep -> IO [ScannedEntry]
 renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
     same <-
@@ -1852,13 +1893,26 @@ renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
         atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
         ignoreSubdirError wt [] (rescanDir subCfg wt to)
     else do
+        reused <- isOldPathReused
         unwatchSubtree wt from
-        addSubdirToWatch cfg wt to
-        return []
+        if reused
+        then addNewDirWith False cfg wt to
+        else [] <$ addSubdirToWatch cfg wt to
 
     where
 
     subCfg = subdirConfig cfg
+
+    isCreatedFrom wp = wpCreated wp && eqPathRep (wpRep wp) from
+
+    isOldPathReused = do
+        m <- readIORef wdMapRef
+        case Map.lookup wd m of
+            Just (WdPaths wps)
+                | any isCreatedFrom wps ->
+                    ignoreSubdirError wt False
+                        $ updateWatch (watchFlags subCfg) wt wd from
+            _ -> return False
 
 -- | Handle IN_MOVED_TO of a directory that reports the given paths. A path
 -- whose root has a path with the cookie is a rename within that root, the

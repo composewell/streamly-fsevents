@@ -34,8 +34,9 @@
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
 - Linux: in recursive mode, a directory created and renamed within the tree
-  before its create event is read now reports its entries at the new path.
-  Earlier these entries were not reported.
+  before its create event is read now reports its entries at the new path,
+  also if another directory is created at the old path. Earlier these entries
+  were not reported.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
 - macOS: fix a link failure of `setFullHistory`.
 
