@@ -306,6 +306,15 @@ test-suite FileSystem.Event.Linux
   if impl(ghc < 9.4) || !os(linux)
     buildable: False
 
+test-suite FileSystem.Event.LinuxModel
+  import: test-options
+  type: exitcode-stdio-1.0
+  main-is: Streamly/Test/FileSystem/Event/LinuxModel.hs
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.LinuxModel
+  build-depends: containers
+  if impl(ghc < 9.4) || !os(linux)
+    buildable: False
+
 test-suite FileSystem.Event.Windows
   import: test-options
   type: exitcode-stdio-1.0

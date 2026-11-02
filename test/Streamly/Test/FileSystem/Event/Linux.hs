@@ -16,7 +16,7 @@ import Control.Exception
     ( AsyncException(ThreadKilled), IOException, SomeException, bracket
     , finally, fromException, mask, throwIO, try
     )
-import Control.Monad (filterM, when)
+import Control.Monad (filterM, void, when)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf, nub, sort)
 import Numeric (readOct)
@@ -24,6 +24,7 @@ import Streamly.Internal.FS.Event.Linux (Event)
 import System.Directory
     ( createDirectory
     , createDirectoryLink
+    , createFileLink
     , doesDirectoryExist
     , getPermissions
     , getSymbolicLinkTarget
@@ -34,7 +35,7 @@ import System.Directory
     , setOwnerExecutable
     , setPermissions
     )
-import System.FilePath ((</>), takeDirectory)
+import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO
     ( IOMode(AppendMode, ReadMode, WriteMode), hClose, hFlush, hPutStr
     , openFile
@@ -1634,6 +1635,158 @@ recScanCreatedThenMovedOut =
                 renameDirectory dir out
             pathsOf Event.isScanEvent evs `shouldBe` []
 
+-- | Run the action on the watched @dir1@ containing @sub@, before the events
+-- are read, with the directory @dir@ as the path that it reuses. Check that
+-- @dir@ and @sub@ then report each event once. Returns all the events.
+checkReusedPath ::
+    (FilePath -> FilePath -> FilePath -> IO ()) -> IO [Event]
+checkReusedPath action =
+    withRenameDirs $ \root w dir1 _ -> do
+        let dir = root </> "dir"
+            later = dir </> "later"
+            subLater = dir </> "sub" </> "later"
+        evs <-
+            recEventsBeforeAdd root w
+                (action (takeDirectory root </> "out") dir dir1)
+        evs1 <- recEventsOf recCfg root w $ do
+            createFile later
+            createFile subLater
+        pathsOf Event.isCreated evs1
+            `shouldBe` [later, subLater, root </> "sentinel"]
+        return (evs ++ evs1)
+
+-- IN_CREATE of dir finds the watch descriptor of dir1 and adds dir as its
+-- second path, IN_MOVED_TO of the renamed new directory removes that path.
+-- dir1 is renamed to dir on its own IN_MOVED_TO, and stays watched.
+--
+-- XXX isRootUnwatched of dir and dir/sub is reported after the rename to dir,
+-- although the kernel watch was not removed. This test records the current
+-- behavior, see "Reused paths" in dev/design.md.
+recReusedPathMovedWithin :: Spec
+recReusedPathMovedWithin =
+    it "keeps a watched directory moved to a renamed new directory's path" $ do
+        evs <- checkReusedPath $ \_ dir dir1 -> do
+            createDirectory dir
+            renameDirectory dir (dir ++ "-renamed")
+            renameDirectory dir1 dir
+        map (takeFileName . snd) (unwatched evs) `shouldBe` ["dir", "sub"]
+
+-- No event removes the second path of dir1 added by IN_CREATE of dir, the
+-- rename of dir1 to dir must not leave the path twice.
+recReusedPathDeleted :: Spec
+recReusedPathDeleted =
+    it "keeps a watched directory moved to a path of a deleted new directory"
+        $ void $ checkReusedPath $ \_ dir dir1 -> do
+            createDirectory dir
+            removeDirectory dir
+            renameDirectory dir1 dir
+
+-- IN_MOVED_FROM of dir records its cookie in the second path of dir1, no
+-- IN_MOVED_TO removes it. IN_MOVE_SELF of dir1 must not remove dir, dir1 was
+-- not moved out.
+recReusedPathMovedOut :: Spec
+recReusedPathMovedOut =
+    it "keeps a watched directory moved to a path of a moved out new directory"
+        $ void $ checkReusedPath $ \out dir dir1 -> do
+            createDirectory dir
+            renameDirectory dir out
+            renameDirectory dir1 dir
+
+-- IN_MOVE_SELF of dir1 removes its watch when it is read, the kernel queues
+-- IN_IGNORED after the IN_CREATE event of the new dir1. isRootUnwatched refers
+-- to the directory that was at the path, the new dir1 is watched. This test
+-- records the current behavior, see "Reused paths" in dev/design.md.
+recUnwatchedAfterRecreated :: Spec
+recUnwatchedAfterRecreated =
+    it "reports isRootUnwatched of a moved out directory after a path reuse"
+        $ withRenameDirs $ \root w dir1 _ -> do
+            let later = dir1 </> "later"
+                isAtDir ev =
+                    getAbsPath ev == dir1
+                        && (Event.isCreated ev || Event.isRootUnwatched ev)
+            evs <- recEventsBeforeAdd root w $ do
+                renameDirectory dir1 (takeDirectory root </> "out")
+                createDirectory dir1
+            evs1 <- recEventsOf recCfg root w (createFile later)
+            map Event.isRootUnwatched (filter isAtDir (evs ++ evs1))
+                `shouldBe` [False, True]
+            pathsOf Event.isCreated evs1
+                `shouldBe` [later, root </> "sentinel"]
+
+-- rename(2) replaces the empty dir. IN_CREATE of dir adds it as the second
+-- path of dir1, the same as a deleted new directory.
+recReusedPathReplaced :: Spec
+recReusedPathReplaced =
+    it "keeps a watched directory moved over an empty new directory"
+        $ void $ checkReusedPath $ \_ dir dir1 -> do
+            createDirectory dir
+            renameDirectory dir1 dir
+
+-- IN_CREATE of dir finds src and scans it. IN_MOVED_FROM of dir then tells the
+-- consumer that the path and the entries under it are gone. IN_MOVED_TO finds
+-- the path already watched. The entries must be reported after IN_MOVED_TO.
+recReusedPathMovedIn :: Spec
+recReusedPathMovedIn =
+    it "reports a directory moved in at a path of a moved out new directory"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                out = takeDirectory root </> "out"
+                dir = root </> "dir"
+            createDirectory src
+            createFile (src </> "file")
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                renameDirectory dir out
+                renameDirectory src dir
+            let isMovedToDir ev = Event.isMovedTo ev && getAbsPath ev == dir
+            scannedPaths (const True) (dropWhile (not . isMovedToDir) evs)
+                `shouldBe` [dir </> "file"]
+
+-- The second rename leaves the cookie of the moved out dir on the path dir, as
+-- the only path of dir1. IN_MOVE_SELF of dir1 must not remove dir.
+recReusedPathMovedOutRenamedTwice :: Spec
+recReusedPathMovedOutRenamedTwice =
+    it "keeps a directory renamed twice to a path of a moved out new directory"
+        $ void $ checkReusedPath $ \out dir dir1 -> do
+            let dir2 = dir1 ++ "-renamed"
+            createDirectory dir
+            renameDirectory dir1 dir2
+            renameDirectory dir out
+            renameDirectory dir2 dir
+
+-- The add of sub on its IN_CREATE finds the symbolic link loop at its parent,
+-- inotify_add_watch fails with ELOOP. The stream must not raise an exception.
+recParentReplacedBySymlinkLoop :: Spec
+recParentReplacedBySymlinkLoop =
+    it "ignores a new directory whose parent is replaced by a symlink loop"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory (dir1 </> "new")
+                renameDirectory dir1 dir2
+                createFileLink dir1 dir1
+            scannedPaths (const True) evs `shouldBe` []
+
+-- IN_DONT_FOLLOW covers only the last component of a path. The add of new on
+-- its IN_CREATE goes through the symbolic link at its parent, to a directory
+-- outside the tree. That directory must not be reported.
+recParentReplacedBySymlink :: Spec
+recParentReplacedBySymlink =
+    it "does not watch outside the tree via a symlink at a new dir's parent"
+        $ withRenameDirs $ \root w dir1 dir2 -> do
+            let outside = takeDirectory root </> "outside"
+                inNew = dir2 </> "new" </> "later"
+            createDirectory outside
+            createDirectory (outside </> "new")
+            _ <- recEventsBeforeAdd root w $ do
+                createDirectory (dir1 </> "new")
+                renameDirectory dir1 dir2
+                createFileLink outside dir1
+            evs1 <- recEventsOf recCfg root w $ do
+                createFile (outside </> "new" </> "stray")
+                createFile inNew
+            pathsOf Event.isCreated evs1
+                `shouldBe` [inNew, root </> "sentinel"]
+
 recScanCreatedRenamedDisabled :: Spec
 recScanCreatedRenamedDisabled =
     it "setScanNewDirs False does not report a renamed new directory"
@@ -2082,6 +2235,16 @@ watchTests =
                 recIntermediatePath
                 recScanCreatedThenMovedOut
                 recScanCreatedRenamedDisabled
+            describe "recursive mode reused paths" $ do
+                recReusedPathMovedWithin
+                recUnwatchedAfterRecreated
+                recReusedPathDeleted
+                recReusedPathMovedOut
+                recReusedPathReplaced
+                recReusedPathMovedIn
+                recReusedPathMovedOutRenamedTwice
+                recParentReplacedBySymlinkLoop
+                recParentReplacedBySymlink
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan

@@ -113,7 +113,7 @@ where
 import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
-import Control.Exception (finally, onException, try)
+import Control.Exception (bracket, finally, onException, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
@@ -129,8 +129,9 @@ import Data.Semigroup (Semigroup(..))
 import Data.Set (Set)
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
-    ( Errno(..), eAGAIN, eINTR, eINVAL, eNOTDIR, eWOULDBLOCK, getErrno
-    , throwErrno, throwErrnoIfMinus1, throwErrnoIfMinus1_
+    ( Errno(..), eAGAIN, eINTR, eINVAL, eLOOP, eNOENT, eNOTDIR, eWOULDBLOCK
+    , errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
+    , throwErrnoIfMinus1_
     )
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
@@ -906,6 +907,114 @@ foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
         :: CInt -> CString -> CUInt -> IO CInt
 
+foreign import capi "fcntl.h openat" c_openat3
+    :: CInt -> CString -> CInt -> IO CInt
+
+foreign import capi "fcntl.h value AT_FDCWD" aT_FDCWD :: CInt
+
+foreign import capi "fcntl.h value O_PATH" o_PATH :: CInt
+
+foreign import capi "fcntl.h value O_DIRECTORY" o_DIRECTORY :: CInt
+
+foreign import capi "fcntl.h value O_NOFOLLOW" o_NOFOLLOW :: CInt
+
+foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
+
+-- | Whether adding or listing a subdirectory failed because the path no longer
+-- refers to a directory. The path may have been deleted, or it may now be a
+-- file or a symbolic link. ELOOP is a symbolic link loop in place of the
+-- directory or of its parent.
+isNotSubdirError :: IOError -> Bool
+isNotSubdirError e =
+    isDoesNotExistError e || fmap Errno (ioe_errno e) `elem` errnos
+
+    where
+
+    errnos = [Just eNOTDIR, Just eLOOP]
+
+-- | The components of a subdirectory path.
+subComponents :: Path -> [Array Word8]
+subComponents = map A.fromList . go . A.toList . Path.toArray
+
+    where
+
+    slash = 47
+
+    go bytes =
+        case break (== slash) bytes of
+            (x, []) -> [x | not (null x)]
+            (x, _ : rest) -> [x | not (null x)] ++ go rest
+
+-- | Open an O_PATH fd of a subdirectory, starting from its root and without
+-- following a symbolic link in any component under the root. Raise an
+-- exception if a component is not a directory.
+openSubdir :: Path -> Path -> IO CInt
+openSubdir root sub = do
+    fd <-
+        A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+            throwErrnoIfMinus1 err
+                $ c_openat3 aT_FDCWD ptr (dirFlags .|. o_CLOEXEC)
+    go fd (subComponents sub)
+
+    where
+
+    err = "addToWatch: " ++ Path.toString (Path.join root sub)
+    dirFlags = o_PATH .|. o_DIRECTORY
+    subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
+
+    go fd [] = return fd
+    go fd (x : xs) = do
+        next <- A.asCStringUnsafe x $ \ptr -> c_openat3 fd ptr subFlags
+        errno <- getErrno
+        _ <- c_close fd
+        if next == -1
+        then ioError (errnoToIOError err errno Nothing Nothing)
+        else go next xs
+
+-- | Call inotify_add_watch on a path and return the watch descriptor. Raise an
+-- exception on failure.
+--
+-- IN_DONT_FOLLOW covers only the last component of a path. inotify_add_watch
+-- resolves a subdirectory path when its event is read, a parent may have been
+-- replaced by a symbolic link by then, which can be a link to a directory
+-- outside the tree. A subdirectory is therefore opened without following
+-- symbolic links, and the watch is added using the fd, via @\/proc@. Checking
+-- the components and then calling inotify_add_watch with the path would leave
+-- a gap between the two.
+--
+-- A root is added using its path, a symbolic link can be used to reach a root.
+-- If @\/proc@ is not mounted a subdirectory is also added using its path, the
+-- check of the components by 'openSubdir' still applies.
+addWatchFor :: CInt -> Word32 -> PathRep -> IO CInt
+addWatchFor fd flags prep =
+    case prep of
+        (_, Nothing) -> addPath
+        (root, Just sub) -> bracket (openSubdir root sub) c_close addViaFd
+
+    where
+
+    absPath = combinePathRep prep
+    err = "addToWatch: " ++ Path.toString absPath
+
+    addPath =
+        A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
+            throwErrnoIfMinus1 err
+                $ c_inotify_add_watch fd pathPtr (CUInt flags)
+
+    -- /proc/self/fd/N must be followed to reach the directory. The directory
+    -- has been opened with O_NOFOLLOW.
+    addViaFd dirFd = do
+        wd <-
+            withCString ("/proc/self/fd/" ++ show dirFd) $ \pathPtr ->
+                c_inotify_add_watch fd pathPtr
+                    (CUInt (flags .&. complement iN_DONT_FOLLOW))
+        errno <- getErrno
+        if wd /= -1
+        then return wd
+        else if errno == eNOENT
+        then addPath
+        else ioError (errnoToIOError err errno Nothing Nothing)
+
 -- Returns 'False' if the path is already being watched.
 insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
 insertPath wd prep m =
@@ -924,15 +1033,11 @@ insertPath wd prep m =
 -- Returns the watch descriptor, and 'False' if the path is already being
 -- watched.
 addPathWith :: Word32 -> Watch -> PathRep -> IO (Int, Bool)
-addPathWith flags watch0@(Watch _ _ wdMapRef) prep = do
-    let absPath = combinePathRep prep
-
+addPathWith flags watch0@(Watch _ _ wdMapRef) prep =
     -- The watch descriptor is inserted in the map with the lock held, so that
     -- the watch cannot be closed in between.
     withWatchFd "addToWatch" watch0 $ \fd -> do
-        wd <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
-            throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath) $
-                c_inotify_add_watch fd pathPtr (CUInt flags)
+        wd <- addWatchFor fd flags prep
 
         -- We add the parent first so that we start getting events for any
         -- new creates and add the new subdirectories on creates while we are
@@ -977,26 +1082,17 @@ foreign import ccall unsafe
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
 updateWatch flags wt@(Watch _ _ wdMapRef) wd prep =
     withWatchFd "addToWatch" wt $ \fd -> do
-        r <- A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
-            try
-                $ throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath)
-                $ c_inotify_add_watch fd pathPtr (CUInt flags)
+        r <- try (addWatchFor fd flags prep)
         case r of
-            Left (e :: IOError) ->
-                let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
-                 in if isDoesNotExistError e || notDir
-                    then return False
-                    else ioError e
+            Left (e :: IOError)
+                | isNotSubdirError e -> return False
+                | otherwise -> ioError e
             Right wd1 -> do
                 m <- readIORef wdMapRef
                 let same = fromIntegral wd1 == wd
                 when (not same && Map.notMember (fromIntegral wd1) m)
                     $ void $ c_inotify_rm_watch fd wd1
                 return same
-
-    where
-
-    absPath = combinePathRep prep
 
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
@@ -1041,15 +1137,17 @@ addToWatch cfg@Config{..} watch0 prep = do
     --   marker queued by IN_MOVED_TO of e, the events in f are reported
     --   twice, under f and under d.
     --
-    -- XXX Two cases of a watched f moved to a reused path are not handled:
-    --
     -- * mkdir d, rmdir d, mv f d: IN_CREATE of d adds d as the second path of
-    --   f, nothing removes it, and 'renamePaths' changes f to d. The map then
-    --   has the path d twice, the events in the tree of d are reported twice
-    --   for as long as it is watched.
+    --   f, nothing removes it. 'renamePaths' changes f to d and drops the
+    --   second path.
     -- * mkdir d, mv d /outside, mv f d: IN_MOVED_FROM of d records its cookie
-    --   in the second path and no IN_MOVED_TO clears it. IN_MOVE_SELF of f
-    --   finds the cookie and removes d, the tree of d is left unwatched.
+    --   in the second path of f. 'renamePaths' drops that path, so the cookie
+    --   does not reach IN_MOVE_SELF of f.
+    -- * mkdir d, mv d /outside, mv m d, where m is outside the tree:
+    --   IN_MOVED_TO of d finds the cookie, 'addMovedDir' reports the entries
+    --   again because the consumer removed them on IN_MOVED_FROM.
+    -- * mkdir f/new, mv f g, ln -s /outside f: the add of f/new is refused,
+    --   see 'addWatchFor'. The rename adds g/new.
     --
     -- 'addNewDir' reports the entries of a created or moved directory. This
     -- scan adds the subdirectories only, it is used for the roots and after an
@@ -1083,14 +1181,13 @@ forSubdirs prep action = do
     --   returns it, 'ignoreMissing' skips the entry.
     -- * ENOENT from opendir of absPath, absPath was deleted. The watch on
     --   absPath reports the deletion.
+    -- * ELOOP from opendir of absPath, a symbolic link loop replaced it.
     -- * ENOTDIR from opendir of absPath, absPath is not a directory. A root
     --   added without 'setOnlyDir' may be a file, and a directory may be
     --   replaced by a file after its watch is added.
     let f = action . addSub prep
     S.fold (FL.drainMapM f) (Dir.readDirs (Dir.ignoreMissing True) absPath)
-        `catchIOError` \e ->
-            let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
-             in unless (isDoesNotExistError e || notDir) (ioError e)
+        `catchIOError` \e -> unless (isNotSubdirError e) (ioError e)
 
 -- | Add the subdirectories of a path to the watch, if the path is a
 -- directory. The subdirectories already watched via the same root are not
@@ -1121,8 +1218,7 @@ ignoreSubdirError :: Watch -> a -> IO a -> IO a
 ignoreSubdirError wt def action =
     action `catchIOError` \e -> do
         closed <- isWatchClosed wt
-        let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
-        if isDoesNotExistError e || notDir || closed
+        if isNotSubdirError e || closed
         then return def
         else ioError e
 
@@ -1132,10 +1228,7 @@ listEntries :: PathRep -> IO [Either Path Path]
 listEntries prep =
     S.fold FL.toList (Dir.readEither (Dir.ignoreMissing True) absPath)
         `catchIOError` \e ->
-            let notDir = fmap Errno (ioe_errno e) == Just eNOTDIR
-             in if isDoesNotExistError e || notDir
-                then return []
-                else ioError e
+            if isNotSubdirError e then return [] else ioError e
 
     where
 
@@ -1195,8 +1288,6 @@ foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
-
-foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
 
 -- | Mark the paths that satisfy the predicate as removed. Returns the watch
 -- descriptors whose paths are now all removed, and the removed paths of the
@@ -1739,7 +1830,10 @@ takeMoved cookie m =
     isMatch wp = not (wpRemoved wp) && wpMoveCookie wp == Just cookie
 
 -- | @renamePaths from to@ changes the directory @from@ and the paths under it
--- to @to@, in all the watch descriptors.
+-- to @to@, in all the watch descriptors. A path of the watch descriptor equal
+-- to a new path is dropped. It was added on the IN_CREATE event of a directory
+-- that no longer exists at that path, when the path already referred to the
+-- renamed directory, see the NOTE in 'addToWatch'.
 renamePaths :: PathRep -> PathRep -> IntMap WdEntry -> IntMap WdEntry
 renamePaths from to = StrictMap.map step
 
@@ -1759,16 +1853,25 @@ renamePaths from to = StrictMap.map step
 
     step (WdPaths wps)
         | any isMoving wps =
-            WdPaths [if isMoving wp then newPath wp else wp | wp <- wps]
+            let moved = map newPath (filter isMoving wps)
+                isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
+                isReplaced wp =
+                    not (isMoving wp) && not (wpRemoved wp) && isTarget wp
+             in WdPaths
+                    [ if isMoving wp then newPath wp else wp
+                    | wp <- wps
+                    , not (isReplaced wp)
+                    ]
     step e = e
 
 -- | Walk the tree of a renamed directory, add the subdirectories that are not
--- watched and return the entries found in them. The watches are changed the
--- same way as in 'restartDir', the listing generates no events on the watches
--- of the tree. Listing the renamed directory generates the open, access and
--- close events of its parent, which are reported if they are enabled.
-rescanDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
-rescanDir cfg0 wt = go cfg0 False
+-- watched and return the entries found in them, or all the entries if
+-- @isNew0@ is 'True'. The watches are changed the same way as in 'restartDir',
+-- the listing generates no events on the watches of the tree. Listing the
+-- renamed directory generates the open, access and close events of its parent,
+-- which are reported if they are enabled.
+rescanDir :: Bool -> Config -> Watch -> PathRep -> IO [ScannedEntry]
+rescanDir isNew0 cfg0 wt = go cfg0 isNew0
 
     where
 
@@ -1790,6 +1893,33 @@ rescanDir cfg0 wt = go cfg0 False
             $ void $ updateWatch (watchFlags cfg) wt wd prep
         return found
 
+-- | Add a directory that arrived at the path @to@ by a move, and return its
+-- entries.
+--
+-- The path may be already watched with the cookie of a move out. The path was
+-- added on the IN_CREATE event of a directory that was then moved out, when
+-- the path already referred to this directory. The scan of that IN_CREATE
+-- reported the entries, and the IN_MOVED_FROM event read after it told the
+-- consumer that they are gone. The entries are returned again.
+addMovedDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
+addMovedDir cfg wt@(Watch _ _ wdMapRef) to = do
+    reused <- atomicModifyIORef' wdMapRef takeStale
+    if reused
+    then ignoreSubdirError wt [] (rescanDir True (subdirConfig cfg) wt to)
+    else addDirWithScan cfg wt to
+
+    where
+
+    isStale wp =
+        not (wpRemoved wp)
+            && isJust (wpMoveCookie wp)
+            && eqPathRep (wpRep wp) to
+
+    hasStale (WdPaths wps) = any isStale wps
+    hasStale _ = False
+
+    takeStale m = (clearMoved isStale m, any hasStale (Map.elems m))
+
 -- | Handle the rename of the directory @from@ to @to@ under the same root, see
 -- the NOTE above. Returns the entries found in the subdirectories that were
 -- not watched, or in the new path if the watch is not kept.
@@ -1801,10 +1931,10 @@ renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
     if same
     then do
         atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-        ignoreSubdirError wt [] (rescanDir subCfg wt to)
+        ignoreSubdirError wt [] (rescanDir False subCfg wt to)
     else do
         unwatchSubtree wt from
-        addDirWithScan cfg wt to
+        addMovedDir cfg wt to
 
     where
 
@@ -1822,7 +1952,7 @@ movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
         moveTo to =
             case find (isSameRoot to . snd) froms of
                 Just from -> renameDir cfg wt from to
-                Nothing -> addDirWithScan cfg wt to
+                Nothing -> addMovedDir cfg wt to
         isMovedOut from = not (any (isSameRoot from) paths)
     mapM_ (unwatchSubtree wt) (filter isMovedOut (map snd froms))
     concat <$> mapM moveTo paths
@@ -2231,6 +2361,14 @@ isEventsLost = getFlag iN_Q_OVERFLOW
 --
 -- Note that in recursive watch mode all the subdirectories are watch roots,
 -- therefore, they will all generate this event.
+--
+-- This event refers to the directory that was at the path, it does not mean
+-- that the path is unwatched at the time the event is read. In recursive mode,
+-- in @mv d \/outside; mkdir d@ this event of the old @d@ is emitted after the
+-- create event of the new @d@, and the new @d@ is watched. Similarly, in
+-- @mkdir d; mv d e; mv f d@ with @f@ watched, this event of the new directory
+-- is emitted for the path @d@ after @f@ is renamed to @d@, and @d@ stays
+-- watched.
 --
 -- /Occurs only for a watched path/
 isRootUnwatched :: Event -> Bool
