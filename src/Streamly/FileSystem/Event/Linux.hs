@@ -75,7 +75,7 @@
 --
 -- A directory moved into the tree is handled the same way, its entries are
 -- reported by the scan even if they existed before the move. A move event does
--- not show where a directory came from, see 'isMoveScanEvent'.
+-- not show where a directory came from, see 'setScanNewDirs'.
 --
 -- = Platform differences
 --
@@ -168,7 +168,6 @@ module Streamly.FileSystem.Event.Linux
     -- ** Item Path info
     , isDir
     , isScanEvent
-    , isMoveScanEvent
 
     -- ** Exception Conditions
     , isEventsLost

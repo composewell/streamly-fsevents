@@ -100,7 +100,6 @@ module Streamly.Internal.FS.Event.Linux
     -- ** Item Path info
     , isDir
     , isScanEvent
-    , isMoveScanEvent
 
     -- ** Exception Conditions
     , isEventsLost
@@ -262,28 +261,32 @@ setFlag mask status cfg@Config{..} =
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 
--- | In recursive mode, report the entries found in a directory created in the
--- tree or moved into it.
+-- | In recursive mode, report the entries found in a newly created directory
+-- before its watch is added, or the pre-existing entries in a directory moved
+-- from outside the watched tree.
 --
 -- A directory is not watched until after its create event is read. Without
--- this setting the entries created in it by then are not reported. With this
--- setting the directory and its subdirectories are scanned after its watch is
--- added. Each entry found is emitted as an event with 'isCreated' and
--- 'isScanEvent' true. These events are emitted after the create event of the
--- directory. For example,
--- @mkdir -p a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and @a\/b\/f@.
+-- the scan the entries created in it by then are not reported. With this
+-- setting the directory tree is scanned after its watch is added. Each entry
+-- found in it is emitted as an event with 'isCreated' and 'isScanEvent' true.
+-- These events are emitted after the create event of the directory. For
+-- example, @mkdir -p a\/b; touch a\/b\/f@ reports @a@, @a\/b@ and
+-- @a\/b\/f@.
 --
--- A directory that arrives by a move is scanned the same way, unless the move
--- is a rename within the tree that keeps the watch of the directory. The
--- events are emitted after its 'isMovedTo' event, and 'isMoveScanEvent' is
--- true for them.
--- For example, @mv \/outside\/d d@ reports the move of @d@ and @d\/f@.
+-- A directory that is moved from outside the watched tree is also scanned. Its
+-- pre-existing entries are emitted as events with 'isCreated' and
+-- 'isScanEvent' true after its 'isMovedTo' event. For example,
+-- @mv \/outside\/d d@ reports the move of @d@ and @d\/f@.
 --
+-- A rename of an already watched tree does not require a scan.
 -- The move events cannot tell where a directory came from. The events of
 -- @mkdir a; touch a\/f; mv a b@ read after the rename are the same as the
 -- events of a directory moved in, and @f@ has no other report. A directory
 -- already watched and renamed twice before its events are read, for example,
--- by @mv a b; mv b c@, is scanned too, and reports its entries again.
+-- by @mv a b; mv b c@, is scanned too, and reports its entries again. For
+-- this reason the events of a scan on a move are not distinguished from the
+-- events of a scan on a create, an entry reported by either may or may not be
+-- new.
 --
 -- The scan reports the state of the directory, not its history. Every entry
 -- present when the scan reads it is reported. An entry created and deleted
@@ -300,8 +303,7 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 --
 -- Disabling this setting does not avoid reading the tree. Adding the watches
 -- of a new or moved tree reads all its directories in either case. It saves
--- the memory for the entries and the events reported. To drop only the entries
--- of moved directories, use 'isMoveScanEvent', the memory is still used.
+-- the memory for the entries and the events reported.
 --
 -- 'setMovedTo' does not control the scan on a move. With 'setMovedTo' 'False'
 -- the entries of a moved directory are reported without a move event.
@@ -1548,7 +1550,6 @@ data Event = Event
    , eventRoot :: Path
    , eventRelPath :: Maybe Path
    , eventScanned :: Bool
-   , eventMoveScanned :: Bool
    }
 
 -- The inotify event struct from the man page/header file:
@@ -1940,6 +1941,39 @@ renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
 
     subCfg = subdirConfig cfg
 
+-- NOTE: A directory created in the tree and a directory moved in:
+--
+-- The entries found by a scan are reported after the event that caused the
+-- scan, IN_CREATE or IN_MOVED_TO of the directory. The events are read after
+-- the operations, the event that causes the scan does not always match how
+-- the directory arrived. In the cases below, all the operations happen before
+-- the events are read. "Watched a" is a directory whose events have been read,
+-- d is a directory outside the tree containing f.
+--
+-- | Operations                     | Dir | Actual   | Reported as |
+-- |--------------------------------|-----|----------|-------------|
+-- | mkdir a; touch a/f; mv a b     | b   | created  | moved in    |
+-- | Watched a:                     | b/s | created  | moved in    |
+-- | mkdir a/s; touch a/s/f; mv a b |     |          |             |
+-- | mkdir a; rmdir a; mv d a       | a   | moved in | created     |
+-- | Watched a: mv a b; mv b c      | c   | renamed  | moved in    |
+-- | Watched a: mv a b; mv b a      | a   | renamed  | moved in    |
+--
+-- * mkdir a; touch a/f; mv a b: the add of a on IN_CREATE fails, the path no
+--   longer exists. b is scanned on IN_MOVED_TO, b/f follows the isMovedTo
+--   event of b.
+-- * mkdir a/s; touch a/s/f; mv a b: the add of a/s on IN_CREATE fails. The
+--   rename keeps the watch of a, the scan of b finds b/s not watched. b/s and
+--   b/s/f follow the isMovedTo event of b.
+-- * mkdir a; rmdir a; mv d a: IN_CREATE of a finds d at the path and scans it,
+--   a/f follows the isCreated event of a. IN_MOVED_TO of a finds the path
+--   already watched and does not scan it again.
+-- * mv a b; mv b c and mv a b; mv b a: 'updateWatch' at b fails, the path no
+--   longer exists, the watch of a is not kept. The directory is scanned at its
+--   final path, and its entries are reported again.
+--
+-- For this reason a scan event has one flag, 'isScanEvent', for both causes.
+
 -- | Handle IN_MOVED_TO of a directory that reports the given paths. A path
 -- whose root has a path with the cookie is a rename within that root, the
 -- other paths are moved in. A path with the cookie whose root does not have a
@@ -2018,15 +2052,13 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                 , eventRoot = root
                 , eventRelPath = rel
                 , eventScanned = False
-                , eventMoveScanned = False
                 }
-        mkScanned onMove ScannedEntry{..} =
+        mkScanned ScannedEntry{..} =
             (mkEvent ewd sePath)
                 { eventFlags =
                     if seIsDir then iN_CREATE .|. iN_ISDIR else iN_CREATE
                 , eventCookie = 0
                 , eventScanned = True
-                , eventMoveScanned = onMove
                 }
         isIgnored = eflags .&. iN_IGNORED /= 0
     -- The kernel event queue overflowed and events were dropped. The overflow
@@ -2120,7 +2152,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                         [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
                 return
                     $ (if isUnrequested then [] else reported)
-                    ++ map (mkScanned isDirMovedIn) scanned
+                    ++ map mkScanned scanned
 
     where
 
@@ -2551,35 +2583,6 @@ isDir = getFlag iN_ISDIR
 isScanEvent :: Event -> Bool
 isScanEvent = eventScanned
 
--- | Determine whether the event was generated by a scan that a move event
--- caused, see 'setScanNewDirs'. 'isScanEvent' is true for such an event.
---
--- This predicate reports the cause of the scan, not the origin of the entry.
--- It is usually the same as the entry being in a moved directory. The two
--- cases below differ only if a directory is renamed, or a path is reused,
--- before its earlier events are read. These are narrow edge cases, not the
--- common behavior.
---
--- /False positives/, reported as a move but actually not. The entry is new:
---
--- * @f@ in @mkdir a; touch a\/f; mv a b@, if the rename happens before the
--- create event of @a@ is read.
--- * The entries of a subdirectory created in a directory that is renamed
--- before the create event of the subdirectory is read.
---
--- /False negatives/, is a move but not reported as a move. In
--- @mkdir a; rmdir a; mv \/outside\/d a@ the scan on the create event of @a@
--- finds the directory moved in, and its entries are reported as the entries of
--- a new directory.
---
--- Dropping these events drops the entries found by a scan on a move. A false
--- positive has no other report, so scan the directory on its 'isMovedTo' event
--- to find it. A false negative is not dropped, it is reported as a new entry.
---
--- /Linux only/
-isMoveScanEvent :: Event -> Bool
-isMoveScanEvent = eventMoveScanned
-
 -------------------------------------------------------------------------------
 -- Debugging
 -------------------------------------------------------------------------------
@@ -2619,7 +2622,6 @@ showEvent ev@Event{..} =
 
     ++ showev isDir "Dir"
     ++ showev isScanEvent "Scanned"
-    ++ showev isMoveScanEvent "MoveScanned"
     ++ "\n"
 
         where showev f str = if f ev then "\n" ++ str else ""

@@ -1417,40 +1417,21 @@ recNoScanOnRename =
                 (renameDirectory dir (root </> "dir1"))
             pathsOf Event.isScanEvent evs `shouldBe` []
 
-recMoveScanEvent :: Spec
-recMoveScanEvent =
-    describe "isMoveScanEvent" $ do
-        it "is true for the entries found on a move"
-            $ withRoot recCfg $ \root w -> do
-                let dir = root </> "dir"
-                    dir1 = root </> "dir1"
-                evs <- recEventsBeforeAdd root w $ do
-                    createDirectory dir
-                    createFile (dir </> "file")
-                    renameDirectory dir dir1
-                pathsOf Event.isMoveScanEvent evs
-                    `shouldBe` [dir1 </> "file"]
-        it "is false for the entries of a new directory"
-            $ withRoot recCfg $ \root w -> do
-                let dir = root </> "dir"
-                evs <- recEventsBeforeAdd root w $ do
-                    createDirectory dir
-                    createFile (dir </> "file")
-                scannedPaths (const True) evs `shouldBe` [dir </> "file"]
-                pathsOf Event.isMoveScanEvent evs `shouldBe` []
-        -- The scan on the create event of dir finds the directory moved in.
-        it "is false for a directory moved in that a create event finds"
-            $ withRoot recCfg $ \root w -> do
-                let src = takeDirectory root </> "src"
-                    dir = root </> "dir"
-                createDirectory src
-                createFile (src </> "file")
-                evs <- recEventsBeforeAdd root w $ do
-                    createDirectory dir
-                    removeDirectory dir
-                    renameDirectory src dir
-                scannedPaths (const True) evs `shouldBe` [dir </> "file"]
-                pathsOf Event.isMoveScanEvent evs `shouldBe` []
+-- The scan on the create event of dir finds the directory moved in. The later
+-- IN_MOVED_TO finds the path already watched and does not scan it again.
+recScanCreatedFindsMovedIn :: Spec
+recScanCreatedFindsMovedIn =
+    it "reports once the entries of a directory moved in at a created path"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+            createDirectory src
+            createFile (src </> "file")
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                removeDirectory dir
+                renameDirectory src dir
+            scannedPaths (const True) evs `shouldBe` [dir </> "file"]
 
 -- The scan on the create event of dir fails, the path no longer exists. The
 -- directory is scanned at its new path.
@@ -2224,7 +2205,7 @@ watchTests =
                 recScanOnMoveIn
                 recScanOnMoveInDisabled
                 recNoScanOnRename
-                recMoveScanEvent
+                recScanCreatedFindsMovedIn
                 recScanCreatedThenRenamed
                 recScanCreatedRenamedTwice
                 recScanCreatedRenamedPathReused
