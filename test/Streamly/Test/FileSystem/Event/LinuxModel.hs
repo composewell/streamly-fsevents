@@ -35,6 +35,7 @@ import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, createFileLink
+    , doesDirectoryExist, listDirectory, pathIsSymbolicLink
     , removeDirectory, removeFile, removePathForcibly, renamePath )
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeDirectory, takeFileName)
@@ -94,6 +95,9 @@ data World = World
     , wConfig :: Event.Config
     -- | The consumer can apply the events to get the tree.
     , wCheckView :: Bool
+    -- | The consumer lists a directory on its create and move to events, as a
+    -- program does with 'Event.setScanNewDirs' 'False'.
+    , wConsumerScans :: Bool
     -- | Check the create events of the probes, otherwise their open events.
     , wCreateEvents :: Bool
     }
@@ -164,9 +168,8 @@ execOp base (Mv p q) = renamePath (base </> p) (base </> q)
 -- The view of a consumer that applies the events in order
 -------------------------------------------------------------------------------
 
--- | The paths known to the consumer, and the entries of the directories whose
--- 'Event.isMovedFrom' event has been read, by cookie.
-type View = (Set FilePath, [(Event.Cookie, (FilePath, [FilePath]))])
+-- | The paths known to the consumer.
+type View = Set FilePath
 
 getAbsPath :: Event.Event -> FilePath
 getAbsPath = Path.toString . Event.getAbsPath
@@ -176,25 +179,19 @@ getAbsPath = Path.toString . Event.getAbsPath
 isControl :: FilePath -> Bool
 isControl = isPrefixOf "." . takeFileName
 
+-- | A rename is applied as the tree leaving and coming back in, no cookie is
+-- matched: 'Event.isMovedFrom' removes the directory and the paths under it,
+-- the entries at the new path are reported by scan events after
+-- 'Event.isMovedTo'. rmdir(2) needs an empty directory, a deleted directory
+-- removes the paths under it too, a scan event reported before the deletion
+-- of its directory is removed with it.
 applyEvent :: View -> Event.Event -> View
-applyEvent (v, pending) ev
-    | isControl path = (v, pending)
-    | Event.isMovedFrom ev =
-        -- With overlapping roots the event is reported for each root, with
-        -- the same cookie. The entries were removed by the first one.
-        let (sub, rest) = Set.partition (isBelow path) (Set.delete path v)
-            cookie = Event.getCookie ev
-            earlier = maybe [] snd (lookup cookie pending)
-         in (rest, (cookie, (path, Set.toList sub ++ earlier)) : pending)
-    | Event.isMovedTo ev =
-        case lookup (Event.getCookie ev) pending of
-            Just (from, sub) ->
-                let new = map ((path ++) . drop (length from)) sub
-                 in (Set.fromList (path : new) `Set.union` v, pending)
-            Nothing -> (Set.insert path v, pending)
-    | Event.isCreated ev = (Set.insert path v, pending)
-    | Event.isDeleted ev = (Set.delete path v, pending)
-    | otherwise = (v, pending)
+applyEvent v ev
+    | isControl path = v
+    | Event.isMovedFrom ev || Event.isDeleted ev =
+        Set.filter (\q -> q /= path && not (isBelow path q)) v
+    | Event.isMovedTo ev || Event.isCreated ev = Set.insert path v
+    | otherwise = v
 
     where
 
@@ -203,6 +200,38 @@ applyEvent (v, pending) ev
 -------------------------------------------------------------------------------
 -- Running a test case
 -------------------------------------------------------------------------------
+
+-- | An event read by the consumer, or the paths found when the consumer
+-- listed a directory after reading its event.
+data Logged = Ev Event.Event | Listed [FilePath]
+
+applyLogged :: View -> Logged -> View
+applyLogged v (Ev ev) = applyEvent v ev
+applyLogged v (Listed ps) =
+    foldr Set.insert v (filter (not . isControl) ps)
+
+-- | The paths of all the entries under a directory, symbolic links are not
+-- followed. A path that cannot be read has no entries.
+listTree :: FilePath -> IO [FilePath]
+listTree dir = do
+    r <- try (listDirectory dir)
+    case r of
+        Left (_ :: SomeException) -> return []
+        Right names -> concat <$> mapM entry names
+
+    where
+
+    entry name = do
+        let path = dir </> name
+        r <- try $ do
+            isLink <- pathIsSymbolicLink path
+            if isLink then return False else doesDirectoryExist path
+        sub <-
+            case r of
+                Right True -> listTree path
+                Right False -> return []
+                Left (_ :: SomeException) -> return []
+        return (path : sub)
 
 -- | Which roots of the world reach a path.
 rootsOf :: World -> FilePath -> [FilePath]
@@ -222,8 +251,8 @@ setupTree base t =
             File -> createFile (base </> p)
 
 failuresOf ::
-       World -> FilePath -> Tree -> [Event.Event] -> [String]
-failuresOf w base final evs =
+       World -> FilePath -> Tree -> [Logged] -> [String]
+failuresOf w base final logged =
        [ "probe missing: " ++ rel p | p <- expected \\ reported ]
     ++ [ "probe extra: " ++ rel p | p <- reported \\ expected ]
     ++ [ "probe no open: " ++ rel p | p <- expected \\ opened ]
@@ -233,6 +262,7 @@ failuresOf w base final evs =
     where
 
     rel = drop (length base + 1)
+    evs = [ev | Ev ev <- logged]
     dirs = [p | (p, Dir) <- Map.toList final]
     expected =
         sort
@@ -251,7 +281,7 @@ failuresOf w base final evs =
     inRoots t =
         Set.fromList [base </> p | p <- Map.keys t, not (null (rootsOf w p))]
     view0 = inRoots (wTree w)
-    (view, _) = foldl applyEvent (view0, []) evs
+    view = foldl applyLogged view0 logged
     lost = inRoots final `Set.difference` view
 
 -- | Run @ops1@ with no event read, then read the events and run @ops2@ when
@@ -276,6 +306,12 @@ runCase base w ops1 split ops2 = do
     final = foldl applyOp (foldl applyOp (wTree w) ops1) ops2
     dirs = [p | (p, Dir) <- Map.toList final]
     limit = 5000000
+    consumerScans ev =
+        wConsumerScans w
+            && Event.isDir ev
+            && (Event.isCreated ev || Event.isMovedTo ev)
+            && not (Event.isScanEvent ev)
+            && not (isControl (getAbsPath ev))
 
     go wt = do
         evRef <- newIORef []
@@ -292,7 +328,10 @@ runCase base w ops1 split ops2 = do
                     mapM_ (execOp base) ops2
                     createFile (sentinel 2)
             onEvent ev = do
-                modifyIORef' evRef (ev :)
+                modifyIORef' evRef (Ev ev :)
+                when (consumerScans ev) $ do
+                    found <- listTree (getAbsPath ev)
+                    modifyIORef' evRef (Listed found :)
                 modifyIORef' countRef (+ 1)
                 n <- readIORef countRef
                 when (Just n == split) $ do
@@ -323,14 +362,14 @@ runCase base w ops1 split ops2 = do
                     mapM_ (\d -> createFile (base </> d </> ".probe")) dirs
                     createFile (sentinel 3)
                     timeout limit (takeMVar finished)
-            evs <- reverse <$> readIORef evRef
+            logged <- reverse <$> readIORef evRef
             reached <- readIORef splitRef
             err <- timeout 1 (takeMVar failed)
             let failures =
                     case (r1, r2) of
                         (Nothing, _) -> ["timeout before the sentinel"]
                         (_, Nothing) -> ["timeout before the probes"]
-                        _ -> failuresOf w base final evs
+                        _ -> failuresOf w base final logged
             return
                 Outcome
                     { oFailures = maybe failures (: failures) err
@@ -423,6 +462,7 @@ oneRoot = World
     , wLinkTarget = "r/f"
     , wConfig = recCfg
     , wCheckView = True
+    , wConsumerScans = False
     , wCreateEvents = True
     }
 
@@ -439,6 +479,7 @@ twoRoots = World
     , wLinkTarget = "r/f"
     , wConfig = recCfg
     , wCheckView = True
+    , wConsumerScans = False
     , wCreateEvents = True
     }
 
@@ -477,13 +518,15 @@ noScan = oneRoot
     { wName = "setScanNewDirs False"
     , wPaths = ["r/a", "r/b", "r/f", "o/m", "o/x"]
     , wConfig = Event.setScanNewDirs False recCfg
-    , wCheckView = False
+    , wConsumerScans = True
     }
 
 noCreated :: World
 noCreated = noScan
     { wName = "setCreated False"
     , wConfig = Event.setCreated False recCfg
+    , wCheckView = False
+    , wConsumerScans = False
     , wCreateEvents = False
     }
 
@@ -491,6 +534,8 @@ noMoves :: World
 noMoves = noScan
     { wName = "setMovedFrom False, setMovedTo False"
     , wConfig = Event.setMovedFrom False (Event.setMovedTo False recCfg)
+    , wCheckView = False
+    , wConsumerScans = False
     }
 
 -------------------------------------------------------------------------------

@@ -38,9 +38,10 @@
 
 ### Enhancements
 
-- Linux: in recursive mode, a newly created directory and a directory moved
-  into the tree are scanned to report their entries as `isCreated` events.
-  See `setScanNewDirs` and `isScanEvent`.
+- Linux: in recursive mode, a newly created directory, a directory moved
+  into the tree and a directory renamed within it are scanned to report their
+  entries as `isCreated` events. A rename is reported as the tree leaving and
+  coming back in. See `setScanNewDirs` and `isScanEvent`.
 - Linux: a directory renamed within a recursive watch keeps its watches, the
   events generated during the rename are no longer lost and report the new
   path.

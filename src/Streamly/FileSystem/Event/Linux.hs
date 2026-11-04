@@ -73,9 +73,10 @@
 -- period, for example, a modification or a deletion of an entry, are lost.
 -- inotify provides no way to avoid this loss.
 --
--- A directory moved into the tree is handled the same way, its entries are
--- reported by the scan even if they existed before the move. A move event does
--- not show where a directory came from, see 'setScanNewDirs'.
+-- A directory moved into the tree, or renamed within it, is handled the same
+-- way, its entries are reported by the scan even if they existed before the
+-- move. A move event does not show where a directory came from, a rename is
+-- reported as the tree leaving and coming back in, see 'setScanNewDirs'.
 --
 -- = Platform differences
 --
@@ -138,8 +139,6 @@ module Streamly.FileSystem.Event.Linux
     , getRelPath
     , getAbsPath
     , showEvent
-    , Cookie
-    , getCookie
 
     -- ** Root Level Events
     , isRootPathEvent
