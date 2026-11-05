@@ -314,6 +314,28 @@ overlapRemoveBoth =
                     && getAbsPath ev == sub) w
             unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
 
+-- The inner root sub is moved out of the outer root. The watch descriptors
+-- of sub and sub/dir are still used by the inner root, the outer root paths
+-- are removed by a marker event.
+overlapMoveOutInner :: Spec
+overlapMoveOutInner =
+    it "moving the inner root out of the outer root keeps the inner root"
+        $ withNestedRoots $ \root sub w -> do
+            let dir = sub </> "dir"
+                out = takeDirectory root </> "out"
+                file = root </> "file"
+            createDirectory dir
+            waitWatched recCfg w dir
+            renameDirectory sub out
+            evs <- readUntil recCfg
+                (\ev -> isUnwatchedAt dir ev && getRoot ev == root) w
+            unwatched evs `shouldBe` [(root, sub), (root, dir)]
+            createFile (out </> "dir" </> "file")
+            createFile file
+            evs1 <- readUntil recCfg (isCreatedAt file) w
+            map getRoot (filter Event.isCreated evs1) `shouldBe` [sub, root]
+            unwatched evs1 `shouldBe` []
+
 -- The second add of the root finds the existing watch, the path is watched
 -- once.
 duplicateRoot :: Spec
@@ -497,24 +519,27 @@ isUnwatchedAt path ev = Event.isRootUnwatched ev && getAbsPath ev == path
 isUnder :: FilePath -> FilePath -> Bool
 isUnder dir path = path == dir || (dir ++ "/") `isPrefixOf` path
 
--- | Move @root/dir@, containing @sub@, out of the tree. The watches of @dir@
--- and @sub@ are removed in the ascending order of their watch descriptors,
--- the isRootUnwatched event of @sub@ is the last. Returns the events up to
--- that event.
+-- | Move @root/dir@, containing @sub@ and @sub/sub1@, out of the tree. The
+-- watches are removed in the ascending order of their watch descriptors, the
+-- isRootUnwatched event of @sub1@ is the last. Returns the events up to that
+-- event.
 recMoveOut :: Event.Config -> IO [Event]
 recMoveOut cfg =
     withRoot cfg $ \root w -> do
         let dir = root </> "dir"
             sub = dir </> "sub"
+            sub1 = sub </> "sub1"
             out = takeDirectory root </> "out"
             sentinel = root </> "sentinel"
         createDirectory dir
         createDirectory sub
+        createDirectory sub1
         waitWatched cfg w dir
         renameDirectory dir out
-        evs <- readUntil cfg (isUnwatchedAt sub) w
-        unwatched evs `shouldBe` [(root, dir), (root, sub)]
+        evs <- readUntil cfg (isUnwatchedAt sub1) w
+        unwatched evs `shouldBe` [(root, dir), (root, sub), (root, sub1)]
         createFile (out </> "sub" </> "file")
+        createFile (out </> "sub" </> "sub1" </> "file")
         createFile sentinel
         evs1 <- readUntil cfg (isCreatedAt sentinel) w
         filter (isUnder dir) (map getAbsPath evs1) `shouldBe` []
@@ -2231,6 +2256,7 @@ watchTests =
                 overlapRemoveInner
                 overlapRemoveOuter
                 overlapRemoveBoth
+                overlapMoveOutInner
                 duplicateRoot
             describe "watch descriptors" largeWd
             describe "recursive mode" $ do
