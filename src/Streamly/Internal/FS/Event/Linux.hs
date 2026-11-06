@@ -2028,7 +2028,8 @@ renamePaths from to = StrictMap.map step
     step e = e
 
 -- | Add a directory that arrived at the path @to@ by a move, and return all
--- the entries under it, whether the path is already watched or not. A move is
+-- the entries under it if they are reported, see 'reportsScan', whether the
+-- path is already watched or not. A move is
 -- reported as the tree leaving and coming back in, see "Moves and scans" in
 -- dev/design.md.
 --
@@ -2039,7 +2040,9 @@ addMovedDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
 addMovedDir cfg wt@(Watch _ _ wdMapRef) to = do
     reused <- atomicModifyIORef' wdMapRef takeStale
     if reused || reportsScan cfg
-    then ignoreSubdirError wt [] (rescanDir True (subdirConfig cfg) wt to)
+    then
+        ignoreSubdirError wt []
+            (rescanDir (reportsScan cfg) (subdirConfig cfg) wt to)
     else addDirWithScan cfg wt to
 
     where
@@ -2055,8 +2058,8 @@ addMovedDir cfg wt@(Watch _ _ wdMapRef) to = do
     takeStale m = (clearMoved isStale m, any hasStale (Map.elems m))
 
 -- | Handle the rename of the directory @from@ to @to@ under the same root, see
--- the NOTE above. Returns all the entries under the new path, whether the
--- watch is kept or not.
+-- the NOTE above. Returns all the entries under the new path if they are
+-- reported, see 'reportsScan', whether the watch is kept or not.
 renameDir :: Config -> Watch -> (Int, PathRep) -> PathRep -> IO [ScannedEntry]
 renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
     same <-
@@ -2065,7 +2068,7 @@ renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
     if same
     then do
         atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-        ignoreSubdirError wt [] (rescanDir True subCfg wt to)
+        ignoreSubdirError wt [] (rescanDir (reportsScan cfg) subCfg wt to)
     else do
         unwatchSubtree wt from
         addMovedDir cfg wt to
