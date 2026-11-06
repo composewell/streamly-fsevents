@@ -59,6 +59,34 @@
 -- system. The number of events cannot be used to count changes on any
 -- platform. See @docs\/platform-differences.md@ in this package for what is
 -- coalesced on each platform.
+--
+-- = Combining Predicates
+--
+-- An event predicate is a pure function @Event -> Bool@. The boolean
+-- operators @&&@ and @||@ can be lifted to predicates:
+--
+-- @
+-- and_ :: (a -> Bool) -> (a -> Bool) -> a -> Bool
+-- and_ = liftA2 (&&)
+-- infixr 3 \`and_\`
+--
+-- or_ :: (a -> Bool) -> (a -> Bool) -> a -> Bool
+-- or_ = liftA2 (||)
+-- infixr 2 \`or_\`
+-- @
+--
+-- To keep only the create and move events:
+--
+-- @
+-- Stream.filter ('isCreated' \`or_\` 'isMoved')
+-- @
+--
+-- To keep only the modify events of non-directories, using the Linux
+-- specific @isDir@ predicate:
+--
+-- @
+-- Stream.filter ('isModified' \`and_\` not . Linux.isDir)
+-- @
 
 module Streamly.FileSystem.Event
     (
