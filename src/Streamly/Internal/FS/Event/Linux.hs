@@ -113,7 +113,7 @@ import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (bracket, finally, onException, try)
-import Control.Monad (unless, void, when)
+import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
@@ -502,7 +502,8 @@ setRootDeleted = setFlag iN_DELETE_SELF
 foreign import capi
     "sys/inotify.h value IN_MOVE_SELF" iN_MOVE_SELF :: Word32
 
--- | Report when the watched root path itself gets renamed.
+-- | Report when the watched root path itself gets renamed. A renamed root is
+-- removed from the watch whether or not this is enabled, see 'isRootMoved'.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
@@ -693,10 +694,17 @@ defaultConfig =
         , createFlags = 0
         }
 
+-- | The events that the kernel watch must generate in both modes. A root
+-- that reports IN_MOVE_SELF is removed from the watch if its path no longer
+-- refers to the watched object, see 'unwatchMovedRoots'.
+rootEvents :: Word32
+rootEvents = iN_MOVE_SELF
+
 -- | The events that the kernel watch must generate in recursive mode, to add
 -- and remove the watches of the subdirectories.
 recursiveEvents :: Word32
-recursiveEvents = iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO .|. iN_MOVE_SELF
+recursiveEvents =
+    iN_CREATE .|. iN_MOVED_FROM .|. iN_MOVED_TO .|. rootEvents
 
 -- | The flags of the kernel watch.
 --
@@ -723,7 +731,7 @@ watchFlags :: Config -> Word32
 watchFlags Config{..} =
     if watchRec
     then flags .|. recursiveEvents
-    else flags
+    else flags .|. rootEvents
 
     where
 
@@ -2101,6 +2109,30 @@ unwatchMoved wt@(Watch _ _ wdMapRef) = do
           ]
         )
 
+-- | Remove the roots of a watch descriptor that reported IN_MOVE_SELF, and the
+-- paths under them, if the path of the root no longer refers to the watched
+-- object. A root renamed back before the event is read stays watched. Two
+-- hard links watched as roots share the watch descriptor, the rename of one
+-- link reports IN_MOVE_SELF for both, only the renamed one is removed.
+--
+-- A renamed root is removed because its events would report the old path,
+-- which does not exist or refers to another object, and the kernel does not
+-- report the new path of a root.
+unwatchMovedRoots :: Config -> Watch -> Int -> [PathRep] -> IO ()
+unwatchMovedRoots cfg wt wd roots = do
+    moved <- filterM isRenamed roots
+    unless (null moved)
+        $ unwatchPaths wt "unwatchMovedRoots" (\p -> any (isUnder p) moved)
+
+    where
+
+    isRenamed prep =
+        not
+            <$> ignoreSubdirError wt False
+                    (updateWatch (watchFlags cfg) wt wd prep)
+
+    isUnder p root = eqPath (getRepRoot p) (getRepRoot root)
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
@@ -2220,6 +2252,14 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                         , not (wpRemoved wp)
                         , isJust (wpMoveCookie wp)
                         ]
+                when (eflags .&. iN_MOVE_SELF /= 0)
+                    $ PR.fromEffect
+                    $ unwatchMovedRoots cfg wt (fromIntegral ewd)
+                        [ wpRep wp
+                        | wp <- wps
+                        , not (wpRemoved wp)
+                        , isNothing (getRepSub (wpRep wp))
+                        ]
                 scanned <-
                     if watchRec cfg && isDirCreated
                     then
@@ -2242,7 +2282,8 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                         eflags .&. (iN_DELETE_SELF .|. iN_MOVE_SELF) /= 0
                     -- The events added by 'watchFlags' only.
                     unrequested =
-                        recursiveEvents .&. complement (createFlags cfg)
+                        (recursiveEvents .|. rootEvents)
+                            .&. complement (createFlags cfg)
                     isUnrequested = eflags .&. unrequested /= 0
                     isReported wp =
                         not isSelfEvent || isNothing (getRepSub (wpRep wp))
@@ -2486,7 +2527,7 @@ isEventsLost = getFlag iN_Q_OVERFLOW
 -- Compare with isRootChanged on macOS. isRootChanged includes all these cases.
 --
 -- | A path was removed from the watch explicitly using 'removeFromWatch' or
--- automatically (file was deleted, or filesystem was unmounted).
+-- automatically (file was deleted or renamed, or filesystem was unmounted).
 --
 -- Note that in recursive watch mode all the subdirectories are watch roots,
 -- therefore, they will all generate this event.
@@ -2517,6 +2558,10 @@ isRootDeleted :: Event -> Bool
 isRootDeleted = getFlag iN_DELETE_SELF
 
 -- | Watched file/directory was itself moved within the file system.
+--
+-- The root is removed from the watch, and 'isRootUnwatched' is reported
+-- later. The root is removed whether or not this event is enabled by
+-- 'setRootMoved'.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- move of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.

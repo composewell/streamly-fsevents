@@ -260,13 +260,13 @@ behaviors =
         { title = "renamed root is watched"
         , ops = renameRootAndCreate
         , check = const (createdNamed "file")
-        , expected = onPlatform Yes No Exception
+        , expected = onPlatform No No Exception
         }
     , base
         { title = "events of a renamed root use the old path"
         , ops = renameRootAndCreate
         , check = \p -> any ((== watchRoot p </> "file") . absPath)
-        , expected = onPlatform Yes No Exception
+        , expected = onPlatform No No Exception
         }
     , base
         { title = "dir created in a renamed recursive root is watched"

@@ -32,6 +32,7 @@ import System.Directory
     , removeDirectory
     , removeFile
     , renameDirectory
+    , renamePath
     , setOwnerExecutable
     , setPermissions
     )
@@ -42,6 +43,7 @@ import System.IO
     )
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performGC)
+import System.Posix.Files (createLink)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(ResourceLimit)
     , ResourceLimits(softLimit), getResourceLimit, setResourceLimit
@@ -314,12 +316,13 @@ overlapRemoveBoth =
                     && getAbsPath ev == sub) w
             unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
 
--- The inner root sub is moved out of the outer root. The watch descriptors
--- of sub and sub/dir are still used by the inner root, the outer root paths
--- are removed by a marker event.
+-- The inner root sub is moved out of the outer root. The outer root paths
+-- are removed first, by a marker event, while the inner root still uses the
+-- watch descriptors of sub and sub/dir. The inner root is renamed, it is
+-- removed next, which removes the watch descriptors.
 overlapMoveOutInner :: Spec
 overlapMoveOutInner =
-    it "moving the inner root out of the outer root keeps the inner root"
+    it "moving the inner root out of the outer root unwatches both"
         $ withNestedRoots $ \root sub w -> do
             let dir = sub </> "dir"
                 out = takeDirectory root </> "out"
@@ -328,12 +331,13 @@ overlapMoveOutInner =
             waitWatched recCfg w dir
             renameDirectory sub out
             evs <- readUntil recCfg
-                (\ev -> isUnwatchedAt dir ev && getRoot ev == root) w
-            unwatched evs `shouldBe` [(root, sub), (root, dir)]
+                (\ev -> isUnwatchedAt dir ev && getRoot ev == sub) w
+            unwatched evs
+                `shouldBe` [(root, sub), (root, dir), (sub, sub), (sub, dir)]
             createFile (out </> "dir" </> "file")
             createFile file
             evs1 <- readUntil recCfg (isCreatedAt file) w
-            map getRoot (filter Event.isCreated evs1) `shouldBe` [sub, root]
+            map getRoot (filter Event.isCreated evs1) `shouldBe` [root]
             unwatched evs1 `shouldBe` []
 
 -- The second add of the root finds the existing watch, the path is watched
@@ -469,6 +473,84 @@ defaultAttrsModified =
             setPermissions file (setOwnerExecutable True perms)
             evs <- readUntil Event.defaultConfig Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
+
+-------------------------------------------------------------------------------
+-- Renamed roots tests
+-------------------------------------------------------------------------------
+
+-- | Rename the watch root @root@ to @root ++ "-moved"@ and read the events
+-- up to the 'Event.isRootUnwatched' event of @path@.
+renameRootUntil ::
+    Event.Config -> FilePath -> FilePath -> Event.Watch -> IO [Event]
+renameRootUntil cfg root path w = do
+    renamePath root (root ++ "-moved")
+    readUntil cfg (\ev -> Event.isRootUnwatched ev && getAbsPath ev == path) w
+
+rootRenamed :: Spec
+rootRenamed =
+    it "a renamed root reports isRootMoved and is unwatched"
+        $ withRoot cfg $ \root w -> do
+            evs <- renameRootUntil cfg root root w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            unwatched evs `shouldBe` [(root, root)]
+
+    where
+
+    cfg = Event.setRootMoved True Event.defaultConfig
+
+-- IN_MOVE_SELF is requested for every root, it is not reported unless
+-- 'setRootMoved' is enabled.
+rootRenamedUnrequested :: Spec
+rootRenamedUnrequested =
+    it "a renamed root is unwatched without setRootMoved"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            evs <- renameRootUntil Event.defaultConfig root root w
+            pathsOf Event.isRootMoved evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root)]
+
+recRootRenamed :: Spec
+recRootRenamed =
+    it "a renamed recursive root is unwatched with the paths under it"
+        $ withRoot recCfg $ \root w -> do
+            let sub = root </> "sub"
+            createDirectory sub
+            createFile (root </> "sentinel")
+            _ <- readUntil recCfg (isCreatedAt (root </> "sentinel")) w
+            evs <- renameRootUntil recCfg root sub w
+            unwatched evs `shouldBe` [(root, root), (root, sub)]
+
+-- Both renames are done before the events are read.
+rootRenamedBack :: Spec
+rootRenamedBack =
+    it "a root renamed back before the event is read stays watched"
+        $ withRoot watchCfg $ \root w -> do
+            let file = root </> "file"
+            renameDirectory root (root ++ "-moved")
+            renameDirectory (root ++ "-moved") root
+            createFile file
+            evs <- readUntil watchCfg (isCreatedAt file) w
+            unwatched evs `shouldBe` []
+
+-- The rename of one hard link reports IN_MOVE_SELF for both roots.
+rootHardLinkRenamed :: Spec
+rootHardLinkRenamed =
+    it "renaming one of two hard links watched as roots unwatches it only"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let f = fp </> "f"
+                g = fp </> "g"
+            createFile f
+            createLink f g
+            roots <- mapM Path.fromString [f, g]
+            bracket
+                (Event.openWatch watchCfg (NonEmpty.fromList roots))
+                Event.closeWatch
+                $ \w -> do
+                    evs <- renameRootUntil watchCfg f f w
+                    unwatched evs `shouldBe` [(f, f)]
+                    appendFile g "x"
+                    evs1 <- readUntil watchCfg Event.isModified w
+                    map getRoot (filter Event.isModified evs1)
+                        `shouldBe` [g]
 
 -------------------------------------------------------------------------------
 -- Recursive mode tests
@@ -2307,6 +2389,12 @@ watchTests =
                 overlapRemoveBoth
                 overlapMoveOutInner
                 duplicateRoot
+            describe "renamed roots" $ do
+                rootRenamed
+                rootRenamedUnrequested
+                recRootRenamed
+                rootRenamedBack
+                rootHardLinkRenamed
             describe "watch descriptors" largeWd
             describe "recursive mode" $ do
                 recSubdirSelfEvents

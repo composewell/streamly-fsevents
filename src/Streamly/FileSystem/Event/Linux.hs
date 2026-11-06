@@ -35,11 +35,12 @@
 -- /Watch root:/
 --
 -- * If a watch root is deleted, its watch ends with an 'isRootUnwatched'
--- event. A new object created at the same path is not watched.
--- * If a watch root is renamed, its watch continues and the events are
--- reported with the old path. In recursive mode, a directory created in the
--- renamed root is not watched, because the old path of the directory does not
--- exist.
+-- event.
+-- * If a watch root is renamed, its watch ends with an 'isRootUnwatched'
+-- event. The kernel does not report the new path of the root.
+-- * An object created at the path of a removed root later, or renamed to it,
+-- is not watched, including the root renamed back. Add the path to the watch
+-- again to watch it.
 --
 -- Use 'setRootPathEvents' to receive the 'isRootDeleted' and 'isRootMoved'
 -- events. Objects inside a watched directory do not have these limitations. A

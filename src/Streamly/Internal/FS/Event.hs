@@ -114,16 +114,10 @@ watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith = Event.watchWith
 
 -- macOS and Windows seem to do a path level watch i.e. they watch the path
--- rather than the underlying inode, possibly they can map the inode back to a
--- path?.  On Linux we cannot keep watching a watch root if the inode it is
--- pointing to has moved. However, the inode continues to be watched in this
--- case instead of the path, which is not the case for macOS.
---
--- To make the behavior same for all platforms, for the Linux case we will have
--- to stop watching the inode if it moves from under the path, on the
--- IN_MOVE_SELF event of the root, no inotify flag does that.  And on macOS we
--- can stop watching  a path if the inode under it changes i.e. just filter out
--- events for that path.
+-- rather than the underlying inode. Linux watches the inode, the library
+-- removes a root on its IN_MOVE_SELF event, so a renamed root is not watched
+-- on Linux and macOS. A new object created at the path of a deleted or renamed
+-- root is watched on macOS but not on Linux.
 --
 -- Also, to make the behavior of Linux same as macOS we need to set
 -- setFollowSymLinks on Linux.
