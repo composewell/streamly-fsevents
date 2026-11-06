@@ -1,9 +1,11 @@
 appveyor.yml
 .github/workflows/haskell.yml
+.github/workflows/markdown-doctest.yml
 .github/workflows/no-proc.yml
 .gitignore
 .packcheck.ignore
 cabal.project
+cabal.project.markdown-doctest
 stack.yaml
 .hlint.yaml
 flake.lock
