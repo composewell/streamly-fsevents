@@ -2305,6 +2305,47 @@ overflowRecRootDeleted =
                             unwatched evs
                                 `shouldBe` [(root2, root2), (root2, sub)]
 
+-- | Run the action on root2 during an overflow of root1, and read the events
+-- up to the 'Event.isRootUnwatched' event of root2.
+overflowRoot2 ::
+    Event.Config -> (FilePath -> IO ()) -> Expectation
+overflowRoot2 cfg action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root1 = fp </> "root1"
+            root2 = fp </> "root2"
+        createDirectory root1
+        createDirectory root2
+        roots <- mapM Path.fromString [root1, root2]
+        bracket
+            (Event.openWatch cfg (NonEmpty.fromList roots))
+            Event.closeWatch
+            $ \w -> do
+                r <- withOverflow root1 (action root2)
+                case r of
+                    Nothing -> pendingWith "max_queued_events is too high"
+                    Just () -> do
+                        evs <- readUntil cfg (isUnwatchedAt root2) w
+                        unwatched evs `shouldBe` [(root2, root2)]
+
+-- The kernel drops the IN_MOVE_SELF event of the root when the queue is full.
+overflowRootRenamed :: Spec
+overflowRootRenamed =
+    it "removes a root renamed during an overflow in non-recursive mode"
+        $ overflowRoot2 watchCfg
+            (\root2 -> renameDirectory root2 (root2 ++ "x"))
+
+-- The kernel drops the IN_IGNORED event of the root when the queue is full.
+overflowRootDeleted :: Spec
+overflowRootDeleted =
+    it "removes a root deleted during an overflow in non-recursive mode"
+        $ overflowRoot2 watchCfg removeDirectory
+
+overflowRecRootRenamedNoRestart :: Spec
+overflowRecRootRenamedNoRestart =
+    it "removes a root renamed during an overflow if restart is disabled"
+        $ overflowRoot2 noRestartCfg
+            (\root2 -> renameDirectory root2 (root2 ++ "x"))
+
 overflowRecCreateNoRestart :: Spec
 overflowRecCreateNoRestart =
     it "does not watch a directory created during an overflow if disabled"
@@ -2436,6 +2477,9 @@ watchTests =
                 overflowRecCreate
                 overflowRecCreateReported
                 overflowRecCreateNoRestart
+                overflowRootRenamed
+                overflowRootDeleted
+                overflowRecRootRenamedNoRestart
                 overflowRecRename
                 overflowRecMoveOut
                 overflowRecRootRenamed

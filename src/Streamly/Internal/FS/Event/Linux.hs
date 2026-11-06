@@ -113,7 +113,7 @@ import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (bracket, finally, onException, try)
-import Control.Monad (filterM, unless, void, when)
+import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
@@ -350,7 +350,11 @@ setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 -- way, in an inconsistent state. An application that needs a complete watch
 -- must close the watch and open a new one after 'isEventsLost'.
 --
--- 'isEventsLost' is always reported irrespective of this option setting.
+-- 'isEventsLost' is always reported irrespective of this option setting. A
+-- watch root that was renamed, deleted or replaced during the overflow is
+-- removed from the watch irrespective of this option setting, and in
+-- non-recursive mode too. 'isRootUnwatched' is reported for the root and for
+-- the paths under it.
 --
 -- When this option is 'True', the following happens after an overflow:
 --
@@ -365,9 +369,6 @@ setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 -- the old path of a renamed directory, are removed and 'isRootUnwatched' is
 -- reported for those. A directory deleted during the overflow is reported
 -- this way, not as 'isDeleted'.
--- * A watch root that was renamed, deleted or replaced during the overflow is
--- removed from the watch, its path no longer refers to the watched directory.
--- 'isRootUnwatched' is reported for the root and for the paths under it.
 --
 -- The 'isCreated' events of the restart are reported after the 'isEventsLost'
 -- events, a directory before the directories under it. 'isScanEvent' is true
@@ -694,9 +695,10 @@ defaultConfig =
         , createFlags = 0
         }
 
--- | The events that the kernel watch must generate in both modes. A root
--- that reports IN_MOVE_SELF is removed from the watch if its path no longer
--- refers to the watched object, see 'unwatchMovedRoots'.
+-- | The events that the kernel watch must generate in both recursive and
+-- non-recursive mode. A root that reports IN_MOVE_SELF is removed from the
+-- watch if its path no longer refers to the watched object, see
+-- 'unwatchGoneRoots'.
 rootEvents :: Word32
 rootEvents = iN_MOVE_SELF
 
@@ -1772,6 +1774,50 @@ restartDir cfg wt seen added prep = do
 pathKey :: PathRep -> Array Word8
 pathKey = Path.toArray . combinePathRep
 
+-- | The roots in the map that are not removed, with their watch descriptors.
+liveRoots :: IntMap WdEntry -> [(Int, PathRep)]
+liveRoots m =
+    [ (wd, wpRep wp)
+    | (wd, WdPaths wps) <- Map.toList m
+    , wp <- wps
+    , not (wpRemoved wp)
+    , isNothing (getRepSub (wpRep wp))
+    ]
+
+-- | Whether the path of a root still refers to the object watched via its
+-- watch descriptor. The flags of the watch are set to 'watchFlags'.
+isRootAt :: Config -> Watch -> (Int, PathRep) -> IO Bool
+isRootAt cfg wt (wd, prep) =
+    ignoreSubdirError wt False $ updateWatch (watchFlags cfg) wt wd prep
+
+-- | Remove the roots whose path no longer refers to the watched object, and
+-- the paths under them. Such a root was renamed, deleted or replaced. Its
+-- events would report the old path, which does not exist or refers to another
+-- object, and the kernel does not report the new path of a root.
+--
+-- Called with the roots of a watch descriptor that reported IN_MOVE_SELF, and
+-- with all the roots after an event queue overflow when the tree is not
+-- restarted, the IN_MOVE_SELF and IN_IGNORED events of a root may have been
+-- dropped. A root renamed back before the check stays watched. Two hard links
+-- watched as roots share the watch descriptor, the rename of one link reports
+-- IN_MOVE_SELF for both, only the renamed one is removed.
+--
+-- The kernel watch of a deleted root is already removed, and its IN_IGNORED
+-- event may have been dropped, 'syncRemovals' reports the removal in that
+-- case. The roots are matched by their paths, if a root that is kept has the
+-- same path, the paths are kept.
+unwatchGoneRoots :: Config -> Watch -> [(Int, PathRep)] -> IO ()
+unwatchGoneRoots cfg wt roots = do
+    results <- mapM (\root -> (,) (snd root) <$> isRootAt cfg wt root) roots
+    let kept = [root | (root, True) <- results]
+        gone = [root | (root, False) <- results]
+        isGone p = any (isUnder p) gone && not (any (isUnder p) kept)
+    unless (null gone) $ unwatchPaths wt "unwatchGoneRoots" isGone
+
+    where
+
+    isUnder p root = eqPath (getRepRoot p) (getRepRoot root)
+
 -- | Add the tree of each watch root again, after an event queue overflow. A
 -- subdirectory is added on its IN_CREATE or IN_MOVED_TO event, and its path is
 -- changed on IN_MOVED_TO, these events are dropped when the queue overflows.
@@ -1808,12 +1854,7 @@ restartTree cfg wt@(Watch _ _ wdMapRef) = do
         else return Nothing
     results <-
         mapM (\root -> (,) (snd root) <$> restartRoot seen added root)
-            [ (wd, wpRep wp)
-            | (wd, WdPaths wps) <- Map.toList m
-            , wp <- wps
-            , not (wpRemoved wp)
-            , isNothing (getRepSub (wpRep wp))
-            ]
+            (liveRoots m)
     found <- readIORef seen
     let isUnder roots prep = any (eqPath (getRepRoot prep) . fst) roots
         restarted = [root | (root, True) <- results]
@@ -1830,10 +1871,8 @@ restartTree cfg wt@(Watch _ _ wdMapRef) = do
 
     where
 
-    restartRoot seen added (wd, prep) = do
-        same <-
-            ignoreSubdirError wt False
-                $ updateWatch (watchFlags cfg) wt wd prep
+    restartRoot seen added root@(_, prep) = do
+        same <- isRootAt cfg wt root
         when same
             $ ignoreSubdirError wt () (restartDir cfg wt seen added prep)
         return same
@@ -2109,30 +2148,6 @@ unwatchMoved wt@(Watch _ _ wdMapRef) = do
           ]
         )
 
--- | Remove the roots of a watch descriptor that reported IN_MOVE_SELF, and the
--- paths under them, if the path of the root no longer refers to the watched
--- object. A root renamed back before the event is read stays watched. Two
--- hard links watched as roots share the watch descriptor, the rename of one
--- link reports IN_MOVE_SELF for both, only the renamed one is removed.
---
--- A renamed root is removed because its events would report the old path,
--- which does not exist or refers to another object, and the kernel does not
--- report the new path of a root.
-unwatchMovedRoots :: Config -> Watch -> Int -> [PathRep] -> IO ()
-unwatchMovedRoots cfg wt wd roots = do
-    moved <- filterM isRenamed roots
-    unless (null moved)
-        $ unwatchPaths wt "unwatchMovedRoots" (\p -> any (isUnder p) moved)
-
-    where
-
-    isRenamed prep =
-        not
-            <$> ignoreSubdirError wt False
-                    (updateWatch (watchFlags cfg) wt wd prep)
-
-    isUnder p root = eqPath (getRepRoot p) (getRepRoot root)
-
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
@@ -2195,14 +2210,20 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
     -- The roots are the paths without a sub path; a path with a sub path is a
     -- subdirectory added under a recursive root. Marker entries are skipped,
     -- they are not watched paths. The directories added by 'restartTree' are
-    -- reported after the overflow events.
+    -- reported after the overflow events. When the tree is not restarted,
+    -- only the paths of the roots are checked, see 'unwatchGoneRoots'.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
         PR.fromEffect $ unwatchMoved wt
         added <-
-            if watchRec cfg && restartOnOverflow cfg
-            then PR.fromEffect $ restartTree cfg wt
-            else return []
+            PR.fromEffect
+                $ if watchRec cfg && restartOnOverflow cfg
+                  then restartTree cfg wt
+                  else do
+                    m <- readIORef wdMapRef
+                    unwatchGoneRoots cfg wt (liveRoots m)
+                        `catchIOError` \_ -> return ()
+                    return []
         PR.fromEffect $ syncRemovals wt
         return
             $ [ mkEvent (fromIntegral wd) (wpRep wp)
@@ -2254,8 +2275,8 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
                         ]
                 when (eflags .&. iN_MOVE_SELF /= 0)
                     $ PR.fromEffect
-                    $ unwatchMovedRoots cfg wt (fromIntegral ewd)
-                        [ wpRep wp
+                    $ unwatchGoneRoots cfg wt
+                        [ (fromIntegral ewd, wpRep wp)
                         | wp <- wps
                         , not (wpRemoved wp)
                         , isNothing (getRepSub (wpRep wp))
@@ -2516,7 +2537,9 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 --
 -- In recursive mode, the tree of each watch root is added to the watch again
 -- after an overflow, and the directories whose create or move events were lost
--- are reported, see 'setRestartOnOverflow'.
+-- are reported, see 'setRestartOnOverflow'. A watch root renamed, deleted or
+-- replaced during the overflow is removed and reports 'isRootUnwatched', in
+-- both modes.
 isEventsLost :: Event -> Bool
 isEventsLost = getFlag iN_Q_OVERFLOW
 
