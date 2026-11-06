@@ -2088,6 +2088,24 @@ overflowRecCreate =
                     evs <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs `shouldBe` [root]
 
+-- The kernel drops the create events of the directories when the queue is
+-- full, the restart reports them.
+overflowRecCreateReported :: Spec
+overflowRecCreateReported =
+    it "setRestartOnOverflow reports a directory created during an overflow"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+            r <- withOverflow root $ do
+                createDirectory dir
+                createDirectory sub
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    evs <- readUntil recCfg (isCreatedAt sub) w
+                    scannedPaths Event.isDir evs `shouldBe` [dir, sub]
+                    kernelCreated (filter Event.isDir evs) `shouldBe` []
+
 -- The kernel drops the move events of the directory when the queue is full.
 overflowRecRename :: Spec
 overflowRecRename =
@@ -2100,7 +2118,8 @@ overflowRecRename =
             case r of
                 Nothing -> pendingWith "max_queued_events is too high"
                 Just () -> do
-                    _ <- readUntil recCfg Event.isEventsLost w
+                    evs0 <- readUntil recCfg (isCreatedAt dir1) w
+                    scannedPaths Event.isDir evs0 `shouldBe` [dir1]
                     createFile file
                     evs <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs `shouldBe` [root]
@@ -2297,6 +2316,7 @@ watchTests =
                 overflowRemove
                 overflowRemoveShared
                 overflowRecCreate
+                overflowRecCreateReported
                 overflowRecCreateNoRestart
                 overflowRecRename
                 overflowRecMoveOut
