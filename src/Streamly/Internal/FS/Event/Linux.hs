@@ -113,7 +113,7 @@ import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (bracket, finally, onException, try)
-import Control.Monad (filterM, unless, void, when)
+import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.IntMap.Lazy (IntMap)
@@ -365,10 +365,9 @@ setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 -- the old path of a renamed directory, are removed and 'isRootUnwatched' is
 -- reported for those. A directory deleted during the overflow is reported
 -- this way, not as 'isDeleted'.
--- * A watch root that was renamed, deleted or replaced is not restarted, its
--- path no longer refers to the watched directory. The directories under a
--- renamed root keep the paths they had before the overflow, the changes made
--- under it during the overflow are not reported.
+-- * A watch root that was renamed, deleted or replaced during the overflow is
+-- removed from the watch, its path no longer refers to the watched directory.
+-- 'isRootUnwatched' is reported for the root and for the paths under it.
 --
 -- The 'isCreated' events of the restart are reported after the 'isEventsLost'
 -- events, a directory before the directories under it. 'isScanEvent' is true
@@ -1780,10 +1779,17 @@ pathKey = Path.toArray . combinePathRep
 -- max_queued_events directories would overflow the queue again.
 --
 -- A path under a restarted root that is not found is no longer in the tree, it
--- is removed. A root is skipped if its path no longer refers to the watched
--- directory, a renamed root is still watched and its subdirectories cannot be
--- reached by the old path. Failing to remove a path is ignored, like in
--- 'syncRemovals', the next overflow tries again.
+-- is removed. A root whose path no longer refers to the watched directory is
+-- not restarted, it was renamed, deleted or replaced during the overflow. Its
+-- subdirectories cannot be reached by the old path, the root and the paths
+-- under it are removed. The kernel watch of a deleted root is already
+-- removed, and its IN_IGNORED event may have been dropped, 'syncRemovals'
+-- reports the removal in that case.
+--
+-- The roots are matched by their paths. If a restarted root and a root that
+-- is not restarted have the same path, the paths of that root are kept.
+-- Failing to remove a path is ignored, like in 'syncRemovals', the next
+-- overflow tries again.
 restartTree :: Config -> Watch -> IO [(Int, PathRep)]
 restartTree cfg wt@(Watch _ _ wdMapRef) = do
     m <- readIORef wdMapRef
@@ -1792,8 +1798,8 @@ restartTree cfg wt@(Watch _ _ wdMapRef) = do
         if createFlags cfg .&. iN_CREATE /= 0
         then Just <$> newIORef []
         else return Nothing
-    roots <-
-        filterM (restartRoot seen added)
+    results <-
+        mapM (\root -> (,) (snd root) <$> restartRoot seen added root)
             [ (wd, wpRep wp)
             | (wd, WdPaths wps) <- Map.toList m
             , wp <- wps
@@ -1801,12 +1807,17 @@ restartTree cfg wt@(Watch _ _ wdMapRef) = do
             , isNothing (getRepSub (wpRep wp))
             ]
     found <- readIORef seen
-    let isRestarted prep = any (eqPath (getRepRoot prep) . fst . snd) roots
+    let isUnder roots prep = any (eqPath (getRepRoot prep) . fst) roots
+        restarted = [root | (root, True) <- results]
+        skipped = [root | (root, False) <- results]
+        isRestarted = isUnder restarted
         isStale prep =
                isJust (getRepSub prep)
             && isRestarted prep
             && Set.notMember (pathKey prep) found
-    unwatchPaths wt "restartTree" isStale `catchIOError` \_ -> return ()
+        isGone prep = isUnder skipped prep && not (isRestarted prep)
+    unwatchPaths wt "restartTree" (\p -> isStale p || isGone p)
+        `catchIOError` \_ -> return ()
     maybe (return []) (fmap reverse . readIORef) added
 
     where
