@@ -570,10 +570,16 @@ recEventsOf cfg root w action = do
     createFile sentinel
     readUntil cfg (isCreatedAt sentinel) w
 
--- | Read the events up to the create event of @dir@. The watch adds @dir@
--- and the directories under it when it reads the event.
+-- | Read the events up to the create event of @dir@ and the events of the scan
+-- of @dir@. The directories under @dir@ are watched when their scan events
+-- are read. A marker created in the parent of @dir@ is read after the scan.
+-- The marker is a symbolic link, its creation generates only a create event.
 waitWatched :: Event.Config -> Event.Watch -> FilePath -> IO ()
-waitWatched cfg w dir = () <$ readUntil cfg (isCreatedAt dir) w
+waitWatched cfg w dir = do
+    _ <- readUntil cfg (isCreatedAt dir) w
+    let marker = dir ++ ".scanned"
+    createFileLink "missing" marker
+    () <$ readUntil cfg (isCreatedAt marker) w
 
 -- The subdirectory watch generates IN_DELETE_SELF and IN_MOVE_SELF, the
 -- events are not reported.
@@ -651,8 +657,8 @@ recMoveIn =
             createDirectory src
             createDirectory (src </> "sub")
             renameDirectory src dir
-            _ <- readUntil recCfg
-                (\ev -> Event.isMovedTo ev && getAbsPath ev == dir) w
+            -- dir/sub is watched when its scan event is read.
+            _ <- readUntil recCfg (isCreatedAt (dir </> "sub")) w
             createFile file
             evs <- readUntil recCfg (isCreatedAt file) w
             pathsOf Event.isCreated evs `shouldBe` [file]
@@ -863,6 +869,11 @@ recRenameDuringScan =
                     _ <- readUntil recCfg
                         (\ev -> Event.isMovedTo ev && getAbsPath ev == dir1) w
                     takeMVar done
+            -- The flags of sub are restored by the scan of dir1, the create
+            -- event of the marker is read after the scan.
+            let marker = root </> "marker"
+            createFile marker
+            _ <- readUntil recCfg (isCreatedAt marker) w
             openFile file ReadMode >>= hClose
             evs <- readUntil recCfg
                 (\ev -> getAbsPath ev == file && Event.isNonWriteClosed ev) w

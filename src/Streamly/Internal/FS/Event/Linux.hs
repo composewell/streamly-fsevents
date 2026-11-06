@@ -111,7 +111,9 @@ where
 
 import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
-    (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
+    ( MVar, modifyMVar, modifyMVarMasked, modifyMVar_, newMVar, readMVar
+    , withMVar
+    )
 import Control.Exception (bracket, finally, onException, try)
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
@@ -121,7 +123,7 @@ import Data.IORef
     (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (find, isPrefixOf)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 #if !(MIN_VERSION_base(4,13,0))
 import Data.Semigroup (Semigroup(..))
 #endif
@@ -141,6 +143,7 @@ import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
 import GHC.IO.Exception (IOException(ioe_errno))
 import Streamly.Data.Array (Array)
 import Streamly.Data.Stream (Stream)
+import Streamly.Data.StreamK (StreamK)
 import Streamly.Data.Parser (Parser)
 import System.IO.Error
     ( catchIOError, illegalOperationErrorType, isDoesNotExistError
@@ -160,6 +163,7 @@ import qualified Streamly.Data.Fold as FL
 import qualified Streamly.Data.Array as A
     (createOf, fromList, reader, toList)
 import qualified Streamly.Data.Stream as S
+import qualified Streamly.Data.StreamK as StreamK (fromStream, nil, uncons)
 import qualified Streamly.Data.Unfold as UF
 import qualified Streamly.Internal.FileSystem.Path as Path
 
@@ -909,6 +913,9 @@ data Watch =
         -- block.
         (MVar FdState)
         (IORef (IntMap WdEntry)) -- Map key is the watch descriptor
+        -- The events not yet read by 'watchToStream', 'Nothing' until the
+        -- first read. A stream that stops reading leaves the rest here.
+        (MVar (Maybe (StreamK IO Event)))
 
 -- Instead of using the watch descriptor we can provide APIs that use the path
 -- itself to identify the watch. That will require us to maintain a map from wd
@@ -945,13 +952,14 @@ createWatch = do
         newMVar
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef Map.empty
-    return $ Watch fd lock emptyMapRef
+    readerRef <- newMVar Nothing
+    return $ Watch fd lock emptyMapRef readerRef
 
 -- | Run an action on the fd of a watch, holding the lock of the watch. The
 -- action must not block. Throw an exception if the watch is closed. The
 -- string is the name of the operation, used in the exception message.
 withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
-withWatchFd op (Watch fd lock _) action =
+withWatchFd op (Watch fd lock _ _) action =
     withMVar lock $ \st ->
         if fsWatchClosed st
         then ioError
@@ -965,11 +973,11 @@ withWatchFd op (Watch fd lock _) action =
 -- | Run an action holding the lock of the watch, do nothing if the watch is
 -- closed. The action must not block. See 'withWatchFd'.
 whenWatchOpen :: Watch -> IO () -> IO ()
-whenWatchOpen (Watch _ lock _) action =
+whenWatchOpen (Watch _ lock _ _) action =
     withMVar lock $ \st -> unless (fsWatchClosed st) action
 
 isWatchClosed :: Watch -> IO Bool
-isWatchClosed (Watch _ lock _) = fsWatchClosed <$> readMVar lock
+isWatchClosed (Watch _ lock _ _) = fsWatchClosed <$> readMVar lock
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -1101,7 +1109,7 @@ insertPath wd prep m =
 -- Returns the watch descriptor, and 'False' if the path is already being
 -- watched.
 addPathWith :: Word32 -> Watch -> PathRep -> IO (Int, Bool)
-addPathWith flags watch0@(Watch _ _ wdMapRef) prep =
+addPathWith flags watch0@(Watch _ _ wdMapRef _) prep =
     -- The watch descriptor is inserted in the map with the lock held, so that
     -- the watch cannot be closed in between.
     withWatchFd "addToWatch" watch0 $ \fd -> do
@@ -1148,7 +1156,7 @@ foreign import ccall unsafe
 --   directory with its new path.
 -- * If the path is now another directory in the map, it has the same flags.
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
-updateWatch flags wt@(Watch _ _ wdMapRef) wd prep =
+updateWatch flags wt@(Watch _ _ wdMapRef _) wd prep =
     withWatchFd "addToWatch" wt $ \fd -> do
         r <- try (addWatchFor fd flags prep)
         case r of
@@ -1501,7 +1509,7 @@ addRemovalMarker fd wdMapRef markers paths =
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths wt@(Watch fd _ wdMapRef) desc p =
+unwatchPaths wt@(Watch fd _ wdMapRef _) desc p =
     whenWatchOpen wt $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
@@ -1590,7 +1598,7 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
-closeWatch (Watch fd lock _) =
+closeWatch (Watch fd lock _ _) =
     modifyMVar_ lock $ \st ->
         if fsWatchClosed st
         then return st
@@ -1729,7 +1737,7 @@ pendingRemovals m =
 -- Failing to queue the marker, for example, when the process is out of fds,
 -- is ignored, the next IN_Q_OVERFLOW event tries again.
 syncRemovals :: Watch -> IO ()
-syncRemovals wt@(Watch fd _ wdMapRef) =
+syncRemovals wt@(Watch fd _ wdMapRef _) =
     whenWatchOpen wt $ do
         (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
         when (not (null markers && null paths))
@@ -1845,7 +1853,7 @@ unwatchGoneRoots cfg wt roots = do
 -- Failing to remove a path is ignored, like in 'syncRemovals', the next
 -- overflow tries again.
 restartTree :: Config -> Watch -> IO [(Int, PathRep)]
-restartTree cfg wt@(Watch _ _ wdMapRef) = do
+restartTree cfg wt@(Watch _ _ wdMapRef _) = do
     m <- readIORef wdMapRef
     seen <- newIORef Set.empty
     added <-
@@ -2037,7 +2045,7 @@ renamePaths from to = StrictMap.map step
 -- added on the IN_CREATE event of a directory that was then moved out, when
 -- the path already referred to this directory. The cookie is removed.
 addMovedDir :: Config -> Watch -> PathRep -> IO [ScannedEntry]
-addMovedDir cfg wt@(Watch _ _ wdMapRef) to = do
+addMovedDir cfg wt@(Watch _ _ wdMapRef _) to = do
     reused <- atomicModifyIORef' wdMapRef takeStale
     if reused || reportsScan cfg
     then
@@ -2061,7 +2069,7 @@ addMovedDir cfg wt@(Watch _ _ wdMapRef) to = do
 -- the NOTE above. Returns all the entries under the new path if they are
 -- reported, see 'reportsScan', whether the watch is kept or not.
 renameDir :: Config -> Watch -> (Int, PathRep) -> PathRep -> IO [ScannedEntry]
-renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
+renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
     same <-
         ignoreSubdirError wt False
             $ updateWatch (watchFlags subCfg) wt wd to
@@ -2117,7 +2125,7 @@ renameDir cfg wt@(Watch _ _ wdMapRef) (wd, from) to = do
 -- new path is moved out of that root. Returns the entries found by the
 -- renames and in the directories moved in.
 movedInDir :: Config -> Watch -> Word32 -> [PathRep] -> IO [ScannedEntry]
-movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
+movedInDir cfg wt@(Watch _ _ wdMapRef _) cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
     let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
         moveTo to =
@@ -2134,7 +2142,7 @@ movedInDir cfg wt@(Watch _ _ wdMapRef) cookie paths = do
 -- the directory as a directory moved in. Failing to remove a path is ignored,
 -- like in 'syncRemovals'.
 unwatchMoved :: Watch -> IO ()
-unwatchMoved wt@(Watch _ _ wdMapRef) = do
+unwatchMoved wt@(Watch _ _ wdMapRef _) = do
     paths <- atomicModifyIORef' wdMapRef takeAll
     mapM_ (unwatchSubtree wt) paths `catchIOError` \_ -> return ()
 
@@ -2167,7 +2175,7 @@ unwatchMoved wt@(Watch _ _ wdMapRef) = do
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO [Event]
-readOneEvent cfg  wt@(Watch _ _ wdMapRef) = do
+readOneEvent cfg  wt@(Watch _ _ wdMapRef _) = do
     -- XXX the header format is implicit in the code, this could be bug prone.
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
@@ -2333,7 +2341,7 @@ foreign import ccall unsafe "unistd.h read"
 -- | Read the events available on the fd of a watch, wait for the events if
 -- none is available. Returns 'Nothing' if the watch is closed.
 readEvents :: Watch -> IO (Maybe (Array Word8))
-readEvents (Watch fd lock _) = loop
+readEvents (Watch fd lock _ _) = loop
 
     where
 
@@ -2422,15 +2430,38 @@ readEvents (Watch fd lock _) = loop
 -- 'removeFromWatch' and 'closeWatch' on the watch. An event is reported to
 -- only one of the streams if more than one stream reads the same watch.
 --
+-- A stream can stop reading before the watch is closed. The next stream on
+-- the watch starts with the first event not yet read.
+--
 -- /Pre-release/
 --
 watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wt =
-    S.unfoldEach UF.fromList
-        $ S.catRights
-        $ S.parseMany (readOneEvent cfg wt)
-        $ S.unfoldEach A.reader
-        $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wt) ()
+watchToStream cfg wt@(Watch _ _ _ readerRef) = S.unfoldrM step ()
+
+    where
+
+    events =
+        StreamK.fromStream
+            $ S.unfoldEach UF.fromList
+            $ S.catRights
+            $ S.parseMany (readOneEvent cfg wt)
+            $ S.unfoldEach A.reader
+            $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wt) ()
+
+    -- The step runs with async exceptions masked. An exception can arrive
+    -- only where the step blocks, the rest of the events is then left as it
+    -- was before the step. The step blocks waiting for the fd in
+    -- 'readEvents', before any data is read, running the step again is
+    -- the same. It can also block on the lock of the watch while it adds or
+    -- updates a watch. Running that step again finds the changes made before
+    -- the exception, for example, a directory already watched is scanned as
+    -- in 'rescanDir'.
+    step () =
+        modifyMVarMasked readerRef $ \r -> do
+            next <- StreamK.uncons (fromMaybe events r)
+            return $ case next of
+                Nothing -> (Just StreamK.nil, Nothing)
+                Just (ev, rest) -> (Just rest, Just (ev, ()))
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
