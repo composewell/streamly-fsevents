@@ -1951,6 +1951,61 @@ recParentReplacedBySymlink =
             pathsOf Event.isCreated evs1
                 `shouldBe` [inNew, root </> "sentinel"]
 
+-- | Move the directory @src@, containing @sub@, into the tree as @dir@. When
+-- the scan reports @dir/sub@, its watch is added and it is not listed yet,
+-- run the action, then create a marker file and read up to its event. Returns
+-- the paths reported by the scan.
+scanReplacedDuringScan ::
+    FilePath -> Event.Watch -> FilePath -> (FilePath -> FilePath -> IO ())
+    -> IO [FilePath]
+scanReplacedDuringScan root w src replace = do
+    let dir = root </> "dir"
+        sub = dir </> "sub"
+        marker = root </> "marker"
+        onScan ev =
+            when (Event.isScanEvent ev && getAbsPath ev == sub) $ do
+                replace dir sub
+                createFile marker
+    renameDirectory src dir
+    evs <- readUntilWith recCfg onScan (isCreatedAt marker) w
+    return (scannedPaths (const True) evs)
+
+-- The listing of sub starts after its scan event is read.
+recScanDirReplacedBySymlink :: Spec
+recScanDirReplacedBySymlink =
+    it "does not list a symlink that replaced a directory during its scan"
+        $ withRoot recCfg $ \root w -> do
+            let base = takeDirectory root
+                outside = base </> "outside"
+                src = base </> "src"
+            createDirectory outside
+            createFile (outside </> "stray")
+            createDirectory src
+            createDirectory (src </> "sub")
+            createFile (src </> "sub" </> "file")
+            scanned <- scanReplacedDuringScan root w src $ \_ sub -> do
+                renameDirectory sub (base </> "sub-old")
+                createDirectoryLink outside sub
+            scanned `shouldNotContain` [root </> "dir" </> "sub" </> "stray"]
+
+recScanParentReplacedBySymlink :: Spec
+recScanParentReplacedBySymlink =
+    it "does not list via a symlink that replaced a parent during a scan"
+        $ withRoot recCfg $ \root w -> do
+            let base = takeDirectory root
+                outside = base </> "outside"
+                src = base </> "src"
+            createDirectory outside
+            createDirectory (outside </> "sub")
+            createFile (outside </> "sub" </> "stray")
+            createDirectory src
+            createDirectory (src </> "sub")
+            createFile (src </> "sub" </> "file")
+            scanned <- scanReplacedDuringScan root w src $ \dir _ -> do
+                renameDirectory dir (base </> "dir-old")
+                createDirectoryLink outside dir
+            scanned `shouldNotContain` [root </> "dir" </> "sub" </> "stray"]
+
 recScanCreatedRenamedDisabled :: Spec
 recScanCreatedRenamedDisabled =
     it "setScanNewDirs False does not report a renamed new directory"
@@ -2537,6 +2592,8 @@ watchTests =
                 recReusedPathMovedOutRenamedTwice
                 recParentReplacedBySymlinkLoop
                 recParentReplacedBySymlink
+                recScanDirReplacedBySymlink
+                recScanParentReplacedBySymlink
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan
