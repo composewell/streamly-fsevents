@@ -137,7 +137,7 @@ import Foreign.C.Error
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
 import Foreign.Marshal.Array (allocaArray)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
 import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
 import GHC.IO.Exception (IOException(ioe_errno))
@@ -172,8 +172,9 @@ import qualified Streamly.Internal.Data.Array as A
     )
 import qualified Streamly.Internal.Data.MutArray as MArray
     (byteLength, unsafeCreateWithPtr')
-import qualified Streamly.Internal.FileSystem.DirIO as Dir
-    (ignoreMissing, readDirs, readEither)
+import qualified Streamly.Internal.FileSystem.DirIO as Dir (ignoreMissing)
+import qualified Streamly.Internal.FileSystem.Posix.ReadDir as ReadDir
+    (DirStream(..), closeDirStream, readDirStreamEither)
 import qualified Streamly.Internal.Data.Parser as PR
     (takeEQ, fromEffect)
 import qualified Streamly.Internal.Data.StreamK as StreamK
@@ -1010,11 +1011,16 @@ foreign import capi "fcntl.h value AT_FDCWD" aT_FDCWD :: CInt
 
 foreign import capi "fcntl.h value O_PATH" o_PATH :: CInt
 
+foreign import capi "fcntl.h value O_RDONLY" o_RDONLY :: CInt
+
 foreign import capi "fcntl.h value O_DIRECTORY" o_DIRECTORY :: CInt
 
 foreign import capi "fcntl.h value O_NOFOLLOW" o_NOFOLLOW :: CInt
 
 foreign import ccall unsafe "unistd.h close" c_close :: CInt -> IO CInt
+
+foreign import ccall unsafe "dirent.h fdopendir"
+    c_fdopendir :: CInt -> IO (Ptr ())
 
 -- | Whether adding or listing a subdirectory failed because the path no longer
 -- refers to a directory. The path may have been deleted, or it may now be a
@@ -1072,24 +1078,30 @@ openSubdir root sub = do
 -- openat call, instead of opening every component from the root.
 type ParentDir = (CInt, Path)
 
--- | Open an O_PATH fd of a directory, without following a symbolic link in
--- any component under its root. With a parent, the directory is opened
--- relative to the parent fd, the parent was opened the same way. A root is
--- opened by its path, a symbolic link to a root is followed. Raise an
--- exception if the path is not a directory.
+-- | Open a directory with the access mode @O_PATH@ or @O_RDONLY@, without
+-- following a symbolic link in any component under its root. With a parent,
+-- the directory is opened relative to the parent fd, the parent was opened
+-- the same way. A root is opened by its path, a symbolic link to a root is
+-- followed. Raise an exception if the path is not a directory.
 --
 -- The parent fd refers to the directory, not to its path. If the parent is
 -- moved out of the tree during the walk, its subdirectories are added under
 -- the old path, and the move event of the parent removes them when it is
 -- read. Without the parent fd, opening the old path fails and they are not
 -- added.
-openDirAt :: Maybe ParentDir -> PathRep -> IO CInt
-openDirAt parent prep =
+--
+-- 'openSubdir' opens the components of a path with @O_PATH@, which needs only
+-- the search permission. With @O_RDONLY@ the directory is then opened again
+-- as @.@ relative to the @O_PATH@ fd.
+openDirAt :: CInt -> Maybe ParentDir -> PathRep -> IO CInt
+openDirAt mode parent prep =
     case (parent, prep) of
         (Just (pfd, name), (_, Just _)) ->
             A.asCStringUnsafe (Path.toArray name) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 pfd ptr subFlags
-        (_, (root, Just sub)) -> openSubdir root sub
+        (_, (root, Just sub))
+            | mode == o_PATH -> openSubdir root sub
+            | otherwise -> bracket (openSubdir root sub) c_close (openDot prep)
         (_, (root, Nothing)) ->
             A.asCStringUnsafe (Path.toArray root) $ \ptr ->
                 throwErrnoIfMinus1 err
@@ -1098,8 +1110,55 @@ openDirAt parent prep =
     where
 
     err = "addToWatch: " ++ Path.toString (combinePathRep prep)
-    dirFlags = o_PATH .|. o_DIRECTORY
+    dirFlags = mode .|. o_DIRECTORY
     subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
+
+-- | Open the directory of an @O_PATH@ fd again, for reading.
+openDot :: PathRep -> CInt -> IO CInt
+openDot prep pfd =
+    withCString "." $ \ptr ->
+        throwErrnoIfMinus1
+            ("addToWatch: " ++ Path.toString (combinePathRep prep))
+            $ c_openat3 pfd ptr (o_RDONLY .|. o_DIRECTORY .|. o_CLOEXEC)
+
+-- | Open a directory for reading using the given action, and return its fd
+-- and a directory stream on the fd. The directory is listed through the fd,
+-- not by its path, a symbolic link that replaces it or a parent later is not
+-- followed. Closing the directory stream closes the fd.
+--
+-- Opening a directory for reading generates @IN_OPEN@ on its watch and on the
+-- watch of its parent, and closing it @IN_CLOSE_NOWRITE@. These watches must
+-- have 'scanFlags' from before the open until after the close.
+openDirStream :: PathRep -> IO CInt -> IO (CInt, ReadDir.DirStream)
+openDirStream prep open = do
+    fd <- open
+    dirp <- c_fdopendir fd
+    if dirp == nullPtr
+    then do
+        errno <- getErrno
+        _ <- c_close fd
+        ioError
+            $ errnoToIOError
+                ("fdopendir: " ++ Path.toString (combinePathRep prep))
+                errno Nothing Nothing
+    else return (fd, ReadDir.DirStream (castPtr dirp))
+
+-- | Open a directory for reading, see 'openDirAt' and 'openDirStream'.
+openDirStreamAt :: Maybe ParentDir -> PathRep -> IO (CInt, ReadDir.DirStream)
+openDirStreamAt parent prep =
+    openDirStream prep (openDirAt o_RDONLY parent prep)
+
+-- | The entries of a directory stream, directories on the 'Left'. An entry
+-- deleted after it is read is skipped.
+readEntries :: PathRep -> ReadDir.DirStream -> Stream IO (Either Path Path)
+readEntries prep ds = S.unfoldrM step ()
+
+    where
+
+    step () =
+        fmap (\e -> (e, ()))
+            <$> ReadDir.readDirStreamEither (Dir.ignoreMissing True)
+                    (combinePathRep prep, ds)
 
 -- | Call inotify_add_watch on a path and return the watch descriptor. Raise an
 -- exception on failure.
@@ -1120,7 +1179,7 @@ addWatchFor fd flags prep =
     case prep of
         (_, Nothing) -> addWatchByPath fd flags prep
         (_, Just _) ->
-            bracket (openDirAt Nothing prep) c_close
+            bracket (openDirAt o_PATH Nothing prep) c_close
                 (addWatchViaFd fd flags prep)
 
 -- | Call inotify_add_watch on the path of a 'PathRep'.
@@ -1213,38 +1272,45 @@ addPathUsing watch0@(Watch _ _ wdMapRef _) prep addWatch =
             <$> atomicModifyIORef' wdMapRef (insertPath (fromIntegral wd) prep)
 
 -- | Add the watch of a directory and run an action with the result of
--- 'addPathWith' and the O_PATH fd of the directory, see 'openDirAt'. The fd
--- is closed when the action ends, the subdirectories are opened relative to
--- it while it is open. A walk holds one fd for each level of the tree.
+-- 'addPathWith' and the fd and the directory stream of the directory, see
+-- 'openDirStream'. The directory is opened with @O_PATH@, which does not
+-- generate any events, the watch is added with the given flags through this
+-- fd, and the directory is then opened for reading relative to it. The fds are
+-- closed when the action ends, the subdirectories are opened relative to the
+-- fd while it is open. A walk holds two fds for each level of the tree. The
+-- caller restores 'watchFlags' after this returns, after the close.
 --
--- A root is added by its path, see 'addWatchFor'. Its fd is 'Nothing' if it
--- is not a directory.
+-- A root is added by its path, see 'addWatchFor'. Its directory is 'Nothing'
+-- if it is not a directory.
 withAddedDir ::
        Word32
     -> Watch
     -> Maybe ParentDir
     -> PathRep
-    -> ((Int, Bool) -> Maybe CInt -> IO a)
+    -> ((Int, Bool) -> Maybe (CInt, ReadDir.DirStream) -> IO a)
     -> IO a
 withAddedDir flags wt parent prep action =
     case prep of
         (_, Nothing) -> do
             r <- addPathWith flags wt prep
-            bracket openRoot (mapM_ c_close) (action r)
+            bracket openRoot (mapM_ close) (action r)
         (_, Just _) ->
-            bracket (openDirAt parent prep) c_close $ \fd -> do
-                r <- addPathAt flags wt prep fd
-                action r (Just fd)
+            bracket (openDirAt o_PATH parent prep) c_close $ \pfd -> do
+                r <- addPathAt flags wt prep pfd
+                bracket (openDirStream prep (openDot prep pfd)) close
+                    (action r . Just)
 
     where
 
+    close = ReadDir.closeDirStream . snd
+
     openRoot = do
-        r <- try (openDirAt Nothing prep)
+        r <- try (openDirStreamAt Nothing prep)
         case r of
             Left e
                 | isNotSubdirError e -> return Nothing
                 | otherwise -> ioError e
-            Right fd -> return (Just fd)
+            Right dir -> return (Just dir)
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -1299,7 +1365,7 @@ addToWatch cfg wt = addToWatchAt cfg wt Nothing
 -- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
 -- the parent is given.
 addToWatchAt :: Config -> Watch -> Maybe ParentDir -> PathRep -> IO ()
-addToWatchAt cfg@Config{..} watch0 parent prep =
+addToWatchAt cfg@Config{..} watch0 parent prep = do
     --    showPathRep (root, Nothing) = "root = " ++ Path.toString root
     --    showPathRep (root, Just sub) =
     --        "root = " ++ Path.toString root ++ " sub = " ++ Path.toString sub
@@ -1348,44 +1414,40 @@ addToWatchAt cfg@Config{..} watch0 parent prep =
     -- add a config option to ignore such errors, like the options for
     -- ignoring errors when reading a directory.
     --
-    withAddedDir (scanFlags cfg) watch0 parent prep $ \(wd, isNew) dirFd -> do
+    wd <- withAddedDir (scanFlags cfg) watch0 parent prep
+        $ \(wd, isNew) dir -> do
+            -- Now add the children. If we missed any creates while we were
+            -- adding the parent, this will make sure they are added too.
+            when (isNew && watchRec) $ mapM_ (addSubdirs cfg watch0 prep) dir
+            return wd
 
-    -- Now add the children. If we missed any creates while we were adding the
-    -- parent, this will make sure they are added too.
-    when (isNew && watchRec) $ mapM_ (addSubdirs cfg watch0 prep) dirFd
-
-    -- The directory has been listed. The watch of its parent still has
-    -- 'scanFlags' until the scan of the parent ends, the directories are
+    -- The directory has been listed and closed. The watch of its parent still
+    -- has 'scanFlags' until the scan of the parent ends, the directories are
     -- changed in the reverse order of adding them. An already watched path is
     -- changed too, to add the flags of this config.
     when (scanFlags cfg /= watchFlags cfg)
         $ void $ updateWatch (watchFlags cfg) watch0 wd prep
 
--- | Run an action on the name of each subdirectory of a path, if the path is
--- a directory.
-forSubdirs :: PathRep -> (Path -> IO ()) -> IO ()
-forSubdirs prep action = do
-    let absPath = combinePathRep prep
+-- | Run an action on the name of each subdirectory in a directory stream.
+forSubdirs :: PathRep -> ReadDir.DirStream -> (Path -> IO ()) -> IO ()
+forSubdirs prep ds action =
     -- The errors ignored:
     --
     -- * ENOENT from lstat of a DT_UNKNOWN entry deleted after readdir
     --   returns it, 'ignoreMissing' skips the entry.
-    -- * ENOENT from opendir of absPath, absPath was deleted. The watch on
-    --   absPath reports the deletion.
-    -- * ELOOP from opendir of absPath, a symbolic link loop replaced it.
-    -- * ENOTDIR from opendir of absPath, absPath is not a directory. A root
-    --   added without 'setOnlyDir' may be a file, and a directory may be
-    --   replaced by a file after its watch is added.
-    S.fold (FL.drainMapM action)
-        (Dir.readDirs (Dir.ignoreMissing True) absPath)
+    -- * ENOENT, ELOOP or ENOTDIR from lstat of a DT_UNKNOWN entry, by its
+    --   path, if a parent was replaced.
+    S.fold (FL.drainMapM (either action (const (return ()))))
+        (readEntries prep ds)
         `catchIOError` \e -> unless (isNotSubdirError e) (ioError e)
 
--- | Add the subdirectories of a directory to the watch, given its fd. The
--- subdirectories already watched via the same root are not scanned again.
--- An error is ignored as in 'addSubdirToWatch'.
-addSubdirs :: Config -> Watch -> PathRep -> CInt -> IO ()
-addSubdirs cfg wt prep dirFd =
-    forSubdirs prep $ \name ->
+-- | Add the subdirectories of a directory to the watch, given its fd and
+-- directory stream. The subdirectories already watched via the same root are
+-- not scanned again. An error is ignored as in 'addSubdirToWatch'.
+addSubdirs ::
+    Config -> Watch -> PathRep -> (CInt, ReadDir.DirStream) -> IO ()
+addSubdirs cfg wt prep (dirFd, ds) =
+    forSubdirs prep ds $ \name ->
         ignoreSubdirError wt ()
             $ addToWatchAt (subdirConfig cfg) wt (Just (dirFd, name))
                 (addSub prep name)
@@ -1427,13 +1489,6 @@ handleSubdirError wt =
         if isNotSubdirError e || closed
         then return S.nil
         else ioError e
-
--- | The entries of a directory, directories on the 'Left'. The stream is
--- empty if the path does not exist or is not a directory.
-listEntries :: Watch -> PathRep -> Stream IO (Either Path Path)
-listEntries wt prep =
-    handleSubdirError wt
-        $ Dir.readEither (Dir.ignoreMissing True) (combinePathRep prep)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
@@ -1512,14 +1567,17 @@ scanChildren wt mode parent prep =
         case prep of
             (_, Nothing) -> addPathWith flags wt prep
             (_, Just _) ->
-                bracket (openDirAt parent prep) c_close
+                bracket (openDirAt o_PATH parent prep) c_close
                     (addPathAt flags wt prep)
 
     list cfg wd reported childMode =
         withWatchFlags cfg wt wd prep
             $ handleSubdirError wt
-            $ S.bracketIO (openDirAt parent prep) c_close
-            $ \fd -> S.mapM (node fd reported childMode) (listEntries wt prep)
+            $ S.bracketIO
+                (openDirStreamAt parent prep)
+                (ReadDir.closeDirStream . snd)
+            $ \(fd, ds) ->
+                S.mapM (node fd reported childMode) (readEntries prep ds)
 
     node fd reported childMode (Left dir) = do
         let path = addSub prep dir
@@ -1966,13 +2024,14 @@ restartDir ::
     -> Maybe ParentDir
     -> PathRep
     -> IO ()
-restartDir cfg wt seen added parent prep =
-    withAddedDir flags wt parent prep $ \(wd, isNew) dirFd -> do
-    modifyIORef' seen (Set.insert (pathKey prep))
-    case added of
-        Just ref | isNew -> modifyIORef' ref ((wd, prep) :)
-        _ -> return ()
-    mapM_ (\fd -> forSubdirs prep (restartSubdir fd)) dirFd
+restartDir cfg wt seen added parent prep = do
+    wd <- withAddedDir flags wt parent prep $ \(wd, isNew) dir -> do
+        modifyIORef' seen (Set.insert (pathKey prep))
+        case added of
+            Just ref | isNew -> modifyIORef' ref ((wd, prep) :)
+            _ -> return ()
+        mapM_ (\(fd, ds) -> forSubdirs prep ds (restartSubdir fd)) dir
+        return wd
     when (scanFlags cfg /= watchFlags cfg)
         $ void $ updateWatch (watchFlags cfg) wt wd prep
 
