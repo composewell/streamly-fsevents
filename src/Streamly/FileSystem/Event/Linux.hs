@@ -171,6 +171,7 @@ module Streamly.FileSystem.Event.Linux
 
     -- ** Exception Conditions
     , isEventsLost
+    , isAccessDenied
     )
 where
 

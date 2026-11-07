@@ -19,6 +19,9 @@
 
 ### Bug Fixes
 
+- Linux: in recursive mode, a subdirectory without read or search
+  permission no longer raises an exception that ends the watch. The
+  subdirectory is skipped and reported by the new event `isAccessDenied`.
 - Linux: in recursive mode, fix the watching of subdirectories that are
   created, deleted, moved or renamed while the tree is watched. A directory
   moved into the tree is now watched, one moved out is no longer watched,

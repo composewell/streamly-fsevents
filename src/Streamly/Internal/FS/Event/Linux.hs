@@ -103,6 +103,7 @@ module Streamly.Internal.FS.Event.Linux
 
     -- ** Exception Conditions
     , isEventsLost
+    , isAccessDenied
 
     -- * Debugging
     , showEvent
@@ -130,8 +131,8 @@ import Data.Semigroup (Semigroup(..))
 import Data.Set (Set)
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
-    ( Errno(..), eAGAIN, eINTR, eINVAL, eLOOP, eNOENT, eNOTDIR, eWOULDBLOCK
-    , errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
+    ( Errno(..), eACCES, eAGAIN, eINTR, eINVAL, eLOOP, eNOENT, eNOTDIR, ePERM
+    , eWOULDBLOCK, errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
     , throwErrnoIfMinus1_
     )
 import Foreign.C.String (CString, withCString)
@@ -937,6 +938,9 @@ data Watch =
         -- The events not yet read by 'watchToStream', 'Nothing' until the
         -- first read. A stream that stops reading leaves the rest here.
         (MVar (Maybe (StreamK IO Event)))
+        -- The subdirectories not added because of a permission error, most
+        -- recent first, to be reported as 'isAccessDenied' events.
+        (IORef [PathRep])
 
 -- Instead of using the watch descriptor we can provide APIs that use the path
 -- itself to identify the watch. That will require us to maintain a map from wd
@@ -974,13 +978,14 @@ createWatch = do
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef Map.empty
     readerRef <- newMVar Nothing
-    return $ Watch fd lock emptyMapRef readerRef
+    deniedRef <- newIORef []
+    return $ Watch fd lock emptyMapRef readerRef deniedRef
 
 -- | Run an action on the fd of a watch, holding the lock of the watch. The
 -- action must not block. Throw an exception if the watch is closed. The
 -- string is the name of the operation, used in the exception message.
 withWatchFd :: String -> Watch -> (CInt -> IO a) -> IO a
-withWatchFd op (Watch fd lock _ _) action =
+withWatchFd op (Watch fd lock _ _ _) action =
     withMVar lock $ \st ->
         if fsWatchClosed st
         then ioError
@@ -994,11 +999,21 @@ withWatchFd op (Watch fd lock _ _) action =
 -- | Run an action holding the lock of the watch, do nothing if the watch is
 -- closed. The action must not block. See 'withWatchFd'.
 whenWatchOpen :: Watch -> IO () -> IO ()
-whenWatchOpen (Watch _ lock _ _) action =
+whenWatchOpen (Watch _ lock _ _ _) action =
     withMVar lock $ \st -> unless (fsWatchClosed st) action
 
 isWatchClosed :: Watch -> IO Bool
-isWatchClosed (Watch _ lock _ _) = fsWatchClosed <$> readMVar lock
+isWatchClosed (Watch _ lock _ _ _) = fsWatchClosed <$> readMVar lock
+
+-- | Record a subdirectory not added because of a permission error.
+recordDenied :: Watch -> PathRep -> IO ()
+recordDenied (Watch _ _ _ _ deniedRef) prep =
+    atomicModifyIORef' deniedRef (\ps -> (prep : ps, ()))
+
+-- | Take the subdirectories recorded by 'recordDenied', oldest first.
+takeDenied :: Watch -> IO [PathRep]
+takeDenied (Watch _ _ _ _ deniedRef) =
+    reverse <$> atomicModifyIORef' deniedRef (\ps -> ([], ps))
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
@@ -1033,6 +1048,12 @@ isNotSubdirError e =
     where
 
     errnos = [Just eNOTDIR, Just eLOOP]
+
+-- | Whether adding or listing a directory failed because of missing
+-- permission. inotify_add_watch needs the read permission, listing the
+-- directory needs the read and the search permissions.
+isAccessError :: IOError -> Bool
+isAccessError e = fmap Errno (ioe_errno e) `elem` [Just eACCES, Just ePERM]
 
 -- | The components of a subdirectory path.
 subComponents :: Path -> [Array Word8]
@@ -1243,7 +1264,7 @@ addPathAt flags wt prep dirFd =
 -- | Add a watch using the given action on the inotify fd, and insert the
 -- path in the map.
 addPathUsing :: Watch -> PathRep -> (CInt -> IO CInt) -> IO (Int, Bool)
-addPathUsing watch0@(Watch _ _ wdMapRef _) prep addWatch =
+addPathUsing watch0@(Watch _ _ wdMapRef _ _) prep addWatch =
     -- The watch descriptor is inserted in the map with the lock held, so that
     -- the watch cannot be closed in between.
     withWatchFd "addToWatch" watch0 $ \fd -> do
@@ -1281,7 +1302,9 @@ addPathUsing watch0@(Watch _ _ wdMapRef _) prep addWatch =
 -- caller restores 'watchFlags' after this returns, after the close.
 --
 -- A root is added by its path, see 'addWatchFor'. Its directory is 'Nothing'
--- if it is not a directory.
+-- if it is not a directory. The directory of a subdirectory is 'Nothing' if
+-- it was added but cannot be listed because of a permission error, it is
+-- recorded by 'recordDenied'.
 withAddedDir ::
        Word32
     -> Watch
@@ -1297,12 +1320,19 @@ withAddedDir flags wt parent prep action =
         (_, Just _) ->
             bracket (openDirAt o_PATH parent prep) c_close $ \pfd -> do
                 r <- addPathAt flags wt prep pfd
-                bracket (openDirStream prep (openDot prep pfd)) close
-                    (action r . Just)
+                bracket (openSub pfd) (mapM_ close) (action r)
 
     where
 
     close = ReadDir.closeDirStream . snd
+
+    openSub pfd = do
+        r <- try (openDirStream prep (openDot prep pfd))
+        case r of
+            Left e
+                | isAccessError e -> Nothing <$ recordDenied wt prep
+                | otherwise -> ioError e
+            Right dir -> return (Just dir)
 
     openRoot = do
         r <- try (openDirStreamAt Nothing prep)
@@ -1330,13 +1360,17 @@ foreign import ccall unsafe
 --   of such a watch descriptor is dropped. The move event of the path adds the
 --   directory with its new path.
 -- * If the path is now another directory in the map, it has the same flags.
+--
+-- A subdirectory that cannot be reached because of a permission error is
+-- treated like a path that is not a directory. A root raises the exception.
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
-updateWatch flags wt@(Watch _ _ wdMapRef _) wd prep =
+updateWatch flags wt@(Watch _ _ wdMapRef _ _) wd prep =
     withWatchFd "addToWatch" wt $ \fd -> do
         r <- try (addWatchFor fd flags prep)
         case r of
             Left (e :: IOError)
                 | isNotSubdirError e -> return False
+                | isAccessError e && isJust (getRepSub prep) -> return False
                 | otherwise -> ioError e
             Right wd1 -> do
                 m <- readIORef wdMapRef
@@ -1409,10 +1443,9 @@ addToWatchAt cfg@Config{..} watch0 parent prep = do
     -- scan adds the subdirectories only, it is used for the roots and after an
     -- overflow.
     --
-    -- XXX If the caller does not have permission to read the path,
-    -- inotify_add_watch fails with EACCES and we throw an exception. We could
-    -- add a config option to ignore such errors, like the options for
-    -- ignoring errors when reading a directory.
+    -- A root that cannot be added or listed because of a permission error
+    -- raises the exception. A subdirectory is skipped and reported as
+    -- 'isAccessDenied', see 'skipSubdir'.
     --
     wd <- withAddedDir (scanFlags cfg) watch0 parent prep
         $ \(wd, isNew) dir -> do
@@ -1443,14 +1476,14 @@ forSubdirs prep ds action =
 
 -- | Add the subdirectories of a directory to the watch, given its fd and
 -- directory stream. The subdirectories already watched via the same root are
--- not scanned again. An error is ignored as in 'addSubdirToWatch'.
+-- not scanned again. An error is handled as in 'addSubdirToWatch'.
 addSubdirs ::
     Config -> Watch -> PathRep -> (CInt, ReadDir.DirStream) -> IO ()
 addSubdirs cfg wt prep (dirFd, ds) =
-    forSubdirs prep ds $ \name ->
-        ignoreSubdirError wt ()
-            $ addToWatchAt (subdirConfig cfg) wt (Just (dirFd, name))
-                (addSub prep name)
+    forSubdirs prep ds $ \name -> do
+        let sub = addSub prep name
+        skipSubdir wt sub ()
+            $ addToWatchAt (subdirConfig cfg) wt (Just (dirFd, name)) sub
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
@@ -1458,13 +1491,15 @@ addSubdirs cfg wt prep (dirFd, ds) =
 -- a subdirectory may be deleted, moved or replaced by another file before its
 -- watch is added. Its parent reports the deletion or the move. The watch may
 -- be closed by another thread while the event stream adds a subdirectory.
+-- A subdirectory that cannot be added because of a permission error is
+-- skipped, see 'skipSubdir'.
 --
 -- The subdirectory is added with 'setOnlyDir' and without
 -- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wt prep =
-    ignoreSubdirError wt () (addToWatch (subdirConfig cfg) wt prep)
+    skipSubdir wt prep () (addToWatch (subdirConfig cfg) wt prep)
 
 subdirConfig :: Config -> Config
 subdirConfig = setOnlyDir True . setFollowSymLinks False
@@ -1479,16 +1514,31 @@ ignoreSubdirError wt def action =
         then return def
         else ioError e
 
--- | Like 'ignoreSubdirError' for the generation of a stream. The stream ends
--- if it raises an exception because the subdirectory does not exist, is not a
--- directory, or if the watch is closed.
-handleSubdirError :: Watch -> Stream IO a -> Stream IO a
-handleSubdirError wt =
-    S.handle $ \(e :: IOError) -> do
+-- | Like 'ignoreSubdirError', and also return the default value if the
+-- action fails because of a permission error on the subdirectory @prep@. The
+-- subdirectory is recorded by 'recordDenied' then. The tree under it is not
+-- watched, its entries are not reported by a scan.
+--
+-- A subdirectory created in the tree with mode 000 by any user who can write
+-- to its parent would otherwise end the watch of the whole tree.
+skipSubdir :: Watch -> PathRep -> a -> IO a -> IO a
+skipSubdir wt prep def action =
+    action `catchIOError` \e -> do
         closed <- isWatchClosed wt
         if isNotSubdirError e || closed
-        then return S.nil
+        then return def
+        else if isAccessError e
+        then def <$ recordDenied wt prep
         else ioError e
+
+-- | Like 'skipSubdir' for the generation of a stream. The stream ends if it
+-- raises an exception because the subdirectory @prep@ does not exist, is not
+-- a directory, cannot be listed because of a permission error, or if the
+-- watch is closed.
+handleSubdirError :: Watch -> PathRep -> Stream IO a -> Stream IO a
+handleSubdirError wt prep =
+    S.handle $ \(e :: IOError) ->
+        S.nil <$ skipSubdir wt prep () (ioError e)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
@@ -1548,13 +1598,13 @@ scanChildren wt mode parent prep =
     case mode of
         ScanNew cfg -> do
             let subCfg = subdirConfig cfg
-            (wd, isNew) <-
-                ignoreSubdirError wt (0, False) $ add (scanFlags subCfg)
-            if isNew
-            then return $ list subCfg wd True (ScanNew cfg)
-            else
-                ignoreSubdirError wt S.nil
-                    $ scanChildren wt (ScanRescan True subCfg) parent prep
+            r <- skipSubdir wt prep Nothing $ Just <$> add (scanFlags subCfg)
+            case r of
+                Nothing -> return S.nil
+                Just (wd, True) -> return $ list subCfg wd True (ScanNew cfg)
+                Just (_, False) ->
+                    skipSubdir wt prep S.nil
+                        $ scanChildren wt (ScanRescan True subCfg) parent prep
         ScanRescan underNew cfg -> do
             (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
             let isNew = underNew || added
@@ -1572,7 +1622,7 @@ scanChildren wt mode parent prep =
 
     list cfg wd reported childMode =
         withWatchFlags cfg wt wd prep
-            $ handleSubdirError wt
+            $ handleSubdirError wt prep
             $ S.bracketIO
                 (openDirStreamAt parent prep)
                 (ReadDir.closeDirStream . snd)
@@ -1582,7 +1632,7 @@ scanChildren wt mode parent prep =
     node fd reported childMode (Left dir) = do
         let path = addSub prep dir
         children <-
-            ignoreSubdirError wt S.nil
+            skipSubdir wt path S.nil
                 (scanChildren wt childMode (Just (fd, dir)) path)
         return $ ScanNode reported (ScannedEntry True path) children
     node _ reported _ (Right file) =
@@ -1770,7 +1820,7 @@ addRemovalMarker fd wdMapRef markers paths =
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths wt@(Watch fd _ wdMapRef _) desc p =
+unwatchPaths wt@(Watch fd _ wdMapRef _ _) desc p =
     whenWatchOpen wt $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
@@ -1859,7 +1909,7 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- /Pre-release/
 --
 closeWatch :: Watch -> IO ()
-closeWatch (Watch fd lock _ _) =
+closeWatch (Watch fd lock _ _ _) =
     modifyMVar_ lock $ \st ->
         if fsWatchClosed st
         then return st
@@ -1936,6 +1986,11 @@ foreign import capi
 foreign import capi
     "sys/inotify.h value IN_IGNORED" iN_IGNORED :: Word32
 
+-- | The flag of an 'isAccessDenied' event. It is not an inotify flag, the
+-- inotify events do not use the bits from 0x00010000 to 0x00800000.
+accessDeniedFlag :: Word32
+accessDeniedFlag = 0x00100000
+
 -- | Remove a marker and the removed paths listed in it from the map. Returns
 -- the paths that were still in the map.
 removeMarker ::
@@ -1998,7 +2053,7 @@ pendingRemovals m =
 -- Failing to queue the marker, for example, when the process is out of fds,
 -- is ignored, the next IN_Q_OVERFLOW event tries again.
 syncRemovals :: Watch -> IO ()
-syncRemovals wt@(Watch fd _ wdMapRef _) =
+syncRemovals wt@(Watch fd _ wdMapRef _ _) =
     whenWatchOpen wt $ do
         (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
         when (not (null markers && null paths))
@@ -2039,10 +2094,10 @@ restartDir cfg wt seen added parent prep = do
 
     flags = scanFlags cfg .&. complement iN_MASK_ADD
 
-    restartSubdir fd name =
-        ignoreSubdirError wt ()
-            $ restartDir (subdirConfig cfg) wt seen added (Just (fd, name))
-                (addSub prep name)
+    restartSubdir fd name = do
+        let sub = addSub prep name
+        skipSubdir wt sub ()
+            $ restartDir (subdirConfig cfg) wt seen added (Just (fd, name)) sub
 
 pathKey :: PathRep -> Array Word8
 pathKey = Path.toArray . combinePathRep
@@ -2118,7 +2173,7 @@ unwatchGoneRoots cfg wt roots = do
 -- Failing to remove a path is ignored, like in 'syncRemovals', the next
 -- overflow tries again.
 restartTree :: Config -> Watch -> IO [(Int, PathRep)]
-restartTree cfg wt@(Watch _ _ wdMapRef _) = do
+restartTree cfg wt@(Watch _ _ wdMapRef _ _) = do
     m <- readIORef wdMapRef
     seen <- newIORef Set.empty
     added <-
@@ -2311,11 +2366,11 @@ renamePaths from to = StrictMap.map step
 -- added on the IN_CREATE event of a directory that was then moved out, when
 -- the path already referred to this directory. The cookie is removed.
 addMovedDir :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-addMovedDir cfg wt@(Watch _ _ wdMapRef _) to = do
+addMovedDir cfg wt@(Watch _ _ wdMapRef _ _) to = do
     reused <- atomicModifyIORef' wdMapRef takeStale
     if reused || reportsScan cfg
     then
-        ignoreSubdirError wt S.nil
+        skipSubdir wt to S.nil
             (rescanDir (reportsScan cfg) (subdirConfig cfg) wt to)
     else addDirWithScan cfg wt to
 
@@ -2340,14 +2395,14 @@ renameDir ::
     -> (Int, PathRep)
     -> PathRep
     -> IO (Stream IO ScannedEntry)
-renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
+renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
     same <-
         ignoreSubdirError wt False
             $ updateWatch (watchFlags subCfg) wt wd to
     if same
     then do
         atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-        ignoreSubdirError wt S.nil
+        skipSubdir wt to S.nil
             (rescanDir (reportsScan cfg) subCfg wt to)
     else do
         unwatchSubtree wt from
@@ -2398,7 +2453,7 @@ renameDir cfg wt@(Watch _ _ wdMapRef _) (wd, from) to = do
 -- renames and in the directories moved in.
 movedInDir ::
     Config -> Watch -> Word32 -> [PathRep] -> IO (Stream IO ScannedEntry)
-movedInDir cfg wt@(Watch _ _ wdMapRef _) cookie paths = do
+movedInDir cfg wt@(Watch _ _ wdMapRef _ _) cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
     let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
         moveTo to =
@@ -2415,7 +2470,7 @@ movedInDir cfg wt@(Watch _ _ wdMapRef _) cookie paths = do
 -- the directory as a directory moved in. Failing to remove a path is ignored,
 -- like in 'syncRemovals'.
 unwatchMoved :: Watch -> IO ()
-unwatchMoved wt@(Watch _ _ wdMapRef _) = do
+unwatchMoved wt@(Watch _ _ wdMapRef _ _) = do
     paths <- atomicModifyIORef' wdMapRef takeAll
     mapM_ (unwatchSubtree wt) paths `catchIOError` \_ -> return ()
 
@@ -2448,7 +2503,7 @@ unwatchMoved wt@(Watch _ _ wdMapRef _) = do
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO (Stream IO Event)
-readOneEvent cfg  wt@(Watch _ _ wdMapRef _) = do
+readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
     -- XXX the header format is implicit in the code, this could be bug prone.
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
@@ -2623,7 +2678,7 @@ foreign import ccall unsafe "unistd.h read"
 -- | Read the events available on the fd of a watch, wait for the events if
 -- none is available. Returns 'Nothing' if the watch is closed.
 readEvents :: Watch -> IO (Maybe (Array Word8))
-readEvents (Watch fd lock _ _) = loop
+readEvents (Watch fd lock _ _ _) = loop
 
     where
 
@@ -2719,13 +2774,30 @@ readEvents (Watch fd lock _ _) = loop
 -- /Pre-release/
 --
 watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wt@(Watch _ _ _ readerRef) = S.unfoldrM step ()
+watchToStream cfg wt@(Watch _ _ _ readerRef _) = S.unfoldrM step ()
 
     where
 
+    mkDenied (root, sub) =
+        Event
+            { eventWd = -1
+            , eventFlags = accessDeniedFlag .|. iN_ISDIR
+            , eventCookie = 0
+            , eventRoot = root
+            , eventRelPath = sub
+            , eventScanned = False
+            }
+
+    -- The subdirectories skipped by 'skipSubdir'. Those skipped by
+    -- 'openWatch' or 'addToWatch' are reported before the next event, those
+    -- skipped while handling an event are reported after the entries found by
+    -- its scan.
+    denied = S.concatEffect (S.fromList . map mkDenied <$> takeDenied wt)
+
     events =
         StreamK.fromStream
-            $ S.concatMap id
+            $ S.append denied
+            $ S.concatMap (`S.append` denied)
             $ S.catRights
             $ S.parseMany (readOneEvent cfg wt)
             $ S.unfoldEach A.reader
@@ -2859,6 +2931,25 @@ getFlag mask Event{..} = eventFlags .&. mask /= 0
 -- both modes.
 isEventsLost :: Event -> Bool
 isEventsLost = getFlag iN_Q_OVERFLOW
+
+-- | In recursive mode, a directory in the tree could not be added to the
+-- watch or listed because of missing permission. A directory needs the read
+-- and the search (execute) permissions. The directory is skipped and the
+-- watch continues. The tree under it is not watched, the events in it are
+-- not reported, except possibly the events of its direct entries. 'isDir' is
+-- true for this event.
+--
+-- The directory is not added again when its permissions change. It is added
+-- if it is moved, or when the tree is added again after an overflow, see
+-- 'setRestartOnOverflow'. The event may be reported more than once for the
+-- same directory, for example, when it is created while its parent is being
+-- scanned.
+--
+-- A watch root without permission raises an exception instead.
+--
+-- /Occurs only in recursive mode/
+isAccessDenied :: Event -> Bool
+isAccessDenied = getFlag accessDeniedFlag
 
 -------------------------------------------------------------------------------
 -- Events affecting the watched path only
@@ -3096,6 +3187,7 @@ showEvent ev@Event{..} =
     ++ "\nFlags " ++ show eventFlags
 
     ++ showev isEventsLost "Overflow"
+    ++ showev isAccessDenied "AccessDenied"
 
     ++ showev isRootUnwatched "RootUnwatched"
     ++ showev isRootDeleted "RootDeleted"
