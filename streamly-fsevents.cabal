@@ -307,6 +307,20 @@ test-suite FileSystem.Event.Linux
   if impl(ghc < 9.4) || !os(linux)
     buildable: False
 
+test-suite FileSystem.Event.Stress
+  import: test-options
+  type: exitcode-stdio-1.0
+  main-is: Streamly/Test/FileSystem/Event/Stress.hs
+  other-modules: Streamly.Test.FileSystem.Event.Tree
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.Stress
+  build-depends: containers
+  if os(windows)
+    build-depends: Win32 >= 2.6 && < 2.15
+  else
+    build-depends: process
+  if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
+    buildable: False
+
 test-suite FileSystem.Event.LinuxModel
   import: test-options
   type: exitcode-stdio-1.0
