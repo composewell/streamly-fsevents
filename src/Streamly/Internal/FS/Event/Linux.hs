@@ -858,13 +858,13 @@ isInSubtree _ _ = False
 -- * two hard links to the same file, added as roots
 -- * a root added again before its removal is complete
 data WatchPath = WatchPath
-    { wpRep :: PathRep
+    { wpRep :: !PathRep
     -- | 'removeFromWatch' was called for the root, the path reports the
     -- events until its 'isRootUnwatched' event.
-    , wpRemoved :: Bool
+    , wpRemoved :: !Bool
     -- | The cookie of the IN_MOVED_FROM event read for the path, if its
     -- IN_MOVED_TO or IN_MOVE_SELF event has not been read yet.
-    , wpMoveCookie :: Maybe Word32
+    , wpMoveCookie :: !(Maybe Word32)
     }
 
 -- | The map entry of a watch descriptor. A user watch descriptor and a
@@ -878,6 +878,17 @@ data WdEntry =
     -- markers, and the removed paths, as (user watch descriptor, path), to
     -- be reported 'isRootUnwatched' when its IN_IGNORED event is read.
     | WdMarker [Int] [(Int, PathRep)]
+
+-- | Build a 'WdPaths' entry with its paths evaluated. The map is updated by
+-- mapping over it, an unevaluated path would keep the old entry, its paths
+-- and their bytes alive until a later traversal of the map.
+wdPaths :: [WatchPath] -> WdEntry
+wdPaths wps = foldr (seq . forcePaths) () wps `seq` WdPaths wps
+
+    where
+
+    forcePaths WatchPath{wpRep = (root, sub)} =
+        root `seq` maybe () (`seq` ()) sub
 
 -- NOTE: Waiting for events and closing the watch:
 --
@@ -1106,8 +1117,8 @@ insertPath wd prep m =
     case Map.lookup wd m of
         Just (WdPaths wps)
             | any isSame wps -> (m, False)
-            | otherwise -> (Map.insert wd (WdPaths (wps ++ [new])) m, True)
-        _ -> (Map.insert wd (WdPaths [new]) m, True)
+            | otherwise -> (Map.insert wd (wdPaths (wps ++ [new])) m, True)
+        _ -> (Map.insert wd (wdPaths [new]) m, True)
 
     where
 
@@ -1498,8 +1509,8 @@ markRemoved p m =
          in if null removing
             then (acc, WdPaths wps)
             else if all wpRemoved wps1
-            then ((wd : wds, shared), WdPaths wps1)
-            else ((wds, shared1), WdPaths wps1)
+            then ((wd : wds, shared), wdPaths wps1)
+            else ((wds, shared1), wdPaths wps1)
 
 -- | Undo 'markRemoved' for the listed paths. For each path, the first path of
 -- its watch descriptor that is marked removed and equal to it is unmarked.
@@ -1516,7 +1527,7 @@ unmarkRemoved paths m0 = foldl step m0 paths
                 Just (WdPaths wps)
                     | (xs, wp : ys) <- break isMatch wps ->
                         let wp1 = wp {wpRemoved = False}
-                         in Map.insert wd (WdPaths (xs ++ wp1 : ys)) m
+                         in Map.insert wd (wdPaths (xs ++ wp1 : ys)) m
                 _ -> m
 
 -- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
@@ -1776,7 +1787,7 @@ removeMarker marker markers paths m0 =
                 _ -> (m, acc)
 
     update wd [] m = Map.delete wd m
-    update wd wps m = Map.insert wd (WdPaths wps) m
+    update wd wps m = Map.insert wd (wdPaths wps) m
 
 -- | The removed paths whose IN_IGNORED event is not read yet. Returns a pair:
 --
@@ -2038,7 +2049,7 @@ clearMoved p = StrictMap.map step
 
     step (WdPaths wps)
         | any p wps =
-            WdPaths
+            wdPaths
                 [if p wp then wp {wpMoveCookie = Nothing} else wp | wp <- wps]
     step e = e
 
@@ -2055,7 +2066,7 @@ markMoved cookie paths = StrictMap.map step
 
     step (WdPaths wps)
         | any isSource wps =
-            WdPaths
+            wdPaths
                 [ if isSource wp then wp {wpMoveCookie = Just cookie} else wp
                 | wp <- wps
                 ]
@@ -2105,7 +2116,7 @@ renamePaths from to = StrictMap.map step
                 isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
                 isReplaced wp =
                     not (isMoving wp) && not (wpRemoved wp) && isTarget wp
-             in WdPaths
+             in wdPaths
                     [ if isMoving wp then newPath wp else wp
                     | wp <- wps
                     , not (isReplaced wp)
