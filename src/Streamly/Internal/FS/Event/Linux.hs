@@ -1067,6 +1067,40 @@ openSubdir root sub = do
         then ioError (errnoToIOError err errno Nothing Nothing)
         else go next xs
 
+-- | The O_PATH fd of an open directory and the name of an entry in it. A
+-- walk of a tree opens a subdirectory relative to the fd of its parent, one
+-- openat call, instead of opening every component from the root.
+type ParentDir = (CInt, Path)
+
+-- | Open an O_PATH fd of a directory, without following a symbolic link in
+-- any component under its root. With a parent, the directory is opened
+-- relative to the parent fd, the parent was opened the same way. A root is
+-- opened by its path, a symbolic link to a root is followed. Raise an
+-- exception if the path is not a directory.
+--
+-- The parent fd refers to the directory, not to its path. If the parent is
+-- moved out of the tree during the walk, its subdirectories are added under
+-- the old path, and the move event of the parent removes them when it is
+-- read. Without the parent fd, opening the old path fails and they are not
+-- added.
+openDirAt :: Maybe ParentDir -> PathRep -> IO CInt
+openDirAt parent prep =
+    case (parent, prep) of
+        (Just (pfd, name), (_, Just _)) ->
+            A.asCStringUnsafe (Path.toArray name) $ \ptr ->
+                throwErrnoIfMinus1 err $ c_openat3 pfd ptr subFlags
+        (_, (root, Just sub)) -> openSubdir root sub
+        (_, (root, Nothing)) ->
+            A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+                throwErrnoIfMinus1 err
+                    $ c_openat3 aT_FDCWD ptr (dirFlags .|. o_CLOEXEC)
+
+    where
+
+    err = "addToWatch: " ++ Path.toString (combinePathRep prep)
+    dirFlags = o_PATH .|. o_DIRECTORY
+    subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
+
 -- | Call inotify_add_watch on a path and return the watch descriptor. Raise an
 -- exception on failure.
 --
@@ -1080,36 +1114,46 @@ openSubdir root sub = do
 --
 -- A root is added using its path, a symbolic link can be used to reach a root.
 -- If @\/proc@ is not mounted a subdirectory is also added using its path, the
--- check of the components by 'openSubdir' still applies.
+-- check of the components by 'openDirAt' still applies.
 addWatchFor :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchFor fd flags prep =
     case prep of
-        (_, Nothing) -> addPath
-        (root, Just sub) -> bracket (openSubdir root sub) c_close addViaFd
+        (_, Nothing) -> addWatchByPath fd flags prep
+        (_, Just _) ->
+            bracket (openDirAt Nothing prep) c_close
+                (addWatchViaFd fd flags prep)
+
+-- | Call inotify_add_watch on the path of a 'PathRep'.
+addWatchByPath :: CInt -> Word32 -> PathRep -> IO CInt
+addWatchByPath fd flags prep =
+    A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
+        throwErrnoIfMinus1 ("addToWatch: " ++ Path.toString absPath)
+            $ c_inotify_add_watch fd pathPtr (CUInt flags)
 
     where
 
     absPath = combinePathRep prep
-    err = "addToWatch: " ++ Path.toString absPath
 
-    addPath =
-        A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
-            throwErrnoIfMinus1 err
-                $ c_inotify_add_watch fd pathPtr (CUInt flags)
-
+-- | Call inotify_add_watch on a subdirectory opened by 'openDirAt', using its
+-- fd. See 'addWatchFor'.
+addWatchViaFd :: CInt -> Word32 -> PathRep -> CInt -> IO CInt
+addWatchViaFd fd flags prep dirFd = do
     -- /proc/self/fd/N must be followed to reach the directory. The directory
     -- has been opened with O_NOFOLLOW.
-    addViaFd dirFd = do
-        wd <-
-            withCString ("/proc/self/fd/" ++ show dirFd) $ \pathPtr ->
-                c_inotify_add_watch fd pathPtr
-                    (CUInt (flags .&. complement iN_DONT_FOLLOW))
-        errno <- getErrno
-        if wd /= -1
-        then return wd
-        else if errno == eNOENT
-        then addPath
-        else ioError (errnoToIOError err errno Nothing Nothing)
+    wd <-
+        withCString ("/proc/self/fd/" ++ show dirFd) $ \pathPtr ->
+            c_inotify_add_watch fd pathPtr
+                (CUInt (flags .&. complement iN_DONT_FOLLOW))
+    errno <- getErrno
+    if wd /= -1
+    then return wd
+    else if errno == eNOENT
+    then addWatchByPath fd flags prep
+    else
+        ioError
+            $ errnoToIOError
+                ("addToWatch: " ++ Path.toString (combinePathRep prep))
+                errno Nothing Nothing
 
 -- Returns 'False' if the path is already being watched.
 insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
@@ -1129,11 +1173,22 @@ insertPath wd prep m =
 -- Returns the watch descriptor, and 'False' if the path is already being
 -- watched.
 addPathWith :: Word32 -> Watch -> PathRep -> IO (Int, Bool)
-addPathWith flags watch0@(Watch _ _ wdMapRef _) prep =
+addPathWith flags wt prep =
+    addPathUsing wt prep (\fd -> addWatchFor fd flags prep)
+
+-- | Like 'addPathWith' for a directory already opened by 'openDirAt'.
+addPathAt :: Word32 -> Watch -> PathRep -> CInt -> IO (Int, Bool)
+addPathAt flags wt prep dirFd =
+    addPathUsing wt prep (\fd -> addWatchViaFd fd flags prep dirFd)
+
+-- | Add a watch using the given action on the inotify fd, and insert the
+-- path in the map.
+addPathUsing :: Watch -> PathRep -> (CInt -> IO CInt) -> IO (Int, Bool)
+addPathUsing watch0@(Watch _ _ wdMapRef _) prep addWatch =
     -- The watch descriptor is inserted in the map with the lock held, so that
     -- the watch cannot be closed in between.
     withWatchFd "addToWatch" watch0 $ \fd -> do
-        wd <- addWatchFor fd flags prep
+        wd <- addWatch fd
 
         -- We add the parent first so that we start getting events for any
         -- new creates and add the new subdirectories on creates while we are
@@ -1156,6 +1211,40 @@ addPathWith flags watch0@(Watch _ _ wdMapRef _) prep =
         -- scans the directory.
         (,) (fromIntegral wd)
             <$> atomicModifyIORef' wdMapRef (insertPath (fromIntegral wd) prep)
+
+-- | Add the watch of a directory and run an action with the result of
+-- 'addPathWith' and the O_PATH fd of the directory, see 'openDirAt'. The fd
+-- is closed when the action ends, the subdirectories are opened relative to
+-- it while it is open. A walk holds one fd for each level of the tree.
+--
+-- A root is added by its path, see 'addWatchFor'. Its fd is 'Nothing' if it
+-- is not a directory.
+withAddedDir ::
+       Word32
+    -> Watch
+    -> Maybe ParentDir
+    -> PathRep
+    -> ((Int, Bool) -> Maybe CInt -> IO a)
+    -> IO a
+withAddedDir flags wt parent prep action =
+    case prep of
+        (_, Nothing) -> do
+            r <- addPathWith flags wt prep
+            bracket openRoot (mapM_ c_close) (action r)
+        (_, Just _) ->
+            bracket (openDirAt parent prep) c_close $ \fd -> do
+                r <- addPathAt flags wt prep fd
+                action r (Just fd)
+
+    where
+
+    openRoot = do
+        r <- try (openDirAt Nothing prep)
+        case r of
+            Left e
+                | isNotSubdirError e -> return Nothing
+                | otherwise -> ioError e
+            Right fd -> return (Just fd)
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -1205,7 +1294,12 @@ updateWatch flags wt@(Watch _ _ wdMapRef _) wd prep =
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg@Config{..} watch0 prep = do
+addToWatch cfg wt = addToWatchAt cfg wt Nothing
+
+-- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
+-- the parent is given.
+addToWatchAt :: Config -> Watch -> Maybe ParentDir -> PathRep -> IO ()
+addToWatchAt cfg@Config{..} watch0 parent prep =
     --    showPathRep (root, Nothing) = "root = " ++ Path.toString root
     --    showPathRep (root, Just sub) =
     --        "root = " ++ Path.toString root ++ " sub = " ++ Path.toString sub
@@ -1254,11 +1348,11 @@ addToWatch cfg@Config{..} watch0 prep = do
     -- add a config option to ignore such errors, like the options for
     -- ignoring errors when reading a directory.
     --
-    (wd, isNew) <- addPathWith (scanFlags cfg) watch0 prep
+    withAddedDir (scanFlags cfg) watch0 parent prep $ \(wd, isNew) dirFd -> do
 
     -- Now add the children. If we missed any creates while we were adding the
     -- parent, this will make sure they are added too.
-    when (isNew && watchRec) $ addSubdirs cfg watch0 prep
+    when (isNew && watchRec) $ mapM_ (addSubdirs cfg watch0 prep) dirFd
 
     -- The directory has been listed. The watch of its parent still has
     -- 'scanFlags' until the scan of the parent ends, the directories are
@@ -1267,8 +1361,9 @@ addToWatch cfg@Config{..} watch0 prep = do
     when (scanFlags cfg /= watchFlags cfg)
         $ void $ updateWatch (watchFlags cfg) watch0 wd prep
 
--- | Run an action on each subdirectory of a path, if the path is a directory.
-forSubdirs :: PathRep -> (PathRep -> IO ()) -> IO ()
+-- | Run an action on the name of each subdirectory of a path, if the path is
+-- a directory.
+forSubdirs :: PathRep -> (Path -> IO ()) -> IO ()
 forSubdirs prep action = do
     let absPath = combinePathRep prep
     -- The errors ignored:
@@ -1281,15 +1376,19 @@ forSubdirs prep action = do
     -- * ENOTDIR from opendir of absPath, absPath is not a directory. A root
     --   added without 'setOnlyDir' may be a file, and a directory may be
     --   replaced by a file after its watch is added.
-    let f = action . addSub prep
-    S.fold (FL.drainMapM f) (Dir.readDirs (Dir.ignoreMissing True) absPath)
+    S.fold (FL.drainMapM action)
+        (Dir.readDirs (Dir.ignoreMissing True) absPath)
         `catchIOError` \e -> unless (isNotSubdirError e) (ioError e)
 
--- | Add the subdirectories of a path to the watch, if the path is a
--- directory. The subdirectories already watched via the same root are not
--- scanned again.
-addSubdirs :: Config -> Watch -> PathRep -> IO ()
-addSubdirs cfg wt prep = forSubdirs prep (addSubdirToWatch cfg wt)
+-- | Add the subdirectories of a directory to the watch, given its fd. The
+-- subdirectories already watched via the same root are not scanned again.
+-- An error is ignored as in 'addSubdirToWatch'.
+addSubdirs :: Config -> Watch -> PathRep -> CInt -> IO ()
+addSubdirs cfg wt prep dirFd =
+    forSubdirs prep $ \name ->
+        ignoreSubdirError wt ()
+            $ addToWatchAt (subdirConfig cfg) wt (Just (dirFd, name))
+                (addSub prep name)
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
@@ -1848,24 +1947,27 @@ restartDir ::
     -> Watch
     -> IORef (Set (Array Word8))
     -> Maybe (IORef [(Int, PathRep)])
+    -> Maybe ParentDir
     -> PathRep
     -> IO ()
-restartDir cfg wt seen added prep = do
-    (wd, isNew) <-
-        addPathWith (scanFlags cfg .&. complement iN_MASK_ADD) wt prep
+restartDir cfg wt seen added parent prep =
+    withAddedDir flags wt parent prep $ \(wd, isNew) dirFd -> do
     modifyIORef' seen (Set.insert (pathKey prep))
     case added of
         Just ref | isNew -> modifyIORef' ref ((wd, prep) :)
         _ -> return ()
-    forSubdirs prep restartSubdir
+    mapM_ (\fd -> forSubdirs prep (restartSubdir fd)) dirFd
     when (scanFlags cfg /= watchFlags cfg)
         $ void $ updateWatch (watchFlags cfg) wt wd prep
 
     where
 
-    restartSubdir p =
+    flags = scanFlags cfg .&. complement iN_MASK_ADD
+
+    restartSubdir fd name =
         ignoreSubdirError wt ()
-            (restartDir (subdirConfig cfg) wt seen added p)
+            $ restartDir (subdirConfig cfg) wt seen added (Just (fd, name))
+                (addSub prep name)
 
 pathKey :: PathRep -> Array Word8
 pathKey = Path.toArray . combinePathRep
@@ -1970,7 +2072,8 @@ restartTree cfg wt@(Watch _ _ wdMapRef _) = do
     restartRoot seen added root@(_, prep) = do
         same <- isRootAt cfg wt root
         when same
-            $ ignoreSubdirError wt () (restartDir cfg wt seen added prep)
+            $ ignoreSubdirError wt ()
+                (restartDir cfg wt seen added Nothing prep)
         return same
 
 -- | Remove a directory and the tree under it from the watch.
