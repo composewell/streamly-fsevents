@@ -373,6 +373,37 @@ behaviors =
         , expected = onPlatform WatchException Yes WatchException
         }
     , base
+        { title = "recursive root with an unreadable subdir is watched"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            denyRead (deniedDir p)
+        , cleanup = allowRead . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        , racy = notLinux
+        }
+    , base
+        { title = "unreadable dir moved into a recursive root is skipped"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (renamedRoot p)
+            denyRead (renamedRoot p)
+        , cleanup = \p -> do
+            ignoreError (allowRead (renamedRoot p))
+            ignoreError (allowRead (deniedDir p))
+        , skip = stillReadable . renamedRoot
+        , ops = \p -> do
+            renameDirectory (renamedRoot p) (deniedDir p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        , racy = notLinux
+        }
+    , base
         { title = "regular file as a root is watched"
         , setup = \p -> do
             removeDirectory (watchRoot p)
@@ -534,11 +565,18 @@ behaviors =
         createFile (watchRoot p </> "file")
         settle
 
-    rootStillReadable p = do
-        r <- try (listDirectory (watchRoot p))
+    rootStillReadable = stillReadable . watchRoot
+
+    stillReadable dir = do
+        r <- try (listDirectory dir)
         return $ case r of
             Left (_ :: IOException) -> Nothing
             Right _ -> Just "the permission was not removed"
+
+    deniedDir p = watchRoot p </> "denied"
+
+    ignoreError action =
+        void (try action :: IO (Either IOException ()))
 
     dirChange =
         base

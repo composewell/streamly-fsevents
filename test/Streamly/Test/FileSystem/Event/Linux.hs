@@ -43,11 +43,13 @@ import System.IO
     )
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performGC)
-import System.Posix.Files (createLink)
+import System.Posix.Files (createLink, setFileMode)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(ResourceLimit)
     , ResourceLimits(softLimit), getResourceLimit, setResourceLimit
     )
+import System.Posix.Types (FileMode)
+import System.Posix.User (getEffectiveUserID)
 import System.Timeout (timeout)
 import Test.Hspec
 -- #if __GLASGOW_HASKELL__ == 902
@@ -2132,6 +2134,113 @@ recDirReplacedByWatched =
             filter (== dir2 </> "sub" </> "file") (map getAbsPath evs)
                 `shouldBe` []
 
+-- | Run the test unless the process runs as root, which has the permissions
+-- of every directory.
+unlessSuperuser :: IO () -> IO ()
+unlessSuperuser test = do
+    uid <- getEffectiveUserID
+    if uid == 0
+    then pendingWith "running as root"
+    else test
+
+-- | Run the action on the directory @dir@ with the given mode. After the
+-- action, restore the owner permissions of the paths, those that exist, so
+-- that the tree can be removed.
+withMode :: FileMode -> FilePath -> [FilePath] -> IO a -> IO a
+withMode mode dir paths action =
+    (setFileMode dir mode >> action) `finally` mapM_ restore (dir : paths)
+
+    where
+
+    restore path =
+        void (try (setFileMode path 0o700) :: IO (Either IOException ()))
+
+-- | The paths of the 'Event.isAccessDenied' events.
+accessDenied :: [Event] -> [FilePath]
+accessDenied = pathsOf (\ev -> Event.isAccessDenied ev && Event.isDir ev)
+
+-- A directory without the read permission cannot be added, a directory
+-- without the search permission cannot be listed.
+recDeniedAtStart :: Spec
+recDeniedAtStart =
+    describe "subdirectory without permission at the start of the watch" $ do
+        test "without read permission" 0o300
+        test "without search permission" 0o600
+        test "with mode 000" 0o000
+
+    where
+
+    test title mode =
+        it title $ unlessSuperuser
+            $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+                let root = fp </> "root"
+                    dir = root </> "dir"
+                    sentinel = root </> "sentinel"
+                createDirectory root
+                createDirectory dir
+                createDirectory (dir </> "sub")
+                r <- Path.fromString root
+                withMode mode dir []
+                    $ bracket
+                        (Event.openWatch recCfg (r NonEmpty.:| []))
+                        Event.closeWatch
+                    $ \w -> do
+                        createFile sentinel
+                        evs <- readUntil recCfg (isCreatedAt sentinel) w
+                        accessDenied evs `shouldBe` [dir]
+
+-- The isAccessDenied event follows the create or move event of the
+-- directory. The directory is changed before its event is read.
+recDeniedAdded :: Spec
+recDeniedAdded =
+    describe "subdirectory without permission added to the tree" $ do
+        it "created directory" $ unlessSuperuser
+            $ withRoot recCfg $ \root w -> do
+                let dir = root </> "dir"
+                createDirectory dir
+                withMode 0o000 dir [] $ do
+                    evs <- recEventsBeforeAdd root w (return ())
+                    pathsOf Event.isCreated evs
+                        `shouldBe` [dir, root </> "sync"]
+                    accessDenied evs `shouldBe` [dir]
+        -- rename(2) of a directory needs the write permission on it, to
+        -- change its ".." entry.
+        it "directory moved in" $ unlessSuperuser
+            $ withRoot recCfg $ \root w -> do
+                let dir = root </> "dir"
+                    out = takeDirectory root </> "out"
+                createDirectory out
+                withMode 0o300 out [dir] $ do
+                    evs <- recEventsBeforeAdd root w (renameDirectory out dir)
+                    accessDenied evs `shouldBe` [dir]
+        it "subdirectory of a directory moved in" $ unlessSuperuser
+            $ withRoot recCfg $ \root w -> do
+                let out = takeDirectory root </> "out"
+                    dir = root </> "dir"
+                    sub = dir </> "sub"
+                createDirectory out
+                createDirectory (out </> "sub")
+                withMode 0o000 (out </> "sub") [sub] $ do
+                    evs <- recEventsBeforeAdd root w (renameDirectory out dir)
+                    pathsOf Event.isCreated evs
+                        `shouldBe` [sub, root </> "sync"]
+                    accessDenied evs `shouldBe` [sub]
+
+-- The watch of a directory is kept when its permissions are removed later.
+recDeniedAfterWatched :: Spec
+recDeniedAfterWatched =
+    it "reports the events of a watched directory without read permission"
+        $ unlessSuperuser
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+            createDirectory dir
+            waitWatched recCfg w dir
+            evs <- withMode 0o300 dir []
+                $ recEventsOf recCfg root w (createFile (dir </> "file"))
+            pathsOf Event.isCreated evs
+                `shouldBe` [dir </> "file", root </> "sentinel"]
+            accessDenied evs `shouldBe` []
+
 -- | Run the action after overflowing the event queue of the watch, by
 -- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
 -- the queue limit is more than 100000 events.
@@ -2560,6 +2669,9 @@ watchTests =
                 recDirRecreated
                 recDirMovedAndRecreated
                 recDirReplacedByWatched
+                recDeniedAtStart
+                recDeniedAdded
+                recDeniedAfterWatched
             describe "recursive mode scan of new directories" $ do
                 recScanNewDir
                 recScanDisabled
