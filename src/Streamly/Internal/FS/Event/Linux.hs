@@ -1480,38 +1480,54 @@ withWatchFlags cfg wt wd prep
 -- entries. The directory is read when the stream is read. The watch of a
 -- subdirectory is added when the stream reads its entry, before the entry is
 -- returned.
-scanChildren :: Watch -> ScanMode -> PathRep -> IO (Stream IO ScanNode)
-scanChildren wt mode prep =
+--
+-- A subdirectory is opened relative to the fd of its parent, see 'openDirAt'.
+-- The fd used to add the watch is closed before the stream is returned, the
+-- stream may never be read. The stream opens the directory again when it is
+-- read, and holds the fd until it ends, to open the subdirectories. A
+-- subdirectory's stream is read in the depth first walk of 'scanTree' while
+-- the stream of its parent is open, the parent fd is open then.
+scanChildren ::
+    Watch -> ScanMode -> Maybe ParentDir -> PathRep -> IO (Stream IO ScanNode)
+scanChildren wt mode parent prep =
     case mode of
         ScanNew cfg -> do
             let subCfg = subdirConfig cfg
             (wd, isNew) <-
-                ignoreSubdirError wt (0, False)
-                    $ addPathWith (scanFlags subCfg) wt prep
+                ignoreSubdirError wt (0, False) $ add (scanFlags subCfg)
             if isNew
             then return $ list subCfg wd True (ScanNew cfg)
             else
                 ignoreSubdirError wt S.nil
-                    $ scanChildren wt (ScanRescan True subCfg) prep
+                    $ scanChildren wt (ScanRescan True subCfg) parent prep
         ScanRescan underNew cfg -> do
-            (wd, added) <-
-                addPathWith (scanFlags cfg .&. complement iN_MASK_ADD) wt prep
+            (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
             let isNew = underNew || added
             return
                 $ list cfg wd isNew (ScanRescan isNew (subdirConfig cfg))
 
     where
 
+    add flags =
+        case prep of
+            (_, Nothing) -> addPathWith flags wt prep
+            (_, Just _) ->
+                bracket (openDirAt parent prep) c_close
+                    (addPathAt flags wt prep)
+
     list cfg wd reported childMode =
         withWatchFlags cfg wt wd prep
-            $ S.mapM (node reported childMode) (listEntries wt prep)
+            $ handleSubdirError wt
+            $ S.bracketIO (openDirAt parent prep) c_close
+            $ \fd -> S.mapM (node fd reported childMode) (listEntries wt prep)
 
-    node reported childMode (Left dir) = do
+    node fd reported childMode (Left dir) = do
         let path = addSub prep dir
         children <-
-            ignoreSubdirError wt S.nil (scanChildren wt childMode path)
+            ignoreSubdirError wt S.nil
+                (scanChildren wt childMode (Just (fd, dir)) path)
         return $ ScanNode reported (ScannedEntry True path) children
-    node reported _ (Right file) =
+    node _ reported _ (Right file) =
         return
             $ ScanNode reported (ScannedEntry False (addSub prep file)) S.nil
 
@@ -1534,7 +1550,7 @@ scanChildren wt mode prep =
 -- ends, a walk holds one open directory for each level of the tree.
 scanTree :: Watch -> ScanMode -> PathRep -> IO (Stream IO ScannedEntry)
 scanTree wt mode prep = do
-    top <- scanChildren wt mode prep
+    top <- scanChildren wt mode Nothing prep
     return
         $ fmap snEntry
         $ S.filter snReported
