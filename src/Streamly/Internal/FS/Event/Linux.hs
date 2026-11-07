@@ -119,6 +119,7 @@ import Control.Exception (bracket, finally, onException, try)
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
+import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef
     (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -1057,16 +1058,8 @@ isAccessError e = fmap Errno (ioe_errno e) `elem` [Just eACCES, Just ePERM]
 
 -- | The components of a subdirectory path.
 subComponents :: Path -> [Array Word8]
-subComponents = map A.fromList . go . A.toList . Path.toArray
-
-    where
-
-    slash = 47
-
-    go bytes =
-        case break (== slash) bytes of
-            (x, []) -> [x | not (null x)]
-            (x, _ : rest) -> [x | not (null x)] ++ go rest
+subComponents =
+    map Path.toArray . runIdentity . S.toList . Path.splitPath_
 
 -- | Open an O_PATH fd of a subdirectory, starting from its root and without
 -- following a symbolic link in any component under the root. Raise an
