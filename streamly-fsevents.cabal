@@ -178,10 +178,14 @@ common optimization-options
     ghc-options: -fplugin Fusion.Plugin
 
 
+-- The tests run with a heap limit of 1 GB, a space leak fails the test
+-- instead of exhausting the memory of the machine.
 common threading-options
   if flag(threaded)
     ghc-options:  -threaded
-                  -with-rtsopts=-N
+                  "-with-rtsopts=-N -M1G"
+  else
+    ghc-options:  -with-rtsopts=-M1G
 
 -- We need optimization options here to optimize internal (non-inlined)
 -- versions of functions. Also, we have some benchmarking inspection tests
