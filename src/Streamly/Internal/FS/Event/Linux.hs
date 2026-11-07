@@ -3156,8 +3156,8 @@ isDeleted = getFlag iN_DELETE
 -- watcher must remove everthing under that tree from its view.
 --
 -- In recursive mode, a directory renamed within the watched tree reports
--- 'isMovedTo' for the new path later, and all the entries under it after that,
--- are reported with 'isMovedTo'.
+-- 'isMovedTo' for the new path later, and all the entries under it are
+-- reported after that as 'isCreated' events with 'isScanEvent' true.
 --
 -- /Occurs only for an object inside the watched directory/
 isMovedFrom :: Event -> Bool

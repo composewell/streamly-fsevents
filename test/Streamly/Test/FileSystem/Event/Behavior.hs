@@ -268,6 +268,16 @@ behaviors =
         , check = \p -> any ((== watchRoot p </> "file") . absPath)
         , expected = onPlatform No No Exception
         }
+    -- On Linux the rename of a root is reported by 'Linux.isRootMoved' only.
+    , base
+        { title = "renamed root reports isMoved for the root"
+        , ops = \p -> renameDirectory (watchRoot p) (renamedRoot p)
+        , check = \p ->
+            let isRoot ev = absPath ev `elem` [watchRoot p, renamedRoot p]
+             in any (\ev -> isRoot ev && Event.isMoved ev)
+        , expected = onPlatform No Yes Exception
+        , racy = onDarwin
+        }
     , base
         { title = "dir created in a renamed recursive root is watched"
         , config = Event.setRecursiveMode True
@@ -556,6 +566,8 @@ behaviors =
     onWindows = platformName == "Windows"
 
     notLinux = platformName /= "Linux"
+
+    onDarwin = platformName == "macOS"
 
     withDir p = do
         createDirectory (watchRoot p </> "dir")

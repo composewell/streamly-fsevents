@@ -220,10 +220,14 @@ isCreated = Event.isCreated
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
--- | Determine whether the event indicates rename of an object within the
--- monitored path. This event is generated when an object is renamed within the
--- watched directory or if it is moved out of or in the watched directory.
--- Moving hard links is no different than other types of objects.
+-- | Determine whether the event is for the old path or the new path of a
+-- rename, when that path is under the watch root. A rename within the watched
+-- tree reports two events, one for each path. A move out of the tree reports
+-- one event, for the old path, and a move into the tree reports one event, for
+-- the new path. Moving hard links is no different than other types of objects.
+--
+-- Whether this event occurs when the watch root itself is renamed depends on
+-- the platform. See @docs\/platform-differences.md@ in this package.
 --
 -- This event is reported for the moved directory, not for the entries in it.
 -- In a recursive watch, see 'setRecursiveMode' for the entries of a directory

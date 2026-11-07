@@ -912,7 +912,7 @@ foreign import ccall safe
     kFSEventStreamEventFlagItemRenamed :: Word32
 
 -- | Determine whether the event indicates rename of an object within the
--- monitored path. This event is generated when a file is renamed within the
+-- monitored path. This event is generated when an object is renamed within the
 -- watched directory or if it is moved out of or in the watched directory.
 --
 -- /Applicable only when 'setFileEvents' is 'True'/
