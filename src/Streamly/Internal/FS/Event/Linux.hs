@@ -2065,17 +2065,21 @@ removeListed markers paths m0 =
 --
 -- * the watch descriptors of the markers
 -- * the removed paths, as (user watch descriptor, path watched via it). These
---   are the paths listed in the markers, and the paths watched via a user
---   watch descriptor when every path watched via it is removed.
+--   are the paths in the map that are marked removed, each listed once. A
+--   removed path stays in the map until the IN_IGNORED event of its watch
+--   descriptor, or of a marker listing it, is read.
+--
+-- The paths listed in the markers are not used. A marker lists the paths of
+-- the older markers, the lists would double with each marker queued while
+-- the IN_IGNORED events of the markers are dropped.
 pendingRemovals :: IntMap WdEntry -> ([Int], [(Int, PathRep)])
 pendingRemovals m =
     ( [wd | (wd, WdMarker _ _) <- entries]
-    , [p | (_, WdMarker _ ps) <- entries, p <- ps]
-        ++ [ (wd, wpRep wp)
-           | (wd, WdPaths wps) <- entries
-           , all wpRemoved wps
-           , wp <- wps
-           ]
+    , [ (wd, wpRep wp)
+      | (wd, WdPaths wps) <- entries
+      , wp <- wps
+      , wpRemoved wp
+      ]
     )
 
     where

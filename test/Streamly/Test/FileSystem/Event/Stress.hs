@@ -455,13 +455,14 @@ churn root out deadline = go 0
             toggle (t </> "d8/d0") (out </> "d8d0")
             go (i + 1)
 
--- | Block the consumer, overflow the queue, then change the tree for 10
--- seconds while the consumer reads. On Linux, each overflow restarts the
--- watch, and the changes during a restart cause another overflow.
-cascade :: FilePath -> IO ()
-cascade base = do
+-- | Block the consumer, overflow the queue, then change a tree of at most
+-- @dirs@ directories for 10 seconds while the consumer reads. On Linux, each
+-- overflow restarts the watch, and the changes during a restart cause
+-- another overflow.
+cascade :: Int -> FilePath -> IO ()
+cascade dirs base = do
     queued <- queuedEventsLimit
-    budget <- dirBudget (stressBudget 10000 3 (queued + 2000)) base
+    budget <- dirBudget (stressBudget dirs 3 (queued + 2000)) base
     if budget < 2000
     then pendingWith "the limits do not allow the test"
     else do
@@ -494,4 +495,10 @@ main = hspec $ describe moduleName $ do
     it "the tree is watched after changes during an overflow"
         $ maybe (withBase 600 overflowChanges) pendingWith overflowSkip
     it "the tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 cascade) pendingWith overflowSkip
+        $ maybe (withBase 600 (cascade 10000)) pendingWith overflowSkip
+    -- A restart of a tree of 2000 directories takes less time than one of
+    -- 10000 directories, more overflows follow each other. On Linux, the
+    -- IN_IGNORED events of the removal markers are dropped by the next
+    -- overflow, and the markers accumulate.
+    it "a small tree is watched after overflows that repeat while it changes"
+        $ maybe (withBase 600 (cascade 2000)) pendingWith overflowSkip
