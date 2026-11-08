@@ -57,7 +57,8 @@ import qualified Streamly.Internal.FS.Event.Linux as Event
 -- Model of the file system
 -------------------------------------------------------------------------------
 
-data Kind = Dir | File deriving (Eq, Show)
+-- | A symbolic link is a 'Link', a write to it is not generated.
+data Kind = Dir | File | Link deriving (Eq, Show)
 
 -- | The tree, the paths are relative to the base directory of a test case.
 type Tree = Map FilePath Kind
@@ -68,8 +69,10 @@ data Op =
     | Touch FilePath
     | Rm FilePath
     | Mv FilePath FilePath
-    -- | @Ln target path@. A symbolic link is a file for the model.
+    -- | @Ln target path@.
     | Ln FilePath FilePath
+    -- | Append to a regular file in the roots.
+    | Write FilePath
 
 showOp :: Op -> String
 showOp (Mkdir p) = "mkdir " ++ p
@@ -78,6 +81,7 @@ showOp (Touch p) = "touch " ++ p
 showOp (Rm p) = "rm " ++ p
 showOp (Mv p q) = "mv " ++ p ++ " " ++ q
 showOp (Ln t p) = "ln -s " ++ t ++ " " ++ p
+showOp (Write p) = "echo >> " ++ p
 
 -- | A path strictly under a directory.
 isBelow :: FilePath -> FilePath -> Bool
@@ -119,8 +123,11 @@ canMove t p q =
             (Nothing, _) -> False
             (Just _, Nothing) -> True
             (Just Dir, Just Dir) -> not (hasChildren t q)
-            (Just File, Just File) -> True
-            _ -> False
+            (Just k1, Just k2) -> k1 /= Dir && k2 /= Dir
+
+-- | Which roots of the world reach a path.
+rootsOf :: World -> FilePath -> [FilePath]
+rootsOf w p = [r | r <- wRoots w, r == p || isBelow r p]
 
 validOps :: World -> Tree -> [Op]
 validOps w t =
@@ -128,8 +135,9 @@ validOps w t =
     ++ [Rmdir p | p <- ps, is Dir p, not (hasChildren t p)]
     ++ [Touch p | p <- ps, absent p, parentIsDir t p]
     ++ [Ln (wLinkTarget w) p | p <- ps, absent p, parentIsDir t p]
-    ++ [Rm p | p <- ps, is File p]
+    ++ [Rm p | p <- ps, is File p || is Link p]
     ++ [Mv p q | p <- ps, q <- ps, canMove t p q]
+    ++ [Write p | (p, File) <- Map.toList t, not (null (rootsOf w p))]
 
     where
 
@@ -141,7 +149,8 @@ applyOp :: Tree -> Op -> Tree
 applyOp t (Mkdir p) = Map.insert p Dir t
 applyOp t (Rmdir p) = Map.delete p t
 applyOp t (Touch p) = Map.insert p File t
-applyOp t (Ln _ p) = Map.insert p File t
+applyOp t (Ln _ p) = Map.insert p Link t
+applyOp t (Write _) = t
 applyOp t (Rm p) = Map.delete p t
 applyOp t (Mv p q) =
     Map.fromList (map move (Map.toList (Map.delete q t)))
@@ -163,6 +172,7 @@ execOp base (Touch p) = createFile (base </> p)
 execOp base (Ln t p) = createFileLink (base </> t) (base </> p)
 execOp base (Rm p) = removeFile (base </> p)
 execOp base (Mv p q) = renamePath (base </> p) (base </> q)
+execOp base (Write p) = appendFile (base </> p) "x"
 
 -------------------------------------------------------------------------------
 -- The view of a consumer that applies the events in order
@@ -233,10 +243,6 @@ listTree dir = do
                 Left (_ :: SomeException) -> return []
         return (path : sub)
 
--- | Which roots of the world reach a path.
-rootsOf :: World -> FilePath -> [FilePath]
-rootsOf w p = [r | r <- wRoots w, r == p || isBelow r p]
-
 data Outcome = Outcome
     { oFailures :: [String]
     -- | The number of events asked for was read before the operations ended.
@@ -249,15 +255,47 @@ setupTree base t =
         case k of
             Dir -> createDirectoryIfMissing True (base </> p)
             File -> createFile (base </> p)
+            Link -> error "setupTree: a symbolic link in the initial tree"
+
+-- | The writes that must be reported by 'Event.isModified' events, as the
+-- path of the file at the time of the write, once for each root that reaches
+-- it. A write is expected if its directory was in the roots at the start and
+-- has not left them since. A directory created or moved in later is watched
+-- only after its event is read, its events before that are not reported.
+expectedWrites :: World -> [Op] -> [FilePath]
+expectedWrites w = go initial
+
+    where
+
+    inRoots = not . null . rootsOf w
+    initial = Set.fromList [p | (p, Dir) <- Map.toList (wTree w), inRoots p]
+
+    move p q d
+        | d == p = q
+        | isBelow p d = q ++ drop (length p) d
+        | otherwise = d
+
+    go _ [] = []
+    go ds (op : ops) =
+        case op of
+            Write p
+                | Set.member (takeDirectory p) ds ->
+                    replicate (length (rootsOf w p)) p ++ go ds ops
+            Rmdir p -> go (Set.delete p ds) ops
+            Mv p q ->
+                let ds1 = Set.map (move p q) (Set.delete q ds)
+                 in go (Set.filter inRoots ds1) ops
+            _ -> go ds ops
 
 failuresOf ::
-       World -> FilePath -> Tree -> [Logged] -> [String]
-failuresOf w base final logged =
+       World -> FilePath -> Tree -> [Op] -> [Logged] -> [String]
+failuresOf w base final ops logged =
        [ "probe missing: " ++ rel p | p <- expected \\ reported ]
     ++ [ "probe extra: " ++ rel p | p <- reported \\ expected ]
     ++ [ "probe no open: " ++ rel p | p <- expected \\ opened ]
     ++ [ "entry not reported: " ++ rel p
        | wCheckView w, p <- Set.toList lost ]
+    ++ [ "write not reported: " ++ rel p | p <- writes \\ modified ]
 
     where
 
@@ -277,6 +315,8 @@ failuresOf w base final logged =
         , takeFileName (getAbsPath ev) == ".probe"
         ]
     reported = if wCreateEvents w then probes Event.isCreated else opened
+    writes = sort [base </> p | p <- expectedWrites w ops]
+    modified = sort [getAbsPath ev | ev <- evs, Event.isModified ev]
     opened = probes Event.isOpened
     inRoots t =
         Set.fromList [base </> p | p <- Map.keys t, not (null (rootsOf w p))]
@@ -369,7 +409,7 @@ runCase base w ops1 split ops2 = do
                     case (r1, r2) of
                         (Nothing, _) -> ["timeout before the sentinel"]
                         (_, Nothing) -> ["timeout before the probes"]
-                        _ -> failuresOf w base final logged
+                        _ -> failuresOf w base final (ops1 ++ ops2) logged
             return
                 Outcome
                     { oFailures = maybe failures (: failures) err

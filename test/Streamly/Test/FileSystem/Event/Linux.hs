@@ -832,14 +832,14 @@ recRenameCreateBeforeRename =
             evs1 <- readUntil recCfg (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
 
--- dir2 does not exist when the IN_MOVED_TO of the first rename is read, the
--- paths of dir1 are removed and dir3 is added on the second IN_MOVED_TO. file
--- is reported under the old path, and by the scan of dir3 at the new path.
--- This is the current behavior, a change that keeps the watches over two
--- renames must change this test.
+-- dir2 does not exist when the IN_MOVED_TO of the first rename is read. The
+-- watch of dir1 is kept with the pending path dir2, IN_MOVE_SELF confirms it,
+-- and the second rename changes it to dir3. The create event of file is read
+-- after that and reports dir3/file, the scan of dir3 reports it again. No
+-- path reports isRootUnwatched.
 recRenameTwice :: Spec
 recRenameTwice =
-    it "adds the directory again if it is renamed twice before the read"
+    it "keeps the watch if the directory is renamed twice before the read"
         $ withRenameDirs $ \root w dir1 dir2 -> do
             let dir3 = root </> "dir3"
                 later = dir3 </> "sub" </> "later"
@@ -849,7 +849,7 @@ recRenameTwice =
                 createFile (dir3 </> "file")
             sort (pathsOf Event.isCreated evs)
                 `shouldBe` sort
-                    [ dir1 </> "file"
+                    [ dir3 </> "file"
                     , dir3 </> "file"
                     , dir3 </> "sub"
                     , root </> "sentinel"
@@ -857,6 +857,7 @@ recRenameTwice =
             createFile later
             evs1 <- readUntil recCfg (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
+            unwatched (evs ++ evs1) `shouldBe` []
 
 -- The paths of dir1 are changed before its isMovedTo event is delivered.
 recRenameScanOnMovedTo :: Spec

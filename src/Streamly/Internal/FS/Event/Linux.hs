@@ -871,6 +871,10 @@ data WatchPath = WatchPath
     -- | The cookie of the IN_MOVED_FROM event read for the path, if its
     -- IN_MOVED_TO or IN_MOVE_SELF event has not been read yet.
     , wpMoveCookie :: !(Maybe Word32)
+    -- | The path was set by an IN_MOVED_TO event whose new path did not exist
+    -- when the event was read, and is not confirmed yet. See the NOTE above
+    -- 'renameDir'.
+    , wpPending :: !Bool
     }
 
 -- | The map entry of a watch descriptor. A user watch descriptor and a
@@ -1254,9 +1258,72 @@ addWatchViaFd fd flags prep dirFd = do
                 ("addToWatch: " ++ Path.toString (combinePathRep prep))
                 errno Nothing Nothing
 
+-- | @renamePaths from to@ changes the directory @from@ and the paths under it
+-- to @to@, in all the watch descriptors. A path of the watch descriptor equal
+-- to a new path is dropped. It was added on the IN_CREATE event of a directory
+-- that no longer exists at that path, when the path already referred to the
+-- renamed directory, see the NOTE in 'addToWatch'.
+renamePaths :: PathRep -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+renamePaths from to = StrictMap.map step
+
+    where
+
+    prefixLen = length (subBytes from)
+
+    subBytes = foldMap (A.toList . Path.toArray) . getRepSub
+
+    isMoving wp = not (wpRemoved wp) && isInSubtree from (wpRep wp)
+
+    newPath wp =
+        case drop (prefixLen + 1) (subBytes (wpRep wp)) of
+            [] -> wp {wpRep = to}
+            rest ->
+                wp {wpRep = addSub to (Path.unsafeFromArray (A.fromList rest))}
+
+    step (WdPaths wps)
+        | any isMoving wps =
+            let moved = map newPath (filter isMoving wps)
+                isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
+                isReplaced wp =
+                    not (isMoving wp) && not (wpRemoved wp) && isTarget wp
+             in wdPaths
+                    [ if isMoving wp then newPath wp else wp
+                    | wp <- wps
+                    , not (isReplaced wp)
+                    ]
+    step e = e
+
+-- | @relocatePending wd prep@: the directory of @wd@ is at @prep@. If @wd@ has
+-- a pending path, see 'renameDir', its directory was not moved to that path,
+-- or it has been moved on since. The pending path and the paths under it are
+-- changed to @prep@.
+relocatePending :: Int -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+relocatePending wd prep m =
+    case Map.lookup wd m of
+        Just (WdPaths wps)
+            | (q : _) <- [wpRep wp | wp <- wps, isPending wp] ->
+                if eqPathRep q prep
+                then Map.insert wd (wdPaths (map clear wps)) m
+                else renamePaths q prep (clearPending wd m)
+        _ -> m
+
+    where
+
+    isPending wp = wpPending wp && not (wpRemoved wp)
+    clear wp = wp {wpPending = False}
+
+-- | Clear the pending flag of the paths of a watch descriptor.
+clearPending :: Int -> IntMap WdEntry -> IntMap WdEntry
+clearPending = Map.adjust step
+
+    where
+
+    step (WdPaths wps) = wdPaths [wp {wpPending = False} | wp <- wps]
+    step e = e
+
 -- Returns 'False' if the path is already being watched.
 insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
-insertPath wd prep m =
+insertPath wd prep m0 =
     case Map.lookup wd m of
         Just (WdPaths wps)
             | any isSame wps -> (m, False)
@@ -1265,7 +1332,14 @@ insertPath wd prep m =
 
     where
 
-    new = WatchPath {wpRep = prep, wpRemoved = False, wpMoveCookie = Nothing}
+    m = relocatePending wd prep m0
+    new =
+        WatchPath
+            { wpRep = prep
+            , wpRemoved = False
+            , wpMoveCookie = Nothing
+            , wpPending = False
+            }
     isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) prep
 
 -- | Add the watch of a path using the given flags, without scanning it.
@@ -1382,21 +1456,43 @@ foreign import ccall unsafe
 --
 -- A subdirectory that cannot be reached because of a permission error is
 -- treated like a path that is not a directory. A root raises the exception.
+--
+-- If the path refers to the directory and the watch descriptor has a pending
+-- path, the pending path is changed to this path, see 'relocatePending'.
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
-updateWatch flags wt@(Watch _ _ wdMapRef _ _) wd prep =
+updateWatch flags wt wd prep =
+    (== ProbeSame) <$> probeWatch flags wt wd prep
+
+-- | The result of 'probeWatch'.
+data Probe =
+      ProbeSame -- ^ The path refers to the directory of the watch descriptor
+    | ProbeOther -- ^ The path refers to another directory
+    | ProbeMissing -- ^ The path does not exist or is not a directory
+    deriving Eq
+
+-- | Like 'updateWatch', and tells a path that is not a directory from a path
+-- that is another directory.
+probeWatch :: Word32 -> Watch -> Int -> PathRep -> IO Probe
+probeWatch flags wt@(Watch _ _ wdMapRef _ _) wd prep =
     withWatchFd "addToWatch" wt $ \fd -> do
         r <- try (addWatchFor fd flags prep)
         case r of
             Left (e :: IOError)
-                | isNotSubdirError e -> return False
-                | isAccessError e && isJust (getRepSub prep) -> return False
+                | isNotSubdirError e -> return ProbeMissing
+                | isAccessError e && isJust (getRepSub prep) ->
+                    return ProbeMissing
                 | otherwise -> ioError e
             Right wd1 -> do
                 m <- readIORef wdMapRef
                 let same = fromIntegral wd1 == wd
                 when (not same && Map.notMember (fromIntegral wd1) m)
                     $ void $ c_inotify_rm_watch fd wd1
-                return same
+                if same
+                then do
+                    atomicModifyIORef' wdMapRef
+                        (\m1 -> (relocatePending wd prep m1, ()))
+                    return ProbeSame
+                else return ProbeOther
 
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
@@ -2369,41 +2465,6 @@ takeMoved cookie m =
 
     isMatch wp = not (wpRemoved wp) && wpMoveCookie wp == Just cookie
 
--- | @renamePaths from to@ changes the directory @from@ and the paths under it
--- to @to@, in all the watch descriptors. A path of the watch descriptor equal
--- to a new path is dropped. It was added on the IN_CREATE event of a directory
--- that no longer exists at that path, when the path already referred to the
--- renamed directory, see the NOTE in 'addToWatch'.
-renamePaths :: PathRep -> PathRep -> IntMap WdEntry -> IntMap WdEntry
-renamePaths from to = StrictMap.map step
-
-    where
-
-    prefixLen = length (subBytes from)
-
-    subBytes = foldMap (A.toList . Path.toArray) . getRepSub
-
-    isMoving wp = not (wpRemoved wp) && isInSubtree from (wpRep wp)
-
-    newPath wp =
-        case drop (prefixLen + 1) (subBytes (wpRep wp)) of
-            [] -> wp {wpRep = to}
-            rest ->
-                wp {wpRep = addSub to (Path.unsafeFromArray (A.fromList rest))}
-
-    step (WdPaths wps)
-        | any isMoving wps =
-            let moved = map newPath (filter isMoving wps)
-                isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
-                isReplaced wp =
-                    not (isMoving wp) && not (wpRemoved wp) && isTarget wp
-             in wdPaths
-                    [ if isMoving wp then newPath wp else wp
-                    | wp <- wps
-                    , not (isReplaced wp)
-                    ]
-    step e = e
-
 -- | Add a directory that arrived at the path @to@ by a move, and return all
 -- the entries under it if they are reported, see 'reportsScan', whether the
 -- path is already watched or not. A move is
@@ -2434,9 +2495,66 @@ addMovedDir cfg wt@(Watch _ _ wdMapRef _ _) to = do
 
     takeStale m = (clearMoved isStale m, any hasStale (Map.elems m))
 
+-- NOTE: A rename to a path that no longer exists:
+--
+-- For a watched a, in mv a b; mv b c read after both renames, b does not
+-- exist when IN_MOVED_TO of b is read. The watch W of a is kept, its paths
+-- are changed to b, and b is marked pending. b is not scanned. The events of
+-- b are read later and decide:
+--
+-- * IN_MOVE_SELF of W: W is the directory that was renamed to b, the pending
+--   mark is removed. rename(2) queues IN_MOVE_SELF after IN_MOVED_TO while it
+--   holds the lock of the parent of b, before any later event of b.
+-- * inotify_add_watch on a path p returns W: W is at p, the pending path is
+--   changed to p, see 'relocatePending'. Such a W was added after the rename,
+--   on the IN_CREATE event of a reused path, see the NOTE in 'addToWatch'.
+-- * IN_MOVED_FROM or IN_DELETE of b before IN_MOVE_SELF of W: the event is
+--   for the directory that was renamed, W is not that directory. Its pending
+--   paths are removed, as for a new path that is not the watched directory.
+--
+-- If the new path exists and is another directory, the paths are removed and
+-- the new path is added as a directory moved in.
+
+-- | Mark the path of a watch descriptor equal to the given path as pending.
+markPending :: Int -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+markPending wd prep = Map.adjust step wd
+
+    where
+
+    step (WdPaths wps) =
+        wdPaths
+            [ if not (wpRemoved wp) && eqPathRep (wpRep wp) prep
+              then wp {wpPending = True}
+              else wp
+            | wp <- wps
+            ]
+    step e = e
+
+-- | The pending paths named by an IN_MOVED_FROM or IN_DELETE event of a
+-- directory, see the NOTE above 'markPending'. The pending marks are removed,
+-- the caller removes the paths.
+takeNamedPending ::
+    [PathRep] -> IntMap WdEntry -> (IntMap WdEntry, [PathRep])
+takeNamedPending paths m =
+    (foldr (clearPending . fst) m found, map snd found)
+
+    where
+
+    isNamed wp =
+        wpPending wp
+            && not (wpRemoved wp)
+            && any (eqPathRep (wpRep wp)) paths
+    found =
+        [ (wd, wpRep wp)
+        | (wd, WdPaths wps) <- Map.toList m
+        , wp <- wps
+        , isNamed wp
+        ]
+
 -- | Handle the rename of the directory @from@ to @to@ under the same root, see
--- the NOTE above. Returns all the entries under the new path if they are
--- reported, see 'reportsScan', whether the watch is kept or not.
+-- the NOTE above 'clearMoved'. Returns all the entries under the new path if
+-- they are reported, see 'reportsScan', whether the watch is kept or not. A
+-- new path that does not exist is pending, see the NOTE above 'markPending'.
 renameDir ::
        Config
     -> Watch
@@ -2444,17 +2562,21 @@ renameDir ::
     -> PathRep
     -> IO (Stream IO ScannedEntry)
 renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
-    same <-
-        ignoreSubdirError wt False
-            $ updateWatch (watchFlags subCfg) wt wd to
-    if same
-    then do
-        atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-        skipSubdir wt to S.nil
-            (rescanDir (reportsScan cfg) subCfg wt to)
-    else do
-        unwatchSubtree wt from
-        addMovedDir cfg wt to
+    r <-
+        ignoreSubdirError wt ProbeOther
+            $ probeWatch (watchFlags subCfg) wt wd to
+    case r of
+        ProbeSame -> do
+            atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
+            skipSubdir wt to S.nil
+                (rescanDir (reportsScan cfg) subCfg wt to)
+        ProbeMissing -> do
+            atomicModifyIORef' wdMapRef
+                (\m -> (markPending wd to (renamePaths from to m), ()))
+            return S.nil
+        ProbeOther -> do
+            unwatchSubtree wt from
+            addMovedDir cfg wt to
 
     where
 
@@ -2475,8 +2597,6 @@ renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
 -- | Watched a:                     | b/s | created  | moved in    |
 -- | mkdir a/s; touch a/s/f; mv a b |     |          |             |
 -- | mkdir a; rmdir a; mv d a       | a   | moved in | created     |
--- | Watched a: mv a b; mv b c      | c   | renamed  | moved in    |
--- | Watched a: mv a b; mv b a      | a   | renamed  | moved in    |
 --
 -- * mkdir a; touch a/f; mv a b: the add of a on IN_CREATE fails, the path no
 --   longer exists. b is scanned on IN_MOVED_TO, b/f follows the isMovedTo
@@ -2487,29 +2607,39 @@ renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
 -- * mkdir a; rmdir a; mv d a: IN_CREATE of a finds d at the path and scans it,
 --   a/f follows the isCreated event of a, before the isDeleted event of a.
 --   IN_MOVED_TO of a scans the path again and reports a/f again.
--- * mv a b; mv b c and mv a b; mv b a: 'updateWatch' at b fails, the path no
---   longer exists, the watch of a is not kept. The directory is scanned at its
---   final path, and its entries are reported again.
+-- * Watched a: mv a b; mv b c. b does not exist when IN_MOVED_TO of b is
+--   read, the watch of a is kept with the pending path b, see the NOTE above
+--   'markPending'. c is scanned on IN_MOVED_TO of c, as every rename, and the
+--   entries of a are reported again.
 --
 -- For this reason a scan event has one flag, 'isScanEvent', for both causes,
 -- and every IN_MOVED_TO of a directory reports all its entries.
 
 -- | Handle IN_MOVED_TO of a directory that reports the given paths. A path
--- whose root has a path with the cookie is a rename within that root, the
--- other paths are moved in. A path with the cookie whose root does not have a
--- new path is moved out of that root. Returns the entries found by the
+-- whose root has a path with the cookie is a rename within that root. A path
+-- with the cookie whose root does not have a new path is moved out of that
+-- root. The other new paths are paired, in order, with the paths moved out of
+-- their roots, such a pair is a rename between two roots of the watch, the
+-- directory stays watched. The remaining new paths are moved in, and the
+-- remaining paths moved out are removed. Returns the entries found by the
 -- renames and in the directories moved in.
 movedInDir ::
     Config -> Watch -> Word32 -> [PathRep] -> IO (Stream IO ScannedEntry)
 movedInDir cfg wt@(Watch _ _ wdMapRef _ _) cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
     let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
+        sameRootFrom to = find (isSameRoot to . snd) froms
+        movedOut = filter (\f -> not (any (isSameRoot (snd f)) paths)) froms
+        movedIn = filter (isNothing . sameRootFrom) paths
+        acrossRoots = zip movedIn movedOut
         moveTo to =
-            case find (isSameRoot to . snd) froms of
+            case sameRootFrom to of
                 Just from -> renameDir cfg wt from to
-                Nothing -> addMovedDir cfg wt to
-        isMovedOut from = not (any (isSameRoot from) paths)
-    mapM_ (unwatchSubtree wt) (filter isMovedOut (map snd froms))
+                Nothing ->
+                    case find (eqPathRep to . fst) acrossRoots of
+                        Just (_, from) -> renameDir cfg wt from to
+                        Nothing -> addMovedDir cfg wt to
+    mapM_ (unwatchSubtree wt . snd) (drop (length movedIn) movedOut)
     concatStreams <$> mapM moveTo paths
 
 -- | The IN_MOVED_TO and IN_MOVE_SELF events of a directory that reported
@@ -2647,6 +2777,17 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
                     isDirCreated = isDirEv && eflags .&. iN_CREATE /= 0
                     isDirMovedIn = isDirEv && eflags .&. iN_MOVED_TO /= 0
                     isDirMovedOut = isDirEv && eflags .&. iN_MOVED_FROM /= 0
+                    isDirDeleted = isDirEv && eflags .&. iN_DELETE /= 0
+                -- See the NOTE above 'markPending'.
+                when (watchRec cfg && (isDirMovedOut || isDirDeleted))
+                    $ PR.fromEffect $ do
+                        gone <-
+                            atomicModifyIORef' wdMapRef (takeNamedPending live)
+                        mapM_ (unwatchSubtree wt) gone
+                when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
+                    $ PR.fromEffect
+                    $ atomicModifyIORef' wdMapRef
+                    $ \m -> (clearPending (fromIntegral ewd) m, ())
                 -- See the NOTE above 'clearMoved'.
                 when (watchRec cfg && isDirMovedOut)
                     $ PR.fromEffect
