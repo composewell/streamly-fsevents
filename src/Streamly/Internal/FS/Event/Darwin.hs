@@ -870,15 +870,15 @@ foreign import ccall safe
     kFSEventStreamEventFlagItemCreated :: Word32
 
 -- | Determine whether the event indicates creation of an object within the
--- monitored path. This event is generated when any file system object other
--- than a hard link is created.  On hard linking only an 'isAttrsModified'
--- event on the directory is generated, it is not a create event. However, when
--- a hard link is deleted 'isDeleted' and 'isHardLink' both are true.
+-- monitored path. This event is generated when any file system object is
+-- created, including a hard link. Creating a hard link also generates an
+-- 'isAttrsModified' event on the directory. When a hard link is deleted
+-- 'isDeleted' and 'isHardLink' both are true.
 --
 -- This event can occur for the watched path if the path was deleted/moved and
--- created again (tested on macOS 10.15.1). However, if a watch is started on a
--- non-existing path and the path is created later, then this event is not
--- generated, the path is not watched.
+-- created again (tested on macOS 10.15.1). If a watch is started on a
+-- non-existing path and the path is created later, the path is watched
+-- (tested on macOS 26).
 --
 -- BUGS: On 10.15.1 when we use a "touch x" to create a file for the first time
 -- only an 'isAttrsModified' event occurs and there is no 'isCreated'
