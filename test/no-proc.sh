@@ -9,6 +9,8 @@
 #
 # Usage: test/no-proc.sh [enoent|eacces] [test arguments]
 #
+# Run it from the root of the package.
+#
 # Without a mode both the modes are run. Requires unprivileged user
 # namespaces, unshare and setpriv (util-linux). On Ubuntu 24.04 the AppArmor
 # restriction must be lifted first:
@@ -22,8 +24,12 @@ case "$1" in
     *) modes="enoent eacces" ;;
 esac
 
-cabal build FileSystem.Event.Linux
-bin=$(cabal list-bin FileSystem.Event.Linux)
+# CABAL_BUILD_OPTIONS, e.g. "--flag limit-build-mem", is passed to cabal.
+target=FileSystem.Event.Linux
+# shellcheck disable=SC2086
+cabal build --enable-tests $CABAL_BUILD_OPTIONS $target
+# shellcheck disable=SC2086
+bin=$(cabal list-bin --enable-tests $CABAL_BUILD_OPTIONS $target)
 
 # The inotify limits are not per namespace, the tests read the limit from
 # the environment when /proc is not available.
