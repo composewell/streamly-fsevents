@@ -444,6 +444,32 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform No No No
         }
+    -- On Linux, dir2 is a new directory when IN_MOVED_TO of dir2 is read, the
+    -- watch of the renamed directory is removed then and added again on
+    -- IN_MOVED_TO of dir3. See "Keeping the watch over two renames" in
+    -- dev/design.md.
+    , base
+        { title =
+            "write in a dir renamed twice, middle path reused, is reported"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (watchRoot p </> "dir1")
+            createFile (watchRoot p </> "dir1/file")
+            settle
+        , paused = True
+        , ops = \p -> do
+            let root = watchRoot p
+            renameDirectory (root </> "dir1") (root </> "dir2")
+            renameDirectory (root </> "dir2") (root </> "dir3")
+            createDirectory (root </> "dir2")
+            appendFile (root </> "dir3/file") "x"
+        , check = \p ->
+            any (\ev ->
+                absPath ev == watchRoot p </> "dir3/file"
+                    && Event.isModified ev)
+        , expected = onPlatform No Yes No
+        , racy = notLinux
+        }
     , base
         { title = "rename reports isMoved for the source and the destination"
         , setup = withFile

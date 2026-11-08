@@ -257,35 +257,134 @@ setupTree base t =
             File -> createFile (base </> p)
             Link -> error "setupTree: a symbolic link in the initial tree"
 
+-- | The state of 'expectedWrites'. A directory of the initial tree in the
+-- roots is identified by its number.
+data WriteState = WriteState
+    { wsTree :: Tree
+    -- | The current paths of the directories that have not left the roots.
+    , wsDirs :: Map FilePath Int
+    -- | The path that a directory arrived at by its last move, and the number
+    -- of the operation.
+    , wsArrived :: Map Int (FilePath, Int)
+    -- | A path that a directory arrived at by a move and then left, with the
+    -- directory and the number of the operation that moved it there.
+    , wsVacated :: Map FilePath (Int, Int)
+    }
+
 -- | The writes that must be reported by 'Event.isModified' events, as the
 -- path of the file at the time of the write, once for each root that reaches
 -- it. A write is expected if its directory was in the roots at the start and
 -- has not left them since. A directory created or moved in later is watched
 -- only after its event is read, its events before that are not reported.
+--
+-- A directory that arrives at a path by a move, leaves it, and whose path is
+-- then taken by another directory, as in @mv f a; mv a b; mkdir a@, loses its
+-- watch when IN_MOVED_TO of @a@ is read, see "Keeping the watch over two
+-- renames" in dev/design.md. The writes in its tree after it arrived at the
+-- path are not expected.
 expectedWrites :: World -> [Op] -> [FilePath]
-expectedWrites w = go initial
+expectedWrites w ops0 =
+    [ p
+    | (p, ids, t) <- writes
+    , not (any (\i -> any (< t) (Map.findWithDefault [] i lost)) ids)
+    ]
 
     where
 
     inRoots = not . null . rootsOf w
-    initial = Set.fromList [p | (p, Dir) <- Map.toList (wTree w), inRoots p]
+    initialDirs =
+        [p | (p, Dir) <- Map.toList (wTree w), inRoots p]
+    st0 =
+        WriteState
+            { wsTree = wTree w
+            , wsDirs = Map.fromList (zip initialDirs [0 ..])
+            , wsArrived = Map.empty
+            , wsVacated = Map.empty
+            }
+    (writes, lost) = go 0 st0 ops0
 
     move p q d
         | d == p = q
         | isBelow p d = q ++ drop (length p) d
         | otherwise = d
 
-    go _ [] = []
-    go ds (op : ops) =
+    -- The path q is taken by a directory other than the one numbered @self@.
+    reuse self q st =
+        case Map.lookup q (wsVacated st) of
+            Just (i, ta) | Just i /= self ->
+                let dirs = wsDirs st
+                    gone =
+                        [ d
+                        | (d0, j) <- Map.toList dirs
+                        , j == i
+                        , d <- Map.keys dirs
+                        , d == d0 || isBelow d0 d
+                        ]
+                 in ( Just (i, ta)
+                    , st { wsDirs = foldr Map.delete dirs gone
+                         , wsVacated = Map.delete q (wsVacated st)
+                         }
+                    )
+            Just _ ->
+                (Nothing, st {wsVacated = Map.delete q (wsVacated st)})
+            Nothing -> (Nothing, st)
+
+    go ::
+           Int
+        -> WriteState
+        -> [Op]
+        -> ([(FilePath, [Int], Int)], Map Int [Int])
+    go _ _ [] = ([], Map.empty)
+    go t st (op : ops) =
+        let (st1, ws, l) = step t st op
+            (ws1, l1) = go (t + 1) st1 {wsTree = applyOp (wsTree st) op} ops
+            addLost (i, ta) = Map.insertWith (++) i [ta]
+         in (ws ++ ws1, maybe l1 (`addLost` l1) l)
+
+    step t st op =
         case op of
             Write p
-                | Set.member (takeDirectory p) ds ->
-                    replicate (length (rootsOf w p)) p ++ go ds ops
-            Rmdir p -> go (Set.delete p ds) ops
-            Mv p q ->
-                let ds1 = Set.map (move p q) (Set.delete q ds)
-                 in go (Set.filter inRoots ds1) ops
-            _ -> go ds ops
+                | Map.member dir (wsDirs st) ->
+                    let ids =
+                            [ i
+                            | (d, i) <- Map.toList (wsDirs st)
+                            , d == dir || isBelow d dir
+                            ]
+                        n = length (rootsOf w p)
+                     in (st, replicate n (p, ids, t), Nothing)
+                where dir = takeDirectory p
+            Mkdir q ->
+                let (l, st1) = reuse Nothing q st in (st1, [], l)
+            Rmdir p ->
+                (st {wsDirs = Map.delete p (wsDirs st)}, [], Nothing)
+            Mv p q
+                | Map.lookup p (wsTree st) == Just Dir ->
+                    let top = Map.lookup p (wsDirs st)
+                        (l, st1) = reuse top q st
+                        arrivedAt i = Map.lookup i (wsArrived st1)
+                        vacated =
+                            case top of
+                                Just i
+                                    | Just (a, ta) <- arrivedAt i
+                                    , a == p ->
+                                        Map.insert p (i, ta) (wsVacated st1)
+                                _ -> wsVacated st1
+                        dirs =
+                            Map.filterWithKey (\d _ -> inRoots d)
+                                $ Map.mapKeys (move p q)
+                                $ Map.delete q (wsDirs st1)
+                        arrived =
+                            case top of
+                                Just i | inRoots q -> Map.insert i (q, t)
+                                _ -> id
+                     in ( st1 { wsDirs = dirs
+                              , wsArrived = arrived (wsArrived st1)
+                              , wsVacated = vacated
+                              }
+                        , []
+                        , l
+                        )
+            _ -> (st, [], Nothing)
 
 failuresOf ::
        World -> FilePath -> Tree -> [Op] -> [Logged] -> [String]
