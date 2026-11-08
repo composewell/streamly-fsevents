@@ -16,11 +16,12 @@ import Control.Exception
     ( AsyncException(ThreadKilled), IOException, SomeException, bracket
     , finally, fromException, mask, throwIO, try
     )
-import Control.Monad (filterM, void, when)
+import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.&.))
 import Data.List (isPrefixOf, nub, sort)
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
+import System.Environment (lookupEnv)
 import System.Directory
     ( createDirectory
     , createDirectoryLink
@@ -175,6 +176,13 @@ getRoot = Path.toString . Event.getRoot
 getAbsPath :: Event -> FilePath
 getAbsPath = Path.toString . Event.getAbsPath
 
+-- | Whether @\/proc\/self\/fd@ can be listed. The library falls back to a
+-- lax removal of a shared root without it, see 'Event.removeFromWatch'.
+procAvailable :: IO Bool
+procAvailable = do
+    r <- try (listDirectory "/proc/self/fd")
+    return $ either (\(_ :: IOException) -> False) (const True) r
+
 -- | The last event must be the isRootUnwatched event for root1.
 shouldEndUnwatched :: [Event] -> FilePath -> Expectation
 shouldEndUnwatched evs root1 = do
@@ -289,16 +297,49 @@ overlapRemoveInner =
             createdRoots file1 evs1 `shouldBe` [root]
             filter (== sub) (map getRoot evs1) `shouldBe` []
 
+-- The create event of file is queued before the removal of sub. With
+-- @\/proc@ the marker reports it for sub, without @\/proc@ sub is removed at
+-- once and it is reported for root only.
+overlapRemoveQueued :: Spec
+overlapRemoveQueued =
+    it "removing the inner root reports the events queued before it"
+        $ withNestedRoots $ \root sub w -> do
+            hasProc <- procAvailable
+            let file = sub </> "file"
+            createFile file
+            Event.removeFromWatch w =<< Path.fromString sub
+            evs <- readUntil recCfg
+                (\ev -> Event.isRootUnwatched ev
+                    || (isCreatedAt file ev && getRoot ev == root)) w
+            if hasProc
+            then do
+                evs1 <- readUntil recCfg Event.isRootUnwatched w
+                createdRoots file (evs ++ evs1) `shouldBe` [root, sub]
+                unwatched (evs ++ evs1) `shouldBe` [(sub, sub)]
+            else do
+                unwatched evs `shouldBe` [(sub, sub)]
+                evs1 <- readUntil recCfg (isCreatedAt file) w
+                createdRoots file evs1 `shouldBe` [root]
+
 -- The watch descriptor of root is removed from the kernel, the watch
 -- descriptor of sub is still used by sub.
 overlapRemoveOuter :: Spec
 overlapRemoveOuter =
     it "removing the outer root keeps the inner root watching"
         $ withNestedRoots $ \root sub w -> do
+            hasProc <- procAvailable
             Event.removeFromWatch w =<< Path.fromString root
             evs <- readUntil recCfg
                 (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
-            unwatched evs `shouldBe` [(root, root), (root, sub)]
+            if hasProc
+            then unwatched evs `shouldBe` [(root, root), (root, sub)]
+            -- The shared watch descriptor of sub is removed for root at once,
+            -- before the IN_IGNORED event of the watch descriptor of root.
+            else do
+                evs2 <- readUntil recCfg
+                    (\ev -> Event.isRootUnwatched ev && getAbsPath ev == root)
+                    w
+                unwatched (evs ++ evs2) `shouldBe` [(root, sub), (root, root)]
             let file = sub </> "file"
             createFile file
             evs1 <- readUntil recCfg (isCreatedAt file) w
@@ -888,6 +929,8 @@ recRenameDuringScan =
 -- | The inotify file descriptors of the process.
 inotifyFds :: IO [FilePath]
 inotifyFds = do
+    hasProc <- procAvailable
+    unless hasProc $ pendingWith "/proc is not available"
     fds <- listDirectory "/proc/self/fd"
     filterM isInotify fds
 
@@ -1135,6 +1178,23 @@ removeWhileReading =
                 return r
             r `shouldBe` Just ()
             unwatched evs `shouldBe` [(root, root)]
+
+-- The reader thread is blocked reading the watch fd. The isRootUnwatched
+-- event of sub wakes it up without a file system event: the marker event
+-- with @\/proc@, the pending event in the threaded RTS without it.
+removeSharedWhileReading :: Spec
+removeSharedWhileReading =
+    it "removing a shared root wakes up a thread reading the events"
+        $ withNestedRoots $ \root sub w -> do
+            hasProc <- procAvailable
+            p <- Path.fromString sub
+            (r, evs) <- whileReading recCfg Event.isRootUnwatched w $ do
+                r <- timeout 2000000 $ Event.removeFromWatch w p
+                unless (hasProc || rtsSupportsBoundThreads)
+                    $ createFile (root </> "file")
+                return r
+            r `shouldBe` Just ()
+            unwatched evs `shouldBe` [(sub, sub)]
 
 -- The reader thread is blocked reading the watch fd. The stream ends when
 -- the watch is closed, without any file system event.
@@ -2241,12 +2301,25 @@ recDeniedAfterWatched =
                 `shouldBe` [dir </> "file", root </> "sentinel"]
             accessDenied evs `shouldBe` []
 
+-- | The max_queued_events limit of inotify.
+maxQueuedEvents :: IO Int
+maxQueuedEvents = do
+    r <- try (readFile "/proc/sys/fs/inotify/max_queued_events")
+    case r of
+        Right s -> return (read s)
+        Left (e :: IOException) -> do
+            v <- lookupEnv "FSEVENTS_MAX_QUEUED_EVENTS"
+            maybe (throwIO e) (return . read) v
+
 -- | Run the action after overflowing the event queue of the watch, by
 -- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
 -- the queue limit is more than 100000 events.
+--
+-- Without @\/proc@ the limit is taken from the environment variable
+-- @FSEVENTS_MAX_QUEUED_EVENTS@.
 withOverflow :: FilePath -> IO a -> IO (Maybe a)
 withOverflow dir action = do
-    limit <- read <$> readFile "/proc/sys/fs/inotify/max_queued_events"
+    limit <- maxQueuedEvents
     if limit > (100000 :: Int)
     then return Nothing
     else do
@@ -2269,19 +2342,25 @@ overflowRemove =
                     unwatched evs `shouldBe` [(root2, root2)]
 
 -- The marker of the shared watch descriptor of sub is dropped when the queue
--- is full.
+-- is full. Without @\/proc@ there is no marker, isRootUnwatched is reported
+-- before the events in the queue.
 overflowRemoveShared :: Spec
 overflowRemoveShared =
     it "removing a shared root stops its events after a queue overflow"
         $ withNestedRoots $ \root sub w -> do
+            hasProc <- procAvailable
             p <- Path.fromString sub
             r <- withOverflow root (Event.removeFromWatch w p)
             case r of
                 Nothing -> pendingWith "max_queued_events is too high"
                 Just () -> do
                     evs <- readUntil recCfg Event.isRootUnwatched w
-                    any Event.isEventsLost evs `shouldBe` True
                     unwatched evs `shouldBe` [(sub, sub)]
+                    lost <-
+                        if hasProc
+                        then return evs
+                        else readUntil recCfg Event.isEventsLost w
+                    any Event.isEventsLost lost `shouldBe` True
                     let file = sub </> "file"
                     createFile file
                     evs1 <- readUntil recCfg (isCreatedAt file) w
@@ -2601,6 +2680,7 @@ watchTests =
             describe "overlapping roots" $ do
                 overlapFanOut
                 overlapRemoveInner
+                overlapRemoveQueued
                 overlapRemoveOuter
                 overlapRemoveBoth
                 overlapMoveOutInner
@@ -2642,6 +2722,7 @@ watchTests =
             describe "concurrency" $ do
                 addWhileReading
                 removeWhileReading
+                removeSharedWhileReading
                 closeWhileReading
             describe "failures" $ do
                 removeFailRetry
