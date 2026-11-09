@@ -51,7 +51,7 @@ import Control.Concurrent
     ( Chan, MVar, ThreadId, forkIO, killThread, newChan, newEmptyMVar
     , putMVar, readChan, takeMVar, threadDelay, tryReadMVar, writeChan
     )
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM_, unless, when)
 import Data.Function ((&))
 import Data.IORef
@@ -139,13 +139,16 @@ watchesInUse = do
             Left (_ :: SomeException) -> return 0
             Right fds -> sum <$> mapM (countFd pid) fds
 
+    -- readFile is lazy, the count is evaluated inside try so that an fd
+    -- closed during the read is skipped.
     countFd pid fd = do
-        r <- try (readFile ("/proc" </> pid </> "fdinfo" </> fd))
+        r <- try $ do
+            s <- readFile ("/proc" </> pid </> "fdinfo" </> fd)
+            evaluate
+                $ length (filter ("inotify wd:" `isPrefixOf`) (lines s))
         case r of
             Left (_ :: SomeException) -> return 0
-            Right s -> do
-                let n = length (filter ("inotify wd:" `isPrefixOf`) (lines s))
-                n `seq` return n
+            Right n -> return n
 
 -- | The inotify watches that this user can still add, leaving 2000 free.
 freeWatches :: IO Int
