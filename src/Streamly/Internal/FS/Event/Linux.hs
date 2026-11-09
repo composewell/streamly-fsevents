@@ -236,7 +236,10 @@ setFlag mask status cfg@Config{..} =
 -- 'isMovedFrom'. The directory and the subdirectories under it are removed
 -- from the watch, and each of them reports 'isRootUnwatched' under its old
 -- path. Until then, the events of the moved out tree are reported under the
--- old path.
+-- old path. The kernel queues an @IN_IGNORED@ event for each removed watch,
+-- so moving out a tree of more than
+-- @\/proc\/sys\/fs\/inotify\/max_queued_events@ directories, 16384 by
+-- default, overflows the queue and reports 'isEventsLost'.
 --
 -- /Renames within the tree/: A directory renamed within the tree reports
 -- 'isMovedFrom' for the old path and 'isMovedTo' for the new path, and the
