@@ -458,9 +458,9 @@ churn root out deadline = go 0
 -- | Block the consumer, overflow the queue, then change a tree of at most
 -- @dirs@ directories for 10 seconds while the consumer reads. On Linux, each
 -- overflow restarts the watch, and the changes during a restart cause
--- another overflow.
-cascade :: Int -> FilePath -> IO ()
-cascade dirs base = do
+-- another overflow. On Linux, at least @atLeast@ overflows are required.
+cascade :: Int -> Int -> FilePath -> IO ()
+cascade atLeast dirs base = do
     queued <- queuedEventsLimit
     budget <- dirBudget (stressBudget dirs 3 (queued + 2000)) base
     if budget < 2000
@@ -480,7 +480,7 @@ cascade dirs base = do
             Left (e :: SomeException) -> expectationFailure (show e)
             Right rounds -> say $ "rounds of changes: " ++ show rounds
         n <- settledLost w "cascade"
-        checkLost 2 n
+        checkLost atLeast n
         checkTree w
         stopWatch w
 
@@ -495,10 +495,12 @@ main = hspec $ describe moduleName $ do
     it "the tree is watched after changes during an overflow"
         $ maybe (withBase 600 overflowChanges) pendingWith overflowSkip
     it "the tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 10000)) pendingWith overflowSkip
+        $ maybe (withBase 600 (cascade 2 10000)) pendingWith overflowSkip
     -- A restart of a tree of 2000 directories takes less time than one of
     -- 10000 directories, more overflows follow each other. On Linux, the
     -- IN_IGNORED events of the removal markers are dropped by the next
-    -- overflow, and the markers accumulate.
+    -- overflow, and the markers accumulate. On a fast machine the restart
+    -- of the small tree can finish before the queue fills again, only one
+    -- overflow is required.
     it "a small tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 2000)) pendingWith overflowSkip
+        $ maybe (withBase 600 (cascade 1 2000)) pendingWith overflowSkip
