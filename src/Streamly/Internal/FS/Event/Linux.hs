@@ -2618,12 +2618,12 @@ unwatchSubtree wtch pRep =
 --
 -- In both cases the tree at the new path is walked and all its entries are
 -- returned, a rename is reported as the tree leaving and coming back in. See
--- "Moves and scans" in dev/design.md. The walk also adds the subdirectories
--- that are not watched. Such a subdirectory had its create event read when the
--- old path no longer existed and it could not be added, or the event is not
--- read yet. The walk also restores 'watchFlags' on a directory that was
--- renamed while it was being listed, 'updateWatch' could not find its old
--- path.
+-- "Moves and scans" in dev/design.linux.md. The walk also adds the
+-- subdirectories that are not watched. Such a subdirectory had its create
+-- event read when the old path no longer existed and it could not be added,
+-- or the event is not read yet. The walk also restores 'watchFlags' on a
+-- directory that was renamed while it was being listed, 'updateWatch' could
+-- not find its old path.
 
 -- | The watch descriptors that have a path with a cookie, in the ascending
 -- order.
@@ -2682,7 +2682,7 @@ takeMoved cookie m =
 -- the entries under it if they are reported, see 'reportsScan', whether the
 -- path is already watched or not. A move is
 -- reported as the tree leaving and coming back in, see "Moves and scans" in
--- dev/design.md.
+-- dev/design.linux.md.
 --
 -- The path may be already watched with the cookie of a move out. The path was
 -- added on the IN_CREATE event of a directory that was then moved out, when

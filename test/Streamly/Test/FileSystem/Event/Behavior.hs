@@ -447,7 +447,7 @@ behaviors =
     -- On Linux, dir2 is a new directory when IN_MOVED_TO of dir2 is read, the
     -- watch of the renamed directory is removed then and added again on
     -- IN_MOVED_TO of dir3. See "Keeping the watch over two renames" in
-    -- dev/design.md.
+    -- dev/design.linux.md.
     , base
         { title =
             "write in a dir renamed twice, middle path reused, is reported"

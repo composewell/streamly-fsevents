@@ -2087,7 +2087,7 @@ checkReusedPath action =
 --
 -- XXX isRootUnwatched of dir and dir/sub is reported after the rename to dir,
 -- although the kernel watch was not removed. This test records the current
--- behavior, see "Reused paths" in dev/design.md.
+-- behavior, see "Reused paths" in dev/design.linux.md.
 recReusedPathMovedWithin :: Spec
 recReusedPathMovedWithin =
     it "keeps a watched directory moved to a renamed new directory's path" $ do
@@ -2121,7 +2121,7 @@ recReusedPathMovedOut =
 -- IN_MOVE_SELF of dir1 removes its watch when it is read, the kernel queues
 -- IN_IGNORED after the IN_CREATE event of the new dir1. isRootUnwatched refers
 -- to the directory that was at the path, the new dir1 is watched. This test
--- records the current behavior, see "Reused paths" in dev/design.md.
+-- records the current behavior, see "Reused paths" in dev/design.linux.md.
 recUnwatchedAfterRecreated :: Spec
 recUnwatchedAfterRecreated =
     it "reports isRootUnwatched of a moved out directory after a path reuse"

@@ -11,7 +11,7 @@
 -- against the library. Some operations run before the events are read, the
 -- others after a given number of events is read, which covers the orderings
 -- of the operations and the event reader. See "Exhaustive test" in
--- dev/design.md for the checks.
+-- dev/design.linux.md for the checks.
 --
 -- Environment variables, for a deeper search:
 --
@@ -280,8 +280,8 @@ data WriteState = WriteState
 -- A directory that arrives at a path by a move, leaves it, and whose path is
 -- then taken by another directory, as in @mv f a; mv a b; mkdir a@, loses its
 -- watch when IN_MOVED_TO of @a@ is read, see "Keeping the watch over two
--- renames" in dev/design.md. The writes in its tree after it arrived at the
--- path are not expected.
+-- renames" in dev/design.linux.md. The writes in its tree after it arrived
+-- at the path are not expected.
 expectedWrites :: World -> [Op] -> [FilePath]
 expectedWrites w ops0 =
     [ p
