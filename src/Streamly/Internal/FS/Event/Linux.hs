@@ -1036,7 +1036,7 @@ recordPending (Watch _ _ _ _ pendingVar) new =
 
 -- | Record a subdirectory not added because of a permission error.
 recordDenied :: Watch -> PathRep -> IO ()
-recordDenied wt prep = recordPending wt [PendingDenied prep]
+recordDenied wtch prep = recordPending wtch [PendingDenied prep]
 
 -- | Take the events recorded by 'recordPending', oldest first.
 takePending :: Watch -> IO [Pending]
@@ -1349,13 +1349,13 @@ insertPath wd prep m0 =
 -- Returns the watch descriptor, and 'False' if the path is already being
 -- watched.
 addPathWith :: Word32 -> Watch -> PathRep -> IO (Int, Bool)
-addPathWith flags wt prep =
-    addPathUsing wt prep (\fd -> addWatchFor fd flags prep)
+addPathWith flags wtch prep =
+    addPathUsing wtch prep (\fd -> addWatchFor fd flags prep)
 
 -- | Like 'addPathWith' for a directory already opened by 'openDirAt'.
 addPathAt :: Word32 -> Watch -> PathRep -> CInt -> IO (Int, Bool)
-addPathAt flags wt prep dirFd =
-    addPathUsing wt prep (\fd -> addWatchViaFd fd flags prep dirFd)
+addPathAt flags wtch prep dirFd =
+    addPathUsing wtch prep (\fd -> addWatchViaFd fd flags prep dirFd)
 
 -- | Add a watch using the given action on the inotify fd, and insert the
 -- path in the map.
@@ -1408,14 +1408,14 @@ withAddedDir ::
     -> PathRep
     -> ((Int, Bool) -> Maybe (CInt, ReadDir.DirStream) -> IO a)
     -> IO a
-withAddedDir flags wt parent prep action =
+withAddedDir flags wtch parent prep action =
     case prep of
         (_, Nothing) -> do
-            r <- addPathWith flags wt prep
+            r <- addPathWith flags wtch prep
             bracket openRoot (mapM_ close) (action r)
         (_, Just _) ->
             bracket (openDirAt o_PATH parent prep) c_close $ \pfd -> do
-                r <- addPathAt flags wt prep pfd
+                r <- addPathAt flags wtch prep pfd
                 bracket (openSub pfd) (mapM_ close) (action r)
 
     where
@@ -1426,7 +1426,7 @@ withAddedDir flags wt parent prep action =
         r <- try (openDirStream prep (openDot prep pfd))
         case r of
             Left e
-                | isAccessError e -> Nothing <$ recordDenied wt prep
+                | isAccessError e -> Nothing <$ recordDenied wtch prep
                 | otherwise -> ioError e
             Right dir -> return (Just dir)
 
@@ -1463,8 +1463,8 @@ foreign import ccall unsafe
 -- If the path refers to the directory and the watch descriptor has a pending
 -- path, the pending path is changed to this path, see 'relocatePending'.
 updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
-updateWatch flags wt wd prep =
-    (== ProbeSame) <$> probeWatch flags wt wd prep
+updateWatch flags wtch wd prep =
+    (== ProbeSame) <$> probeWatch flags wtch wd prep
 
 -- | The result of 'probeWatch'.
 data Probe =
@@ -1476,8 +1476,8 @@ data Probe =
 -- | Like 'updateWatch', and tells a path that is not a directory from a path
 -- that is another directory.
 probeWatch :: Word32 -> Watch -> Int -> PathRep -> IO Probe
-probeWatch flags wt@(Watch _ _ wdMapRef _ _) wd prep =
-    withWatchFd "addToWatch" wt $ \fd -> do
+probeWatch flags wtch@(Watch _ _ wdMapRef _ _) wd prep =
+    withWatchFd "addToWatch" wtch $ \fd -> do
         r <- try (addWatchFor fd flags prep)
         case r of
             Left (e :: IOError)
@@ -1512,7 +1512,7 @@ probeWatch flags wt@(Watch _ _ wdMapRef _ _) wd prep =
 -- /Pre-release/
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg wt = addToWatchAt cfg wt Nothing
+addToWatch cfg wtch = addToWatchAt cfg wtch Nothing
 
 -- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
 -- the parent is given.
@@ -1597,11 +1597,11 @@ forSubdirs prep ds action =
 -- not scanned again. An error is handled as in 'addSubdirToWatch'.
 addSubdirs ::
     Config -> Watch -> PathRep -> (CInt, ReadDir.DirStream) -> IO ()
-addSubdirs cfg wt prep (dirFd, ds) =
+addSubdirs cfg wtch prep (dirFd, ds) =
     forSubdirs prep ds $ \name -> do
         let sub = addSub prep name
-        skipSubdir wt sub ()
-            $ addToWatchAt (subdirConfig cfg) wt (Just (dirFd, name)) sub
+        skipSubdir wtch sub ()
+            $ addToWatchAt (subdirConfig cfg) wtch (Just (dirFd, name)) sub
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
@@ -1616,8 +1616,8 @@ addSubdirs cfg wt prep (dirFd, ds) =
 -- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
-addSubdirToWatch cfg wt prep =
-    skipSubdir wt prep () (addToWatch (subdirConfig cfg) wt prep)
+addSubdirToWatch cfg wtch prep =
+    skipSubdir wtch prep () (addToWatch (subdirConfig cfg) wtch prep)
 
 subdirConfig :: Config -> Config
 subdirConfig = setOnlyDir True . setFollowSymLinks False
@@ -1625,9 +1625,9 @@ subdirConfig = setOnlyDir True . setFollowSymLinks False
 -- | Return the default value if the action fails because the subdirectory
 -- does not exist, is not a directory, or if the watch is closed.
 ignoreSubdirError :: Watch -> a -> IO a -> IO a
-ignoreSubdirError wt def action =
+ignoreSubdirError wtch def action =
     action `catchIOError` \e -> do
-        closed <- isWatchClosed wt
+        closed <- isWatchClosed wtch
         if isNotSubdirError e || closed
         then return def
         else ioError e
@@ -1640,13 +1640,13 @@ ignoreSubdirError wt def action =
 -- A subdirectory created in the tree with mode 000 by any user who can write
 -- to its parent would otherwise end the watch of the whole tree.
 skipSubdir :: Watch -> PathRep -> a -> IO a -> IO a
-skipSubdir wt prep def action =
+skipSubdir wtch prep def action =
     action `catchIOError` \e -> do
-        closed <- isWatchClosed wt
+        closed <- isWatchClosed wtch
         if isNotSubdirError e || closed
         then return def
         else if isAccessError e
-        then def <$ recordDenied wt prep
+        then def <$ recordDenied wtch prep
         else ioError e
 
 -- | Like 'skipSubdir' for the generation of a stream. The stream ends if it
@@ -1654,9 +1654,9 @@ skipSubdir wt prep def action =
 -- a directory, cannot be listed because of a permission error, or if the
 -- watch is closed.
 handleSubdirError :: Watch -> PathRep -> Stream IO a -> Stream IO a
-handleSubdirError wt prep =
+handleSubdirError wtch prep =
     S.handle $ \(e :: IOError) ->
-        S.nil <$ skipSubdir wt prep () (ioError e)
+        S.nil <$ skipSubdir wtch prep () (ioError e)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
@@ -1691,13 +1691,13 @@ data ScanNode = ScanNode
 -- read to the end.
 withWatchFlags ::
     Config -> Watch -> Int -> PathRep -> Stream IO a -> Stream IO a
-withWatchFlags cfg wt wd prep
+withWatchFlags cfg wtch wd prep
     | scanFlags cfg == watchFlags cfg = id
     | otherwise =
         S.finallyIO
             $ void
-            $ ignoreSubdirError wt False
-            $ updateWatch (watchFlags cfg) wt wd prep
+            $ ignoreSubdirError wtch False
+            $ updateWatch (watchFlags cfg) wtch wd prep
 
 -- | Add the watch of a directory with 'scanFlags' and return the stream of its
 -- entries. The directory is read when the stream is read. The watch of a
@@ -1712,17 +1712,18 @@ withWatchFlags cfg wt wd prep
 -- the stream of its parent is open, the parent fd is open then.
 scanChildren ::
     Watch -> ScanMode -> Maybe ParentDir -> PathRep -> IO (Stream IO ScanNode)
-scanChildren wt mode parent prep =
+scanChildren wtch mode parent prep =
     case mode of
         ScanNew cfg -> do
             let subCfg = subdirConfig cfg
-            r <- skipSubdir wt prep Nothing $ Just <$> add (scanFlags subCfg)
+            r <- skipSubdir wtch prep Nothing $ Just <$> add (scanFlags subCfg)
             case r of
                 Nothing -> return S.nil
                 Just (wd, True) -> return $ list subCfg wd True (ScanNew cfg)
                 Just (_, False) ->
-                    skipSubdir wt prep S.nil
-                        $ scanChildren wt (ScanRescan True subCfg) parent prep
+                    skipSubdir wtch prep S.nil
+                        $ scanChildren
+                            wtch (ScanRescan True subCfg) parent prep
         ScanRescan underNew cfg -> do
             (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
             let isNew = underNew || added
@@ -1733,14 +1734,14 @@ scanChildren wt mode parent prep =
 
     add flags =
         case prep of
-            (_, Nothing) -> addPathWith flags wt prep
+            (_, Nothing) -> addPathWith flags wtch prep
             (_, Just _) ->
                 bracket (openDirAt o_PATH parent prep) c_close
-                    (addPathAt flags wt prep)
+                    (addPathAt flags wtch prep)
 
     list cfg wd reported childMode =
-        withWatchFlags cfg wt wd prep
-            $ handleSubdirError wt prep
+        withWatchFlags cfg wtch wd prep
+            $ handleSubdirError wtch prep
             $ S.bracketIO
                 (openDirStreamAt parent prep)
                 (ReadDir.closeDirStream . snd)
@@ -1750,8 +1751,8 @@ scanChildren wt mode parent prep =
     node fd reported childMode (Left dir) = do
         let path = addSub prep dir
         children <-
-            skipSubdir wt path S.nil
-                (scanChildren wt childMode (Just (fd, dir)) path)
+            skipSubdir wtch path S.nil
+                (scanChildren wtch childMode (Just (fd, dir)) path)
         return $ ScanNode reported (ScannedEntry True path) children
     node _ reported _ (Right file) =
         return
@@ -1775,8 +1776,8 @@ scanChildren wt mode parent prep =
 -- A directory is opened when the walk reaches it and closed when its stream
 -- ends, a walk holds one open directory for each level of the tree.
 scanTree :: Watch -> ScanMode -> PathRep -> IO (Stream IO ScannedEntry)
-scanTree wt mode prep = do
-    top <- scanChildren wt mode Nothing prep
+scanTree wtch mode prep = do
+    top <- scanChildren wtch mode Nothing prep
     return
         $ fmap snEntry
         $ S.filter snReported
@@ -1792,7 +1793,7 @@ scanTree wt mode prep = do
 -- Listing the directory generates the open, access and close events of its
 -- parent, which are reported if they are enabled. See 'scanTree'.
 rescanDir :: Bool -> Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-rescanDir isNew0 cfg wt = scanTree wt (ScanRescan isNew0 cfg)
+rescanDir isNew0 cfg wtch = scanTree wtch (ScanRescan isNew0 cfg)
 
 -- | Add a directory reported by IN_CREATE or IN_MOVED_TO and return the
 -- entries in it. The watch is added before the directory is read, an entry
@@ -1805,7 +1806,7 @@ rescanDir isNew0 cfg wt = scanTree wt (ScanRescan isNew0 cfg)
 -- before the events are read, the first IN_CREATE adds and scans the second
 -- a, and the consumer removes its entries on the IN_DELETE.
 addNewDir :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-addNewDir cfg wt = scanTree wt (ScanNew cfg)
+addNewDir cfg wtch = scanTree wtch (ScanNew cfg)
 
 -- | Whether the entries found by 'addNewDir' are reported.
 reportsScan :: Config -> Bool
@@ -1813,9 +1814,9 @@ reportsScan cfg = scanNewDirs cfg && createFlags cfg .&. iN_CREATE /= 0
 
 -- | Add a new directory, and return its entries if they are reported.
 addDirWithScan :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-addDirWithScan cfg wt prep
-    | reportsScan cfg = addNewDir cfg wt prep
-    | otherwise = S.nil <$ addSubdirToWatch cfg wt prep
+addDirWithScan cfg wtch prep
+    | reportsScan cfg = addNewDir cfg wtch prep
+    | otherwise = S.nil <$ addSubdirToWatch cfg wtch prep
 
 -- | Concatenate a list of streams.
 concatStreams :: [Stream IO a] -> Stream IO a
@@ -1923,7 +1924,7 @@ queueIgnored err fd action =
 -- events already queued for the paths and not yet read are not reported.
 --
 addRemovalMarker :: Watch -> [Int] -> [(Int, PathRep)] -> IO ()
-addRemovalMarker wt@(Watch fd _ wdMapRef _ _) markers paths = do
+addRemovalMarker wtch@(Watch fd _ wdMapRef _ _) markers paths = do
     queued <-
         queueIgnored err fd $ \wd ->
             -- The marker must be in the map before its IN_IGNORED is read.
@@ -1934,7 +1935,7 @@ addRemovalMarker wt@(Watch fd _ wdMapRef _ _) markers paths = do
     unless queued $ do
         removed <-
             atomicModifyIORef' wdMapRef (removeListed markers paths)
-        recordPending wt (map (uncurry PendingUnwatched) removed)
+        recordPending wtch (map (uncurry PendingUnwatched) removed)
 
     where
 
@@ -1958,8 +1959,8 @@ addRemovalMarker wt@(Watch fd _ wdMapRef _ _) markers paths = do
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths :: Watch -> String -> (PathRep -> Bool) -> IO ()
-unwatchPaths wt@(Watch fd _ wdMapRef _ _) desc p =
-    whenWatchOpen wt $ do
+unwatchPaths wtch@(Watch fd _ wdMapRef _ _) desc p =
+    whenWatchOpen wtch $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
         --
@@ -1986,7 +1987,7 @@ unwatchPaths wt@(Watch fd _ wdMapRef _ _) desc p =
         -- path being remove from the shared wd.
         --
         when (not (null shared))
-            $ addRemovalMarker wt [] shared
+            $ addRemovalMarker wtch [] shared
                 `onException` atomicModifyIORef' wdMapRef
                     (\m -> (unmarkRemoved shared m, ()))
 
@@ -2027,8 +2028,8 @@ unwatchPaths wt@(Watch fd _ wdMapRef _ _) desc p =
 -- /Pre-release/
 --
 removeFromWatch :: Watch -> Path -> IO ()
-removeFromWatch wt root =
-    unwatchPaths wt (show (Path.toString root)) (eqPath root . getRepRoot)
+removeFromWatch wtch root =
+    unwatchPaths wtch (show (Path.toString root)) (eqPath root . getRepRoot)
 
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
 -- the fd to become readable, in the threaded RTS. The kernel releases the fd
@@ -2200,11 +2201,11 @@ pendingRemovals m =
 -- Failing to queue the marker, for example, when the process is out of fds,
 -- is ignored, the next IN_Q_OVERFLOW event tries again.
 syncRemovals :: Watch -> IO ()
-syncRemovals wt@(Watch _ _ wdMapRef _ _) =
-    whenWatchOpen wt $ do
+syncRemovals wtch@(Watch _ _ wdMapRef _ _) =
+    whenWatchOpen wtch $ do
         (markers, paths) <- pendingRemovals <$> readIORef wdMapRef
         when (not (null markers && null paths))
-            $ addRemovalMarker wt markers paths
+            $ addRemovalMarker wtch markers paths
                 `catchIOError` \_ -> return ()
 
 -- | Add a directory and the tree under it again, recording the paths found.
@@ -2226,8 +2227,8 @@ restartDir ::
     -> Maybe ParentDir
     -> PathRep
     -> IO ()
-restartDir cfg wt seen added parent prep = do
-    wd <- withAddedDir flags wt parent prep $ \(wd, isNew) dir -> do
+restartDir cfg wtch seen added parent prep = do
+    wd <- withAddedDir flags wtch parent prep $ \(wd, isNew) dir -> do
         modifyIORef' seen (Set.insert (pathKey prep))
         case added of
             Just ref | isNew -> modifyIORef' ref ((wd, prep) :)
@@ -2235,7 +2236,7 @@ restartDir cfg wt seen added parent prep = do
         mapM_ (\(fd, ds) -> forSubdirs prep ds (restartSubdir fd)) dir
         return wd
     when (scanFlags cfg /= watchFlags cfg)
-        $ void $ updateWatch (watchFlags cfg) wt wd prep
+        $ void $ updateWatch (watchFlags cfg) wtch wd prep
 
     where
 
@@ -2243,8 +2244,9 @@ restartDir cfg wt seen added parent prep = do
 
     restartSubdir fd name = do
         let sub = addSub prep name
-        skipSubdir wt sub ()
-            $ restartDir (subdirConfig cfg) wt seen added (Just (fd, name)) sub
+        skipSubdir wtch sub ()
+            $ restartDir
+                (subdirConfig cfg) wtch seen added (Just (fd, name)) sub
 
 pathKey :: PathRep -> Array Word8
 pathKey = Path.toArray . combinePathRep
@@ -2262,8 +2264,8 @@ liveRoots m =
 -- | Whether the path of a root still refers to the object watched via its
 -- watch descriptor. The flags of the watch are set to 'watchFlags'.
 isRootAt :: Config -> Watch -> (Int, PathRep) -> IO Bool
-isRootAt cfg wt (wd, prep) =
-    ignoreSubdirError wt False $ updateWatch (watchFlags cfg) wt wd prep
+isRootAt cfg wtch (wd, prep) =
+    ignoreSubdirError wtch False $ updateWatch (watchFlags cfg) wtch wd prep
 
 -- | Remove the roots whose path no longer refers to the watched object, and
 -- the paths under them. Such a root was renamed, deleted or replaced. Its
@@ -2282,12 +2284,12 @@ isRootAt cfg wt (wd, prep) =
 -- case. The roots are matched by their paths, if a root that is kept has the
 -- same path, the paths are kept.
 unwatchGoneRoots :: Config -> Watch -> [(Int, PathRep)] -> IO ()
-unwatchGoneRoots cfg wt roots = do
-    results <- mapM (\root -> (,) (snd root) <$> isRootAt cfg wt root) roots
+unwatchGoneRoots cfg wtch roots = do
+    results <- mapM (\root -> (,) (snd root) <$> isRootAt cfg wtch root) roots
     let kept = [root | (root, True) <- results]
         gone = [root | (root, False) <- results]
         isGone p = any (isUnder p) gone && not (any (isUnder p) kept)
-    unless (null gone) $ unwatchPaths wt "unwatchGoneRoots" isGone
+    unless (null gone) $ unwatchPaths wtch "unwatchGoneRoots" isGone
 
     where
 
@@ -2320,7 +2322,7 @@ unwatchGoneRoots cfg wt roots = do
 -- Failing to remove a path is ignored, like in 'syncRemovals', the next
 -- overflow tries again.
 restartTree :: Config -> Watch -> IO [(Int, PathRep)]
-restartTree cfg wt@(Watch _ _ wdMapRef _ _) = do
+restartTree cfg wtch@(Watch _ _ wdMapRef _ _) = do
     m <- readIORef wdMapRef
     seen <- newIORef Set.empty
     added <-
@@ -2340,23 +2342,23 @@ restartTree cfg wt@(Watch _ _ wdMapRef _ _) = do
             && isRestarted prep
             && Set.notMember (pathKey prep) found
         isGone prep = isUnder skipped prep && not (isRestarted prep)
-    unwatchPaths wt "restartTree" (\p -> isStale p || isGone p)
+    unwatchPaths wtch "restartTree" (\p -> isStale p || isGone p)
         `catchIOError` \_ -> return ()
     maybe (return []) (fmap reverse . readIORef) added
 
     where
 
     restartRoot seen added root@(_, prep) = do
-        same <- isRootAt cfg wt root
+        same <- isRootAt cfg wtch root
         when same
-            $ ignoreSubdirError wt ()
-                (restartDir cfg wt seen added Nothing prep)
+            $ ignoreSubdirError wtch ()
+                (restartDir cfg wtch seen added Nothing prep)
         return same
 
 -- | Remove a directory and the tree under it from the watch.
 unwatchSubtree :: Watch -> PathRep -> IO ()
-unwatchSubtree wt prep =
-    unwatchPaths wt
+unwatchSubtree wtch prep =
+    unwatchPaths wtch
         (show (Path.toString (combinePathRep prep)))
         (isInSubtree prep)
 
@@ -2478,13 +2480,13 @@ takeMoved cookie m =
 -- added on the IN_CREATE event of a directory that was then moved out, when
 -- the path already referred to this directory. The cookie is removed.
 addMovedDir :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-addMovedDir cfg wt@(Watch _ _ wdMapRef _ _) to = do
+addMovedDir cfg wtch@(Watch _ _ wdMapRef _ _) to = do
     reused <- atomicModifyIORef' wdMapRef takeStale
     if reused || reportsScan cfg
     then
-        skipSubdir wt to S.nil
-            (rescanDir (reportsScan cfg) (subdirConfig cfg) wt to)
-    else addDirWithScan cfg wt to
+        skipSubdir wtch to S.nil
+            (rescanDir (reportsScan cfg) (subdirConfig cfg) wtch to)
+    else addDirWithScan cfg wtch to
 
     where
 
@@ -2564,22 +2566,22 @@ renameDir ::
     -> (Int, PathRep)
     -> PathRep
     -> IO (Stream IO ScannedEntry)
-renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
+renameDir cfg wtch@(Watch _ _ wdMapRef _ _) (wd, from) to = do
     r <-
-        ignoreSubdirError wt ProbeOther
-            $ probeWatch (watchFlags subCfg) wt wd to
+        ignoreSubdirError wtch ProbeOther
+            $ probeWatch (watchFlags subCfg) wtch wd to
     case r of
         ProbeSame -> do
             atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-            skipSubdir wt to S.nil
-                (rescanDir (reportsScan cfg) subCfg wt to)
+            skipSubdir wtch to S.nil
+                (rescanDir (reportsScan cfg) subCfg wtch to)
         ProbeMissing -> do
             atomicModifyIORef' wdMapRef
                 (\m -> (markPending wd to (renamePaths from to m), ()))
             return S.nil
         ProbeOther -> do
-            unwatchSubtree wt from
-            addMovedDir cfg wt to
+            unwatchSubtree wtch from
+            addMovedDir cfg wtch to
 
     where
 
@@ -2628,7 +2630,7 @@ renameDir cfg wt@(Watch _ _ wdMapRef _ _) (wd, from) to = do
 -- renames and in the directories moved in.
 movedInDir ::
     Config -> Watch -> Word32 -> [PathRep] -> IO (Stream IO ScannedEntry)
-movedInDir cfg wt@(Watch _ _ wdMapRef _ _) cookie paths = do
+movedInDir cfg wtch@(Watch _ _ wdMapRef _ _) cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
     let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
         sameRootFrom to = find (isSameRoot to . snd) froms
@@ -2637,12 +2639,12 @@ movedInDir cfg wt@(Watch _ _ wdMapRef _ _) cookie paths = do
         acrossRoots = zip movedIn movedOut
         moveTo to =
             case sameRootFrom to of
-                Just from -> renameDir cfg wt from to
+                Just from -> renameDir cfg wtch from to
                 Nothing ->
                     case find (eqPathRep to . fst) acrossRoots of
-                        Just (_, from) -> renameDir cfg wt from to
-                        Nothing -> addMovedDir cfg wt to
-    mapM_ (unwatchSubtree wt . snd) (drop (length movedIn) movedOut)
+                        Just (_, from) -> renameDir cfg wtch from to
+                        Nothing -> addMovedDir cfg wtch to
+    mapM_ (unwatchSubtree wtch . snd) (drop (length movedIn) movedOut)
     concatStreams <$> mapM moveTo paths
 
 -- | The IN_MOVED_TO and IN_MOVE_SELF events of a directory that reported
@@ -2651,9 +2653,9 @@ movedInDir cfg wt@(Watch _ _ wdMapRef _ _) cookie paths = do
 -- the directory as a directory moved in. Failing to remove a path is ignored,
 -- like in 'syncRemovals'.
 unwatchMoved :: Watch -> IO ()
-unwatchMoved wt@(Watch _ _ wdMapRef _ _) = do
+unwatchMoved wtch@(Watch _ _ wdMapRef _ _) = do
     paths <- atomicModifyIORef' wdMapRef takeAll
-    mapM_ (unwatchSubtree wt) paths `catchIOError` \_ -> return ()
+    mapM_ (unwatchSubtree wtch) paths `catchIOError` \_ -> return ()
 
     where
 
@@ -2684,7 +2686,7 @@ unwatchMoved wt@(Watch _ _ wdMapRef _ _) = do
 --
 {-# INLINE readOneEvent #-}
 readOneEvent :: Config -> Watch -> Parser Word8 IO (Stream IO Event)
-readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
+readOneEvent cfg  wtch@(Watch _ _ wdMapRef _ _) = do
     -- XXX the header format is implicit in the code, this could be bug prone.
     let headerLen = sizeOf (undefined :: CInt) + 12
     arr <- PR.takeEQ headerLen (A.createOf headerLen)
@@ -2734,17 +2736,17 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
     -- only the paths of the roots are checked, see 'unwatchGoneRoots'.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
-        PR.fromEffect $ unwatchMoved wt
+        PR.fromEffect $ unwatchMoved wtch
         added <-
             PR.fromEffect
                 $ if watchRec cfg && restartOnOverflow cfg
-                  then restartTree cfg wt
+                  then restartTree cfg wtch
                   else do
                     m <- readIORef wdMapRef
-                    unwatchGoneRoots cfg wt (liveRoots m)
+                    unwatchGoneRoots cfg wtch (liveRoots m)
                         `catchIOError` \_ -> return ()
                     return []
-        PR.fromEffect $ syncRemovals wt
+        PR.fromEffect $ syncRemovals wtch
         return
             $ S.fromList
             $ [ mkEvent (fromIntegral wd) (wpRep wp)
@@ -2786,7 +2788,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
                     $ PR.fromEffect $ do
                         gone <-
                             atomicModifyIORef' wdMapRef (takeNamedPending live)
-                        mapM_ (unwatchSubtree wt) gone
+                        mapM_ (unwatchSubtree wtch) gone
                 when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
                     $ PR.fromEffect
                     $ atomicModifyIORef' wdMapRef
@@ -2800,7 +2802,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
                 -- the IMPORTANT note above 'clearMoved'.
                 when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
                     $ PR.fromEffect
-                    $ mapM_ (unwatchSubtree wt)
+                    $ mapM_ (unwatchSubtree wtch)
                         [ wpRep wp
                         | wp <- wps
                         , not (wpRemoved wp)
@@ -2808,7 +2810,7 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
                         ]
                 when (eflags .&. iN_MOVE_SELF /= 0)
                     $ PR.fromEffect
-                    $ unwatchGoneRoots cfg wt
+                    $ unwatchGoneRoots cfg wtch
                         [ (fromIntegral ewd, wpRep wp)
                         | wp <- wps
                         , not (wpRemoved wp)
@@ -2824,9 +2826,9 @@ readOneEvent cfg  wt@(Watch _ _ wdMapRef _ _) = do
                         $ if watchRec cfg && isDirCreated
                           then
                             concatStreams
-                                <$> mapM (addDirWithScan cfg wt) live
+                                <$> mapM (addDirWithScan cfg wtch) live
                           else if watchRec cfg && isDirMovedIn
-                          then movedInDir cfg wt cookie live
+                          then movedInDir cfg wtch cookie live
                           else return S.nil
                 scanned <-
                     if reportsScan cfg
@@ -2973,7 +2975,7 @@ readEvents (Watch fd lock _ _ pendingVar) = loop
 -- /Pre-release/
 --
 watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wt@(Watch _ _ _ readerRef _) = S.unfoldrM step ()
+watchToStream cfg wtch@(Watch _ _ _ readerRef _) = S.unfoldrM step ()
 
     where
 
@@ -2996,20 +2998,20 @@ watchToStream cfg wt@(Watch _ _ _ readerRef _) = S.unfoldrM step ()
     -- 'addToWatch' or 'removeFromWatch' are reported before the next event,
     -- those recorded while handling an event are reported after the entries
     -- found by its scan.
-    pending = S.concatEffect (S.fromList . map mkPending <$> takePending wt)
+    pending = S.concatEffect (S.fromList . map mkPending <$> takePending wtch)
 
     -- A read returns whole events, the events of a read are parsed on their
     -- own. An empty read reports the pending events.
     readChunk arr =
         S.concatMap (`S.append` pending)
-            (S.catRights $ S.parseMany (readOneEvent cfg wt) $ A.read arr)
+            (S.catRights $ S.parseMany (readOneEvent cfg wtch) $ A.read arr)
             `S.append` pending
 
     events =
         StreamK.fromStream
             $ S.append pending
             $ S.concatMap readChunk
-            $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wt) ()
+            $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wtch) ()
 
     -- The step runs with async exceptions masked. An exception can arrive
     -- only where the step blocks, the rest of the events is then left as it

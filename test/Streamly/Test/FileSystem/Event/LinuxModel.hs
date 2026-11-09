@@ -452,7 +452,7 @@ runCase base w ops1 split ops2 = do
             && not (Event.isScanEvent ev)
             && not (isControl (getAbsPath ev))
 
-    go wt = do
+    go wtch = do
         evRef <- newIORef []
         countRef <- newIORef (0 :: Int)
         ops2Ref <- newIORef False
@@ -483,7 +483,7 @@ runCase base w ops1 split ops2 = do
             reader = do
                 r <- try
                     $ Stream.fold (Fold.drainMapM onEvent)
-                    $ Event.watchToStream cfg wt
+                    $ Event.watchToStream cfg wtch
                 case r of
                     Left (e :: SomeException) -> do
                         _ <- tryPutMVar failed ("exception: " ++ show e)
