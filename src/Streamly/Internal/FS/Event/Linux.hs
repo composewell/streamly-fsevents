@@ -148,7 +148,6 @@ import GHC.Conc
 import GHC.IO.Exception (IOException(ioe_errno))
 import Streamly.Data.Array (Array)
 import Streamly.Data.Stream (Stream)
-import Streamly.Data.StreamK (StreamK)
 import Streamly.Data.Parser (Parser)
 import System.IO.Error
     ( catchIOError, illegalOperationErrorType, isDoesNotExistError
@@ -168,7 +167,7 @@ import qualified Streamly.Data.Array as A
     (createOf, fromList, read, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.StreamK as StreamK
-    (append, fromStream, nil, toStream, uncons)
+    (append, fromStream, toStream)
 import qualified Streamly.Internal.FileSystem.Path as Path
 
 import qualified Streamly.Internal.Data.Array as A
@@ -962,7 +961,7 @@ data Watch = Watch
       -- reads of the fd still to be made. 'Nothing' until the first event
       -- is taken. A stream that stops reading leaves the rest here, the
       -- next stream on the watch continues from it.
-    , watchUndelivered :: MVar (Maybe (StreamK IO Event))
+    , watchUndelivered :: MVar (Maybe (Stream IO Event))
       -- | The synthetic events, most recent first. A thread waiting for
       -- events in the threaded RTS is woken up when one is added.
     , watchSynthEvents :: TVar [SynthEvent]
@@ -3133,7 +3132,7 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
                 $ S.catRights
                 $ S.parseMany (readOneEvent cfg wtch) (A.read arr)
 
-    events = StreamK.fromStream $ S.concatMap readOne fdReads
+    events = S.concatMap readOne fdReads
 
     -- The step runs with async exceptions masked. An exception can arrive
     -- only where the step blocks, the rest of the events is then left as it
@@ -3145,9 +3144,9 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
     -- in 'rescanDir'.
     step () =
         modifyMVarMasked undeliveredRef $ \r -> do
-            next <- StreamK.uncons (fromMaybe events r)
+            next <- S.uncons (fromMaybe events r)
             return $ case next of
-                Nothing -> (Just StreamK.nil, Nothing)
+                Nothing -> (Just S.nil, Nothing)
                 Just (ev, rest) -> (Just rest, Just (ev, ()))
 
 -- XXX We should not go across the mount points of network file systems or file
