@@ -1497,22 +1497,44 @@ probeWatch flags wtch@(Watch _ _ wdMapRef _ _) wd pRep =
                     return ProbeSame
                 else return ProbeOther
 
--- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
--- being monitored under @root@ via the watch handle @watch@.  @root@ must be
--- an absolute path and @subpath@ must be relative to @root@.
+subdirConfig :: Config -> Config
+subdirConfig = setOnlyDir True . setFollowSymLinks False
+
+-- | Return the default value if the action fails because the subdirectory
+-- does not exist, is not a directory, or if the watch is closed.
+ignoreSubdirError :: Watch -> a -> IO a -> IO a
+ignoreSubdirError wtch def action =
+    action `catchIOError` \e -> do
+        closed <- isWatchClosed wtch
+        if isNotSubdirError e || closed
+        then return def
+        else ioError e
+
+-- | Like 'ignoreSubdirError', and also return the default value if the
+-- action fails because of a permission error on the subdirectory @pRep@. The
+-- subdirectory is recorded by 'recordDenied' then. The tree under it is not
+-- watched, its entries are not reported by a scan.
 --
--- If the same directory is added via two different roots, for example, a
--- recursive root and a root inside it, its events are reported once for each
--- root.
---
--- Can be called from any thread, including while another thread reads the
--- events of the watch using 'watchToStream'. The call does not wait for an
--- event. Raise an exception if the watch is closed.
---
--- /Pre-release/
---
-addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg wtch = addToWatchAt cfg wtch Nothing
+-- A subdirectory created in the tree with mode 000 by any user who can write
+-- to its parent would otherwise end the watch of the whole tree.
+skipSubdir :: Watch -> PathRep -> a -> IO a -> IO a
+skipSubdir wtch pRep def action =
+    action `catchIOError` \e -> do
+        closed <- isWatchClosed wtch
+        if isNotSubdirError e || closed
+        then return def
+        else if isAccessError e
+        then def <$ recordDenied wtch pRep
+        else ioError e
+
+-- | Like 'skipSubdir' for the generation of a stream. The stream ends if it
+-- raises an exception because the subdirectory @pRep@ does not exist, is not
+-- a directory, cannot be listed because of a permission error, or if the
+-- watch is closed.
+handleSubdirError :: Watch -> PathRep -> Stream IO a -> Stream IO a
+handleSubdirError wtch pRep =
+    S.handle $ \(e :: IOError) ->
+        S.nil <$ skipSubdir wtch pRep () (ioError e)
 
 -- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
 -- the parent is given.
@@ -1603,6 +1625,23 @@ addSubdirs cfg wtch pRep (dirFd, ds) =
         skipSubdir wtch sub ()
             $ addToWatchAt (subdirConfig cfg) wtch (Just (dirFd, name)) sub
 
+-- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
+-- being monitored under @root@ via the watch handle @watch@.  @root@ must be
+-- an absolute path and @subpath@ must be relative to @root@.
+--
+-- If the same directory is added via two different roots, for example, a
+-- recursive root and a root inside it, its events are reported once for each
+-- root.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'watchToStream'. The call does not wait for an
+-- event. Raise an exception if the watch is closed.
+--
+-- /Pre-release/
+--
+addToWatch :: Config -> Watch -> PathRep -> IO ()
+addToWatch cfg wtch = addToWatchAt cfg wtch Nothing
+
 -- | Like 'addToWatch' but does not raise an exception if the path does not
 -- exist, is not a directory, or if the watch is closed. Used to add the
 -- subdirectories found by the scan or reported by IN_CREATE or IN_MOVED_TO,
@@ -1618,45 +1657,6 @@ addSubdirs cfg wtch pRep (dirFd, ds) =
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wtch pRep =
     skipSubdir wtch pRep () (addToWatch (subdirConfig cfg) wtch pRep)
-
-subdirConfig :: Config -> Config
-subdirConfig = setOnlyDir True . setFollowSymLinks False
-
--- | Return the default value if the action fails because the subdirectory
--- does not exist, is not a directory, or if the watch is closed.
-ignoreSubdirError :: Watch -> a -> IO a -> IO a
-ignoreSubdirError wtch def action =
-    action `catchIOError` \e -> do
-        closed <- isWatchClosed wtch
-        if isNotSubdirError e || closed
-        then return def
-        else ioError e
-
--- | Like 'ignoreSubdirError', and also return the default value if the
--- action fails because of a permission error on the subdirectory @pRep@. The
--- subdirectory is recorded by 'recordDenied' then. The tree under it is not
--- watched, its entries are not reported by a scan.
---
--- A subdirectory created in the tree with mode 000 by any user who can write
--- to its parent would otherwise end the watch of the whole tree.
-skipSubdir :: Watch -> PathRep -> a -> IO a -> IO a
-skipSubdir wtch pRep def action =
-    action `catchIOError` \e -> do
-        closed <- isWatchClosed wtch
-        if isNotSubdirError e || closed
-        then return def
-        else if isAccessError e
-        then def <$ recordDenied wtch pRep
-        else ioError e
-
--- | Like 'skipSubdir' for the generation of a stream. The stream ends if it
--- raises an exception because the subdirectory @pRep@ does not exist, is not
--- a directory, cannot be listed because of a permission error, or if the
--- watch is closed.
-handleSubdirError :: Watch -> PathRep -> Stream IO a -> Stream IO a
-handleSubdirError wtch pRep =
-    S.handle $ \(e :: IOError) ->
-        S.nil <$ skipSubdir wtch pRep () (ioError e)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
