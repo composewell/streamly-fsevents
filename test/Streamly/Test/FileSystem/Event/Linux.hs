@@ -1182,7 +1182,7 @@ removeWhileReading =
 
 -- The reader thread is blocked reading the watch fd. The isRootUnwatched
 -- event of sub wakes it up without a file system event: the marker event
--- with @\/proc@, the pending event in the threaded RTS without it.
+-- with @\/proc@, the synthetic event in the threaded RTS without it.
 removeSharedWhileReading :: Spec
 removeSharedWhileReading =
     it "removing a shared root wakes up a thread reading the events"
