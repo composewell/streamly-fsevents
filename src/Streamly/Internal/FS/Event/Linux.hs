@@ -1664,18 +1664,6 @@ data ScannedEntry = ScannedEntry
     , sePath :: PathRep
     }
 
--- | How the walk of a scan continues under a directory.
---
--- * 'ScanNew': the walk of 'addNewDir'. The entries of a directory added by
---   the walk are reported. A directory already watched is walked as
---   @'ScanRescan' True@.
--- * 'ScanRescan': the walk of 'rescanDir'. The entries of a directory are
---   reported if the flag is 'True' or if the walk added the directory. The
---   flag is passed down to the subdirectories.
-data ScanMode
-    = ScanNew Config
-    | ScanRescan Bool Config
-
 -- | An entry found by the walk of a scan, whether it is reported, and the
 -- entries under it, empty for a file. The watch of a directory is added
 -- before its node is returned, the entries under it are read when the stream
@@ -1710,25 +1698,21 @@ withWatchFlags cfg wtch wd prep
 -- read, and holds the fd until it ends, to open the subdirectories. A
 -- subdirectory's stream is read in the depth first walk of 'scanTree' while
 -- the stream of its parent is open, the parent fd is open then.
+--
+-- The entries of the directory are reported if @reportAll@ is 'True' or if
+-- the walk added the directory, and then @reportAll@ is 'True' for its
+-- subdirectories. The watch is added without IN_MASK_ADD, the mask of a
+-- directory already watched is replaced with 'scanFlags'.
 scanChildren ::
-    Watch -> ScanMode -> Maybe ParentDir -> PathRep -> IO (Stream IO ScanNode)
-scanChildren wtch mode parent prep =
-    case mode of
-        ScanNew cfg -> do
-            let subCfg = subdirConfig cfg
-            r <- skipSubdir wtch prep Nothing $ Just <$> add (scanFlags subCfg)
-            case r of
-                Nothing -> return S.nil
-                Just (wd, True) -> return $ list subCfg wd True (ScanNew cfg)
-                Just (_, False) ->
-                    skipSubdir wtch prep S.nil
-                        $ scanChildren
-                            wtch (ScanRescan True subCfg) parent prep
-        ScanRescan underNew cfg -> do
-            (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
-            let isNew = underNew || added
-            return
-                $ list cfg wd isNew (ScanRescan isNew (subdirConfig cfg))
+       Watch
+    -> Bool
+    -> Config
+    -> Maybe ParentDir
+    -> PathRep
+    -> IO (Stream IO ScanNode)
+scanChildren wtch reportAll cfg parent prep = do
+    (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
+    return $ list wd (reportAll || added)
 
     where
 
@@ -1739,22 +1723,23 @@ scanChildren wtch mode parent prep =
                 bracket (openDirAt o_PATH parent prep) c_close
                     (addPathAt flags wtch prep)
 
-    list cfg wd reported childMode =
+    list wd reported =
         withWatchFlags cfg wtch wd prep
             $ handleSubdirError wtch prep
             $ S.bracketIO
                 (openDirStreamAt parent prep)
                 (ReadDir.closeDirStream . snd)
             $ \(fd, ds) ->
-                S.mapM (node fd reported childMode) (readEntries prep ds)
+                S.mapM (node fd reported) (readEntries prep ds)
 
-    node fd reported childMode (Left dir) = do
+    node fd reported (Left dir) = do
         let path = addSub prep dir
         children <-
             skipSubdir wtch path S.nil
-                (scanChildren wtch childMode (Just (fd, dir)) path)
+                (scanChildren
+                    wtch reported (subdirConfig cfg) (Just (fd, dir)) path)
         return $ ScanNode reported (ScannedEntry True path) children
-    node _ reported _ (Right file) =
+    node _ reported (Right file) =
         return
             $ ScanNode reported (ScannedEntry False (addSub prep file)) S.nil
 
@@ -1775,9 +1760,10 @@ scanChildren wtch mode parent prep =
 --
 -- A directory is opened when the walk reaches it and closed when its stream
 -- ends, a walk holds one open directory for each level of the tree.
-scanTree :: Watch -> ScanMode -> PathRep -> IO (Stream IO ScannedEntry)
-scanTree wtch mode prep = do
-    top <- scanChildren wtch mode Nothing prep
+scanTree ::
+    Watch -> Bool -> Config -> PathRep -> IO (Stream IO ScannedEntry)
+scanTree wtch reportAll cfg prep = do
+    top <- scanChildren wtch reportAll cfg Nothing prep
     return
         $ fmap snEntry
         $ S.filter snReported
@@ -1788,25 +1774,29 @@ scanTree wtch mode prep = do
 
 -- | Walk the tree of a directory already watched, add the subdirectories that
 -- are not watched and return the entries found in them, or all the entries if
--- @isNew0@ is 'True'. The watches are changed the same way as in 'restartDir',
--- the listing does not generate any events on the watches of the tree.
+-- @reportAll@ is 'True'. The watches are changed the same way as in
+-- 'restartDir', the listing does not generate any events on the watches of
+-- the tree.
 -- Listing the directory generates the open, access and close events of its
 -- parent, which are reported if they are enabled. See 'scanTree'.
 rescanDir :: Bool -> Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-rescanDir isNew0 cfg wtch = scanTree wtch (ScanRescan isNew0 cfg)
+rescanDir reportAll cfg wtch = scanTree wtch reportAll cfg
 
 -- | Add a directory reported by IN_CREATE or IN_MOVED_TO and return the
 -- entries in it. The watch is added before the directory is read, an entry
 -- created later is either found by the scan or reported by the kernel, or
 -- both. See 'scanTree'.
 --
--- A directory already watched is walked by 'rescanDir' and returns all its
--- entries too. The scan that added it may have reported them before an
--- IN_DELETE of the path, for example, in mkdir a; rmdir a; mkdir a, all done
--- before the events are read, the first IN_CREATE adds and scans the second
--- a, and the consumer removes its entries on the IN_DELETE.
+-- The tree is walked by 'rescanDir' with @reportAll@ 'True'. A directory
+-- already watched returns all its entries too. The scan that added it may
+-- have reported them before an IN_DELETE of the path, for example, in mkdir
+-- a; rmdir a; mkdir a, all done before the events are read, the first
+-- IN_CREATE adds and scans the second a, and the consumer removes its entries
+-- on the IN_DELETE.
 addNewDir :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
-addNewDir cfg wtch = scanTree wtch (ScanNew cfg)
+addNewDir cfg wtch prep =
+    skipSubdir wtch prep S.nil
+        $ rescanDir True (subdirConfig cfg) wtch prep
 
 -- | Whether the entries found by 'addNewDir' are reported.
 reportsScan :: Config -> Bool
