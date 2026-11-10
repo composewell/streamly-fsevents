@@ -2999,26 +2999,31 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
     mkSynthEvent (SynthUnwatched wd pRep) =
         mkEvent (fromIntegral wd) iN_IGNORED pRep
 
-    -- The events recorded by 'recordSynthEvents'. Those recorded by
-    -- 'openWatch', 'addToWatch' or 'removeFromWatch' are reported before the
-    -- next event, those recorded while handling an event are reported after
-    -- the entries found by its scan.
-    synthEvents =
+    -- The events recorded by 'recordSynthEvents'.
+    readSynthVar =
         S.concatEffect
             (S.fromList . map mkSynthEvent <$> takeSynthEvents wtch)
 
-    -- A read returns whole events, the events of a read are parsed on their
-    -- own. An empty read reports the synthetic events.
-    readChunk arr =
-        S.concatMap (`S.append` synthEvents)
-            (S.catRights $ S.parseMany (readOneEvent cfg wtch) $ A.read arr)
-            `S.append` synthEvents
+    getKernelArrays = S.unfoldrM (\() -> fmap (, ()) <$> readEvents wtch) ()
 
+    -- A group is the events of one kernel event followed by the entries
+    -- found by its scan. A read returns whole events, the events of a read
+    -- are parsed on their own. Each read starts with an empty group, a read
+    -- woken up by a synthetic event returns no kernel events.
+    readGroups arr =
+        S.cons S.nil
+            $ S.catRights
+            $ S.parseMany (readOneEvent cfg wtch) (A.read arr)
+
+    -- The synthetic events are reported before each group. Those recorded by
+    -- 'openWatch', 'addToWatch' or 'removeFromWatch' are reported before the
+    -- next event, those recorded while handling an event are reported after
+    -- the entries found by its scan. 'readEvents' does not wait if a
+    -- synthetic event is pending.
     events =
         StreamK.fromStream
-            $ S.append synthEvents
-            $ S.concatMap readChunk
-            $ S.unfoldrM (\() -> fmap (, ()) <$> readEvents wtch) ()
+            $ S.concatMap (S.append readSynthVar)
+            $ S.concatMap readGroups getKernelArrays
 
     -- The step runs with async exceptions masked. An exception can arrive
     -- only where the step blocks, the rest of the events is then left as it
