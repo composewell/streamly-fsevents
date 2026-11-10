@@ -1502,23 +1502,23 @@ subdirConfig = setOnlyDir True . setFollowSymLinks False
 
 -- | Return the default value if the action fails because the subdirectory
 -- does not exist, is not a directory, or if the watch is closed.
-ignoreSubdirError :: Watch -> a -> IO a -> IO a
-ignoreSubdirError wtch def action =
+ignoreInvalid :: Watch -> a -> IO a -> IO a
+ignoreInvalid wtch def action =
     action `catchIOError` \e -> do
         closed <- isWatchClosed wtch
         if isNotSubdirError e || closed
         then return def
         else ioError e
 
--- | Like 'ignoreSubdirError', and also return the default value if the
+-- | Like 'ignoreInvalid', and also return the default value if the
 -- action fails because of a permission error on the subdirectory @pRep@. The
 -- subdirectory is recorded by 'recordDenied' then. The tree under it is not
 -- watched, its entries are not reported by a scan.
 --
 -- A subdirectory created in the tree with mode 000 by any user who can write
 -- to its parent would otherwise end the watch of the whole tree.
-skipSubdir :: Watch -> PathRep -> a -> IO a -> IO a
-skipSubdir wtch pRep def action =
+ignoreInvalidOrInaccessible :: Watch -> PathRep -> a -> IO a -> IO a
+ignoreInvalidOrInaccessible wtch pRep def action =
     action `catchIOError` \e -> do
         closed <- isWatchClosed wtch
         if isNotSubdirError e || closed
@@ -1527,14 +1527,14 @@ skipSubdir wtch pRep def action =
         then def <$ recordDenied wtch pRep
         else ioError e
 
--- | Like 'skipSubdir' for the generation of a stream. The stream ends if it
--- raises an exception because the subdirectory @pRep@ does not exist, is not
--- a directory, cannot be listed because of a permission error, or if the
--- watch is closed.
-handleSubdirError :: Watch -> PathRep -> Stream IO a -> Stream IO a
-handleSubdirError wtch pRep =
+-- | Like 'ignoreInvalidOrInaccessible' for the generation of a stream. The
+-- stream ends if it raises an exception because the subdirectory @pRep@ does
+-- not exist, is not a directory, cannot be listed because of a permission
+-- error, or if the watch is closed.
+handleInvalidOrInaccessible :: Watch -> PathRep -> Stream IO a -> Stream IO a
+handleInvalidOrInaccessible wtch pRep =
     S.handle $ \(e :: IOError) ->
-        S.nil <$ skipSubdir wtch pRep () (ioError e)
+        S.nil <$ ignoreInvalidOrInaccessible wtch pRep () (ioError e)
 
 -- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
 -- the parent is given.
@@ -1585,7 +1585,7 @@ addToWatchAt cfg@Config{..} watch0 parent pRep = do
     --
     -- A root that cannot be added or listed because of a permission error
     -- raises the exception. A subdirectory is skipped and reported as
-    -- 'isAccessDenied', see 'skipSubdir'.
+    -- 'isAccessDenied', see 'ignoreInvalidOrInaccessible'.
     --
     wd <- withAddedDir (scanFlags cfg) watch0 parent pRep
         $ \(wd, isNew) dir -> do
@@ -1622,7 +1622,7 @@ addSubdirs ::
 addSubdirs cfg wtch pRep (dirFd, ds) =
     forSubdirs pRep ds $ \name -> do
         let sub = addSub pRep name
-        skipSubdir wtch sub ()
+        ignoreInvalidOrInaccessible wtch sub ()
             $ addToWatchAt (subdirConfig cfg) wtch (Just (dirFd, name)) sub
 
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
@@ -1649,14 +1649,15 @@ addToWatch cfg wtch = addToWatchAt cfg wtch Nothing
 -- watch is added. Its parent reports the deletion or the move. The watch may
 -- be closed by another thread while the event stream adds a subdirectory.
 -- A subdirectory that cannot be added because of a permission error is
--- skipped, see 'skipSubdir'.
+-- skipped, see 'ignoreInvalidOrInaccessible'.
 --
 -- The subdirectory is added with 'setOnlyDir' and without
 -- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO ()
 addSubdirToWatch cfg wtch pRep =
-    skipSubdir wtch pRep () (addToWatch (subdirConfig cfg) wtch pRep)
+    ignoreInvalidOrInaccessible wtch pRep ()
+        (addToWatch (subdirConfig cfg) wtch pRep)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
@@ -1684,7 +1685,7 @@ withWatchFlags cfg wtch wd pRep
     | otherwise =
         S.finallyIO
             $ void
-            $ ignoreSubdirError wtch False
+            $ ignoreInvalid wtch False
             $ updateWatch (watchFlags cfg) wtch wd pRep
 
 -- | Add the watch of a directory with 'scanFlags' and return the stream of its
@@ -1725,7 +1726,7 @@ scanChildren wtch reportAll cfg parent pRep = do
 
     list wd reported =
         withWatchFlags cfg wtch wd pRep
-            $ handleSubdirError wtch pRep
+            $ handleInvalidOrInaccessible wtch pRep
             $ S.bracketIO
                 (openDirStreamAt parent pRep)
                 (ReadDir.closeDirStream . snd)
@@ -1735,7 +1736,7 @@ scanChildren wtch reportAll cfg parent pRep = do
     node fd reported (Left dir) = do
         let path = addSub pRep dir
         children <-
-            skipSubdir wtch path S.nil
+            ignoreInvalidOrInaccessible wtch path S.nil
                 (scanChildren
                     wtch reported (subdirConfig cfg) (Just (fd, dir)) path)
         return $ ScanNode reported (ScannedEntry True path) children
@@ -1795,7 +1796,7 @@ rescanDir reportAll cfg wtch = scanTree wtch reportAll cfg
 -- on the IN_DELETE.
 addNewDir :: Config -> Watch -> PathRep -> IO (Stream IO ScannedEntry)
 addNewDir cfg wtch pRep =
-    skipSubdir wtch pRep S.nil
+    ignoreInvalidOrInaccessible wtch pRep S.nil
         $ rescanDir True (subdirConfig cfg) wtch pRep
 
 -- | Whether the entries found by 'addNewDir' are reported.
@@ -2234,7 +2235,7 @@ restartDir cfg wtch seen added parent pRep = do
 
     restartSubdir fd name = do
         let sub = addSub pRep name
-        skipSubdir wtch sub ()
+        ignoreInvalidOrInaccessible wtch sub ()
             $ restartDir
                 (subdirConfig cfg) wtch seen added (Just (fd, name)) sub
 
@@ -2255,7 +2256,7 @@ liveRoots m =
 -- watch descriptor. The flags of the watch are set to 'watchFlags'.
 isRootAt :: Config -> Watch -> (Int, PathRep) -> IO Bool
 isRootAt cfg wtch (wd, pRep) =
-    ignoreSubdirError wtch False $ updateWatch (watchFlags cfg) wtch wd pRep
+    ignoreInvalid wtch False $ updateWatch (watchFlags cfg) wtch wd pRep
 
 -- | Remove the roots whose path no longer refers to the watched object, and
 -- the paths under them. Such a root was renamed, deleted or replaced. Its
@@ -2341,7 +2342,7 @@ restartTree cfg wtch@(Watch _ _ wdMapRef _ _) = do
     restartRoot seen added root@(_, pRep) = do
         same <- isRootAt cfg wtch root
         when same
-            $ ignoreSubdirError wtch ()
+            $ ignoreInvalid wtch ()
                 (restartDir cfg wtch seen added Nothing pRep)
         return same
 
@@ -2474,7 +2475,7 @@ addMovedDir cfg wtch@(Watch _ _ wdMapRef _ _) to = do
     reused <- atomicModifyIORef' wdMapRef takeStale
     if reused || reportsScan cfg
     then
-        skipSubdir wtch to S.nil
+        ignoreInvalidOrInaccessible wtch to S.nil
             (rescanDir (reportsScan cfg) (subdirConfig cfg) wtch to)
     else addDirWithScan cfg wtch to
 
@@ -2558,12 +2559,12 @@ renameDir ::
     -> IO (Stream IO ScannedEntry)
 renameDir cfg wtch@(Watch _ _ wdMapRef _ _) (wd, from) to = do
     r <-
-        ignoreSubdirError wtch ProbeOther
+        ignoreInvalid wtch ProbeOther
             $ probeWatch (watchFlags subCfg) wtch wd to
     case r of
         ProbeSame -> do
             atomicModifyIORef' wdMapRef (\m -> (renamePaths from to m, ()))
-            skipSubdir wtch to S.nil
+            ignoreInvalidOrInaccessible wtch to S.nil
                 (rescanDir (reportsScan cfg) subCfg wtch to)
         ProbeMissing -> do
             atomicModifyIORef' wdMapRef
