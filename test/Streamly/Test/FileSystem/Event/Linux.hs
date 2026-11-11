@@ -18,6 +18,7 @@ import Control.Exception
     )
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.&.))
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf, nub, sort)
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
@@ -1397,6 +1398,30 @@ readAfterTimeout desc cfg =
             createFile file
             evs <- readUntil cfg (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
+
+-- The events of the files are queued before the first read. The reads time
+-- out after 1 to 200 us, some timeouts arrive while a step produces an
+-- event. The last read collects the remaining events.
+readTimeoutsNoLoss :: Spec
+readTimeoutsNoLoss =
+    it "does not lose an event when the reads time out repeatedly" $ do
+        pendingWith
+            $ "an event is lost if the timeout arrives during the step "
+            ++ "that produces it, see dev/design-issues.md"
+        withRoot recCfg $ \root w -> do
+            let files =
+                    [root </> ("file" ++ show i) | i <- [1 .. 2000 :: Int]]
+            ref <- newIORef []
+            let collect ev = modifyIORef' ref (ev :)
+                drain t =
+                    timeout t
+                        $ Stream.fold (Fold.drainMapM collect)
+                        $ Event.watchToStream recCfg w
+            mapM_ createFile files
+            mapM_ (\i -> drain (1 + i `mod` 200)) [1 .. 2000 :: Int]
+            _ <- drain 500000
+            created <- kernelCreated <$> readIORef ref
+            filter (`notElem` created) files `shouldBe` []
 
 -- The directory cannot be added without a free fd. Its create event is
 -- reported, followed by the exception. The events of the files were read
@@ -2911,6 +2936,7 @@ watchTests =
                 killRepeatedly
                 killConsumer
                 abandonStream
+                readTimeoutsNoLoss
                 readAfterTimeout "all events" recCfg
                 readAfterTimeout "default events"
                     (Event.setRecursiveMode True Event.defaultConfig)
