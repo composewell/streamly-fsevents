@@ -1247,24 +1247,57 @@ addWatchByPath fd flags pRep =
 
     absPath = combinePathRep pRep
 
+foreign import ccall unsafe "unistd.h readlink"
+    c_readlink :: CString -> CString -> CSize -> IO CSsize
+
+-- | Whether a @\/proc\/self\/fd\/N@ link can be read. Reading the link needs
+-- access to @\/proc@, it does not need any permission on the file that the
+-- fd refers to.
+isProcLinkReadable :: String -> IO Bool
+isProcLinkReadable path =
+    withCString path $ \pathPtr ->
+        allocaArray 1 $ \buf -> (/= -1) <$> c_readlink pathPtr buf 1
+
 -- | Call inotify_add_watch on a subdirectory opened by 'openDirAt', using its
 -- fd. See 'addWatchFor'.
 addWatchViaFd :: CInt -> Word32 -> PathRep -> CInt -> IO CInt
 addWatchViaFd fd flags pRep dirFd = do
-    -- /proc/self/fd/N must be followed to reach the directory. The directory
-    -- has been opened with O_NOFOLLOW.
+    -- The watch is added through the fd of the directory, not its path, so
+    -- a symbolic link in the path is not followed. The directory has been
+    -- opened by 'openDirAt' without following symbolic links. The link
+    -- /proc/self/fd/N itself must be followed to reach the directory.
     wd <-
-        withCString ("/proc/self/fd/" ++ show dirFd) $ \pathPtr ->
+        withCString procPath $ \pathPtr ->
             c_inotify_add_watch fd pathPtr
                 (CUInt (flags .&. complement iN_DONT_FOLLOW))
     errno <- getErrno
     if wd /= -1
     then return wd
-    -- ENOENT: /proc is not mounted. EACCES: a security policy, e.g.
-    -- AppArmor or Landlock, denies access to /proc.
+    -- ENOENT: /proc is not mounted. EACCES: access to /proc is denied, for
+    -- example, by a security policy, or the directory has no read
+    -- permission. The watch is added by path only if the /proc link cannot
+    -- be read. If EACCES always fell back to the path, any user who can
+    -- write to a directory in the tree could reach the fallback by creating
+    -- a directory without read permission, and replace its parent before
+    -- the call: @mkdir -m 000 u/a/secret; mv u/a u/b; ln -s /outside u/a@
+    -- would watch @/outside/secret@.
     else if errno == eNOENT || errno == eACCES
-    then addWatchByPath fd flags pRep
-    else
+    then do
+        hasProc <- isProcLinkReadable procPath
+        if hasProc
+        then failWith errno
+        -- The flaw of adding by path: inotify_add_watch resolves the path
+        -- again and follows a symbolic link in any component but the last.
+        -- A parent replaced by a link since the directory was opened
+        -- redirects the watch, possibly to a directory outside the tree.
+        else addWatchByPath fd flags pRep
+    else failWith errno
+
+    where
+
+    procPath = "/proc/self/fd/" ++ show dirFd
+
+    failWith errno =
         ioError
             $ errnoToIOError
                 ("addToWatch: " ++ Path.toString (combinePathRep pRep))
@@ -1284,7 +1317,8 @@ addWatchViaFd fd flags pRep dirFd = do
 -- A root is added using its path, a symbolic link can be used to reach a root.
 -- If @\/proc@ is not mounted, or access to it is denied, a subdirectory is
 -- also added using its path, the check of the components by 'openDirAt'
--- still applies.
+-- still applies. A subdirectory without read permission fails with EACCES
+-- when @\/proc@ is available, it is not added by path.
 addWatchFor :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchFor fd flags pRep =
     case pRep of

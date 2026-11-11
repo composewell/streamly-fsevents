@@ -37,6 +37,9 @@
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
+- Linux: in recursive mode, a subdirectory without read permission is no
+  longer added to the watch by its path. The path could be changed to go
+  through a symbolic link to a directory outside the watched tree.
 - Linux: in recursive mode with `setFollowSymLinks False`, the directory
   tree of the target of a symbolic link root is no longer watched.
 - macOS: fix a link failure of `setFullHistory`.
