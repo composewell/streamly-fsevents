@@ -116,7 +116,7 @@ import Control.Concurrent.MVar
     , withMVar
     )
 import Control.Exception (bracket, finally, onException, try)
-import Control.Monad (void, when)
+import Control.Monad (mapAndUnzipM, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.Functor.Identity (runIdentity)
@@ -2732,7 +2732,7 @@ movedInDir cfg wtch@Watch {watchWdMap = wdMapRef} cookie paths = do
                         Nothing -> (,) [] <$> addMovedDir cfg wtch to
     let goneOut = map snd (drop (length movedIn) movedOut)
     removed <- concat <$> mapM (unwatchSubtree wtch) goneOut
-    (moved, scans) <- unzip <$> mapM moveTo paths
+    (moved, scans) <- mapAndUnzipM moveTo paths
     return (removed ++ concat moved, concatStreams scans)
 
 -- | The IN_MOVED_TO and IN_MOVE_SELF events of a directory that reported
