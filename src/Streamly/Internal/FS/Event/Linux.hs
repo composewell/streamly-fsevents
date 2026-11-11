@@ -112,10 +112,11 @@ where
 
 import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
-    ( MVar, modifyMVar, modifyMVarMasked, modifyMVar_, newMVar, readMVar
+    ( MVar, modifyMVar, modifyMVar_, newMVar, putMVar, readMVar, takeMVar
     , withMVar
     )
-import Control.Exception (bracket, finally, onException, try)
+import Control.Exception
+    (SomeException, bracket, finally, onException, throwIO, try)
 import Control.Monad (mapAndUnzipM, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
@@ -158,7 +159,8 @@ import System.Posix.Types (CSsize(..), Fd(..))
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
 
-import qualified Control.Exception as Exception (mask, uninterruptibleMask_)
+import qualified Control.Exception as Exception
+    (interruptible, mask, mask_, uninterruptibleMask_)
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.IntMap.Strict as StrictMap (map)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -965,6 +967,17 @@ data Event = Event
    , eventScanned :: Bool
    }
 
+-- | An item of the event stream kept in a 'Watch', see 'watchToStream'.
+data StreamItem =
+      ItemEvent Event
+      -- | No event is available. The action waits for an event. It is run
+      -- after the rest of the stream is saved in the 'Watch', an async
+      -- exception that interrupts the wait does not change the stream.
+    | ItemWait (IO ())
+      -- | An operation of the event stream failed. The exception is raised
+      -- to the reader after the rest of the stream is saved in the 'Watch'.
+    | ItemFailed IOException
+
 -- | A handle for a watch.
 --
 data Watch = Watch
@@ -981,7 +994,7 @@ data Watch = Watch
       -- reads of the fd still to be made. 'Nothing' until the first event
       -- is taken. A stream that stops reading leaves the rest here, the
       -- next stream on the watch continues from it.
-    , watchUndelivered :: MVar (Maybe (Stream IO Event))
+    , watchUndelivered :: MVar (Maybe (Stream IO StreamItem))
       -- | The synthetic events, most recent first. A thread waiting for
       -- events in the threaded RTS is woken up when one is added.
     , watchSynthEvents :: TVar [SynthEvent]
@@ -1605,16 +1618,6 @@ ignoreInvalidOrInaccessible wtch def denied action =
         then return denied
         else ioError e
 
--- | Like 'ignoreInvalidOrInaccessible' for the generation of a stream. If the
--- stream raises an exception because the subdirectory does not exist, is not
--- a directory, or if the watch is closed, the stream ends. If the
--- subdirectory cannot be listed because of a permission error, the stream
--- ends with the given element.
-handleInvalidOrInaccessible :: Watch -> a -> Stream IO a -> Stream IO a
-handleInvalidOrInaccessible wtch denied =
-    S.handle $ \(e :: IOError) ->
-        ignoreInvalidOrInaccessible wtch S.nil (S.fromPure denied) (ioError e)
-
 -- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
 -- the parent is given. Returns the subdirectories not added or not listed
 -- because of a permission error, in the order they were found.
@@ -1766,6 +1769,13 @@ data ScanItem =
       -- | A subdirectory not added or not listed because of a permission
       -- error, reported as 'isAccessDenied'.
     | ScanDenied PathRep
+      -- | An operation of the scan failed, for example, the process has no
+      -- free fd or has reached the max_user_watches limit. The event stream
+      -- raises the exception when it reads the item. The scan continues
+      -- after the item, the stream of a scan does not raise an exception.
+      -- An exception raised in the middle of a listing would leave a closed
+      -- directory in the part of the stream already saved in the 'Watch'.
+    | ScanFailed IOException
 
 -- | An item found by the walk of a scan, whether it is reported, and the
 -- items under it, empty for a file. The watch of a directory is added
@@ -1782,16 +1792,40 @@ data ScanNode = ScanNode
 deniedNode :: PathRep -> ScanNode
 deniedNode pRep = ScanNode True (ScanDenied pRep) S.nil
 
+-- | The node of a failed operation of the scan, it is always reported.
+failedNode :: IOException -> ScanNode
+failedNode e = ScanNode True (ScanFailed e) S.nil
+
+-- | Handle an exception raised by the listing of a subdirectory. If the
+-- subdirectory does not exist, is not a directory, or if the watch is closed,
+-- the stream ends. If the subdirectory cannot be listed because of a
+-- permission error, the stream ends with its 'deniedNode'. Any other
+-- 'IOException' ends the stream with its 'failedNode'.
+handleListing :: Watch -> PathRep -> Stream IO ScanNode -> Stream IO ScanNode
+handleListing wtch pRep =
+    S.handle $ \(e :: IOException) ->
+        ignoreInvalidOrInaccessible
+            wtch S.nil (S.fromPure (deniedNode pRep)) (ioError e)
+            `catchIOError` (return . S.fromPure . failedNode)
+
 -- | Change the flags of the watch of a directory to 'watchFlags' when the
--- stream ends, raises an exception, or is garbage collected without being
--- read to the end.
+-- stream ends. A failure follows the stream as a 'failedNode'.
 withWatchFlags ::
-    Config -> Watch -> Int -> PathRep -> Stream IO a -> Stream IO a
-withWatchFlags cfg wtch wd pRep
-    | scanFlags cfg == watchFlags cfg = id
-    | otherwise =
-        S.finallyIO
-            $ void
+       Config
+    -> Watch
+    -> Int
+    -> PathRep
+    -> Stream IO ScanNode
+    -> Stream IO ScanNode
+withWatchFlags cfg wtch wd pRep stream
+    | scanFlags cfg == watchFlags cfg = stream
+    | otherwise = stream `S.append` restoreFlags
+
+    where
+
+    restoreFlags =
+        S.handle (return . S.fromPure . failedNode)
+            $ S.nilM
             $ ignoreInvalid wtch False
             $ updateWatch (watchFlags cfg) wtch wd pRep
 
@@ -1811,6 +1845,8 @@ withWatchFlags cfg wtch wd pRep
 -- the walk added the directory, and then @reportAll@ is 'True' for its
 -- subdirectories. The watch is added without IN_MASK_ADD, the mask of a
 -- directory already watched is replaced with 'scanFlags'.
+--
+-- The stream does not raise an 'IOException', see 'ScanFailed'.
 scanChildren ::
        Watch
     -> Bool
@@ -1833,13 +1869,18 @@ scanChildren wtch reportAll cfg parent pRep = do
 
     list wd reported =
         withWatchFlags cfg wtch wd pRep
-            $ handleInvalidOrInaccessible wtch (deniedNode pRep)
+            $ handleListing wtch pRep
             $ S.bracketIO
                 (openDirStreamAt (scanFlags cfg) parent pRep)
-                (ReadDir.closeDirStream . snd)
+                (closeDir . snd)
             $ \(fd, ds) ->
                 S.mapM (node fd reported) (readEntries pRep ds)
 
+    -- closedir releases the directory stream even if it fails.
+    closeDir ds = ReadDir.closeDirStream ds `catchIOError` \_ -> return ()
+
+    -- A failure to add a subdirectory is returned as a node, the listing
+    -- continues with the next entry.
     node fd reported (Left dir) = do
         let path = addSub pRep dir
         children <-
@@ -1847,6 +1888,7 @@ scanChildren wtch reportAll cfg parent pRep = do
                 wtch S.nil (S.fromPure (deniedNode path))
                 (scanChildren
                     wtch reported (subdirConfig cfg) (Just (fd, dir)) path)
+                `catchIOError` (return . S.fromPure . failedNode)
         return $ ScanNode reported (found True path) children
     node _ reported (Right file) =
         return $ ScanNode reported (found False (addSub pRep file)) S.nil
@@ -2824,8 +2866,58 @@ synthEvent (SynthDenied pRep) =
 synthEvent (SynthUnwatched wd pRep) =
     mkSynth (fromIntegral wd) iN_IGNORED pRep
 
+-- | A kernel event read from the fd of a watch: the watch descriptor, the
+-- flags, the cookie and the name.
+data RawEvent = RawEvent CInt Word32 Word32 (Maybe Path)
+
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
+{-# INLINE readOneEvent #-}
+readOneEvent :: Parser Word8 IO RawEvent
+readOneEvent = do
+    -- XXX the header format is implicit in the code, this could be bug prone.
+    let headerLen = sizeOf (undefined :: CInt) + 12
+    arr <- PR.takeEQ headerLen (A.createOf headerLen)
+    (ewd, eflags, cookie, pathLen) <-
+        PR.fromEffect $ A.unsafePinnedAsPtr arr readHeader
+    mpth <-
+        if pathLen /= 0
+        then do
+            arr1 <- PR.takeEQ pathLen (A.createOf pathLen)
+            -- The name is null terminated and null padded to pathLen bytes.
+            let pth = fst (A.breakEndBy_ (== 0) arr1)
+            return $ Just (Path.unsafeFromArray pth)
+        else return Nothing
+    return (RawEvent ewd eflags cookie mpth)
+
+    where
+
+    readHeader (ptr :: Ptr Word8) _ = do
+        let len = sizeOf (undefined :: CInt)
+        ewd :: CInt <- peek (castPtr ptr)
+        eflags <- peekByteOff ptr len
+        cookie <- peekByteOff ptr (len + 4)
+        pathLen :: Word32 <- peekByteOff ptr (len + 8)
+        return (ewd, eflags, cookie, fromIntegral pathLen)
+
+-- | Run the action of a kernel event. Returns the given events of the kernel
+-- event followed by the stream returned by the action. If the action raises
+-- an 'IOException', the exception follows the events as an 'ItemFailed'.
+--
+-- The action runs before any of the events is returned. An exception raised
+-- by the action itself would reach the reader before the events read from the
+-- fd along with this kernel event are saved in the 'Watch', and those events
+-- would be lost.
+withEffects ::
+    [Event] -> IO (Stream IO StreamItem) -> IO (Stream IO StreamItem)
+withEffects evs action = do
+    r <- try action
+    return
+        $ S.fromList (map ItemEvent evs)
+        `S.append` either (S.fromPure . ItemFailed) id r
+
+-- | Handle a kernel event: change the watches and the map, and return the
+-- events to report.
 --
 -- An event is reported once for each path of its watch descriptor. An
 -- IN_IGNORED event removes its watch descriptor from the map, the event
@@ -2838,22 +2930,13 @@ synthEvent (SynthUnwatched wd pRep) =
 -- IN_IGNORED event may have been dropped. The marker is queued after
 -- 'restartTree', which can remove more paths.
 --
-{-# INLINE readOneEvent #-}
-readOneEvent :: Config -> Watch -> Parser Word8 IO (Stream IO Event)
-readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
-    -- XXX the header format is implicit in the code, this could be bug prone.
-    let headerLen = sizeOf (undefined :: CInt) + 12
-    arr <- PR.takeEQ headerLen (A.createOf headerLen)
-    (ewd, eflags, cookie, pathLen) <- PR.fromEffect $ A.unsafePinnedAsPtr arr readHeader
-    mpth <-
-        if pathLen /= 0
-        then do
-            arr1 <- PR.takeEQ pathLen (A.createOf pathLen)
-            -- The name is null terminated and null padded to pathLen bytes.
-            let pth = fst (A.breakEndBy_ (== 0) arr1)
-            return $ Just (Path.unsafeFromArray pth)
-        else return Nothing
-    wdm <- PR.fromEffect $ readIORef wdMapRef
+-- An 'IOException' raised while handling the event is returned as an
+-- 'ItemFailed' after the events of the kernel event, see 'withEffects'. The
+-- rest of the handling of that kernel event is skipped.
+handleEvent :: Config -> Watch -> RawEvent -> IO (Stream IO StreamItem)
+handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
+    let wdMapRef = watchWdMap wtch
+    wdm <- readIORef wdMapRef
     let mkEvent wd (root, rel) =
             Event
                 { eventWd = wd
@@ -2863,14 +2946,16 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
                 , eventRelPath = rel
                 , eventScanned = False
                 }
-        mkScanned (ScanFound ScannedEntry{..}) =
-            (mkEvent ewd sePath)
-                { eventFlags =
-                    if seIsDir then iN_CREATE .|. iN_ISDIR else iN_CREATE
-                , eventCookie = 0
-                , eventScanned = True
-                }
-        mkScanned (ScanDenied pRep) = synthEvent (SynthDenied pRep)
+        scanItem (ScanFound ScannedEntry{..}) =
+            ItemEvent
+                (mkEvent ewd sePath)
+                    { eventFlags =
+                        if seIsDir then iN_CREATE .|. iN_ISDIR else iN_CREATE
+                    , eventCookie = 0
+                    , eventScanned = True
+                    }
+        scanItem (ScanDenied pRep) = ItemEvent (synthEvent (SynthDenied pRep))
+        scanItem (ScanFailed e) = ItemFailed e
         mkUnwatched (wd, pRep) = synthEvent (SynthUnwatched wd pRep)
         -- A directory added by 'restartTree', reported like a directory found
         -- by a scan.
@@ -2881,6 +2966,7 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
                 , eventScanned = True
                 }
         isIgnored = eflags .&. iN_IGNORED /= 0
+        events = S.fromList . map ItemEvent
     -- The kernel event queue overflowed and events were dropped. The overflow
     -- event is not tied to a watch, its wd is -1. Report one overflow event
     -- per watch root, so that the consumer knows that events may be missing
@@ -2894,7 +2980,13 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
     -- roots are checked, see 'unwatchGoneRoots'.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
-        (added, denied, removed) <- PR.fromEffect $ do
+        let lost =
+                [ mkEvent (fromIntegral wd) (wpRep wp)
+                | (wd, WdUser wps) <- Map.toList wdm
+                , wp <- wps
+                , isNothing (getRepSub (wpRep wp))
+                ]
+        withEffects lost $ do
             moved <- unwatchMoved wtch
             (added, denied, removed) <-
                 if watchRec cfg && restartOnOverflow cfg
@@ -2906,28 +2998,21 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
                             `catchIOError` \_ -> return []
                     return ([], [], gone)
             synced <- syncRemovals wtch
-            return (added, denied, moved ++ removed ++ synced)
-        return
-            $ S.fromList
-            $ [ mkEvent (fromIntegral wd) (wpRep wp)
-              | (wd, WdUser wps) <- Map.toList wdm
-              , wp <- wps
-              , isNothing (getRepSub (wpRep wp))
-              ]
-            ++ map mkRestarted added
-            ++ map (synthEvent . SynthDenied) denied
-            ++ map mkUnwatched removed
+            return
+                $ events
+                $ map mkRestarted added
+                ++ map (synthEvent . SynthDenied) denied
+                ++ map mkUnwatched (moved ++ removed ++ synced)
     else
         case Map.lookup (fromIntegral ewd) wdm of
             Nothing -> return S.nil
             Just (WdMarker markers paths)
                 | isIgnored -> do
                     removed <-
-                        PR.fromEffect
-                            $ atomicModifyIORef' wdMapRef
+                        atomicModifyIORef' wdMapRef
                             $ removeListed (fromIntegral ewd : markers) paths
                     return
-                        $ S.fromList
+                        $ events
                             [ mkEvent (fromIntegral wd) pRep
                             | (wd, pRep) <- removed
                             ]
@@ -2947,73 +3032,13 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
                     isDirDeleted = isDirEv && eflags .&. iN_DELETE /= 0
                     -- The paths removed without a marker are reported
                     -- after the event and its scan.
-                    effectIf c action =
-                        if c then PR.fromEffect action else return []
+                    effectIf c action = if c then action else return []
                     unwatchAll = fmap concat . mapM (unwatchSubtree wtch)
-                -- See the NOTE above 'markPending'.
-                removedPending <-
-                    effectIf (watchRec cfg && (isDirMovedOut || isDirDeleted))
-                        $ atomicModifyIORef' wdMapRef (takeNamedPending live)
-                            >>= unwatchAll
-                when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
-                    $ PR.fromEffect
-                    $ atomicModifyIORef' wdMapRef
-                    $ \m -> (clearPending (fromIntegral ewd) m, ())
-                -- See the NOTE above 'clearMoved'.
-                when (watchRec cfg && isDirMovedOut)
-                    $ PR.fromEffect
-                    $ atomicModifyIORef' wdMapRef
-                    $ \m -> (markMoved cookie live m, ())
-                -- Assumes that IN_MOVED_TO is queued before IN_MOVE_SELF, see
-                -- the IMPORTANT note above 'clearMoved'.
-                removedMoved <-
-                    effectIf (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
-                        $ unwatchAll
-                            [ wpRep wp
-                            | wp <- wps
-                            , not (wpRemoved wp)
-                            , isJust (wpMoveCookie wp)
-                            ]
-                removedRoots <-
-                    effectIf (eflags .&. iN_MOVE_SELF /= 0)
-                        $ unwatchGoneRoots cfg wtch
-                            [ (fromIntegral ewd, wpRep wp)
-                            | wp <- wps
-                            , not (wpRemoved wp)
-                            , isNothing (getRepSub (wpRep wp))
-                            ]
-                -- The watch of a new directory is added before its event is
-                -- delivered. The watches of the tree under it are added when
-                -- the stream of the scan is read, before the next event is
-                -- parsed. If the entries are not reported, all the watches
-                -- are added now.
-                (removedOut, scan) <-
-                    PR.fromEffect
-                        $ if watchRec cfg && isDirCreated
-                          then
-                            (,) [] . concatStreams
-                                <$> mapM (addDirWithScan cfg wtch) live
-                          else if watchRec cfg && isDirMovedIn
-                          then movedInDir cfg wtch cookie live
-                          else return ([], S.nil)
-                -- The denied subdirectories are reported even if the
-                -- entries are not.
-                scanned <-
-                    if reportsScan cfg
-                    then return scan
-                    else
-                        fmap S.fromList
-                            $ PR.fromEffect
-                            $ S.toList
-                            $ S.filter isDenied scan
-                when isIgnored
-                    $ PR.fromEffect
-                    $ atomicModifyIORef' wdMapRef
-                    $ \m -> (Map.delete (fromIntegral ewd) m, ())
-                -- The parent of a subdirectory reports its deletion and move
-                -- as IN_DELETE and IN_MOVED_FROM, the IN_DELETE_SELF and
-                -- IN_MOVE_SELF events are reported for the roots only.
-                let isSelfEvent =
+                    -- The parent of a subdirectory reports its deletion and
+                    -- move as IN_DELETE and IN_MOVED_FROM, the
+                    -- IN_DELETE_SELF and IN_MOVE_SELF events are reported
+                    -- for the roots only.
+                    isSelfEvent =
                         eflags .&. (iN_DELETE_SELF .|. iN_MOVE_SELF) /= 0
                     -- The events added by 'watchFlags' only.
                     unrequested =
@@ -3024,38 +3049,102 @@ readOneEvent cfg  wtch@Watch {watchWdMap = wdMapRef} = do
                         not isSelfEvent || isNothing (getRepSub (wpRep wp))
                     reported =
                         [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
-                    removed =
-                        removedPending ++ removedMoved ++ removedRoots
-                            ++ removedOut
-                return
-                    $ S.fromList (if isUnrequested then [] else reported)
-                    `S.append` fmap mkScanned scanned
-                    `S.append` S.fromList (map mkUnwatched removed)
+                withEffects (if isUnrequested then [] else reported) $ do
+                    -- See the NOTE above 'markPending'.
+                    removedPending <-
+                        effectIf
+                            (watchRec cfg && (isDirMovedOut || isDirDeleted))
+                            $ atomicModifyIORef' wdMapRef
+                                (takeNamedPending live)
+                                >>= unwatchAll
+                    when (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
+                        $ atomicModifyIORef' wdMapRef
+                        $ \m -> (clearPending (fromIntegral ewd) m, ())
+                    -- See the NOTE above 'clearMoved'.
+                    when (watchRec cfg && isDirMovedOut)
+                        $ atomicModifyIORef' wdMapRef
+                        $ \m -> (markMoved cookie live m, ())
+                    -- Assumes that IN_MOVED_TO is queued before
+                    -- IN_MOVE_SELF, see the IMPORTANT note above
+                    -- 'clearMoved'.
+                    removedMoved <-
+                        effectIf (watchRec cfg && eflags .&. iN_MOVE_SELF /= 0)
+                            $ unwatchAll
+                                [ wpRep wp
+                                | wp <- wps
+                                , not (wpRemoved wp)
+                                , isJust (wpMoveCookie wp)
+                                ]
+                    removedRoots <-
+                        effectIf (eflags .&. iN_MOVE_SELF /= 0)
+                            $ unwatchGoneRoots cfg wtch
+                                [ (fromIntegral ewd, wpRep wp)
+                                | wp <- wps
+                                , not (wpRemoved wp)
+                                , isNothing (getRepSub (wpRep wp))
+                                ]
+                    -- The watch of a new directory is added before its
+                    -- event is delivered. The watches of the tree under it
+                    -- are added when the stream of the scan is read, before
+                    -- the next event is parsed. If the entries are not
+                    -- reported, all the watches are added now.
+                    (removedOut, scan) <-
+                        if watchRec cfg && isDirCreated
+                        then
+                            (,) [] . concatStreams
+                                <$> mapM (addDirWithScan cfg wtch) live
+                        else if watchRec cfg && isDirMovedIn
+                        then movedInDir cfg wtch cookie live
+                        else return ([], S.nil)
+                    -- The denied subdirectories and the failures are
+                    -- reported even if the entries are not.
+                    scanned <-
+                        if reportsScan cfg
+                        then return scan
+                        else
+                            fmap S.fromList
+                                $ S.toList
+                                $ S.filter (not . isFound) scan
+                    when isIgnored
+                        $ atomicModifyIORef' wdMapRef
+                        $ \m -> (Map.delete (fromIntegral ewd) m, ())
+                    let removed =
+                            removedPending ++ removedMoved ++ removedRoots
+                                ++ removedOut
+                    return
+                        $ fmap scanItem scanned
+                        `S.append` events (map mkUnwatched removed)
 
     where
 
-    isDenied (ScanDenied _) = True
-    isDenied (ScanFound _) = False
-
-    readHeader (ptr :: Ptr Word8) _ = do
-        let len = sizeOf (undefined :: CInt)
-        ewd :: CInt <- peek (castPtr ptr)
-        eflags <- peekByteOff ptr len
-        cookie <- peekByteOff ptr (len + 4)
-        pathLen :: Word32 <- peekByteOff ptr (len + 8)
-        return (ewd, eflags, cookie, fromIntegral pathLen)
+    isFound (ScanFound _) = True
+    isFound _ = False
 
 foreign import ccall unsafe "unistd.h read"
     c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
 
 -- | Read the events available on the fd of a watch, and take the events
--- recorded by 'recordSynthEvents', wait if there are none of either. Returns
--- 'Nothing' if the watch is closed. The array is empty if no event is
--- available on the fd.
-readEvents :: Watch -> IO (Maybe ([SynthEvent], Array Word8))
+-- recorded by 'recordSynthEvents'. The array is empty if no event is
+-- available on the fd. If there are none of either, returns an action that
+-- waits for an event. Returns 'Nothing' if the watch is closed.
+--
+-- The wait is registered, or counted, before the action is returned. The
+-- caller must mask async exceptions and must run the action. The action can
+-- be interrupted by an async exception.
+readEvents :: Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], Array Word8)))
 readEvents
     wtch@Watch {watchFd = fd, watchLock = lock, watchSynthEvents = synthVar} =
-    loop
+    modifyMVar lock $ \st ->
+        if fsWatchClosed st
+        then return (st, Nothing)
+        else do
+            arr <- MArray.unsafeCreateWithPtr' bufSize readFd
+            synth <- takeSynthEvents wtch
+            if MArray.byteLength arr /= 0 || not (null synth)
+            then
+                return
+                    (st, Just $ Right (synth, unsafeFreezeWithShrink arr))
+            else fmap (Just . Left) <$> register st
 
     where
 
@@ -3089,27 +3178,25 @@ readEvents
         if rtsSupportsBoundThreads
         then do
             (wait, unregister) <- threadWaitReadSTM (Fd fd)
-            -- The next iteration returns 'Nothing' if the exception is due
-            -- to 'closeWatch'.
+            -- The next read returns 'Nothing' if the exception is due to
+            -- 'closeWatch'.
             let waitSynth = do
                     ps <- readTVar synthVar
                     when (null ps) retry
-                waitTh restore =
-                    restore (atomically (wait `orElse` waitSynth))
+                waitTh =
+                    Exception.interruptible
+                        (atomically (wait `orElse` waitSynth))
                         `catchIOError` (\_ -> return ())
                         `onException` unregister
-            return (st, Just (Left waitTh))
+            return (st, waitTh)
         else do
             -- The lock is never held across a blocking call, taking it
             -- uninterruptibly cannot block for long.
-            let waitNonTh restore =
-                    restore (threadWaitRead (Fd fd))
+            let waitNonTh =
+                    Exception.interruptible (threadWaitRead (Fd fd))
                         `finally` Exception.uninterruptibleMask_
                             (modifyMVar_ lock unregisterNonTh)
-            return
-                ( st {fsFdWaiters = fsFdWaiters st + 1}
-                , Just (Left waitNonTh)
-                )
+            return (st {fsFdWaiters = fsFdWaiters st + 1}, waitNonTh)
 
     unregisterNonTh st = do
         let st1 = st {fsFdWaiters = fsFdWaiters st - 1}
@@ -3118,32 +3205,6 @@ readEvents
             closeInotifyFd fd
             return st1 {fsFdOpen = False}
         else return st1
-
-    -- The wait must be counted or unregistered even if an async exception
-    -- arrives after the registration.
-    loop = do
-        r <- Exception.mask $ \restore -> do
-            r <- modifyMVar lock $ \st ->
-                if fsWatchClosed st
-                then return (st, Nothing)
-                else do
-                    arr <- MArray.unsafeCreateWithPtr' bufSize readFd
-                    synth <- takeSynthEvents wtch
-                    if MArray.byteLength arr /= 0 || not (null synth)
-                    then
-                        return
-                            ( st
-                            , Just $ Right (synth, unsafeFreezeWithShrink arr)
-                            )
-                    else register st
-            case r of
-                Just (Left wait) -> wait restore >> return (Just (Left ()))
-                Just (Right res) -> return (Just (Right res))
-                Nothing -> return Nothing
-        case r of
-            Nothing -> return Nothing
-            Just (Right res) -> return (Just res)
-            Just (Left ()) -> loop
 
 -- | Read the events from a 'Watch' as a stream. The 'Config' must be the one
 -- used to open the watch. The stream does not close the watch, use
@@ -3156,6 +3217,15 @@ readEvents
 -- A stream can stop reading before the watch is closed. The next stream on
 -- the watch starts with the first event not yet read. The scan of a new
 -- directory continues in the next stream, see 'setScanNewDirs'.
+--
+-- A read that is interrupted by an async exception while it waits for an
+-- event, for example, by a timeout, does not lose any event.
+--
+-- If the stream raises an 'IOException', for example, when a directory
+-- cannot be added because the process has reached the
+-- @max_user_watches@ limit or has no free file descriptor, the operation that
+-- failed is not tried again. The directory is not watched, and the next
+-- stream on the watch continues after it.
 --
 -- /Pre-release/
 --
@@ -3171,36 +3241,74 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
     -- 'removeFromWatch' are reported before the kernel events of the same
     -- read. A read returns whole events, the events of a read are parsed on
     -- their own.
-    readOne (synth, arr) =
+    readOne (Left wait) = S.fromPure (ItemWait wait)
+    readOne (Right (synth, arr)) =
         S.append synthEvents kernelEvents
 
         where
 
-        synthEvents = S.fromList (map synthEvent synth)
+        synthEvents = S.fromList (map (ItemEvent . synthEvent) synth)
 
-        -- 'readOneEvent' returns a stream for each kernel event: the event
+        -- 'handleEvent' returns a stream for each kernel event: the event
         -- for each of its paths, followed by the entries found by its scan.
         kernelEvents =
-            S.concatMap id
+            S.concatMapM (handleEvent cfg wtch)
                 $ S.catRights
-                $ S.parseMany (readOneEvent cfg wtch) (A.read arr)
+                $ S.parseMany readOneEvent (A.read arr)
 
-    events = S.concatMap readOne fdReads
+    items = S.concatMap readOne fdReads
 
-    -- The step runs with async exceptions masked. An exception can arrive
-    -- only where the step blocks, the rest of the events is then left as it
-    -- was before the step. The step blocks waiting for the fd in
-    -- 'readEvents', before any data is read, running the step again is
-    -- the same. It can also block on the lock of the watch while it adds or
-    -- updates a watch. Running that step again finds the changes made before
-    -- the exception, for example, a directory already watched is scanned as
-    -- in 'rescanDir'.
+    save = putMVar undeliveredRef . Just
+
+    -- The rest of the stream is not a pure value, it refers to the open
+    -- directories of a scan in progress, and running a part of it changes
+    -- the watches. A stream saved before a step cannot be run again after
+    -- the step has failed. Therefore:
+    --
+    -- * The step runs with async exceptions masked uninterruptibly. It
+    --   blocks only on the lock of the watch, which is never held across a
+    --   blocking call.
+    -- * The step does not wait for events. It returns the wait as an item,
+    --   the wait runs after the rest of the stream is saved, and can be
+    --   interrupted.
+    -- * An 'IOException' is returned as an item, by 'handleEvent' and by the
+    --   stream of a scan, and is raised after the rest of the stream is
+    --   saved.
+    --
+    -- Any other exception leaves the stream in an unknown state. It is
+    -- saved in place of the stream, every later read raises it again.
     step () =
-        modifyMVarMasked undeliveredRef $ \r -> do
-            next <- S.uncons (fromMaybe events r)
-            return $ case next of
-                Nothing -> (Just S.nil, Nothing)
-                Just (ev, rest) -> (Just rest, Just (ev, ()))
+        Exception.mask_ $ do
+            r <- takeMVar undeliveredRef
+            next (fromMaybe items r)
+
+    next stream = do
+        r <- try (Exception.uninterruptibleMask_ (S.uncons stream))
+        case r of
+            Left (e :: SomeException) -> do
+                -- Async exceptions thrown by other threads do not reach
+                -- here, they are masked while the step runs. Only an
+                -- exception raised by the step itself does, for example,
+                -- an 'IOException' from the read of the inotify fd, an
+                -- 'ErrorCall', or a 'StackOverflow', which the RTS raises
+                -- even when async exceptions are masked.
+                --
+                -- The watch cannot be recovered after such an exception,
+                -- it has to be closed and opened again.
+                save (S.concatEffect (throwIO e))
+                throwIO e
+            Right Nothing -> save S.nil >> return Nothing
+            -- An async exception that arrived during the step is raised
+            -- when 'mask_' ends, and the event is lost. See
+            -- dev/design-issues.md.
+            Right (Just (ItemEvent ev, rest)) ->
+                save rest >> return (Just (ev, ()))
+            -- Similarly, the async exception replaces the 'IOException'
+            -- when 'mask_' ends, and the failure is not reported.
+            Right (Just (ItemFailed e, rest)) -> save rest >> ioError e
+            Right (Just (ItemWait wait, rest)) -> do
+                wait `onException` save rest
+                next rest
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.

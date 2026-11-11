@@ -1297,6 +1297,76 @@ removeFailRetry =
                     evs <- readUntil recCfg Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
 
+-- The read that times out reports dir and dir/file, reaches the end of the
+-- scan of dir, which closes dir, and waits for an event.
+readAfterTimeout :: String -> Event.Config -> Spec
+readAfterTimeout desc cfg =
+    it ("reads again after a timeout at the end of a scan, " ++ desc)
+        $ withRoot cfg $ \root w -> do
+            let dir = root </> "dir"
+                file = root </> "file"
+                drain =
+                    timeout 500000
+                        $ Stream.fold Fold.drain (Event.watchToStream cfg w)
+            createDirectory dir
+            createFile (dir </> "file")
+            drain `shouldReturn` Nothing
+            drain `shouldReturn` Nothing
+            createFile file
+            evs <- readUntil cfg (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [root]
+
+-- The directory cannot be added without a free fd. Its create event is
+-- reported, followed by the exception. The events of the files were read
+-- from the fd along with the event of the directory.
+readAfterFailure :: Spec
+readAfterFailure =
+    it "reads the remaining events after the stream raises an exception"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                files = [root </> ("file" ++ show i) | i <- [1 .. 5 :: Int]]
+                isLast = isCreatedAt (last files)
+            createDirectory dir
+            mapM_ createFile files
+            r <- withFdsExhausted (try (readUntil recCfg isLast w))
+            case r of
+                Nothing -> pendingWith "the open file limit is too high"
+                Just (Right _) ->
+                    expectationFailure "the stream did not fail"
+                Just (Left (_ :: IOException)) -> do
+                    evs <- readUntil recCfg isLast w
+                    kernelCreated evs `shouldBe` files
+
+-- The scan of dir is in the middle of the listing of dir when the fds run
+-- out, a file was the last entry reported. A subdirectory listed after that
+-- cannot be added and raises an exception. The scan continues after it.
+readAfterScanFailure :: Spec
+readAfterScanFailure =
+    it "continues a scan after the stream raises an exception"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                names = map show [1 .. 5 :: Int]
+                subs = map (\i -> dir </> ("sub" ++ i)) names
+                files = map (\i -> dir </> ("file" ++ i)) names
+                end = root </> "end"
+                isScannedFile ev =
+                    Event.isScanEvent ev && not (Event.isDir ev)
+            createDirectory dir
+            mapM_ createDirectory subs
+            mapM_ createFile files
+            evs <- readUntil recCfg isScannedFile w
+            when (length (scannedPaths Event.isDir evs) == length subs)
+                $ pendingWith "the subdirectories were listed first"
+            r <- withFdsExhausted (try (readUntil recCfg (const False) w))
+            case r of
+                Nothing -> pendingWith "the open file limit is too high"
+                Just (Right _) ->
+                    expectationFailure "the stream did not fail"
+                Just (Left (_ :: IOException)) -> do
+                    createFile end
+                    evs1 <- readUntil recCfg (isCreatedAt end) w
+                    createdRoots end evs1 `shouldBe` [root]
+
 -- IN_MOVE_SELF tells that the directory is moved out, no fd is needed.
 recMoveOutNoFd :: Spec
 recMoveOutNoFd =
@@ -2745,6 +2815,9 @@ watchTests =
                 killRepeatedly
                 killConsumer
                 abandonStream
+                readAfterTimeout "all events" recCfg
+                readAfterTimeout "default events"
+                    (Event.setRecursiveMode True Event.defaultConfig)
             describe "concurrency" $ do
                 addWhileReading
                 removeWhileReading
@@ -2753,6 +2826,8 @@ watchTests =
             describe "failures" $ do
                 removeFailRetry
                 closeFailFallback
+                readAfterFailure
+                readAfterScanFailure
             describe "queue overflow" $ do
                 overflowRemove
                 overflowRemoveShared
