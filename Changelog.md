@@ -37,6 +37,8 @@
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
+- Linux: in recursive mode with `setFollowSymLinks False`, the directory
+  tree of the target of a symbolic link root is no longer watched.
 - macOS: fix a link failure of `setFullHistory`.
 
 ### Enhancements

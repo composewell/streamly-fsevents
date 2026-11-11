@@ -421,7 +421,8 @@ foreign import capi
 
 -- | If the pathname to be watched is a symbolic link then watch the target of
 -- the symbolic link instead of the symbolic link itself. Applies to the watch
--- roots only.
+-- roots only. When this is 'False', in recursive mode the directory tree of
+-- the target is not watched.
 --
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
@@ -1158,8 +1159,10 @@ openDot pRep pfd =
 -- | Open a directory with the access mode @O_PATH@ or @O_RDONLY@, without
 -- following a symbolic link in any component under its root. With a parent,
 -- the directory is opened relative to the parent fd, the parent was opened
--- the same way. A root is opened by its path, a symbolic link to a root is
--- followed. Raise an exception if the path is not a directory.
+-- the same way. A root is opened by its path. A symbolic link to a root is
+-- followed, unless the inotify flags of the watch have IN_DONT_FOLLOW: the
+-- watch is then on the link itself, and its target must not be listed. Raise
+-- an exception if the path is not a directory.
 --
 -- The parent fd refers to the directory, not to its path. If the parent is
 -- moved out of the tree during the walk, its subdirectories are added under
@@ -1170,8 +1173,8 @@ openDot pRep pfd =
 -- 'openSubdir' opens the components of a path with @O_PATH@, which needs only
 -- the search permission. With @O_RDONLY@ the directory is then opened again
 -- as @.@ relative to the @O_PATH@ fd.
-openDirAt :: CInt -> Maybe ParentDir -> PathRep -> IO CInt
-openDirAt mode parent pRep =
+openDirAt :: CInt -> Word32 -> Maybe ParentDir -> PathRep -> IO CInt
+openDirAt mode flags parent pRep =
     case (parent, pRep) of
         (Just (pfd, name), (_, Just _)) ->
             A.asCStringUnsafe (Path.toArray name) $ \ptr ->
@@ -1181,14 +1184,17 @@ openDirAt mode parent pRep =
             | otherwise -> bracket (openSubdir root sub) c_close (openDot pRep)
         (_, (root, Nothing)) ->
             A.asCStringUnsafe (Path.toArray root) $ \ptr ->
-                throwErrnoIfMinus1 err
-                    $ c_openat3 aT_FDCWD ptr (dirFlags .|. o_CLOEXEC)
+                throwErrnoIfMinus1 err $ c_openat3 aT_FDCWD ptr rootFlags
 
     where
 
     err = "addToWatch: " ++ Path.toString (combinePathRep pRep)
     dirFlags = mode .|. o_DIRECTORY
     subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
+    rootFlags =
+        if flags .&. iN_DONT_FOLLOW /= 0
+        then subFlags
+        else dirFlags .|. o_CLOEXEC
 
 -- | Open a directory for reading using the given action, and return its fd
 -- and a directory stream on the fd. The directory is listed through the fd,
@@ -1213,9 +1219,10 @@ openDirStream pRep open = do
     else return (fd, ReadDir.DirStream (castPtr dirp))
 
 -- | Open a directory for reading, see 'openDirAt' and 'openDirStream'.
-openDirStreamAt :: Maybe ParentDir -> PathRep -> IO (CInt, ReadDir.DirStream)
-openDirStreamAt parent pRep =
-    openDirStream pRep (openDirAt o_RDONLY parent pRep)
+openDirStreamAt ::
+    Word32 -> Maybe ParentDir -> PathRep -> IO (CInt, ReadDir.DirStream)
+openDirStreamAt flags parent pRep =
+    openDirStream pRep (openDirAt o_RDONLY flags parent pRep)
 
 -- | The entries of a directory stream, directories on the 'Left'. An entry
 -- deleted after it is read is skipped.
@@ -1283,7 +1290,7 @@ addWatchFor fd flags pRep =
     case pRep of
         (_, Nothing) -> addWatchByPath fd flags pRep
         (_, Just _) ->
-            bracket (openDirAt o_PATH Nothing pRep) c_close
+            bracket (openDirAt o_PATH flags Nothing pRep) c_close
                 (addWatchViaFd fd flags pRep)
 
 -- | @renamePaths from to@ changes the directory @from@ and the paths under it
@@ -1415,7 +1422,9 @@ addPathAt flags wtch pRep dirFd =
 
 -- | The directory opened by 'withAddedDir'.
 data AddedDir =
-      NotDir -- ^ A root that is not a directory
+      -- | A root that is not a directory, or a directory symbolic link that
+      -- is not followed.
+      NotDir
       -- | A subdirectory added but not listed because of a permission error
     | DirDenied
     | DirOpened (CInt, ReadDir.DirStream) -- ^ The fd and the directory stream
@@ -1448,7 +1457,7 @@ withAddedDir flags wtch parent pRep action =
             r <- addPathWith flags wtch pRep
             bracket openRoot close (action r)
         (_, Just _) ->
-            bracket (openDirAt o_PATH parent pRep) c_close $ \pfd -> do
+            bracket (openDirAt o_PATH flags parent pRep) c_close $ \pfd -> do
                 r <- addPathAt flags wtch pRep pfd
                 bracket (openSub pfd) close (action r)
 
@@ -1466,7 +1475,7 @@ withAddedDir flags wtch parent pRep action =
             Right dir -> return (DirOpened dir)
 
     openRoot = do
-        r <- try (openDirStreamAt Nothing pRep)
+        r <- try (openDirStreamAt flags Nothing pRep)
         case r of
             Left e
                 | isNotSubdirError e -> return NotDir
@@ -1785,14 +1794,14 @@ scanChildren wtch reportAll cfg parent pRep = do
         case pRep of
             (_, Nothing) -> addPathWith flags wtch pRep
             (_, Just _) ->
-                bracket (openDirAt o_PATH parent pRep) c_close
+                bracket (openDirAt o_PATH flags parent pRep) c_close
                     (addPathAt flags wtch pRep)
 
     list wd reported =
         withWatchFlags cfg wtch wd pRep
             $ handleInvalidOrInaccessible wtch (deniedNode pRep)
             $ S.bracketIO
-                (openDirStreamAt parent pRep)
+                (openDirStreamAt (scanFlags cfg) parent pRep)
                 (ReadDir.closeDirStream . snd)
             $ \(fd, ds) ->
                 S.mapM (node fd reported) (readEntries pRep ds)

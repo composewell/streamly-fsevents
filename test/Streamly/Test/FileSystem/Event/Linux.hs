@@ -466,6 +466,31 @@ scannedPaths :: (Event -> Bool) -> [Event] -> [FilePath]
 scannedPaths p =
     pathsOf (\ev -> Event.isScanEvent ev && Event.isCreated ev && p ev)
 
+-- The watch is on the link itself. The files are created through the target
+-- path, they generate no event on the link.
+recRootSymlinkNoFollow :: Spec
+recRootSymlinkNoFollow =
+    it "does not watch the tree of a symlink root that is not followed"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let target = fp </> "target"
+                sub = target </> "sub"
+                link = fp </> "link"
+                other = fp </> "other"
+                end = other </> "end"
+                cfg = Event.setFollowSymLinks False recCfg
+            mapM_ createDirectory [target, sub, other]
+            createDirectoryLink target link
+            roots <- mapM Path.fromString [link, other]
+            bracket
+                (Event.openWatch cfg (NonEmpty.fromList roots))
+                Event.closeWatch
+                $ \w -> do
+                    createFile (sub </> "file")
+                    createFile (target </> "file")
+                    createFile end
+                    evs <- readUntil cfg (isCreatedAt end) w
+                    filter (isUnder link) (map getAbsPath evs) `shouldBe` []
+
 -- The write to the unlinked file generates IN_MODIFY without IN_EXCL_UNLINK.
 -- WriteMode truncates the file before the unlink, generating IN_MODIFY,
 -- AppendMode does not truncate.
@@ -2795,6 +2820,7 @@ watchTests =
                 defaultExcludeUnlinked
                 defaultAttrsModified
                 lastRootEvent
+            describe "symbolic link roots" recRootSymlinkNoFollow
 
 main :: IO ()
 main = do
