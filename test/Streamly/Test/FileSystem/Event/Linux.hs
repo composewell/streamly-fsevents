@@ -1280,6 +1280,88 @@ withFdsExhausted action =
             Left (_ :: IOException) ->
                 (Just <$> action) `finally` mapM_ hClose hs
 
+-- | Run the action with the soft limit on open files lowered to at most @n@.
+withFdLimit :: Integer -> IO a -> IO a
+withFdLimit n action =
+    bracket
+        (getResourceLimit ResourceOpenFiles)
+        (setResourceLimit ResourceOpenFiles)
+        $ \lims -> do
+            setResourceLimit ResourceOpenFiles (lower lims)
+            action
+
+    where
+
+    lower lims =
+        case softLimit lims of
+            ResourceLimit m | m <= n -> lims
+            _ -> lims { softLimit = ResourceLimit n }
+
+-- | The number of levels of 'deepChain' and the limit on open files used
+-- with it. A walk that keeps one fd open for each level exceeds the limit.
+deepLevels :: Int
+deepLevels = 300
+
+deepFdLimit :: Integer
+deepFdLimit = 256
+
+-- | Create a chain of @n@ directories under @base@, each one in the previous
+-- one, with a file in each, and three subdirectories with a file each in the
+-- last one. Returns the directories and the files, relative to @base@, a
+-- directory before the directories under it.
+deepChain :: FilePath -> Int -> IO ([FilePath], [FilePath])
+deepChain base n = do
+    let dirs = take n (drop 1 (iterate (</> "d") ""))
+        subs = [last dirs </> ("s" ++ show i) | i <- [1 .. 3 :: Int]]
+        files = map (</> "f") (dirs ++ subs)
+    mapM_ (createDirectory . (base </>)) (dirs ++ subs)
+    mapM_ (createFile . (base </>)) files
+    return (dirs ++ subs, files)
+
+-- | Open a recursive watch on a root that contains a 'deepChain', with the
+-- limit on open files lowered, and run the action with the root, the watch
+-- and a file to create in the deepest directory.
+withDeepRoot :: (FilePath -> Event.Watch -> FilePath -> IO a) -> IO a
+withDeepRoot action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "root"
+        createDirectory root
+        (dirs, _) <- deepChain root deepLevels
+        r <- Path.fromString root
+        withFdLimit deepFdLimit
+            $ bracket
+                (Event.openWatch recCfg (r NonEmpty.:| []))
+                Event.closeWatch
+                (\w -> action root w (root </> last dirs </> "new"))
+
+-- The start of a watch does not keep every level of the tree open.
+recDeepAtStart :: Spec
+recDeepAtStart =
+    it "starts a watch on a tree deeper than the open file limit"
+        $ withDeepRoot $ \root w new -> do
+            createFile new
+            evs <- readUntil recCfg (isCreatedAt new) w
+            createdRoots new evs `shouldBe` [root]
+
+-- The scan of a directory moved in does not keep every level of the tree
+-- open. Every entry is reported, and the deepest directory is watched.
+recDeepMovedIn :: Spec
+recDeepMovedIn =
+    it "scans a tree deeper than the open file limit"
+        $ withRoot recCfg $ \root w -> do
+            let out = takeDirectory root </> "chain"
+                chain = root </> "chain"
+            createDirectory out
+            (dirs, files) <- deepChain out deepLevels
+            let new = chain </> last dirs </> "new"
+            withFdLimit deepFdLimit $ do
+                evs <- recEventsOf recCfg root w (renameDirectory out chain)
+                sort (scannedPaths (const True) evs)
+                    `shouldBe` sort (map (chain </>) (dirs ++ files))
+                createFile new
+                evs1 <- readUntil recCfg (isCreatedAt new) w
+                createdRoots new evs1 `shouldBe` [root]
+
 -- The marker of the shared watch descriptor of sub needs a pipe, the pipe
 -- fails with EMFILE.
 removeFailRetry :: Spec
@@ -2520,6 +2602,20 @@ overflowRecCreate =
                     evs <- readUntil recCfg (isCreatedAt file) w
                     createdRoots file evs `shouldBe` [root]
 
+-- The restart after an overflow does not keep every level of the tree open.
+overflowRecDeep :: Spec
+overflowRecDeep =
+    it "restarts a tree deeper than the open file limit"
+        $ withDeepRoot $ \root w new -> do
+            r <- withOverflow root (return ())
+            case r of
+                Nothing -> pendingWith "max_queued_events is too high"
+                Just () -> do
+                    _ <- readUntil recCfg Event.isEventsLost w
+                    createFile new
+                    evs <- readUntil recCfg (isCreatedAt new) w
+                    createdRoots new evs `shouldBe` [root]
+
 -- The kernel drops the create events of the directories when the queue is
 -- full, the restart reports them.
 overflowRecCreateReported :: Spec
@@ -2841,6 +2937,7 @@ watchTests =
                 overflowRecMoveOut
                 overflowRecRootRenamed
                 overflowRecRootDeleted
+                overflowRecDeep
             describe "event paths" $ do
                 rootEventPaths
                 overflowPaths
@@ -2854,6 +2951,8 @@ watchTests =
                 recDeniedAtStart
                 recDeniedAdded
                 recDeniedAfterWatched
+                recDeepAtStart
+                recDeepMovedIn
             describe "recursive mode scan of new directories" $ do
                 recScanNewDir
                 recScanDisabled

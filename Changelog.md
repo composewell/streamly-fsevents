@@ -41,6 +41,10 @@
   an async exception, for example, a timeout, or after the stream raises an
   exception. Earlier the next read could use a directory that was already
   closed, and the events already read from the kernel could be lost.
+- Linux: in recursive mode, the number of file descriptors used to add or
+  scan a tree no longer grows with the depth of the tree. A deep chain of
+  directories created in the tree or moved into it could exhaust the file
+  descriptors of the process and end the watch with an exception.
 - Linux: in recursive mode, a subdirectory without read permission is no
   longer added to the watch by its path. The path could be changed to go
   through a symbolic link to a directory outside the watched tree.

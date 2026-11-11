@@ -1487,8 +1487,9 @@ deniedOf _ _ = []
 -- generate any events, the watch is added with the given flags through this
 -- fd, and the directory is then opened for reading relative to it. The fds are
 -- closed when the action ends, the subdirectories are opened relative to the
--- fd while it is open. A walk holds two fds for each level of the tree. The
--- caller restores 'watchFlags' after this returns, after the close.
+-- fd while it is open. A walk holds two fds for each level of the tree that
+-- it keeps open, see 'maxOpenLevels'. The caller restores 'watchFlags' after
+-- this returns, after the close.
 --
 -- A root is added by its path, see 'addWatchFor'.
 withAddedDir ::
@@ -1618,12 +1619,79 @@ ignoreInvalidOrInaccessible wtch def denied action =
         then return denied
         else ioError e
 
--- | Like 'addToWatch', a subdirectory is opened relative to its parent, if
--- the parent is given. Returns the subdirectories not added or not listed
--- because of a permission error, in the order they were found.
+-- | Run an action on the name of each subdirectory in a directory stream,
+-- and concatenate the results.
+forSubdirs :: PathRep -> ReadDir.DirStream -> (Path -> IO [a]) -> IO [a]
+forSubdirs pRep ds action =
+    -- The errors ignored:
+    --
+    -- * ENOENT from lstat of a DT_UNKNOWN entry deleted after readdir
+    --   returns it, 'ignoreMissing' skips the entry.
+    -- * ENOENT, ELOOP or ENOTDIR from lstat of a DT_UNKNOWN entry, by its
+    --   path, if a parent was replaced.
+    concat
+        <$> S.toList
+            (S.mapM action
+                $ S.catLefts
+                $ S.handle ignoreErr (readEntries pRep ds))
+
+    where
+
+    ignoreErr (e :: IOError) =
+        if isNotSubdirError e then return S.nil else ioError e
+
+-- | The number of levels of a walk of a tree that are kept open. A walk
+-- keeps a directory open while it walks the tree under it, to continue the
+-- listing and to open the subdirectories relative to its fd. The open fds
+-- would grow with the depth of the tree, and any user who can create or move
+-- a deep chain of directories into the tree could exhaust the fds of the
+-- process.
+--
+-- A directory at this level of a walk or deeper is closed before its
+-- subdirectories are walked: the names of its subdirectories are collected,
+-- and each subdirectory is then opened from the root, one component at a
+-- time, see 'openSubdir'. The memory used at these levels is proportional to
+-- the number of subdirectories of a directory, each of them has an entry in
+-- the map as well.
+maxOpenLevels :: Int
+maxOpenLevels = 32
+
+-- | @walkSubdirs level pRep dir action@ runs the action on each subdirectory
+-- of an open directory at the given level of a walk, the level of the top
+-- directory is 0. The action takes the parent to open the subdirectory with,
+-- and the name of the subdirectory.
+--
+-- Below 'maxOpenLevels' the action runs with the directory as the parent, and
+-- the results are returned on the 'Right'. Otherwise the names of the
+-- subdirectories are returned on the 'Left', to be passed to
+-- 'walkCollected' after the directory is closed.
+walkSubdirs ::
+       Int
+    -> PathRep
+    -> (CInt, ReadDir.DirStream)
+    -> (Maybe ParentDir -> Path -> IO [a])
+    -> IO (Either [Path] [a])
+walkSubdirs level pRep (fd, ds) action
+    | level < maxOpenLevels =
+        Right <$> forSubdirs pRep ds (\name -> action (Just (fd, name)) name)
+    | otherwise = Left <$> forSubdirs pRep ds (\name -> return [name])
+
+-- | Run the action of 'walkSubdirs' on the subdirectories it collected,
+-- without a parent.
+walkCollected ::
+    (Maybe ParentDir -> Path -> IO [a]) -> Either [Path] [a] -> IO [a]
+walkCollected action = either (fmap concat . mapM (action Nothing)) return
+
+-- | Like 'addToWatch', for a directory at the given level of a walk, see
+-- 'walkSubdirs'. A subdirectory is opened relative to its parent, if the
+-- parent is given. Returns the subdirectories not added or not listed because
+-- of a permission error, in the order they were found.
+--
+-- The subdirectories already watched via the same root are not scanned again.
+-- An error in a subdirectory is handled as in 'addSubdirToWatch'.
 addToWatchAt ::
-    Config -> Watch -> Maybe ParentDir -> PathRep -> IO [PathRep]
-addToWatchAt cfg@Config{..} watch0 parent pRep = do
+    Config -> Watch -> Int -> Maybe ParentDir -> PathRep -> IO [PathRep]
+addToWatchAt cfg@Config{..} watch0 level parent pRep = do
     --    showPathRep (root, Nothing) = "root = " ++ Path.toString root
     --    showPathRep (root, Just sub) =
     --        "root = " ++ Path.toString root ++ " sub = " ++ Path.toString sub
@@ -1671,14 +1739,15 @@ addToWatchAt cfg@Config{..} watch0 parent pRep = do
     -- raises the exception. A subdirectory is skipped and reported as
     -- 'isAccessDenied', see 'ignoreInvalidOrInaccessible'.
     --
-    (wd, denied) <- withAddedDir (scanFlags cfg) watch0 parent pRep
+    (wd, subdirs) <- withAddedDir (scanFlags cfg) watch0 parent pRep
         $ \(wd, isNew) dir ->
             -- Now add the children. If we missed any creates while we were
             -- adding the parent, this will make sure they are added too.
             case dir of
                 DirOpened d | isNew && watchRec ->
-                    (,) wd <$> addSubdirs cfg watch0 pRep d
-                _ -> return (wd, deniedOf pRep dir)
+                    (,) wd <$> walkSubdirs level pRep d addSubdir
+                _ -> return (wd, Right (deniedOf pRep dir))
+    denied <- walkCollected addSubdir subdirs
 
     -- The directory has been listed and closed. The watch of its parent still
     -- has 'scanFlags' until the scan of the parent ends, the directories are
@@ -1688,37 +1757,13 @@ addToWatchAt cfg@Config{..} watch0 parent pRep = do
         $ void $ updateWatch (watchFlags cfg) watch0 wd pRep
     return denied
 
--- | Run an action on the name of each subdirectory in a directory stream,
--- and concatenate the results.
-forSubdirs :: PathRep -> ReadDir.DirStream -> (Path -> IO [a]) -> IO [a]
-forSubdirs pRep ds action =
-    -- The errors ignored:
-    --
-    -- * ENOENT from lstat of a DT_UNKNOWN entry deleted after readdir
-    --   returns it, 'ignoreMissing' skips the entry.
-    -- * ENOENT, ELOOP or ENOTDIR from lstat of a DT_UNKNOWN entry, by its
-    --   path, if a parent was replaced.
-    concat
-        <$> S.toList
-            (S.mapM action
-                $ S.catLefts
-                $ S.handle ignoreErr (readEntries pRep ds))
-
     where
 
-    ignoreErr (e :: IOError) =
-        if isNotSubdirError e then return S.nil else ioError e
-
--- | Add the subdirectories of a directory to the watch, given its fd and
--- directory stream. The subdirectories already watched via the same root are
--- not scanned again. An error is handled as in 'addSubdirToWatch'.
-addSubdirs ::
-    Config -> Watch -> PathRep -> (CInt, ReadDir.DirStream) -> IO [PathRep]
-addSubdirs cfg wtch pRep (dirFd, ds) =
-    forSubdirs pRep ds $ \name -> do
+    addSubdir subParent name = do
         let sub = addSub pRep name
-        ignoreInvalidOrInaccessible wtch [] [sub]
-            $ addToWatchAt (subdirConfig cfg) wtch (Just (dirFd, name)) sub
+        ignoreInvalidOrInaccessible watch0 [] [sub]
+            $ addToWatchAt
+                (subdirConfig cfg) watch0 (level + 1) subParent sub
 
 -- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
@@ -1736,7 +1781,7 @@ addSubdirs cfg wtch pRep (dirFd, ds) =
 --
 addToWatch :: Config -> Watch -> PathRep -> IO ()
 addToWatch cfg wtch pRep = do
-    denied <- addToWatchAt cfg wtch Nothing pRep
+    denied <- addToWatchAt cfg wtch 0 Nothing pRep
     recordSynthEvents wtch (map SynthDenied denied)
 
 -- | Like 'addToWatch' but does not raise an exception if the path does not
@@ -1755,7 +1800,7 @@ addToWatch cfg wtch pRep = do
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO [PathRep]
 addSubdirToWatch cfg wtch pRep =
     ignoreInvalidOrInaccessible wtch [] [pRep]
-        (addToWatchAt (subdirConfig cfg) wtch Nothing pRep)
+        (addToWatchAt (subdirConfig cfg) wtch 0 Nothing pRep)
 
 -- | An entry found by 'addNewDir' or 'rescanDir'.
 data ScannedEntry = ScannedEntry
@@ -1841,6 +1886,15 @@ withWatchFlags cfg wtch wd pRep stream
 -- subdirectory's stream is read in the depth first walk of 'scanTree' while
 -- the stream of its parent is open, the parent fd is open then.
 --
+-- The directory is at the given level of the walk, the level of the top
+-- directory is 0. At 'maxOpenLevels' and deeper the directory is not kept
+-- open while the trees of its subdirectories are walked. Its stream returns
+-- all its entries first, the watch of a subdirectory is added when its entry
+-- is read as at the other levels. The directory is then closed, and the
+-- stream returns one node for each subdirectory that is not reported and has
+-- the entries of the subdirectory as its children. Such a subdirectory is
+-- opened from the root, see 'openSubdir'.
+--
 -- The entries of the directory are reported if @reportAll@ is 'True' or if
 -- the walk added the directory, and then @reportAll@ is 'True' for its
 -- subdirectories. The watch is added without IN_MASK_ADD, the mask of a
@@ -1851,10 +1905,11 @@ scanChildren ::
        Watch
     -> Bool
     -> Config
+    -> Int
     -> Maybe ParentDir
     -> PathRep
     -> IO (Stream IO ScanNode)
-scanChildren wtch reportAll cfg parent pRep = do
+scanChildren wtch reportAll cfg level parent pRep = do
     (wd, added) <- add (scanFlags cfg .&. complement iN_MASK_ADD)
     return $ list wd (reportAll || added)
 
@@ -1867,30 +1922,54 @@ scanChildren wtch reportAll cfg parent pRep = do
                 bracket (openDirAt o_PATH flags parent pRep) c_close
                     (addPathAt flags wtch pRep)
 
+    -- The parent is open when this directory is listed only if the level of
+    -- the parent is kept open.
+    listParent = if level <= maxOpenLevels then parent else Nothing
+
     list wd reported =
         withWatchFlags cfg wtch wd pRep
-            $ handleListing wtch pRep
+            $ if level < maxOpenLevels
+              then listing (node reported)
+              else S.concatEffect (deferred reported)
+
+    listing f =
+        handleListing wtch pRep
             $ S.bracketIO
-                (openDirStreamAt (scanFlags cfg) parent pRep)
+                (openDirStreamAt (scanFlags cfg) listParent pRep)
                 (closeDir . snd)
-            $ \(fd, ds) ->
-                S.mapM (node fd reported) (readEntries pRep ds)
+            $ \(fd, ds) -> S.mapM (f fd) (readEntries pRep ds)
 
     -- closedir releases the directory stream even if it fails.
     closeDir ds = ReadDir.closeDirStream ds `catchIOError` \_ -> return ()
 
+    -- The nodes of the subdirectories are collected while the directory is
+    -- listed, and returned with their children after the directory is
+    -- closed.
+    deferred reported = do
+        ref <- newIORef []
+        let defer fd entry = do
+                n <- node reported fd entry
+                case entry of
+                    Left _ -> do
+                        modifyIORef' ref (n {snReported = False} :)
+                        return n {snChildren = S.nil}
+                    Right _ -> return n
+            collected = S.fromList . reverse <$> readIORef ref
+        return $ listing defer `S.append` S.concatEffect collected
+
     -- A failure to add a subdirectory is returned as a node, the listing
     -- continues with the next entry.
-    node fd reported (Left dir) = do
+    node reported fd (Left dir) = do
         let path = addSub pRep dir
         children <-
             ignoreInvalidOrInaccessible
                 wtch S.nil (S.fromPure (deniedNode path))
                 (scanChildren
-                    wtch reported (subdirConfig cfg) (Just (fd, dir)) path)
+                    wtch reported (subdirConfig cfg) (level + 1)
+                    (Just (fd, dir)) path)
                 `catchIOError` (return . S.fromPure . failedNode)
         return $ ScanNode reported (found True path) children
-    node _ reported (Right file) =
+    node reported _ (Right file) =
         return $ ScanNode reported (found False (addSub pRep file)) S.nil
 
     found dir path = ScanFound (ScannedEntry dir path)
@@ -1912,11 +1991,12 @@ scanChildren wtch reportAll cfg parent pRep = do
 -- directory after the next level is listed.
 --
 -- A directory is opened when the walk reaches it and closed when its stream
--- ends, a walk holds one open directory for each level of the tree.
+-- ends, a walk holds one open directory for each level of the tree that it
+-- keeps open, see 'maxOpenLevels'.
 scanTree ::
     Watch -> Bool -> Config -> PathRep -> IO (Stream IO ScanItem)
 scanTree wtch reportAll cfg pRep = do
-    top <- scanChildren wtch reportAll cfg Nothing pRep
+    top <- scanChildren wtch reportAll cfg 0 Nothing pRep
     return
         $ fmap snItem
         $ S.filter snReported
@@ -2356,7 +2436,8 @@ pathKey = Path.toArray . combinePathRep
 
 -- | Add a directory and the tree under it again, recording the paths found.
 -- The paths added to the map are prepended to @added@, if it is given, with
--- their watch descriptors. Returns the subdirectories not added or not listed
+-- their watch descriptors. The directory is at the given level of the walk,
+-- see 'walkSubdirs'. Returns the subdirectories not added or not listed
 -- because of a permission error, in the order they were found.
 --
 -- The flags are replaced, not added to, so that an existing watch stops
@@ -2371,20 +2452,22 @@ restartDir ::
     -> Watch
     -> IORef (Set (Array Word8))
     -> Maybe (IORef [WdPath])
+    -> Int
     -> Maybe ParentDir
     -> PathRep
     -> IO [PathRep]
-restartDir cfg wtch seen added parent pRep = do
-    (wd, denied) <-
+restartDir cfg wtch seen added level parent pRep = do
+    (wd, subdirs) <-
         withAddedDir flags wtch parent pRep $ \(wd, isNew) dir -> do
             modifyIORef' seen (Set.insert (pathKey pRep))
             case added of
                 Just ref | isNew -> modifyIORef' ref ((wd, pRep) :)
                 _ -> return ()
             case dir of
-                DirOpened (fd, ds) ->
-                    (,) wd <$> forSubdirs pRep ds (restartSubdir fd)
-                _ -> return (wd, deniedOf pRep dir)
+                DirOpened d ->
+                    (,) wd <$> walkSubdirs level pRep d restartSubdir
+                _ -> return (wd, Right (deniedOf pRep dir))
+    denied <- walkCollected restartSubdir subdirs
     when (scanFlags cfg /= watchFlags cfg)
         $ void $ updateWatch (watchFlags cfg) wtch wd pRep
     return denied
@@ -2393,11 +2476,11 @@ restartDir cfg wtch seen added parent pRep = do
 
     flags = scanFlags cfg .&. complement iN_MASK_ADD
 
-    restartSubdir fd name = do
+    restartSubdir subParent name = do
         let sub = addSub pRep name
         ignoreInvalidOrInaccessible wtch [] [sub]
             $ restartDir
-                (subdirConfig cfg) wtch seen added (Just (fd, name)) sub
+                (subdirConfig cfg) wtch seen added (level + 1) subParent sub
 
 -- | The roots in the map that are not removed, with their watch descriptors.
 liveRoots :: IntMap WdEntry -> [WdPath]
@@ -2513,7 +2596,7 @@ restartTree cfg wtch@Watch {watchWdMap = wdMapRef} = do
             if same
             then Just
                     <$> ignoreInvalid wtch []
-                        (restartDir cfg wtch seen added Nothing pRep)
+                        (restartDir cfg wtch seen added 0 Nothing pRep)
             else return Nothing
         return (snd root, denied)
 
