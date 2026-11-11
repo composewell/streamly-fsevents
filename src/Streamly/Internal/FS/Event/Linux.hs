@@ -122,9 +122,13 @@ import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
+import Data.IntSet (IntSet)
 import Data.IORef
     (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (find, isPrefixOf)
+#if !(MIN_VERSION_base(4,20,0))
+import Data.List (foldl')
+#endif
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 #if !(MIN_VERSION_base(4,13,0))
@@ -162,8 +166,9 @@ import Streamly.Internal.FileSystem.Path (Path)
 import qualified Control.Exception as Exception
     (interruptible, mask, mask_, uninterruptibleMask_)
 import qualified Data.IntMap.Lazy as Map
-import qualified Data.IntMap.Strict as StrictMap (map)
+import qualified Data.IntSet as IntSet
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Map.Strict as OrdMap
 import qualified Data.Set as Set
 import qualified Streamly.Data.Array as A
     (createOf, fromList, read, toList)
@@ -901,9 +906,9 @@ data WdEntry =
     -- its IN_IGNORED event is read.
     | WdMarker [Int] [WdUnwatched]
 
--- | Build a 'WdUser' entry with its paths evaluated. The map is updated by
--- mapping over it, an unevaluated path would keep the old entry, its paths
--- and their bytes alive until a later traversal of the map.
+-- | Build a 'WdUser' entry with its paths evaluated. An unevaluated path
+-- would keep the old entry, its paths and their bytes alive until the entry
+-- is used.
 wdUser :: [WatchPath] -> WdEntry
 wdUser wps = foldr (seq . forcePaths) () wps `seq` WdUser wps
 
@@ -911,6 +916,203 @@ wdUser wps = foldr (seq . forcePaths) () wps `seq` WdUser wps
 
     forcePaths WatchPath{wpRep = (root, sub)} =
         root `seq` maybe () (`seq` ()) sub
+
+-- | Compare the subdirectory paths of two 'PathRep's bytewise, with the path
+-- separator ordered before any other byte. A directory is followed by the
+-- paths under it, before any other path. In the plain bytewise order
+-- @a\/b-c@ comes between @a\/b@ and @a\/b\/c@. A root is ordered before
+-- the subdirectories.
+compareSub :: Maybe Path -> Maybe Path -> Ordering
+compareSub Nothing Nothing = EQ
+compareSub Nothing (Just _) = LT
+compareSub (Just _) Nothing = GT
+compareSub (Just a) (Just b) =
+    runIdentity $ S.cmpBy compare (bytes a) (bytes b)
+
+    where
+
+    sep = fromIntegral (ord '/') :: Word8
+
+    -- A file name does not contain the byte 0.
+    rank w = if w == sep then 0 else w
+
+    bytes = fmap rank . A.read . Path.toArray
+
+-- | The key of a path in the path index of a 'WdMap'. The keys are ordered
+-- by the subdirectory path, see 'compareSub', and then by the root. The paths
+-- of a tree are adjacent in the index, together with the paths of the trees
+-- of the same subdirectory path in other roots. The roots are compared last,
+-- most of the paths of a watch have the same root.
+newtype PathKey = PathKey PathRep
+
+-- The comparison must not be inlined or split into a worker that takes the
+-- fields of the 'PathRep'. The insert of the map would then take the key
+-- unboxed and allocate a new tuple to store it, 24 bytes for each path,
+-- instead of sharing the 'PathRep' of the 'WatchPath'.
+#if __GLASGOW_HASKELL__ >= 904
+{-# OPAQUE comparePathKey #-}
+#else
+{-# NOINLINE comparePathKey #-}
+#endif
+comparePathKey :: PathKey -> PathKey -> Ordering
+comparePathKey (PathKey (r1, s1)) (PathKey (r2, s2)) =
+    compareSub s1 s2 <> compare (Path.toArray r1) (Path.toArray r2)
+
+instance Eq PathKey where
+    a == b = comparePathKey a b == EQ
+
+instance Ord PathKey where
+    compare = comparePathKey
+
+-- | The map of the watch descriptors of a watch, and the indexes derived
+-- from it. Only 'insertWdUser', 'insertMarker' and 'deleteWd' change the map,
+-- they keep the indexes up to date.
+--
+-- A directory event is handled in time proportional to the number of paths
+-- it changes, using the indexes. Without them a rename or a removal of a
+-- directory visited every watch descriptor, a watch of 24000 directories
+-- handled 74 directory renames in a second.
+data WdMap = WdMap
+    { -- | Map key is the watch descriptor.
+      wmEntries :: !(IntMap WdEntry)
+      -- | The watch descriptors that have a given path, removed or not.
+    , wmPaths :: !(OrdMap.Map PathKey IntSet)
+      -- | The watch descriptors that have a path with a cookie, see
+      -- 'markMoved'.
+    , wmMoved :: !IntSet
+      -- | The watch descriptors that have a pending path, see
+      -- 'markPending'.
+    , wmPending :: !IntSet
+    }
+
+emptyWdMap :: WdMap
+emptyWdMap = WdMap Map.empty OrdMap.empty IntSet.empty IntSet.empty
+
+lookupWd :: Int -> WdMap -> Maybe WdEntry
+lookupWd wd = Map.lookup wd . wmEntries
+
+-- | The entries in the ascending order of watch descriptors.
+wdEntries :: WdMap -> [(Int, WdEntry)]
+wdEntries = Map.toList . wmEntries
+
+-- | All the watch descriptors, in the ascending order.
+allWds :: WdMap -> [Int]
+allWds = Map.keys . wmEntries
+
+-- | The paths of a user watch descriptor. Empty for a marker, and for a
+-- watch descriptor that is not in the map.
+wdUserPaths :: Int -> WdMap -> [WatchPath]
+wdUserPaths wd m =
+    case lookupWd wd m of
+        Just (WdUser wps) -> wps
+        _ -> []
+
+-- | Remove a watch descriptor from the index entries of the given paths.
+unindexPaths ::
+       Int
+    -> [WatchPath]
+    -> OrdMap.Map PathKey IntSet
+    -> OrdMap.Map PathKey IntSet
+unindexPaths wd wps index = foldl' remove index wps
+
+    where
+
+    remove ix wp = OrdMap.update without (PathKey (wpRep wp)) ix
+
+    without wds =
+        let wds1 = IntSet.delete wd wds
+         in if IntSet.null wds1 then Nothing else Just wds1
+
+-- | Add a watch descriptor to the index entries of the given paths. The key
+-- of a new index entry is the 'PathRep' of the path itself, the index does
+-- not hold a copy of the path.
+indexPaths ::
+       Int
+    -> [WatchPath]
+    -> OrdMap.Map PathKey IntSet
+    -> OrdMap.Map PathKey IntSet
+indexPaths wd wps index = foldl' add index wps
+
+    where
+
+    add ix wp =
+        OrdMap.insertWith
+            IntSet.union (PathKey (wpRep wp)) (IntSet.singleton wd) ix
+
+-- | Add the entry of a user watch descriptor with the given paths, replacing
+-- its existing entry if any, see 'WdUser'.
+insertWdUser :: Int -> [WatchPath] -> WdMap -> WdMap
+insertWdUser wd wps m =
+    let !entry = wdUser wps
+     in WdMap
+            { wmEntries = Map.insert wd entry (wmEntries m)
+            , wmPaths =
+                indexPaths wd wps
+                    $ unindexPaths wd (wdUserPaths wd m) (wmPaths m)
+            , wmMoved = member (any (isJust . wpMoveCookie) wps) (wmMoved m)
+            , wmPending = member (any wpPending wps) (wmPending m)
+            }
+
+    where
+
+    member c = if c then IntSet.insert wd else IntSet.delete wd
+
+-- | Remove a watch descriptor from the map.
+deleteWd :: Int -> WdMap -> WdMap
+deleteWd wd m =
+    WdMap
+        { wmEntries = Map.delete wd (wmEntries m)
+        , wmPaths = unindexPaths wd (wdUserPaths wd m) (wmPaths m)
+        , wmMoved = IntSet.delete wd (wmMoved m)
+        , wmPending = IntSet.delete wd (wmPending m)
+        }
+
+-- | Add the entry of a marker watch descriptor, see 'WdMarker'.
+insertMarker :: Int -> [Int] -> [WdUnwatched] -> WdMap -> WdMap
+insertMarker wd markers paths m =
+    let m1 = deleteWd wd m
+     in m1 {wmEntries = Map.insert wd (WdMarker markers paths) (wmEntries m1)}
+
+-- | Change the paths of the given user watch descriptors. The function
+-- returns 'Nothing' if the paths of a watch descriptor do not change.
+adjustWds :: [Int] -> ([WatchPath] -> Maybe [WatchPath]) -> WdMap -> WdMap
+adjustWds wds f m0 = foldl' step m0 wds
+
+    where
+
+    step m wd =
+        case lookupWd wd m of
+            Just (WdUser wps) | Just wps1 <- f wps -> insertWdUser wd wps1 m
+            _ -> m
+
+-- | The watch descriptors that have the given path, removed or not, in the
+-- ascending order.
+pathWds :: PathRep -> WdMap -> [Int]
+pathWds pRep =
+    foldMap IntSet.toAscList . OrdMap.lookup (PathKey pRep) . wmPaths
+
+-- | The watch descriptors that have the given subdirectory of a root or a
+-- path under it, removed or not, in the ascending order. See 'isInSubtree'.
+-- The watch descriptors of the same subdirectory path in other roots are
+-- included, the caller selects the paths with 'isInSubtree'.
+subtreeWds :: PathRep -> WdMap -> [Int]
+subtreeWds (_, Just sub) m =
+    IntSet.toAscList
+        $ IntSet.unions
+        $ OrdMap.elems
+        $ OrdMap.takeWhileAntitone (isBefore end)
+        $ OrdMap.dropWhileAntitone (isBefore (Just sub)) (wmPaths m)
+
+    where
+
+    isBefore s (PathKey (_, s1)) = compareSub s1 s == LT
+
+    -- The byte 1 is ordered after the path separator and not after any
+    -- other byte of a name, see 'compareSub'. The paths under @sub@ are
+    -- ordered before this path, all other paths ordered after @sub@ are
+    -- not.
+    end = Just (Path.unsafeFromArray (Path.toArray sub <> A.fromList [1]))
+subtreeWds _ _ = []
 
 -- NOTE: Waiting for events and closing the watch:
 --
@@ -986,8 +1188,7 @@ data Watch = Watch
       -- fd, and the fd number cannot be reused, while the system call is in
       -- progress. The system calls made with the lock held must not block.
     , watchLock :: MVar FdState
-      -- | Map key is the watch descriptor.
-    , watchWdMap :: IORef (IntMap WdEntry)
+    , watchWdMap :: IORef WdMap
       -- | The rest of the event stream of 'watchToStream': the events
       -- read from the fd but not yet returned to the application, and the
       -- entries of a new directory scan not yet returned, followed by the
@@ -1034,7 +1235,7 @@ createWatch = do
     lock <-
         newMVar
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
-    emptyMapRef <- newIORef Map.empty
+    emptyMapRef <- newIORef emptyWdMap
     undeliveredRef <- newMVar Nothing
     synthVar <- newTVarIO []
     return
@@ -1345,8 +1546,8 @@ addWatchFor fd flags pRep =
 -- to a new path is dropped. It was added on the IN_CREATE event of a directory
 -- that no longer exists at that path, when the path already referred to the
 -- renamed directory, see the NOTE in 'addToWatch'.
-renamePaths :: PathRep -> PathRep -> IntMap WdEntry -> IntMap WdEntry
-renamePaths from to = StrictMap.map step
+renamePaths :: PathRep -> PathRep -> WdMap -> WdMap
+renamePaths from to m0 = adjustWds (subtreeWds from m0) step m0
 
     where
 
@@ -1362,39 +1563,40 @@ renamePaths from to = StrictMap.map step
             rest ->
                 wp {wpRep = addSub to (Path.unsafeFromArray (A.fromList rest))}
 
-    step (WdUser wps)
+    step wps
         | any isMoving wps =
             let moved = map newPath (filter isMoving wps)
                 isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
                 isReplaced wp =
                     not (isMoving wp) && not (wpRemoved wp) && isTarget wp
-             in wdUser
+             in Just
                     [ if isMoving wp then newPath wp else wp
                     | wp <- wps
                     , not (isReplaced wp)
                     ]
-    step e = e
+        | otherwise = Nothing
 
 -- | Clear the pending flag of the paths of a watch descriptor.
-clearPending :: Int -> IntMap WdEntry -> IntMap WdEntry
-clearPending = Map.adjust step
+clearPending :: Int -> WdMap -> WdMap
+clearPending wd = adjustWds [wd] step
 
     where
 
-    step (WdUser wps) = wdUser [wp {wpPending = False} | wp <- wps]
-    step e = e
+    step wps
+        | any wpPending wps = Just [wp {wpPending = False} | wp <- wps]
+        | otherwise = Nothing
 
 -- | @relocatePending wd pRep@: the directory of @wd@ is at @pRep@. If @wd@ has
 -- a pending path, see 'renameDir', its directory was not moved to that path,
 -- or it has been moved on since. The pending path and the paths under it are
 -- changed to @pRep@.
-relocatePending :: Int -> PathRep -> IntMap WdEntry -> IntMap WdEntry
+relocatePending :: Int -> PathRep -> WdMap -> WdMap
 relocatePending wd pRep m =
-    case Map.lookup wd m of
+    case lookupWd wd m of
         Just (WdUser wps)
             | (q : _) <- [wpRep wp | wp <- wps, isPending wp] ->
                 if eqPathRep q pRep
-                then Map.insert wd (wdUser (map clear wps)) m
+                then insertWdUser wd (map clear wps) m
                 else renamePaths q pRep (clearPending wd m)
         _ -> m
 
@@ -1404,13 +1606,13 @@ relocatePending wd pRep m =
     clear wp = wp {wpPending = False}
 
 -- Returns 'False' if the path is already being watched.
-insertPath :: Int -> PathRep -> IntMap WdEntry -> (IntMap WdEntry, Bool)
+insertPath :: Int -> PathRep -> WdMap -> (WdMap, Bool)
 insertPath wd pRep m0 =
-    case Map.lookup wd m of
+    case lookupWd wd m of
         Just (WdUser wps)
             | any isSame wps -> (m, False)
-            | otherwise -> (Map.insert wd (wdUser (wps ++ [new])) m, True)
-        _ -> (Map.insert wd (wdUser [new]) m, True)
+            | otherwise -> (insertWdUser wd (wps ++ [new]) m, True)
+        _ -> (insertWdUser wd [new] m, True)
 
     where
 
@@ -1556,7 +1758,7 @@ probeWatch flags wtch@Watch {watchWdMap = wdMapRef} wd pRep =
             Right wd1 -> do
                 m <- readIORef wdMapRef
                 let same = fromIntegral wd1 == wd
-                when (not same && Map.notMember (fromIntegral wd1) m)
+                when (not same && isNothing (lookupWd (fromIntegral wd1) m))
                     $ void $ c_inotify_rm_watch fd wd1
                 if same
                 then do
@@ -2052,15 +2254,18 @@ foreign import ccall unsafe "unistd.h pipe2"
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
 
--- | Mark the paths that satisfy the predicate as removed. Returns the watch
--- descriptors whose paths are now all removed, and the removed paths of the
--- other watch descriptors, both in the ascending order of watch descriptors.
+-- | Mark the paths of the given watch descriptors that satisfy the predicate
+-- as removed. The watch descriptors are in the ascending order. Returns the
+-- watch descriptors whose paths are now all removed, and the removed paths of
+-- the other watch descriptors, both in the ascending order of watch
+-- descriptors.
 markRemoved ::
-       (PathRep -> Bool)
-    -> IntMap WdEntry
-    -> (IntMap WdEntry, ([Int], [WdUnwatched]))
-markRemoved p m =
-    let ((wds, shared), m1) = Map.mapAccumWithKey step ([], []) m
+       [Int]
+    -> (PathRep -> Bool)
+    -> WdMap
+    -> (WdMap, ([Int], [WdUnwatched]))
+markRemoved candidates p m0 =
+    let (m1, wds, shared) = foldl' step (m0, [], []) candidates
      in (m1, (reverse wds, reverse shared))
 
     where
@@ -2068,33 +2273,33 @@ markRemoved p m =
     isRemoving wp = not (wpRemoved wp) && p (wpRep wp)
     setRemoved wp = if isRemoving wp then wp {wpRemoved = True} else wp
 
-    step acc _ e@(WdMarker _ _) = (acc, e)
-    step acc@(wds, shared) wd (WdUser wps) =
-        let removing = filter isRemoving wps
+    step acc@(!m, wds, shared) wd =
+        let wps = wdUserPaths wd m
+            removing = filter isRemoving wps
             wps1 = map setRemoved wps
             shared1 = reverse [(wd, wpRep wp) | wp <- removing] ++ shared
+            m1 = insertWdUser wd wps1 m
          in if null removing
-            then (acc, WdUser wps)
+            then acc
             else if all wpRemoved wps1
-            then ((wd : wds, shared), wdUser wps1)
-            else ((wds, shared1), wdUser wps1)
+            then (m1, wd : wds, shared)
+            else (m1, wds, shared1)
 
 -- | Undo 'markRemoved' for the listed paths. For each path, the first path of
 -- its watch descriptor that is marked removed and equal to it is unmarked.
 -- Identical paths of a watch descriptor report the same events, it does not
 -- matter which one is unmarked.
-unmarkRemoved :: [WdUnwatched] -> IntMap WdEntry -> IntMap WdEntry
-unmarkRemoved paths m0 = foldl step m0 paths
+unmarkRemoved :: [WdUnwatched] -> WdMap -> WdMap
+unmarkRemoved paths m0 = foldl' step m0 paths
 
     where
 
     step m (wd, pRep) =
         let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) pRep
-         in case Map.lookup wd m of
-                Just (WdUser wps)
-                    | (xs, wp : ys) <- break isMatch wps ->
-                        let wp1 = wp {wpRemoved = False}
-                         in Map.insert wd (wdUser (xs ++ wp1 : ys)) m
+         in case break isMatch (wdUserPaths wd m) of
+                (xs, wp : ys) ->
+                    let wp1 = wp {wpRemoved = False}
+                     in insertWdUser wd (xs ++ wp1 : ys) m
                 _ -> m
 
 -- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
@@ -2138,25 +2343,23 @@ queueIgnored err fd action =
 removeListed ::
        [Int]
     -> [WdUnwatched]
-    -> IntMap WdEntry
-    -> (IntMap WdEntry, [WdUnwatched])
+    -> WdMap
+    -> (WdMap, [WdUnwatched])
 removeListed markers paths m0 =
-    let m = foldr Map.delete m0 markers
-        (m1, removed) = foldl step (m, []) paths
+    let m = foldr deleteWd m0 markers
+        (m1, removed) = foldl' step (m, []) paths
      in (m1, reverse removed)
 
     where
 
-    step (m, acc) (wd, pRep) =
+    step (!m, acc) (wd, pRep) =
         let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) pRep
-         in case Map.lookup wd m of
-                Just (WdUser wps)
-                    | (xs, _ : ys) <- break isMatch wps ->
-                        (update wd (xs ++ ys) m, (wd, pRep) : acc)
+         in case break isMatch (wdUserPaths wd m) of
+                (xs, _ : ys) -> (update wd (xs ++ ys) m, (wd, pRep) : acc)
                 _ -> (m, acc)
 
-    update wd [] m = Map.delete wd m
-    update wd wps m = Map.insert wd (wdUser wps) m
+    update wd [] m = deleteWd wd m
+    update wd wps m = insertWdUser wd wps m
 
 -- | When multiple paths are being watched through the same wd and we remove
 -- only one path we cannot remove the wd but we still need to identify the
@@ -2181,9 +2384,7 @@ addRemovalMarker
         queueIgnored err fd $ \wd ->
             -- The marker must be in the map before its IN_IGNORED is read.
             atomicModifyIORef' wdMapRef
-                $ \m ->
-                    let e = WdMarker markers paths
-                     in (Map.insert (fromIntegral wd) e m, ())
+                $ \m -> (insertMarker (fromIntegral wd) markers paths m, ())
     if queued
     then return []
     else atomicModifyIORef' wdMapRef (removeListed markers paths)
@@ -2193,7 +2394,9 @@ addRemovalMarker
     err = "unwatchPaths: marker " ++ show (map fst paths)
 
 -- | Remove the paths that satisfy the predicate from the watch. The string
--- describes the paths in the exception message.
+-- describes the paths in the exception message. The function returns the
+-- watch descriptors that can have such paths, in the ascending order, see
+-- 'allWds' and 'subtreeWds'.
 --
 -- The events already queued for the paths are reported, followed by an
 -- 'isRootUnwatched' event for each path.
@@ -2210,8 +2413,13 @@ addRemovalMarker
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
 unwatchPaths ::
-    Watch -> String -> (PathRep -> Bool) -> IO [WdUnwatched]
-unwatchPaths wtch@Watch {watchFd = fd, watchWdMap = wdMapRef} desc p =
+       Watch
+    -> String
+    -> (WdMap -> [Int])
+    -> (PathRep -> Bool)
+    -> IO [WdUnwatched]
+unwatchPaths
+    wtch@Watch {watchFd = fd, watchWdMap = wdMapRef} desc candidates p =
     whenWatchOpen wtch [] $ do
         -- A watch descriptor can be shared by more than one path, see
         -- 'WatchPath' for the cases.
@@ -2220,7 +2428,9 @@ unwatchPaths wtch@Watch {watchFd = fd, watchWdMap = wdMapRef} desc p =
         -- the kernel watch. Otherwise, the kernel watch is still needed for
         -- the other paths.
         --
-        (wds, shared) <- atomicModifyIORef' wdMapRef (markRemoved p)
+        (wds, shared) <-
+            atomicModifyIORef' wdMapRef
+                (\m -> markRemoved (candidates m) p m)
 
         -- The kernel queues an IN_IGNORED event for a removed watch. After
         -- calling inotify_rm_watch, a path still stays in the map until an
@@ -2285,7 +2495,8 @@ removeFromWatch :: Watch -> Path -> IO ()
 removeFromWatch wtch root = do
     removed <-
         unwatchPaths
-            wtch (show (Path.toString root)) (eqPath root . getRepRoot)
+            wtch (show (Path.toString root)) allWds
+            (eqPath root . getRepRoot)
     recordSynthEvents wtch (map (uncurry SynthUnwatched) removed)
 
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
@@ -2393,7 +2604,7 @@ accessDeniedFlag = 0x00100000
 -- The paths listed in the markers are not used. A marker lists the paths of
 -- the older markers, the lists would double with each marker queued while
 -- the IN_IGNORED events of the markers are dropped.
-pendingRemovals :: IntMap WdEntry -> ([Int], [WdUnwatched])
+pendingRemovals :: WdMap -> ([Int], [WdUnwatched])
 pendingRemovals m =
     ( [wd | (wd, WdMarker _ _) <- entries]
     , [ (wd, wpRep wp)
@@ -2405,7 +2616,7 @@ pendingRemovals m =
 
     where
 
-    entries = Map.toList m
+    entries = wdEntries m
 
 -- | The kernel drops the events that do not fit in the event queue,
 -- including the IN_IGNORED events of the removed watches and of the markers,
@@ -2483,10 +2694,10 @@ restartDir cfg wtch seen added level parent pRep = do
                 (subdirConfig cfg) wtch seen added (level + 1) subParent sub
 
 -- | The roots in the map that are not removed, with their watch descriptors.
-liveRoots :: IntMap WdEntry -> [WdPath]
+liveRoots :: WdMap -> [WdPath]
 liveRoots m =
     [ (wd, wpRep wp)
-    | (wd, WdUser wps) <- Map.toList m
+    | (wd, WdUser wps) <- wdEntries m
     , wp <- wps
     , not (wpRemoved wp)
     , isNothing (getRepSub (wpRep wp))
@@ -2524,7 +2735,7 @@ unwatchGoneRoots cfg wtch roots = do
         isGone p = any (isUnder p) gone && not (any (isUnder p) kept)
     if null gone
     then return []
-    else unwatchPaths wtch "unwatchGoneRoots" isGone
+    else unwatchPaths wtch "unwatchGoneRoots" allWds isGone
 
     where
 
@@ -2582,7 +2793,7 @@ restartTree cfg wtch@Watch {watchWdMap = wdMapRef} = do
             && Set.notMember (pathKey pRep) found
         isGone pRep = isUnder skipped pRep && not (isRestarted pRep)
     removed <-
-        unwatchPaths wtch "restartTree" (\p -> isStale p || isGone p)
+        unwatchPaths wtch "restartTree" allWds (\p -> isStale p || isGone p)
             `catchIOError` \_ -> return []
     paths <- maybe (return []) (fmap reverse . readIORef) added
     return (paths, concat [d | (_, Just d) <- results], removed)
@@ -2606,6 +2817,7 @@ unwatchSubtree :: Watch -> PathRep -> IO [WdUnwatched]
 unwatchSubtree wtch pRep =
     unwatchPaths wtch
         (show (Path.toString (combinePathRep pRep)))
+        (subtreeWds pRep)
         (isInSubtree pRep)
 
 -------------------------------------------------------------------------------
@@ -2669,45 +2881,51 @@ unwatchSubtree wtch pRep =
 -- renamed while it was being listed, 'updateWatch' could not find its old
 -- path.
 
--- | Remove the cookie of the paths that satisfy the predicate.
-clearMoved :: (WatchPath -> Bool) -> IntMap WdEntry -> IntMap WdEntry
-clearMoved p = StrictMap.map step
+-- | The watch descriptors that have a path with a cookie, in the ascending
+-- order.
+movedWds :: WdMap -> [Int]
+movedWds = IntSet.toAscList . wmMoved
+
+-- | Remove the cookie of the paths that satisfy the predicate. The predicate
+-- must be 'False' for a path without a cookie.
+clearMoved :: (WatchPath -> Bool) -> WdMap -> WdMap
+clearMoved p m0 = adjustWds (movedWds m0) step m0
 
     where
 
-    step (WdUser wps)
+    step wps
         | any p wps =
-            wdUser
-                [if p wp then wp {wpMoveCookie = Nothing} else wp | wp <- wps]
-    step e = e
+            Just [if p wp then wp {wpMoveCookie = Nothing} else wp | wp <- wps]
+        | otherwise = Nothing
 
 -- | Record the cookie of IN_MOVED_FROM in the paths of a directory. A path
 -- that is not watched has no entry and records nothing, no IN_MOVE_SELF event
 -- is generated for it.
-markMoved :: Word32 -> [PathRep] -> IntMap WdEntry -> IntMap WdEntry
-markMoved cookie paths = StrictMap.map step
+markMoved :: Word32 -> [PathRep] -> WdMap -> WdMap
+markMoved cookie paths m0 =
+    adjustWds (concatMap (`pathWds` m0) paths) step m0
 
     where
 
     isSource wp =
         not (wpRemoved wp) && any (eqPathRep (wpRep wp)) paths
 
-    step (WdUser wps)
+    step wps
         | any isSource wps =
-            wdUser
+            Just
                 [ if isSource wp then wp {wpMoveCookie = Just cookie} else wp
                 | wp <- wps
                 ]
-    step e = e
+        | otherwise = Nothing
 
 -- | Remove a cookie from the map. Returns the paths that had it, with their
 -- watch descriptors.
-takeMoved :: Word32 -> IntMap WdEntry -> (IntMap WdEntry, [WdPath])
+takeMoved :: Word32 -> WdMap -> (WdMap, [WdPath])
 takeMoved cookie m =
     ( clearMoved isMatch m
     , [ (wd, wpRep wp)
-      | (wd, WdUser wps) <- Map.toList m
-      , wp <- wps
+      | wd <- movedWds m
+      , wp <- wdUserPaths wd m
       , isMatch wp
       ]
     )
@@ -2741,10 +2959,9 @@ addMovedDir cfg wtch@Watch {watchWdMap = wdMapRef} to = do
             && isJust (wpMoveCookie wp)
             && eqPathRep (wpRep wp) to
 
-    hasStale (WdUser wps) = any isStale wps
-    hasStale _ = False
+    hasStale m wd = any isStale (wdUserPaths wd m)
 
-    takeStale m = (clearMoved isStale m, any hasStale (Map.elems m))
+    takeStale m = (clearMoved isStale m, any (hasStale m) (movedWds m))
 
 -- NOTE: A rename to a path that no longer exists:
 --
@@ -2767,25 +2984,21 @@ addMovedDir cfg wtch@Watch {watchWdMap = wdMapRef} to = do
 -- the new path is added as a directory moved in.
 
 -- | Mark the path of a watch descriptor equal to the given path as pending.
-markPending :: Int -> PathRep -> IntMap WdEntry -> IntMap WdEntry
-markPending wd pRep = Map.adjust step wd
+markPending :: Int -> PathRep -> WdMap -> WdMap
+markPending wd pRep = adjustWds [wd] (Just . map step)
 
     where
 
-    step (WdUser wps) =
-        wdUser
-            [ if not (wpRemoved wp) && eqPathRep (wpRep wp) pRep
-              then wp {wpPending = True}
-              else wp
-            | wp <- wps
-            ]
-    step e = e
+    step wp =
+        if not (wpRemoved wp) && eqPathRep (wpRep wp) pRep
+        then wp {wpPending = True}
+        else wp
 
 -- | The pending paths named by an IN_MOVED_FROM or IN_DELETE event of a
 -- directory, see the NOTE above 'markPending'. The pending marks are removed,
 -- the caller removes the paths.
 takeNamedPending ::
-    [PathRep] -> IntMap WdEntry -> (IntMap WdEntry, [PathRep])
+    [PathRep] -> WdMap -> (WdMap, [PathRep])
 takeNamedPending paths m =
     (foldr (clearPending . fst) m found, map snd found)
 
@@ -2797,8 +3010,8 @@ takeNamedPending paths m =
             && any (eqPathRep (wpRep wp)) paths
     found =
         [ (wd, wpRep wp)
-        | (wd, WdUser wps) <- Map.toList m
-        , wp <- wps
+        | wd <- IntSet.toAscList (wmPending m)
+        , wp <- wdUserPaths wd m
         , isNamed wp
         ]
 
@@ -2924,8 +3137,8 @@ unwatchMoved wtch@Watch {watchWdMap = wdMapRef} = do
     takeAll m =
         ( clearMoved isPending m
         , [ wpRep wp
-          | (_, WdUser wps) <- Map.toList m
-          , wp <- wps
+          | wd <- movedWds m
+          , wp <- wdUserPaths wd m
           , isPending wp
           ]
         )
@@ -3065,7 +3278,7 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
     then do
         let lost =
                 [ mkEvent (fromIntegral wd) (wpRep wp)
-                | (wd, WdUser wps) <- Map.toList wdm
+                | (wd, WdUser wps) <- wdEntries wdm
                 , wp <- wps
                 , isNothing (getRepSub (wpRep wp))
                 ]
@@ -3087,7 +3300,7 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                 ++ map (synthEvent . SynthDenied) denied
                 ++ map mkUnwatched (moved ++ removed ++ synced)
     else
-        case Map.lookup (fromIntegral ewd) wdm of
+        case lookupWd (fromIntegral ewd) wdm of
             Nothing -> return S.nil
             Just (WdMarker markers paths)
                 | isIgnored -> do
@@ -3190,7 +3403,7 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                                 $ S.filter (not . isFound) scan
                     when isIgnored
                         $ atomicModifyIORef' wdMapRef
-                        $ \m -> (Map.delete (fromIntegral ewd) m, ())
+                        $ \m -> (deleteWd (fromIntegral ewd) m, ())
                     let removed =
                             removedPending ++ removedMoved ++ removedRoots
                                 ++ removedOut

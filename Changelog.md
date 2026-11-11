@@ -41,6 +41,10 @@
   an async exception, for example, a timeout, or after the stream raises an
   exception. Earlier the next read could use a directory that was already
   closed, and the events already read from the kernel could be lost.
+- Linux: in recursive mode, the time taken to handle a rename, a move or a
+  removal of a directory no longer grows with the number of directories
+  watched. On a watch of 24000 directories, 2000 renames of a directory took
+  27 seconds, during which the kernel event queue was not read.
 - Linux: in recursive mode, the number of file descriptors used to add or
   scan a tree no longer grows with the depth of the tree. A deep chain of
   directories created in the tree or moved into it could exhaust the file
