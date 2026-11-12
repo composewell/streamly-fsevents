@@ -375,6 +375,9 @@ resume Watch{..} = putMVar resumed ()
 
 -- | Start a watch of @dir@ and wait until the consumer reads events. If
 -- @track@ is true, the paths of the 'Event.isCreated' events are recorded.
+--
+-- On Linux the stream ends after an overflow, the consumer then opens a new
+-- watch, as an application does.
 startWatch :: (Config -> Config) -> Bool -> FilePath -> IO Watch
 startWatch cfg track dir = do
     lostRef <- newIORef 0
@@ -404,9 +407,14 @@ startWatch cfg track dir = do
         consumer = do
             w <- mk <$> takeMVar started
             rootPath <- Path.fromString dir
-            Event.watchWith
-                (Event.setRecursiveMode True . cfg) (rootPath :| [])
-                & Stream.fold (Fold.drainMapM (observe w))
+            let run = do
+                    n0 <- lostCount w
+                    Event.watchWith
+                        (Event.setRecursiveMode True . cfg) (rootPath :| [])
+                        & Stream.fold (Fold.drainMapM (observe w))
+                    n1 <- lostCount w
+                    when (isLinux && n1 > n0) run
+            run
     tid <- forkIO (try consumer >>= putMVar finishedVar)
     putMVar started tid
     let w = mk tid

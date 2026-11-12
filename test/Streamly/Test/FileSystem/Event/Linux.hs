@@ -2529,49 +2529,6 @@ withOverflow dir action = do
         mapM_ (\i -> createFile (dir </> show i)) [1 .. limit + 1000]
         Just <$> action
 
--- The kernel drops the IN_IGNORED event of the removed root when the queue
--- is full.
-overflowRemove :: Spec
-overflowRemove =
-    it "removeFromWatch reports isRootUnwatched after a queue overflow"
-        $ withTwoRoots $ \root1 root2 w -> do
-            p <- Path.fromString root2
-            r <- withOverflow root1 (Event.removeFromWatch w p)
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    evs <- readUntil watchCfg Event.isRootUnwatched w
-                    any Event.isEventsLost evs `shouldBe` True
-                    unwatched evs `shouldBe` [(root2, root2)]
-
--- The marker of the shared watch descriptor of sub is dropped when the queue
--- is full. Without @\/proc@ there is no marker, isRootUnwatched is reported
--- before the events in the queue.
-overflowRemoveShared :: Spec
-overflowRemoveShared =
-    it "removing a shared root stops its events after a queue overflow"
-        $ withNestedRoots $ \root sub w -> do
-            hasProc <- procAvailable
-            p <- Path.fromString sub
-            r <- withOverflow root (Event.removeFromWatch w p)
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    evs <- readUntil recCfg Event.isRootUnwatched w
-                    unwatched evs `shouldBe` [(sub, sub)]
-                    lost <-
-                        if hasProc
-                        then return evs
-                        else readUntil recCfg Event.isEventsLost w
-                    any Event.isEventsLost lost `shouldBe` True
-                    let file = sub </> "file"
-                    createFile file
-                    evs1 <- readUntil recCfg (isCreatedAt file) w
-                    createdRoots file evs1 `shouldBe` [root]
-
-noRestartCfg :: Event.Config
-noRestartCfg = Event.setRestartOnOverflow False recCfg
-
 -- The scan at the start of a watch lists root and sub.
 recStartScanSilent :: Spec
 recStartScanSilent =
@@ -2609,230 +2566,43 @@ recTouchAfterScan =
                         getAbsPath ev == sub && Event.isNonWriteClosed ev) w
                     pathsOf Event.isOpened evs `shouldContain` [sub]
 
--- The kernel drops the create event of the directory when the queue is full.
-overflowRecCreate :: Spec
-overflowRecCreate =
-    it "watches a directory created during an overflow"
-        $ withRoot recCfg $ \root w -> do
-            let dir = root </> "dir"
-                file = dir </> "sub" </> "file"
-            r <- withOverflow root $ do
-                createDirectory dir
-                createDirectory (dir </> "sub")
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    _ <- readUntil recCfg Event.isEventsLost w
-                    createFile file
-                    evs <- readUntil recCfg (isCreatedAt file) w
-                    createdRoots file evs `shouldBe` [root]
-
--- The restart after an overflow does not keep every level of the tree open.
-overflowRecDeep :: Spec
-overflowRecDeep =
-    it "restarts a tree deeper than the open file limit"
-        $ withDeepRoot $ \root w new -> do
-            r <- withOverflow root (return ())
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    _ <- readUntil recCfg Event.isEventsLost w
-                    createFile new
-                    evs <- readUntil recCfg (isCreatedAt new) w
-                    createdRoots new evs `shouldBe` [root]
-
--- The kernel drops the create events of the directories when the queue is
--- full, the restart reports them.
-overflowRecCreateReported :: Spec
-overflowRecCreateReported =
-    it "setRestartOnOverflow reports a directory created during an overflow"
-        $ withRoot recCfg $ \root w -> do
-            let dir = root </> "dir"
-                sub = dir </> "sub"
-            r <- withOverflow root $ do
-                createDirectory dir
-                createDirectory sub
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    evs <- readUntil recCfg (isCreatedAt sub) w
-                    scannedPaths Event.isDir evs `shouldBe` [dir, sub]
-                    kernelCreated (filter Event.isDir evs) `shouldBe` []
-
--- The kernel drops the move events of the directory when the queue is full.
-overflowRecRename :: Spec
-overflowRecRename =
-    it "setRestartOnOverflow reports the new path of a renamed directory"
-        $ withRootDir $ \root w -> do
-            let dir = root </> "dir"
-                dir1 = root </> "dir1"
-                file = dir1 </> "file"
-            r <- withOverflow root (renameDirectory dir dir1)
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    evs0 <- readUntil recCfg (isCreatedAt dir1) w
-                    scannedPaths Event.isDir evs0 `shouldBe` [dir1]
-                    createFile file
-                    evs <- readUntil recCfg (isCreatedAt file) w
-                    createdRoots file evs `shouldBe` [root]
-                    pathsOf Event.isCreated evs
-                        `shouldNotContain` [dir </> "file"]
-
-    where
-
-    withRootDir action =
-        withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let root = fp </> "root"
-            createDirectory root
-            createDirectory (root </> "dir")
-            p <- Path.fromString root
-            bracket
-                (Event.openWatch recCfg (p NonEmpty.:| []))
-                Event.closeWatch
-                (action root)
-
--- A directory moved out of the tree during the overflow.
-overflowRecMoveOut :: Spec
-overflowRecMoveOut =
-    it "setRestartOnOverflow removes a directory moved out of the tree"
-        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let root = fp </> "root"
-                dir = root </> "dir"
-                outside = fp </> "outside"
-                sentinel = root </> "sentinel"
-            createDirectory root
-            createDirectory dir
-            p <- Path.fromString root
-            bracket
-                (Event.openWatch recCfg (p NonEmpty.:| []))
-                Event.closeWatch
-                $ \w -> do
-                    r <- withOverflow root (renameDirectory dir outside)
-                    case r of
-                        Nothing ->
-                            pendingWith "max_queued_events is too high"
-                        Just () -> do
-                            _ <- readUntil recCfg Event.isRootUnwatched w
-                            createFile (outside </> "file")
-                            createFile sentinel
-                            evs <- readUntil recCfg
-                                    (isCreatedAt sentinel) w
-                            pathsOf Event.isCreated evs `shouldBe` [sentinel]
-
--- The kernel drops the IN_MOVE_SELF event of the root when the queue is full.
-overflowRecRootRenamed :: Spec
-overflowRecRootRenamed =
-    it "setRestartOnOverflow removes a root renamed during an overflow"
-        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let root = fp </> "root"
-                root1 = fp </> "root1"
-                sub = root </> "sub"
-            createDirectory root
-            createDirectory sub
-            p <- Path.fromString root
-            bracket
-                (Event.openWatch recCfg (p NonEmpty.:| []))
-                Event.closeWatch
-                $ \w -> do
-                    r <- withOverflow root (renameDirectory root root1)
-                    case r of
-                        Nothing ->
-                            pendingWith "max_queued_events is too high"
-                        Just () -> do
-                            evs <- readUntil recCfg (\ev ->
-                                Event.isRootUnwatched ev
-                                    && getAbsPath ev == sub) w
-                            unwatched evs
-                                `shouldBe` [(root, root), (root, sub)]
-
--- The kernel drops the IN_IGNORED events of the deleted root and its
--- subdirectory when the queue is full.
-overflowRecRootDeleted :: Spec
-overflowRecRootDeleted =
-    it "setRestartOnOverflow removes a root deleted during an overflow"
+-- | Overflow the event queue of a watch on two roots, then create a file in
+-- the second root. The create event of the file is dropped, the stream ends
+-- after the overflow events, and a new stream on the watch is empty.
+overflowEnds :: String -> Event.Config -> Spec
+overflowEnds mode cfg =
+    it ("ends the stream and closes the watch after an overflow in " ++ mode)
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
             let root1 = fp </> "root1"
                 root2 = fp </> "root2"
-                sub = root2 </> "sub"
+                file = root2 </> "file"
             createDirectory root1
             createDirectory root2
-            createDirectory sub
             roots <- mapM Path.fromString [root1, root2]
             bracket
-                (Event.openWatch recCfg (NonEmpty.fromList roots))
+                (Event.openWatch cfg (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
-                    r <- withOverflow root1 $ do
-                        removeDirectory sub
-                        removeDirectory root2
+                    r <- withOverflow root1 (createFile file)
                     case r of
                         Nothing ->
                             pendingWith "max_queued_events is too high"
                         Just () -> do
-                            evs <- readUntil recCfg (\ev ->
-                                Event.isRootUnwatched ev
-                                    && getAbsPath ev == sub) w
-                            unwatched evs
-                                `shouldBe` [(root2, root2), (root2, sub)]
+                            evs <- readToEnd w
+                            let lost =
+                                    dropWhile (not . Event.isEventsLost) evs
+                            sort (map getRoot lost) `shouldBe` [root1, root2]
+                            all Event.isEventsLost lost `shouldBe` True
+                            pathsOf Event.isCreated evs
+                                `shouldNotContain` [file]
+                            more <- readToEnd w
+                            length more `shouldBe` 0
 
--- | Run the action on root2 during an overflow of root1, and read the events
--- up to the 'Event.isRootUnwatched' event of root2.
-overflowRoot2 ::
-    Event.Config -> (FilePath -> IO ()) -> Expectation
-overflowRoot2 cfg action =
-    withSystemTempDirectory "fsevent_dir" $ \fp -> do
-        let root1 = fp </> "root1"
-            root2 = fp </> "root2"
-        createDirectory root1
-        createDirectory root2
-        roots <- mapM Path.fromString [root1, root2]
-        bracket
-            (Event.openWatch cfg (NonEmpty.fromList roots))
-            Event.closeWatch
-            $ \w -> do
-                r <- withOverflow root1 (action root2)
-                case r of
-                    Nothing -> pendingWith "max_queued_events is too high"
-                    Just () -> do
-                        evs <- readUntil cfg (isUnwatchedAt root2) w
-                        unwatched evs `shouldBe` [(root2, root2)]
+    where
 
--- The kernel drops the IN_MOVE_SELF event of the root when the queue is full.
-overflowRootRenamed :: Spec
-overflowRootRenamed =
-    it "removes a root renamed during an overflow in non-recursive mode"
-        $ overflowRoot2 watchCfg
-            (\root2 -> renameDirectory root2 (root2 ++ "x"))
-
--- The kernel drops the IN_IGNORED event of the root when the queue is full.
-overflowRootDeleted :: Spec
-overflowRootDeleted =
-    it "removes a root deleted during an overflow in non-recursive mode"
-        $ overflowRoot2 watchCfg removeDirectory
-
-overflowRecRootRenamedNoRestart :: Spec
-overflowRecRootRenamedNoRestart =
-    it "removes a root renamed during an overflow if restart is disabled"
-        $ overflowRoot2 noRestartCfg
-            (\root2 -> renameDirectory root2 (root2 ++ "x"))
-
-overflowRecCreateNoRestart :: Spec
-overflowRecCreateNoRestart =
-    it "does not watch a directory created during an overflow if disabled"
-        $ withRoot noRestartCfg $ \root w -> do
-            let dir = root </> "dir"
-                file = dir </> "file"
-                sentinel = root </> "sentinel"
-            r <- withOverflow root (createDirectory dir)
-            case r of
-                Nothing -> pendingWith "max_queued_events is too high"
-                Just () -> do
-                    _ <- readUntil noRestartCfg Event.isEventsLost w
-                    createFile file
-                    createFile sentinel
-                    evs <- readUntil noRestartCfg (isCreatedAt sentinel) w
-                    createdRoots file evs `shouldBe` []
+    readToEnd w = do
+        r <- timeout 10000000 $ Stream.toList $ Event.watchToStream cfg w
+        maybe (error "overflowEnds: timed out") return r
 
 -------------------------------------------------------------------------------
 -- Event path tests
@@ -2951,19 +2721,8 @@ watchTests =
                 readAfterFailure
                 readAfterScanFailure
             describe "queue overflow" $ do
-                overflowRemove
-                overflowRemoveShared
-                overflowRecCreate
-                overflowRecCreateReported
-                overflowRecCreateNoRestart
-                overflowRootRenamed
-                overflowRootDeleted
-                overflowRecRootRenamedNoRestart
-                overflowRecRename
-                overflowRecMoveOut
-                overflowRecRootRenamed
-                overflowRecRootDeleted
-                overflowRecDeep
+                overflowEnds "non-recursive mode" watchCfg
+                overflowEnds "recursive mode" recCfg
             describe "event paths" $ do
                 rootEventPaths
                 overflowPaths

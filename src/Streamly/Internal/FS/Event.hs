@@ -253,6 +253,9 @@ isModified = Event.isModified
 -- The tree under the path returned by 'getAbsPath' has to be scanned again to
 -- know its current state. See @docs\/platform-differences.md@ in this package
 -- for the path reported on each platform.
+--
+-- On Linux the watch is closed and the stream ends after this event, a new
+-- watch has to be opened to continue.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 

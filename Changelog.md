@@ -16,6 +16,10 @@
 - Linux: enable `setAttrsModified` by default, consistent with macOS.
 - Linux: in recursive mode, `isRootDeleted` and `isRootMoved` are reported
   for the watch roots only, not for subdirectories.
+- Linux: after an event queue overflow the watch is closed and the stream
+  ends, in both modes. Earlier the stream continued, and the events after
+  the overflow could have gaps that no event reported. Open a new watch and
+  scan the tree to continue.
 
 ### Bug Fixes
 
@@ -30,9 +34,7 @@
   causes the wrong object, or no object, to be watched.
 - Linux: fix the handling of an event queue overflow. The overflow event,
   `isEventsLost`, is reported once per watch root, and `getRoot` and
-  `getAbsPath` no longer raise an exception on it. In recursive mode,
-  `setRestartOnOverflow` adds the tree again, so that a directory created
-  during the overflow is watched.
+  `getAbsPath` no longer raise an exception on it.
 - Linux: in recursive mode, adding a tree no longer reports the open, access
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
@@ -65,8 +67,6 @@
 - Linux: a directory renamed within a recursive watch keeps its watches, the
   events generated during the rename are no longer lost and report the new
   path.
-- Linux: add `setRestartOnOverflow`, enabled by default, to restart a
-  recursive watch automatically after an event queue overflow.
 - Add the public platform specific modules
   `Streamly.FileSystem.Event.Darwin`, `Streamly.FileSystem.Event.Linux` and
   `Streamly.FileSystem.Event.Windows`.

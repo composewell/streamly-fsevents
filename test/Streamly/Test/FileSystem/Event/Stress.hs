@@ -63,13 +63,6 @@ touchEvents =
 touchEvents = id
 #endif
 
-noRestart :: Config -> Config
-#if defined(CABAL_OS_LINUX)
-noRestart = Linux.setRestartOnOverflow False
-#else
-noRestart = id
-#endif
-
 -- | The overflow event is parsed from an uninitialized buffer on Windows on
 -- this branch.
 --
@@ -229,14 +222,15 @@ overflowCases =
     ]
 #if defined(CABAL_OS_LINUX)
     -- The files are created while the consumer is paused, the kernel queues
-    -- one overflow event and drops the rest of the burst, and the restart
-    -- generates no events, so exactly one 'isEventsLost' is expected.
-    -- 'judgeStopped' would also pass if the restart overflowed the queue a
-    -- few times before stopping. The case for all platforms above keeps
-    -- 'judgeStopped', on macOS and Windows the number of overflows varies.
+    -- one overflow event and drops the rest of the burst. The stream ends,
+    -- and the new watch opened by the consumer generates no events, so
+    -- exactly one 'isEventsLost' is expected. 'judgeStopped' would also pass
+    -- if the new watch overflowed the queue a few times before stopping. The
+    -- case for all platforms above keeps 'judgeStopped', on macOS and Windows
+    -- the number of overflows varies.
     ++
     [ Overflow
-        { title = "restart: one overflow after a burst in a large tree"
+        { title = "reopen: one overflow after a burst in a large tree"
         , config = touchEvents
         , largeTree = True
         , burst = True
@@ -244,17 +238,9 @@ overflowCases =
         , expected = Yes
         }
     , Overflow
-        { title = "restart: one overflow after a burst in a small tree"
+        { title = "reopen: one overflow after a burst in a small tree"
         , config = touchEvents
         , largeTree = False
-        , burst = True
-        , judge = judgeOnce
-        , expected = Yes
-        }
-    , Overflow
-        { title = "no restart: one overflow after a burst"
-        , config = noRestart
-        , largeTree = True
         , burst = True
         , judge = judgeOnce
         , expected = Yes
@@ -262,8 +248,8 @@ overflowCases =
     ]
 #endif
 
--- | The outcome is asserted on Linux only. The library has no restart on
--- macOS and Windows, and an overflow is not certain there.
+-- | The outcome is asserted on Linux only. An overflow is not certain on
+-- macOS and Windows.
 overflowSpec :: Overflow -> Spec
 overflowSpec o =
     it (title o) $ case overflowSkip of
@@ -457,11 +443,11 @@ churn root out deadline = go 0
 
 -- | Block the consumer, overflow the queue, then change a tree of at most
 -- @dirs@ directories for 10 seconds while the consumer reads. On Linux, each
--- overflow restarts the watch, and the changes during a restart can cause
--- another overflow.
+-- overflow ends the stream and the consumer opens a new watch, and the
+-- changes while the new watch adds the tree can cause another overflow.
 --
--- Whether the changes during a restart overflow the queue depends on the
--- time the restart takes. During the changes, the consumer is blocked 3
+-- Whether these changes overflow the queue depends on the time taken to add
+-- the tree. During the changes, the consumer is blocked 3
 -- times, 2 seconds apart, and the queue is overflowed by deleting or creating
 -- the burst files again. On Linux, at least 4 overflows are required.
 cascade :: Int -> FilePath -> IO ()
@@ -513,8 +499,3 @@ main = hspec $ describe moduleName $ do
         $ maybe (withBase 600 overflowChanges) pendingWith overflowSkip
     it "the tree is watched after overflows that repeat while it changes"
         $ maybe (withBase 600 (cascade 10000)) pendingWith overflowSkip
-    -- A restart of a tree of 2000 directories takes less time than one of
-    -- 10000 directories. On Linux, the IN_IGNORED events of the removal
-    -- markers are dropped by the next overflow, and the markers accumulate.
-    it "a small tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 2000)) pendingWith overflowSkip
