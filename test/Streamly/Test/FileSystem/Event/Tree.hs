@@ -59,12 +59,13 @@ import Data.IORef
     ( IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef
     , writeIORef
     )
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sortOn)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Map.Strict (Map)
 import Data.Set (Set)
 import System.Directory (doesDirectoryExist, listDirectory)
-import System.FilePath ((</>), takeFileName)
+import System.FilePath
+    ((</>), makeRelative, takeDirectory, takeFileName)
 import System.Timeout (timeout)
 import Streamly.FileSystem.Event (Config, Event)
 
@@ -453,14 +454,30 @@ data ProbeResult = ProbeResult
 probeBatch :: Int
 probeBatch = if isWindows then 200 else 2000
 
+-- | Print up to 5 of the directories of the probe paths, relative to the
+-- root, the shortest first. The shortest paths are the closest to the top of
+-- a subtree whose probes are missing.
+printProbes :: FilePath -> String -> [FilePath] -> IO ()
+printProbes top label paths =
+    unless (null paths) $
+        putStrLn $ "  " ++ label ++ " probes in: "
+            ++ show (take 5 (sortOn length (map rel paths)))
+
+    where
+
+    rel = makeRelative top . takeDirectory
+
 -- | Create a file named @probe@ in every directory of the tree under the
 -- root, and count the probes that are not reported once. The probes are
 -- created in batches that do not overflow the event queue, a batch is
--- checked after its sync, and its paths are not kept after that.
+-- checked after its sync. Only the paths of its missing probes are kept. The
+-- paths of the missing probes and of the probes reported at paths not probed
+-- are printed, see 'printProbes'.
 probeTree :: Watch -> String -> IO ProbeResult
 probeTree w name = do
     lost0 <- lostCount w
     batchRef <- newIORef []
+    missingRef <- newIORef []
     total <- newIORef (0 :: Int, 0 :: Int, 0 :: Int, 0 :: Int)
     let flush = do
             batch <- readIORef batchRef
@@ -471,8 +488,10 @@ probeTree w name = do
                 let keys = Set.fromList batch
                 found <- atomicModifyIORef' (probes w) $ \m ->
                     (Map.withoutKeys m keys, Map.restrictKeys m keys)
-                let missing = Set.size keys - Map.size found
+                let missingKeys = Set.difference keys (Map.keysSet found)
+                    missing = Set.size missingKeys
                     repeated = Map.size (Map.filter (/= 1) found)
+                modifyIORef' missingRef (Set.toList missingKeys ++)
                 (a, b, c, d) <- readIORef total
                 let !a1 = a + 1
                     !b1 = b + length batch
@@ -493,12 +512,14 @@ probeTree w name = do
     visit (root w)
     flush
     lost1 <- lostCount w
-    extra <- Map.size <$> readIORef (probes w)
+    extras <- Map.keys <$> readIORef (probes w)
+    readIORef missingRef >>= printProbes (root w) "missing"
+    printProbes (root w) "extra" extras
     (_, dirs, missing, repeated) <- readIORef total
     return ProbeResult
         { probeDirs = dirs
         , probeMissing = missing
-        , probeExtra = extra
+        , probeExtra = length extras
         , probeRepeated = repeated
         , probeLost = lost1 - lost0
         }
