@@ -49,7 +49,8 @@ where
 
 import Control.Concurrent
     ( Chan, MVar, ThreadId, forkIO, killThread, newChan, newEmptyMVar
-    , putMVar, readChan, takeMVar, threadDelay, tryReadMVar, writeChan
+    , putMVar, readChan, takeMVar, threadDelay, tryReadMVar, tryTakeMVar
+    , writeChan
     )
 import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM_, unless, when)
@@ -299,11 +300,18 @@ observe Watch{..} ev = do
         when trackCreated $ modifyIORef' created (Set.insert path)
         when (name == "probe")
             $ modifyIORef' probes (Map.insertWith (+) path 1)
+    -- The consumer pauses once for all the markers of a 'pause', the markers
+    -- differ in the number after the last "-".
     when (marker "sync-" || marker "pause-") $ do
+        let isSync = "sync-" `isPrefixOf` name
+            key =
+                if isSync
+                then name
+                else reverse (drop 1 (dropWhile (/= '-') (reverse name)))
         new <- atomicModifyIORef' seen
-            (\s -> (Set.insert name s, not (Set.member name s)))
+            (\s -> (Set.insert key s, not (Set.member key s)))
         when new $
-            if "sync-" `isPrefixOf` name
+            if isSync
             then writeChan markers name
             else putMVar paused () >> takeMVar resumed
 
@@ -340,12 +348,26 @@ sync w@Watch{..} name = go (0 :: Int)
                 r <- timeout 100000 wait
                 maybe (go (i + 1)) return r
 
--- | Block the consumer, it does not read events until 'resume'.
+-- | Block the consumer, it does not read events until 'resume'. A marker
+-- file named @pause-name-i@ is created in the root every 100 ms, until the
+-- consumer reads one of them; an overflow can drop a marker. Raise an
+-- exception if no marker has been read in 60 seconds.
+--
+-- 'tryTakeMVar' is used instead of 'timeout' around 'takeMVar': the timeout
+-- can interrupt the thread after 'takeMVar' has taken the value, the value is
+-- lost and the consumer stays blocked.
 pause :: Watch -> String -> IO ()
-pause Watch{..} name = do
-    createFile (root </> ("pause-" ++ name))
-    r <- timeout 60000000 (takeMVar paused)
-    when (r == Nothing) $ error ("pause: the consumer did not read " ++ name)
+pause Watch{..} name = go (0 :: Int)
+
+    where
+
+    go i = do
+        when (i >= 600)
+            $ error ("pause: the consumer did not read " ++ name)
+        createFile (root </> ("pause-" ++ name ++ "-" ++ show i))
+        threadDelay 100000
+        r <- tryTakeMVar paused
+        maybe (go (i + 1)) return r
 
 resume :: Watch -> IO ()
 resume Watch{..} = putMVar resumed ()

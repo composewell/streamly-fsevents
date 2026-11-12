@@ -457,10 +457,15 @@ churn root out deadline = go 0
 
 -- | Block the consumer, overflow the queue, then change a tree of at most
 -- @dirs@ directories for 10 seconds while the consumer reads. On Linux, each
--- overflow restarts the watch, and the changes during a restart cause
--- another overflow. On Linux, at least @atLeast@ overflows are required.
-cascade :: Int -> Int -> FilePath -> IO ()
-cascade atLeast dirs base = do
+-- overflow restarts the watch, and the changes during a restart can cause
+-- another overflow.
+--
+-- Whether the changes during a restart overflow the queue depends on the
+-- time the restart takes. During the changes, the consumer is blocked 3
+-- times, 2 seconds apart, and the queue is overflowed by deleting or creating
+-- the burst files again. On Linux, at least 4 overflows are required.
+cascade :: Int -> FilePath -> IO ()
+cascade dirs base = do
     queued <- queuedEventsLimit
     budget <- dirBudget (stressBudget dirs 3 (queued + 2000)) base
     if budget < 2000
@@ -469,20 +474,32 @@ cascade atLeast dirs base = do
         (root, out) <- setupTrees base budget
         say $ "directories: " ++ show budget
         w <- startWatch id False root
-        pause w "cascade"
+        pause w "cascade-0"
         createFiles root "burst" (queued + 1000)
         done <- newEmptyMVar
         deadline <- (+ 10) <$> getMonotonicTime
         _ <- forkIO (try (churn root out deadline) >>= putMVar done)
         resume w
+        forM_ [1 .. pauses] $ \k -> do
+            threadDelay 2000000
+            pause w ("cascade-" ++ show k)
+            if odd k
+            then forM_ [1 .. queued + 1000] $ \i ->
+                    removeFile (root </> ("burst" ++ show i))
+            else createFiles root "burst" (queued + 1000)
+            resume w
         r <- takeMVar done
         case r of
             Left (e :: SomeException) -> expectationFailure (show e)
             Right rounds -> say $ "rounds of changes: " ++ show rounds
         n <- settledLost w "cascade"
-        checkLost atLeast n
+        checkLost (pauses + 1) n
         checkTree w
         stopWatch w
+
+    where
+
+    pauses = 3 :: Int
 
 -------------------------------------------------------------------------------
 -- Main
@@ -495,12 +512,9 @@ main = hspec $ describe moduleName $ do
     it "the tree is watched after changes during an overflow"
         $ maybe (withBase 600 overflowChanges) pendingWith overflowSkip
     it "the tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 2 10000)) pendingWith overflowSkip
+        $ maybe (withBase 600 (cascade 10000)) pendingWith overflowSkip
     -- A restart of a tree of 2000 directories takes less time than one of
-    -- 10000 directories, more overflows follow each other. On Linux, the
-    -- IN_IGNORED events of the removal markers are dropped by the next
-    -- overflow, and the markers accumulate. On a fast machine the restart
-    -- of the small tree can finish before the queue fills again, only one
-    -- overflow is required.
+    -- 10000 directories. On Linux, the IN_IGNORED events of the removal
+    -- markers are dropped by the next overflow, and the markers accumulate.
     it "a small tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 1 2000)) pendingWith overflowSkip
+        $ maybe (withBase 600 (cascade 2000)) pendingWith overflowSkip
