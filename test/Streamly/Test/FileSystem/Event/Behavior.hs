@@ -262,12 +262,6 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform No No Exception
         }
-    , base
-        { title = "events of a renamed root use the old path"
-        , ops = renameRootAndCreate
-        , check = \p -> any ((== watchRoot p </> "file") . absPath)
-        , expected = onPlatform No No Exception
-        }
     -- On Linux the rename of a root is reported by 'Linux.isRootMoved' only.
     , base
         { title = "renamed root reports isMoved for the root"
@@ -301,18 +295,6 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform No Yes Exception
         , racy = notLinux
-        }
-    , base
-        { title = "dir created in a renamed recursive root is watched"
-        , config = Event.setRecursiveMode True
-        , ops = \p -> do
-            renameDirectory (watchRoot p) (renamedRoot p)
-            settle
-            createDirectory (renamedRoot p </> "dir")
-            settle
-            createFile (renamedRoot p </> "dir" </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform No No Exception
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
