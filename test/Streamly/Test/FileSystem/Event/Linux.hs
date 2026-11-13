@@ -2271,6 +2271,112 @@ recScanParentReplacedBySymlink =
                 createDirectoryLink outside dir
             scanned `shouldNotContain` [root </> "dir" </> "sub" </> "stray"]
 
+-- | The directories of 'symlinkCycles', relative to its base.
+cycleDirs :: [FilePath]
+cycleDirs = ["a", "a" </> "b", "x", "z"]
+
+-- | The symbolic links of 'symlinkCycles', relative to its base.
+cycleLinks :: [FilePath]
+cycleLinks =
+    [ "a" </> "up", "a" </> "b" </> "top", "x" </> "z", "z" </> "x"
+    , "self", "l1", "l2"
+    ]
+
+-- | Create symbolic links forming cycles in the directories 'cycleDirs'
+-- under @base@: @a/up@ to its parent, @a/b/top@ to the absolute path @top@,
+-- @x/z@ and @z/x@ to each other's directories, @self@ to itself, and @l1@
+-- and @l2@ to each other.
+symlinkCycleLinks :: FilePath -> FilePath -> IO ()
+symlinkCycleLinks base top = do
+    createDirectoryLink ".." (base </> "a" </> "up")
+    createDirectoryLink top (base </> "a" </> "b" </> "top")
+    createDirectoryLink (".." </> "z") (base </> "x" </> "z")
+    createDirectoryLink (".." </> "x") (base </> "z" </> "x")
+    createFileLink "self" (base </> "self")
+    createFileLink "l2" (base </> "l1")
+    createFileLink "l1" (base </> "l2")
+
+-- | Create 'cycleDirs' and 'symlinkCycleLinks' under @base@.
+symlinkCycles :: FilePath -> FilePath -> IO ()
+symlinkCycles base top = do
+    mapM_ (createDirectory . (base </>)) cycleDirs
+    symlinkCycleLinks base top
+
+-- | Create a file in each of 'cycleDirs' under @base@. Each file must be
+-- reported once, and no event may have a path through one of the links. The
+-- events are read up to the create event of the last file.
+checkCycleFiles :: FilePath -> Event.Watch -> IO ()
+checkCycleFiles base w = do
+    let files = map (\d -> base </> d </> "file") cycleDirs
+        links = map (base </>) cycleLinks
+        viaLink p = any (\l -> p == l || isStrictlyUnder l p) links
+    mapM_ createFile files
+    evs <- readUntil recCfg (isCreatedAt (last files)) w
+    pathsOf Event.isCreated evs `shouldBe` files
+    filter viaLink (map getAbsPath evs) `shouldBe` []
+
+-- The walk at the start of the watch finds the links and does not follow
+-- them.
+recStartSymlinkCycles :: Spec
+recStartSymlinkCycles =
+    it "starts a watch on a tree with symlink cycles"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let root = fp </> "root"
+            createDirectory root
+            symlinkCycles root root
+            r <- Path.fromString root
+            bracket
+                (Event.openWatch recCfg (r NonEmpty.:| []))
+                Event.closeWatch
+                (\w -> checkCycleFiles root w)
+
+-- The scan of the directory moved in reports the links as entries, and
+-- nothing under them.
+recMovedInSymlinkCycles :: Spec
+recMovedInSymlinkCycles =
+    it "scans a directory with symlink cycles moved into the tree"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                dir = root </> "dir"
+            createDirectory src
+            symlinkCycles src root
+            evs <- recEventsOf recCfg root w (renameDirectory src dir)
+            sort (scannedPaths (const True) evs)
+                `shouldBe` sort (map (dir </>) (cycleDirs ++ cycleLinks))
+            sort (scannedPaths Event.isDir evs)
+                `shouldBe` sort (map (dir </>) cycleDirs)
+            checkCycleFiles dir w
+
+-- The directory and the links are created before the create event of the
+-- directory is read, its scan finds the links.
+recCreatedSymlinkCycles :: Spec
+recCreatedSymlinkCycles =
+    it "scans a new directory with symlink cycles"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+            evs <- recEventsBeforeAdd root w $ do
+                createDirectory dir
+                symlinkCycles dir root
+            sort (scannedPaths (const True) evs)
+                `shouldBe` sort (map (dir </>) (cycleDirs ++ cycleLinks))
+            checkCycleFiles dir w
+
+-- The links are created in directories that are already watched, each one
+-- is reported by the kernel as a create event.
+recWatchedSymlinkCycles :: Spec
+recWatchedSymlinkCycles =
+    it "keeps watching after symlink cycles are created in the tree"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+            let links = map (dir </>) cycleLinks
+            createDirectory dir
+            mapM_ (createDirectory . (dir </>)) cycleDirs
+            waitWatched recCfg w dir
+            evs <- recEventsOf recCfg root w (symlinkCycleLinks dir root)
+            sort (kernelCreated evs)
+                `shouldBe` sort ((root </> "sentinel") : links)
+            checkCycleFiles dir w
+
 recScanCreatedRenamedDisabled :: Spec
 recScanCreatedRenamedDisabled =
     it "setScanNewDirs False does not report a renamed new directory"
@@ -2772,6 +2878,11 @@ watchTests =
                 recParentReplacedBySymlink
                 recScanDirReplacedBySymlink
                 recScanParentReplacedBySymlink
+            describe "recursive mode symlink cycles" $ do
+                recStartSymlinkCycles
+                recMovedInSymlinkCycles
+                recCreatedSymlinkCycles
+                recWatchedSymlinkCycles
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan
