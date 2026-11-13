@@ -278,6 +278,30 @@ behaviors =
         , expected = onPlatform No Yes Exception
         , racy = onDarwin
         }
+    -- On Linux the root is removed only if its path no longer refers to the
+    -- watched directory when the rename event is read.
+    , base
+        { title = "root renamed back before the event is read is watched"
+        , paused = True
+        , ops = \p -> do
+            renameDirectory (watchRoot p) (renamedRoot p)
+            renameDirectory (renamedRoot p) (watchRoot p)
+        , laterOps = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Exception
+        , racy = notLinux
+        }
+    , base
+        { title = "root renamed back after the event is read is watched"
+        , ops = \p -> do
+            renameDirectory (watchRoot p) (renamedRoot p)
+            settle
+            renameDirectory (renamedRoot p) (watchRoot p)
+        , laterOps = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform No Yes Exception
+        , racy = notLinux
+        }
     , base
         { title = "dir created in a renamed recursive root is watched"
         , config = Event.setRecursiveMode True
@@ -356,6 +380,26 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p </> "dir")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes No No
+        }
+    -- On Linux the scan of the directory at its new path reports the file.
+    , base
+        { title = "file in a dir renamed within the tree is reported"
+        , config = Event.setRecursiveMode True
+        , setup = withDirFile
+        , ops = \p ->
+            renameDirectory (watchRoot p </> "dir") (watchRoot p </> "dir2")
+        , check = \_ -> any (isNamed "file")
+        , expected = onPlatform Yes No No
+        , racy = notLinux
+        }
+    , base
+        { title = "file in a dir moved out of the tree is reported"
+        , config = Event.setRecursiveMode True
+        , setup = withDirFile
+        , ops = \p -> renameDirectory (watchRoot p </> "dir") (renamedRoot p)
+        , check = \_ -> any (isNamed "file")
+        , expected = onPlatform No No No
+        , racy = notLinux
         }
     , newDir
         { title = "subdir created in a new dir before it is read is watched"
@@ -572,6 +616,37 @@ behaviors =
         , expected = onPlatform Yes Yes No
         , racy = notLinux
         }
+    -- On Linux only adjacent identical events are merged.
+    , base
+        { title = "interleaved writes to two files report each isModified"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createFile (watchRoot p </> "other")
+            settle
+        , paused = True
+        , ops = \p -> do
+            appendFile (watchRoot p </> "file") "x"
+            appendFile (watchRoot p </> "other") "x"
+            appendFile (watchRoot p </> "file") "y"
+        , check = \_ evs ->
+            let modified ev = isNamed "file" ev && Event.isModified ev
+             in length (filter modified evs) == 2
+        , expected = onPlatform Yes No Yes
+        , racy = notLinux
+        }
+    -- Overwriting truncates the file and then writes it.
+    , base
+        { title = "one overwrite of a file reports several isModified"
+        , setup = \p -> do
+            writeFile (watchRoot p </> "file") "old"
+            settle
+        , ops = \p -> writeFile (watchRoot p </> "file") "new"
+        , check = \_ evs ->
+            let modified ev = isNamed "file" ev && Event.isModified ev
+             in length (filter modified evs) > 1
+        , expected = onPlatform No No Yes
+        , racy = True
+        }
     , base
         { title = "one event reports isCreated and isDeleted for a file"
         , paused = True
@@ -601,6 +676,11 @@ behaviors =
 
     withFile p = do
         createFile (watchRoot p </> "file")
+        settle
+
+    withDirFile p = do
+        createDirectory (watchRoot p </> "dir")
+        createFile (watchRoot p </> "dir/file")
         settle
 
     rootStillReadable = stillReadable . watchRoot
