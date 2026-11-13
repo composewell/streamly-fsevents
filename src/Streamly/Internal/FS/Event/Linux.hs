@@ -1118,7 +1118,8 @@ data StreamItem =
 -- | A handle for a watch.
 --
 data Watch = Watch
-    { watchFd :: CInt -- ^ The inotify fd
+    { watchConfig :: Config -- ^ The config used to open the watch
+    , watchFd :: CInt -- ^ The inotify fd
       -- | Held during a system call on the fd, 'closeWatch' cannot close the
       -- fd, and the fd number cannot be reused, while the system call is in
       -- progress. The system calls made with the lock held must not block.
@@ -1156,8 +1157,8 @@ foreign import capi
 --
 -- /Pre-release/
 --
-createWatch :: IO Watch
-createWatch = do
+createWatch :: Config -> IO Watch
+createWatch cfg = do
     -- The fd must not be inherited by child processes. An inherited fd
     -- keeps the inotify instance and its watches alive after 'closeWatch',
     -- and counts against the max_user_instances limit.
@@ -1175,7 +1176,8 @@ createWatch = do
     synthVar <- newTVarIO []
     return
         $ Watch
-            { watchFd = fd
+            { watchConfig = cfg
+            , watchFd = fd
             , watchLock = lock
             , watchWdMap = emptyMapRef
             , watchUndelivered = undeliveredRef
@@ -1902,7 +1904,7 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
             $ addToWatchAt
                 (subdirConfig cfg) watch0 (level + 1) subParent sub
 
--- | @addToWatch cfg watch root subpath@ adds @subpath@ to the list of paths
+-- | @addToWatch watch (root, subpath)@ adds @subpath@ to the list of paths
 -- being monitored under @root@ via the watch handle @watch@.  @root@ must be
 -- an absolute path and @subpath@ must be relative to @root@.
 --
@@ -1916,8 +1918,8 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
 --
 -- /Pre-release/
 --
-addToWatch :: Config -> Watch -> PathRep -> IO ()
-addToWatch cfg wtch pRep = do
+addToWatch :: Watch -> PathRep -> IO ()
+addToWatch wtch@Watch {watchConfig = cfg} pRep = do
     denied <- addToWatchAt cfg wtch 0 Nothing pRep
     recordSynthEvents wtch (map SynthDenied denied)
 
@@ -2473,6 +2475,9 @@ closeWatch Watch {watchFd = fd, watchLock = lock} =
 -- monitoring the paths for file system events. Returns a 'Watch' handle which
 -- can then be used to read the event stream or to close the watch.
 --
+-- The 'Config' is kept in the 'Watch', 'readEvent', 'watchToStream' and
+-- 'addToWatch' use it.
+--
 -- If adding a path fails, the watch is closed and the exception is rethrown.
 --
 -- /Pre-release/
@@ -2483,14 +2488,14 @@ openWatch cfg paths =
     -- caller cannot close it. 'mask' ensures that an async exception cannot
     -- arrive between creating the watch and installing the handler.
     Exception.mask $ \restore -> do
-        w <- createWatch
+        w <- createWatch cfg
         restore (mapM_ (add w) (NonEmpty.toList paths))
             `onException` closeWatch w
         return w
 
     where
 
-    add w root = addToWatch cfg w (root, Nothing)
+    add w root = addToWatch w (root, Nothing)
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle
@@ -3196,8 +3201,7 @@ readEvents
         else return st1
 
 -- | Read the next event from a 'Watch', wait for one if none is available.
--- The 'Config' must be the one used to open the watch. Returns 'Nothing'
--- when the watch is closed, and on every later call.
+-- Returns 'Nothing' when the watch is closed, and on every later call.
 --
 -- While a thread reads the watch, other threads can use 'addToWatch',
 -- 'removeFromWatch' and 'closeWatch' on it. If more than one thread reads
@@ -3216,8 +3220,9 @@ readEvents
 --
 -- /Pre-release/
 --
-readEvent :: Config -> Watch -> IO (Maybe Event)
-readEvent cfg wtch@Watch {watchUndelivered = undeliveredRef} =
+readEvent :: Watch -> IO (Maybe Event)
+readEvent
+    wtch@Watch {watchConfig = cfg, watchUndelivered = undeliveredRef} =
     Exception.mask_ $ do
         r <- takeMVar undeliveredRef
         next (fromMaybe items r)
@@ -3296,9 +3301,8 @@ readEvent cfg wtch@Watch {watchUndelivered = undeliveredRef} =
                 next rest
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
--- 'Config' must be the one used to open the watch. The stream does not
--- close the watch, use 'closeWatch' to close it. The stream ends when the
--- watch is closed.
+-- stream does not close the watch, use 'closeWatch' to close it. The stream
+-- ends when the watch is closed.
 --
 -- A stream can stop reading before the watch is closed. The next stream on
 -- the watch starts with the first event not yet read. See 'readEvent' for
@@ -3306,9 +3310,8 @@ readEvent cfg wtch@Watch {watchUndelivered = undeliveredRef} =
 --
 -- /Pre-release/
 --
-watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wtch =
-    S.unfoldrM (\() -> fmap (, ()) <$> readEvent cfg wtch) ()
+watchToStream :: Watch -> Stream IO Event
+watchToStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
@@ -3327,7 +3330,7 @@ watchToStream cfg wtch =
 --      [Path.fromString "dir"]
 -- @
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
-watchWith f paths = S.bracketIO before after (watchToStream cfg)
+watchWith f paths = S.bracketIO before after watchToStream
 
     where
 

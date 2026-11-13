@@ -436,7 +436,6 @@ runCase base w ops1 split ops2 = do
 
     where
 
-    cfg = wConfig w
     root = base </> head (wRoots w)
     sentinel n = root </> (".sentinel" ++ show (n :: Int))
     isSentinel n ev =
@@ -483,7 +482,7 @@ runCase base w ops1 split ops2 = do
             reader = do
                 r <- try
                     $ Stream.fold (Fold.drainMapM onEvent)
-                    $ Event.watchToStream cfg wtch
+                    $ Event.watchToStream wtch
                 case r of
                     Left (e :: SomeException) -> do
                         _ <- tryPutMVar failed ("exception: " ++ show e)

@@ -152,24 +152,23 @@ withTwoRoots action =
 -- | Like 'readUntil', the action is run on each event when it is received,
 -- before the next event is read.
 readUntilWith ::
-    Event.Config -> (Event -> IO ()) -> (Event -> Bool) -> Event.Watch
-    -> IO [Event]
-readUntilWith cfg action p w = do
+    (Event -> IO ()) -> (Event -> Bool) -> Event.Watch -> IO [Event]
+readUntilWith action p w = do
     r <- timeout 10000000
         $ Stream.toList
         $ Stream.takeEndBy p
         $ Stream.trace action
         $ Stream.trace (putStrLn . Event.showEvent)
-        $ Event.watchToStream cfg w
+        $ Event.watchToStream w
     maybe (error "readUntil: timed out") return r
 
-readUntil :: Event.Config -> (Event -> Bool) -> Event.Watch -> IO [Event]
-readUntil cfg = readUntilWith cfg (const (return ()))
+readUntil :: (Event -> Bool) -> Event.Watch -> IO [Event]
+readUntil = readUntilWith (const (return ()))
 
 -- | Read the events from the watch up to and including the first
 -- 'Event.isRootUnwatched' event.
 readUntilUnwatched :: Event.Watch -> IO [Event]
-readUntilUnwatched = readUntil watchCfg Event.isRootUnwatched
+readUntilUnwatched = readUntil Event.isRootUnwatched
 
 getRoot :: Event -> FilePath
 getRoot = Path.toString . Event.getRoot
@@ -277,7 +276,7 @@ overlapFanOut =
         $ withNestedRoots $ \root sub w -> do
             let file = sub </> "file"
             createFile file
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> isCreatedAt file ev && getRoot ev == sub) w
             createdRoots file evs `shouldBe` [root, sub]
 
@@ -288,13 +287,13 @@ overlapRemoveInner =
     it "removing the inner root keeps the outer root watching"
         $ withNestedRoots $ \root sub w -> do
             Event.removeFromWatch w =<< Path.fromString sub
-            evs <- readUntil recCfg Event.isRootUnwatched w
+            evs <- readUntil Event.isRootUnwatched w
             unwatched evs `shouldBe` [(sub, sub)]
             let file1 = sub </> "file1"
                 file2 = root </> "file2"
             createFile file1
             createFile file2
-            evs1 <- readUntil recCfg (isCreatedAt file2) w
+            evs1 <- readUntil (isCreatedAt file2) w
             createdRoots file1 evs1 `shouldBe` [root]
             filter (== sub) (map getRoot evs1) `shouldBe` []
 
@@ -309,17 +308,17 @@ overlapRemoveQueued =
             let file = sub </> "file"
             createFile file
             Event.removeFromWatch w =<< Path.fromString sub
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev
                     || (isCreatedAt file ev && getRoot ev == root)) w
             if hasProc
             then do
-                evs1 <- readUntil recCfg Event.isRootUnwatched w
+                evs1 <- readUntil Event.isRootUnwatched w
                 createdRoots file (evs ++ evs1) `shouldBe` [root, sub]
                 unwatched (evs ++ evs1) `shouldBe` [(sub, sub)]
             else do
                 unwatched evs `shouldBe` [(sub, sub)]
-                evs1 <- readUntil recCfg (isCreatedAt file) w
+                evs1 <- readUntil (isCreatedAt file) w
                 createdRoots file evs1 `shouldBe` [root]
 
 -- The watch descriptor of root is removed from the kernel, the watch
@@ -330,20 +329,20 @@ overlapRemoveOuter =
         $ withNestedRoots $ \root sub w -> do
             hasProc <- procAvailable
             Event.removeFromWatch w =<< Path.fromString root
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
             if hasProc
             then unwatched evs `shouldBe` [(root, root), (root, sub)]
             -- The shared watch descriptor of sub is removed for root at once,
             -- before the IN_IGNORED event of the watch descriptor of root.
             else do
-                evs2 <- readUntil recCfg
+                evs2 <- readUntil
                     (\ev -> Event.isRootUnwatched ev && getAbsPath ev == root)
                     w
                 unwatched (evs ++ evs2) `shouldBe` [(root, sub), (root, root)]
             let file = sub </> "file"
             createFile file
-            evs1 <- readUntil recCfg (isCreatedAt file) w
+            evs1 <- readUntil (isCreatedAt file) w
             createdRoots file evs1 `shouldBe` [sub]
             filter (== root) (map getRoot evs1) `shouldBe` []
 
@@ -355,7 +354,7 @@ overlapRemoveBoth =
         $ withNestedRoots $ \root sub w -> do
             Event.removeFromWatch w =<< Path.fromString sub
             Event.removeFromWatch w =<< Path.fromString root
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getRoot ev == root
                     && getAbsPath ev == sub) w
             unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
@@ -372,15 +371,15 @@ overlapMoveOutInner =
                 out = takeDirectory root </> "out"
                 file = root </> "file"
             createDirectory dir
-            waitWatched recCfg w dir
+            waitWatched w dir
             renameDirectory sub out
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> isUnwatchedAt dir ev && getRoot ev == sub) w
             unwatched evs
                 `shouldBe` [(root, sub), (root, dir), (sub, sub), (sub, dir)]
             createFile (out </> "dir" </> "file")
             createFile file
-            evs1 <- readUntil recCfg (isCreatedAt file) w
+            evs1 <- readUntil (isCreatedAt file) w
             map getRoot (filter Event.isCreated evs1) `shouldBe` [root]
             unwatched evs1 `shouldBe` []
 
@@ -401,7 +400,7 @@ duplicateRoot =
                 $ \w -> do
                     createFile file
                     createFile sentinel
-                    evs <- readUntil watchCfg (isCreatedAt sentinel) w
+                    evs <- readUntil (isCreatedAt sentinel) w
                     createdRoots file evs `shouldBe` [root]
 
 -------------------------------------------------------------------------------
@@ -423,7 +422,7 @@ largeWd =
                 Event.closeWatch
                 $ \w -> do
                     createFile file
-                    evs <- readUntil watchCfg Event.isCreated w
+                    evs <- readUntil Event.isCreated w
                     map getAbsPath (filter Event.isCreated evs)
                         `shouldBe` [file]
 
@@ -489,7 +488,7 @@ recRootSymlinkNoFollow =
                     createFile (sub </> "file")
                     createFile (target </> "file")
                     createFile end
-                    evs <- readUntil cfg (isCreatedAt end) w
+                    evs <- readUntil (isCreatedAt end) w
                     filter (isUnder link) (map getAbsPath evs) `shouldBe` []
 
 -- The write to the unlinked file generates IN_MODIFY without IN_EXCL_UNLINK.
@@ -507,7 +506,7 @@ defaultExcludeUnlinked =
             hFlush h
             hClose h
             createFile sentinel
-            evs <- readUntil Event.defaultConfig (isCreatedAt sentinel) w
+            evs <- readUntil (isCreatedAt sentinel) w
             pathsOf Event.isModified evs `shouldBe` []
 
 -- No activity follows the operation on the root. 'readUntil' raises an
@@ -519,12 +518,12 @@ lastRootEvent =
             $ withRoot Event.defaultConfig $ \root w -> do
                 perms <- getPermissions root
                 setPermissions root (setOwnerExecutable True perms)
-                evs <- readUntil Event.defaultConfig Event.isAttrsModified w
+                evs <- readUntil Event.isAttrsModified w
                 pathsOf Event.isAttrsModified evs `shouldBe` [root]
         it "rename of the root"
             $ withRoot movedCfg $ \root w -> do
                 renameDirectory root (root ++ "-moved")
-                evs <- readUntil movedCfg Event.isRootMoved w
+                evs <- readUntil Event.isRootMoved w
                 pathsOf Event.isRootMoved evs `shouldBe` [root]
 
     where
@@ -540,7 +539,7 @@ defaultAttrsModified =
             createFile file
             perms <- getPermissions file
             setPermissions file (setOwnerExecutable True perms)
-            evs <- readUntil Event.defaultConfig Event.isAttrsModified w
+            evs <- readUntil Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
 
 -------------------------------------------------------------------------------
@@ -549,17 +548,16 @@ defaultAttrsModified =
 
 -- | Rename the watch root @root@ to @root ++ "-moved"@ and read the events
 -- up to the 'Event.isRootUnwatched' event of @path@.
-renameRootUntil ::
-    Event.Config -> FilePath -> FilePath -> Event.Watch -> IO [Event]
-renameRootUntil cfg root path w = do
+renameRootUntil :: FilePath -> FilePath -> Event.Watch -> IO [Event]
+renameRootUntil root path w = do
     renamePath root (root ++ "-moved")
-    readUntil cfg (\ev -> Event.isRootUnwatched ev && getAbsPath ev == path) w
+    readUntil (\ev -> Event.isRootUnwatched ev && getAbsPath ev == path) w
 
 rootRenamed :: Spec
 rootRenamed =
     it "a renamed root reports isRootMoved and is unwatched"
         $ withRoot cfg $ \root w -> do
-            evs <- renameRootUntil cfg root root w
+            evs <- renameRootUntil root root w
             pathsOf Event.isRootMoved evs `shouldBe` [root]
             unwatched evs `shouldBe` [(root, root)]
 
@@ -573,7 +571,7 @@ rootRenamedUnrequested :: Spec
 rootRenamedUnrequested =
     it "a renamed root is unwatched without setRootMoved"
         $ withRoot Event.defaultConfig $ \root w -> do
-            evs <- renameRootUntil Event.defaultConfig root root w
+            evs <- renameRootUntil root root w
             pathsOf Event.isRootMoved evs `shouldBe` []
             unwatched evs `shouldBe` [(root, root)]
 
@@ -584,8 +582,8 @@ recRootRenamed =
             let sub = root </> "sub"
             createDirectory sub
             createFile (root </> "sentinel")
-            _ <- readUntil recCfg (isCreatedAt (root </> "sentinel")) w
-            evs <- renameRootUntil recCfg root sub w
+            _ <- readUntil (isCreatedAt (root </> "sentinel")) w
+            evs <- renameRootUntil root sub w
             unwatched evs `shouldBe` [(root, root), (root, sub)]
 
 -- Both renames are done before the events are read.
@@ -597,7 +595,7 @@ rootRenamedBack =
             renameDirectory root (root ++ "-moved")
             renameDirectory (root ++ "-moved") root
             createFile file
-            evs <- readUntil watchCfg (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             unwatched evs `shouldBe` []
 
 -- The rename of one hard link reports IN_MOVE_SELF for both roots.
@@ -614,10 +612,10 @@ rootHardLinkRenamed =
                 (Event.openWatch watchCfg (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
-                    evs <- renameRootUntil watchCfg f f w
+                    evs <- renameRootUntil f f w
                     unwatched evs `shouldBe` [(f, f)]
                     appendFile g "x"
-                    evs1 <- readUntil watchCfg Event.isModified w
+                    evs1 <- readUntil Event.isModified w
                     map getRoot (filter Event.isModified evs1)
                         `shouldBe` [g]
 
@@ -628,27 +626,26 @@ rootHardLinkRenamed =
 isSelfEvent :: Event -> Bool
 isSelfEvent ev = Event.isRootDeleted ev || Event.isRootMoved ev
 
--- | Run the file system action in a recursive watch of @root@ using @cfg@,
+-- | Run the file system action in a recursive watch of @root@,
 -- then create a file @sentinel@ in @root@. Return the events up to the
 -- create event of @sentinel@.
-recEventsOf ::
-    Event.Config -> FilePath -> Event.Watch -> IO () -> IO [Event]
-recEventsOf cfg root w action = do
+recEventsOf :: FilePath -> Event.Watch -> IO () -> IO [Event]
+recEventsOf root w action = do
     let sentinel = root </> "sentinel"
     action
     createFile sentinel
-    readUntil cfg (isCreatedAt sentinel) w
+    readUntil (isCreatedAt sentinel) w
 
 -- | Read the events up to the create event of @dir@ and the events of the scan
 -- of @dir@. The directories under @dir@ are watched when their scan events
 -- are read. A marker created in the parent of @dir@ is read after the scan.
 -- The marker is a symbolic link, its creation generates only a create event.
-waitWatched :: Event.Config -> Event.Watch -> FilePath -> IO ()
-waitWatched cfg w dir = do
-    _ <- readUntil cfg (isCreatedAt dir) w
+waitWatched :: Event.Watch -> FilePath -> IO ()
+waitWatched w dir = do
+    _ <- readUntil (isCreatedAt dir) w
     let marker = dir ++ ".scanned"
     createFileLink "missing" marker
-    () <$ readUntil cfg (isCreatedAt marker) w
+    () <$ readUntil (isCreatedAt marker) w
 
 -- The subdirectory watch generates IN_DELETE_SELF and IN_MOVE_SELF, the
 -- events are not reported.
@@ -661,8 +658,8 @@ recSubdirSelfEvents =
                 dir3 = root </> "dir3"
             createDirectory dir1
             createDirectory dir2
-            waitWatched recCfg w dir2
-            evs <- recEventsOf recCfg root w $ do
+            waitWatched w dir2
+            evs <- recEventsOf root w $ do
                 renameDirectory dir1 dir3
                 removeDirectory dir2
             pathsOf isSelfEvent evs `shouldBe` []
@@ -691,14 +688,14 @@ recMoveOut cfg =
         createDirectory dir
         createDirectory sub
         createDirectory sub1
-        waitWatched cfg w dir
+        waitWatched w dir
         renameDirectory dir out
-        evs <- readUntil cfg (isUnwatchedAt sub1) w
+        evs <- readUntil (isUnwatchedAt sub1) w
         unwatched evs `shouldBe` [(root, dir), (root, sub), (root, sub1)]
         createFile (out </> "sub" </> "file")
         createFile (out </> "sub" </> "sub1" </> "file")
         createFile sentinel
-        evs1 <- readUntil cfg (isCreatedAt sentinel) w
+        evs1 <- readUntil (isCreatedAt sentinel) w
         filter (isUnder dir) (map getAbsPath evs1) `shouldBe` []
         return evs
 
@@ -727,9 +724,9 @@ recMoveIn =
             createDirectory (src </> "sub")
             renameDirectory src dir
             -- dir/sub is watched when its scan event is read.
-            _ <- readUntil recCfg (isCreatedAt (dir </> "sub")) w
+            _ <- readUntil (isCreatedAt (dir </> "sub")) w
             createFile file
-            evs <- readUntil recCfg (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             pathsOf Event.isCreated evs `shouldBe` [file]
 
 -- The watches of dir1 are kept, its paths are changed on IN_MOVED_TO.
@@ -742,12 +739,12 @@ recRenameWithin =
                 file = dir2 </> "sub" </> "file"
             createDirectory dir1
             createDirectory (dir1 </> "sub")
-            waitWatched recCfg w dir1
+            waitWatched w dir1
             renameDirectory dir1 dir2
-            _ <- readUntil recCfg
+            _ <- readUntil
                 (\ev -> Event.isMovedTo ev && getAbsPath ev == dir2) w
             createFile file
-            evs <- readUntil recCfg (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             filter (isUnder dir1) (map getAbsPath evs) `shouldBe` []
 
 -- | Run the test with a watched directory @dir1@ containing @sub@. The test
@@ -759,7 +756,7 @@ withRenameDirs action =
         let dir1 = root </> "dir1"
         createDirectory dir1
         createDirectory (dir1 </> "sub")
-        waitWatched recCfg w dir1
+        waitWatched w dir1
         action root w dir1 (root </> "dir2")
 
 -- | The paths of all the entries under a directory.
@@ -778,7 +775,7 @@ recRenameCreateBeforeRead =
     it "reports entries created after a rename under the new path"
         $ withRenameDirs $ \root w dir1 dir2 -> do
             let later = dir2 </> "x" </> "later"
-            evs <- recEventsOf recCfg root w $ do
+            evs <- recEventsOf root w $ do
                 renameDirectory dir1 dir2
                 createDirectory (dir2 </> "x")
                 createFile (dir2 </> "x" </> "f")
@@ -795,7 +792,7 @@ recRenameCreateBeforeRead =
                         , dir2 </> "x" </> "f"
                         ]
             createFile later
-            evs1 <- readUntil recCfg (isCreatedAt later) w
+            evs1 <- readUntil (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
 
 -- The action runs after IN_MOVED_FROM is read and before IN_MOVED_TO is read.
@@ -810,7 +807,7 @@ recRenameCreateInGap =
                         createFile (dir2 </> "sub" </> "gap")
                         createFile sentinel
             renameDirectory dir1 dir2
-            evs <- readUntilWith recCfg inGap (isCreatedAt sentinel) w
+            evs <- readUntilWith inGap (isCreatedAt sentinel) w
             kernelCreated evs
                 `shouldBe`
                     [dir2 </> "gap", dir2 </> "sub" </> "gap", sentinel]
@@ -828,10 +825,10 @@ recRenameNoUnwatched :: Spec
 recRenameNoUnwatched =
     it "does not report isRootUnwatched for a renamed directory"
         $ withRenameDirs $ \root w dir1 dir2 -> do
-            evs <- recEventsOf recCfg root w (renameDirectory dir1 dir2)
+            evs <- recEventsOf root w (renameDirectory dir1 dir2)
             createFile (dir2 </> "sub" </> "file")
             createFile (root </> "sentinel1")
-            evs1 <- readUntil recCfg (isCreatedAt (root </> "sentinel1")) w
+            evs1 <- readUntil (isCreatedAt (root </> "sentinel1")) w
             unwatched (evs ++ evs1) `shouldBe` []
 
 -- The create event of x is read after the rename, the old path does not exist
@@ -842,7 +839,7 @@ recRenameCreateBeforeRename =
     it "reports entries of a directory created before the rename"
         $ withRenameDirs $ \root w dir1 dir2 -> do
             let later = dir2 </> "x" </> "later"
-            evs <- recEventsOf recCfg root w $ do
+            evs <- recEventsOf root w $ do
                 createDirectory (dir1 </> "x")
                 createFile (dir1 </> "x" </> "f")
                 renameDirectory dir1 dir2
@@ -855,7 +852,7 @@ recRenameCreateBeforeRename =
                         , dir2 </> "x" </> "f"
                         ]
             createFile later
-            evs1 <- readUntil recCfg (isCreatedAt later) w
+            evs1 <- readUntil (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
 
 -- dir2 does not exist when the IN_MOVED_TO of the first rename is read. The
@@ -869,7 +866,7 @@ recRenameTwice =
         $ withRenameDirs $ \root w dir1 dir2 -> do
             let dir3 = root </> "dir3"
                 later = dir3 </> "sub" </> "later"
-            evs <- recEventsOf recCfg root w $ do
+            evs <- recEventsOf root w $ do
                 renameDirectory dir1 dir2
                 renameDirectory dir2 dir3
                 createFile (dir3 </> "file")
@@ -881,7 +878,7 @@ recRenameTwice =
                     , root </> "sentinel"
                     ]
             createFile later
-            evs1 <- readUntil recCfg (isCreatedAt later) w
+            evs1 <- readUntil (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
             unwatched (evs ++ evs1) `shouldBe` []
 
@@ -897,7 +894,7 @@ recRenameScanOnMovedTo =
             renameDirectory dir1 dir2
             createDirectory (dir2 </> "x")
             createFile (dir2 </> "x" </> "f")
-            _ <- readUntilWith recCfg inGap isMovedToDir w
+            _ <- readUntilWith inGap isMovedToDir w
             entries <- listTree dir2
             sort entries
                 `shouldBe`
@@ -933,19 +930,19 @@ recRenameDuringScan =
                 $ \w1 -> do
                     _ <- forkIO
                         $ (do
-                            _ <- readUntil watchCfg Event.isOpened w1
+                            _ <- readUntil Event.isOpened w1
                             renameDirectory dir dir1
                           ) `finally` putMVar done ()
-                    _ <- readUntil recCfg
+                    _ <- readUntil
                         (\ev -> Event.isMovedTo ev && getAbsPath ev == dir1) w
                     takeMVar done
             -- The flags of sub are restored by the scan of dir1, the create
             -- event of the marker is read after the scan.
             let marker = root </> "marker"
             createFile marker
-            _ <- readUntil recCfg (isCreatedAt marker) w
+            _ <- readUntil (isCreatedAt marker) w
             openFile file ReadMode >>= hClose
-            evs <- readUntil recCfg
+            evs <- readUntil
                 (\ev -> getAbsPath ev == file && Event.isNonWriteClosed ev) w
             pathsOf Event.isOpened evs `shouldContain` [file]
 
@@ -1162,12 +1159,11 @@ abandonStream =
 -- | Run the action while another thread reads the events of the watch up to
 -- and including the first event that satisfies the predicate. Return the
 -- result of the action and the events read.
-whileReading ::
-    Event.Config -> (Event -> Bool) -> Event.Watch -> IO a -> IO (a, [Event])
-whileReading cfg p w action = do
+whileReading :: (Event -> Bool) -> Event.Watch -> IO a -> IO (a, [Event])
+whileReading p w action = do
     mv <- newEmptyMVar
     bracket
-        (forkIO (try (readUntil cfg p w) >>= putMVar mv))
+        (forkIO (try (readUntil p w) >>= putMVar mv))
         killThread
         $ \_ -> do
             -- Let the reader block in read
@@ -1185,8 +1181,8 @@ addWhileReading =
                 file = root2 </> "file"
             createDirectory root2
             p <- Path.fromString root2
-            (r, evs) <- whileReading watchCfg (isCreatedAt file) w $ do
-                r <- timeout 2000000 $ Event.addToWatch watchCfg w (p, Nothing)
+            (r, evs) <- whileReading (isCreatedAt file) w $ do
+                r <- timeout 2000000 $ Event.addToWatch w (p, Nothing)
                 -- Unblock the reader
                 createFile file
                 return r
@@ -1198,7 +1194,7 @@ removeWhileReading =
     it "removeFromWatch does not block while another thread reads the events"
         $ withRoot watchCfg $ \root w -> do
             p <- Path.fromString root
-            (r, evs) <- whileReading watchCfg Event.isRootUnwatched w $ do
+            (r, evs) <- whileReading Event.isRootUnwatched w $ do
                 r <- timeout 2000000 $ Event.removeFromWatch w p
                 -- Unblock the reader if removeFromWatch did not
                 createFile (root </> "file")
@@ -1215,7 +1211,7 @@ removeSharedWhileReading =
         $ withNestedRoots $ \root sub w -> do
             hasProc <- procAvailable
             p <- Path.fromString sub
-            (r, evs) <- whileReading recCfg Event.isRootUnwatched w $ do
+            (r, evs) <- whileReading Event.isRootUnwatched w $ do
                 r <- timeout 2000000 $ Event.removeFromWatch w p
                 unless (hasProc || rtsSupportsBoundThreads)
                     $ createFile (root </> "file")
@@ -1230,7 +1226,7 @@ closeWhileReading =
     it "closeWatch does not block while another thread reads the events"
         $ withRoot watchCfg $ \_ w -> do
             mv <- newEmptyMVar
-            let reader = Stream.drain (Event.watchToStream watchCfg w)
+            let reader = Stream.drain (Event.watchToStream w)
             bracket
                 (forkIO (try reader >>= putMVar mv))
                 killThread
@@ -1341,7 +1337,7 @@ recDeepAtStart =
     it "starts a watch on a tree deeper than the open file limit"
         $ withDeepRoot $ \root w new -> do
             createFile new
-            evs <- readUntil recCfg (isCreatedAt new) w
+            evs <- readUntil (isCreatedAt new) w
             createdRoots new evs `shouldBe` [root]
 
 -- The scan of a directory moved in does not keep every level of the tree
@@ -1356,11 +1352,11 @@ recDeepMovedIn =
             (dirs, files) <- deepChain out deepLevels
             let new = chain </> last dirs </> "new"
             withFdLimit deepFdLimit $ do
-                evs <- recEventsOf recCfg root w (renameDirectory out chain)
+                evs <- recEventsOf root w (renameDirectory out chain)
                 sort (scannedPaths (const True) evs)
                     `shouldBe` sort (map (chain </>) (dirs ++ files))
                 createFile new
-                evs1 <- readUntil recCfg (isCreatedAt new) w
+                evs1 <- readUntil (isCreatedAt new) w
                 createdRoots new evs1 `shouldBe` [root]
 
 -- The marker of the shared watch descriptor of sub needs a pipe, the pipe
@@ -1377,7 +1373,7 @@ removeFailRetry =
                     expectationFailure "removeFromWatch did not fail"
                 Just (Left (_ :: IOException)) -> do
                     Event.removeFromWatch w p
-                    evs <- readUntil recCfg Event.isRootUnwatched w
+                    evs <- readUntil Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
 
 -- The read that times out reports dir and dir/file, reaches the end of the
@@ -1390,13 +1386,13 @@ readAfterTimeout desc cfg =
                 file = root </> "file"
                 drain =
                     timeout 500000
-                        $ Stream.fold Fold.drain (Event.watchToStream cfg w)
+                        $ Stream.fold Fold.drain (Event.watchToStream w)
             createDirectory dir
             createFile (dir </> "file")
             drain `shouldReturn` Nothing
             drain `shouldReturn` Nothing
             createFile file
-            evs <- readUntil cfg (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
 
 -- The events of the files are queued before the first read. The reads time
@@ -1416,7 +1412,7 @@ readTimeoutsNoLoss =
                 drain t =
                     timeout t
                         $ Stream.fold (Fold.drainMapM collect)
-                        $ Event.watchToStream recCfg w
+                        $ Event.watchToStream w
             mapM_ createFile files
             mapM_ (\i -> drain (1 + i `mod` 200)) [1 .. 2000 :: Int]
             _ <- drain 500000
@@ -1435,13 +1431,13 @@ readAfterFailure =
                 isLast = isCreatedAt (last files)
             createDirectory dir
             mapM_ createFile files
-            r <- withFdsExhausted (try (readUntil recCfg isLast w))
+            r <- withFdsExhausted (try (readUntil isLast w))
             case r of
                 Nothing -> pendingWith "the open file limit is too high"
                 Just (Right _) ->
                     expectationFailure "the stream did not fail"
                 Just (Left (_ :: IOException)) -> do
-                    evs <- readUntil recCfg isLast w
+                    evs <- readUntil isLast w
                     kernelCreated evs `shouldBe` files
 
 -- The scan of dir is in the middle of the listing of dir when the fds run
@@ -1461,17 +1457,17 @@ readAfterScanFailure =
             createDirectory dir
             mapM_ createDirectory subs
             mapM_ createFile files
-            evs <- readUntil recCfg isScannedFile w
+            evs <- readUntil isScannedFile w
             when (length (scannedPaths Event.isDir evs) == length subs)
                 $ pendingWith "the subdirectories were listed first"
-            r <- withFdsExhausted (try (readUntil recCfg (const False) w))
+            r <- withFdsExhausted (try (readUntil (const False) w))
             case r of
                 Nothing -> pendingWith "the open file limit is too high"
                 Just (Right _) ->
                     expectationFailure "the stream did not fail"
                 Just (Left (_ :: IOException)) -> do
                     createFile end
-                    evs1 <- readUntil recCfg (isCreatedAt end) w
+                    evs1 <- readUntil (isCreatedAt end) w
                     createdRoots end evs1 `shouldBe` [root]
 
 -- IN_MOVE_SELF tells that the directory is moved out, no fd is needed.
@@ -1481,7 +1477,7 @@ recMoveOutNoFd =
         $ withRenameDirs $ \root w dir1 _ -> do
             renameDirectory dir1 (takeDirectory root </> "out")
             r <- withFdsExhausted
-                    $ readUntil recCfg (isUnwatchedAt (dir1 </> "sub")) w
+                    $ readUntil (isUnwatchedAt (dir1 </> "sub")) w
             when (null r) $ pendingWith "the open file limit is too high"
 
 -- The create event of d watches the second directory, it has no IN_MOVE_SELF
@@ -1500,9 +1496,9 @@ recDirMovedOutAndRecreated =
                 renameDirectory dir out
                 createDirectory dir
             createFile file
-            evs <- readUntil recCfg (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             pathsOf Event.isCreated evs `shouldBe` [file]
-            evs1 <- recEventsOf recCfg root w $ do
+            evs1 <- recEventsOf root w $ do
                 renameDirectory dir dir1
                 createFile file1
             kernelCreated evs1 `shouldBe` [file1, root </> "sentinel"]
@@ -1519,12 +1515,12 @@ recRenameOutOfInnerRoot =
                 dir1 = root </> "dir1"
                 file = dir1 </> "file"
             createDirectory dir
-            waitWatched recCfg w dir
+            waitWatched w dir
             renameDirectory dir dir1
-            evs <- readUntil recCfg (isUnwatchedAt dir) w
+            evs <- readUntil (isUnwatchedAt dir) w
             unwatched evs `shouldBe` [(sub, dir)]
             createFile file
-            evs1 <- readUntil recCfg (isCreatedAt file) w
+            evs1 <- readUntil (isCreatedAt file) w
             createdRoots file evs1 `shouldBe` [root]
 
 -- The scan events of a rename do not depend on its move events. The create
@@ -1537,8 +1533,8 @@ recRenameMovedToDisabled =
                 dir2 = root </> "dir2"
                 file = dir2 </> "x" </> "f"
             createDirectory dir1
-            waitWatched cfg w dir1
-            evs <- recEventsOf cfg root w $ do
+            waitWatched w dir1
+            evs <- recEventsOf root w $ do
                 renameDirectory dir1 dir2
                 createDirectory (dir2 </> "x")
                 createFile file
@@ -1557,7 +1553,7 @@ closeFailFallback =
     it "closeWatch ends the stream without a free fd"
         $ withRoot watchCfg $ \root w -> do
             mv <- newEmptyMVar
-            let reader = Stream.drain (Event.watchToStream watchCfg w)
+            let reader = Stream.drain (Event.watchToStream w)
             bracket
                 (forkIO (try reader >>= putMVar mv))
                 killThread
@@ -1609,7 +1605,7 @@ recSubdirAddedTwice =
             done <- newEmptyMVar
             bracket (forkIO (ops `finally` putMVar done ())) killThread
                 $ \_ -> do
-                    _ <- readUntil recCfg (isCreatedAt sentinel) w
+                    _ <- readUntil (isCreatedAt sentinel) w
                     takeMVar done
 
 -- The directory is replaced by a file before its create event is read.
@@ -1621,8 +1617,8 @@ recDirReplacedByFile =
             createDirectory dir
             removeDirectory dir
             createFile dir
-            waitWatched recCfg w dir
-            evs <- recEventsOf recCfg root w (appendFile dir "x")
+            waitWatched w dir
+            evs <- recEventsOf root w (appendFile dir "x")
             pathsOf Event.isModified evs `shouldBe` [dir]
 
 -- The directory is replaced by a symbolic link to a directory outside the
@@ -1638,8 +1634,8 @@ recDirReplacedBySymlink =
             createDirectory dir
             removeDirectory dir
             createDirectoryLink out dir
-            waitWatched recCfg w dir
-            evs <- recEventsOf recCfg root w $ do
+            waitWatched w dir
+            evs <- recEventsOf root w $ do
                 createFile (out </> "file")
                 createFile (out </> "sub" </> "file")
             filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
@@ -1653,7 +1649,7 @@ recEventsBeforeAdd root w action = do
     let sync = root </> "sync"
     action
     createFile sync
-    readUntil recCfg (isCreatedAt sync) w
+    readUntil (isCreatedAt sync) w
 
 -- The events of a new directory before its watch is added are recovered by a
 -- scan, the watch is added first, so the later events are reported as usual.
@@ -1680,7 +1676,7 @@ recScanNewDir =
                 (\ev -> Event.isCreated ev && not (Event.isScanEvent ev))
                 evs
                 `shouldBe` [dir, root </> "sync"]
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -1697,9 +1693,9 @@ recScanDisabled =
             createDirectory sub
             createFile (dir </> "file")
             createFile sync
-            evs <- readUntil cfg (isCreatedAt sync) w
+            evs <- readUntil (isCreatedAt sync) w
             pathsOf Event.isCreated evs `shouldBe` [dir, sync]
-            evs1 <- recEventsOf cfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -1717,10 +1713,10 @@ recScanCreatedDisabled =
             createDirectory sub
             createFile (dir </> "file")
             writeFile (root </> "sync") "x"
-            evs <- readUntil cfg Event.isModified w
+            evs <- readUntil Event.isModified w
             pathsOf Event.isScanEvent evs `shouldBe` []
             writeFile later "x"
-            evs1 <- readUntil cfg Event.isModified w
+            evs1 <- readUntil Event.isModified w
             pathsOf Event.isModified evs1 `shouldBe` [later]
 
 -- The listing of a new directory generates its events after the sentinel is
@@ -1743,9 +1739,9 @@ recScanNewDirSilent =
             createDirectory sub
             createFile (sub </> "file")
             createFile sentinel
-            evs <- readUntil recCfg (isCreatedAt sentinel) w
+            evs <- readUntil (isCreatedAt sentinel) w
             createFile sentinel1
-            evs1 <- readUntil recCfg (isCreatedAt sentinel1) w
+            evs1 <- readUntil (isCreatedAt sentinel1) w
             filter (isUnder dir) (map getAbsPath evs) `shouldContain` [sub]
             let listed = filter (isUnder dir) (pathsOf isListing (evs ++ evs1))
             filter (/= dir) listed `shouldBe` []
@@ -1762,11 +1758,11 @@ recTouchAfterNewDirScan =
                 sentinel = root </> "sentinel"
             createDirectory dir
             createDirectory sub
-            evs <- recEventsOf recCfg root w (return ())
+            evs <- recEventsOf root w (return ())
             pathsOf Event.isScanEvent evs `shouldBe` [sub]
             _ <- listDirectory sub
             createFile sentinel
-            evs1 <- readUntil recCfg (\ev ->
+            evs1 <- readUntil (\ev ->
                 getAbsPath ev == sub && Event.isNonWriteClosed ev) w
             pathsOf Event.isOpened evs1 `shouldContain` [sub]
 
@@ -1779,7 +1775,7 @@ withWatchedNewDir action =
         createDirectory dir
         createFile (dir </> "file")
         createFile ready
-        _ <- readUntil recCfg (isCreatedAt ready) w
+        _ <- readUntil (isCreatedAt ready) w
         action root w dir
 
 recScanOnMoveIn :: Spec
@@ -1796,7 +1792,7 @@ recScanOnMoveIn =
             createFile (src </> "sub" </> "file")
             evs <- recEventsBeforeAdd root w (renameDirectory src dir)
             sort (scannedPaths (const True) evs) `shouldBe` sort [sub, file]
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -1810,10 +1806,10 @@ recScanOnMoveInDisabled =
             createDirectory src
             createDirectory (src </> "sub")
             createFile (src </> "file")
-            evs <- recEventsOf cfg root w (renameDirectory src dir)
+            evs <- recEventsOf root w (renameDirectory src dir)
             pathsOf Event.isScanEvent evs `shouldBe` []
             createFile later
-            evs1 <- readUntil cfg (isCreatedAt later) w
+            evs1 <- readUntil (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
 
     where
@@ -1896,7 +1892,7 @@ recScanCreatedThenRenamed =
                 renameDirectory dir dir1
             sort (scannedPaths (const True) evs) `shouldBe` sort [sub, file]
             scannedPaths Event.isDir evs `shouldBe` [sub]
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -1930,7 +1926,7 @@ recScanCreatedRenamedPathReused =
                 renameDirectory dir dir1
                 createDirectory dir
             scannedPaths (const True) evs `shouldBe` [dir1 </> "file"]
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -1980,7 +1976,7 @@ recScanMovedAwayAndBack =
                 renameDirectory dir dir1
                 renameDirectory dir1 dir
             scannedPaths (const True) evs `shouldBe` [dir </> "file"]
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -2074,7 +2070,7 @@ checkReusedPath action =
         evs <-
             recEventsBeforeAdd root w
                 (action (takeDirectory root </> "out") dir dir1)
-        evs1 <- recEventsOf recCfg root w $ do
+        evs1 <- recEventsOf root w $ do
             createFile later
             createFile subLater
         pathsOf Event.isCreated evs1
@@ -2133,7 +2129,7 @@ recUnwatchedAfterRecreated =
             evs <- recEventsBeforeAdd root w $ do
                 renameDirectory dir1 (takeDirectory root </> "out")
                 createDirectory dir1
-            evs1 <- recEventsOf recCfg root w (createFile later)
+            evs1 <- recEventsOf root w (createFile later)
             map Event.isRootUnwatched (filter isAtDir (evs ++ evs1))
                 `shouldBe` [False, True]
             pathsOf Event.isCreated evs1
@@ -2210,7 +2206,7 @@ recParentReplacedBySymlink =
                 createDirectory (dir1 </> "new")
                 renameDirectory dir1 dir2
                 createFileLink outside dir1
-            evs1 <- recEventsOf recCfg root w $ do
+            evs1 <- recEventsOf root w $ do
                 createFile (outside </> "new" </> "stray")
                 createFile inNew
             pathsOf Event.isCreated evs1
@@ -2232,7 +2228,7 @@ scanReplacedDuringScan root w src replace = do
                 replace dir sub
                 createFile marker
     renameDirectory src dir
-    evs <- readUntilWith recCfg onScan (isCreatedAt marker) w
+    evs <- readUntilWith onScan (isCreatedAt marker) w
     return (scannedPaths (const True) evs)
 
 -- The listing of sub starts after its scan event is read.
@@ -2311,7 +2307,7 @@ checkCycleFiles base w = do
         links = map (base </>) cycleLinks
         viaLink p = any (\l -> p == l || isStrictlyUnder l p) links
     mapM_ createFile files
-    evs <- readUntil recCfg (isCreatedAt (last files)) w
+    evs <- readUntil (isCreatedAt (last files)) w
     pathsOf Event.isCreated evs `shouldBe` files
     filter viaLink (map getAbsPath evs) `shouldBe` []
 
@@ -2340,7 +2336,7 @@ recMovedInSymlinkCycles =
                 dir = root </> "dir"
             createDirectory src
             symlinkCycles src root
-            evs <- recEventsOf recCfg root w (renameDirectory src dir)
+            evs <- recEventsOf root w (renameDirectory src dir)
             sort (scannedPaths (const True) evs)
                 `shouldBe` sort (map (dir </>) (cycleDirs ++ cycleLinks))
             sort (scannedPaths Event.isDir evs)
@@ -2371,8 +2367,8 @@ recWatchedSymlinkCycles =
             let links = map (dir </>) cycleLinks
             createDirectory dir
             mapM_ (createDirectory . (dir </>)) cycleDirs
-            waitWatched recCfg w dir
-            evs <- recEventsOf recCfg root w (symlinkCycleLinks dir root)
+            waitWatched w dir
+            evs <- recEventsOf root w (symlinkCycleLinks dir root)
             sort (kernelCreated evs)
                 `shouldBe` sort ((root </> "sentinel") : links)
             checkCycleFiles dir w
@@ -2383,7 +2379,7 @@ recScanCreatedRenamedDisabled =
         $ withRoot cfg $ \root w -> do
             let dir = root </> "dir"
                 dir1 = root </> "dir1"
-            evs <- recEventsOf cfg root w $ do
+            evs <- recEventsOf root w $ do
                 createDirectory dir
                 createFile (dir </> "file")
                 renameDirectory dir dir1
@@ -2405,12 +2401,12 @@ recScanOnRenameDisabled =
             createDirectory dir
             createDirectory (dir </> "sub")
             createFile (dir </> "file")
-            waitWatched cfg w dir
-            evs <- recEventsOf cfg root w (renameDirectory dir dir1)
+            waitWatched w dir
+            evs <- recEventsOf root w (renameDirectory dir dir1)
             pathsOf Event.isScanEvent evs `shouldBe` []
             unwatched evs `shouldBe` []
             createFile later
-            evs1 <- readUntil cfg (isCreatedAt later) w
+            evs1 <- readUntil (isCreatedAt later) w
             pathsOf Event.isCreated evs1 `shouldBe` [later]
 
     where
@@ -2451,7 +2447,7 @@ recDirRecreated =
             pathsOf (dirEvent Event.isCreated) evs
                 `shouldBe` [dir, dir </> "sub", dir, dir </> "sub"]
             pathsOf (dirEvent Event.isDeleted) evs `shouldBe` [dir]
-            evs1 <- recEventsOf recCfg root w (createFile file)
+            evs1 <- recEventsOf root w (createFile file)
             pathsOf Event.isCreated evs1
                 `shouldBe` [file, root </> "sentinel"]
 
@@ -2471,7 +2467,7 @@ recDirMovedAndRecreated =
                 renameDirectory dir dir1
                 createDirectory dir
                 createDirectory (dir </> "sub")
-            evs <- recEventsOf recCfg root w $ do
+            evs <- recEventsOf root w $ do
                 createFile file
                 createFile file1
             pathsOf Event.isCreated evs
@@ -2489,12 +2485,12 @@ recDirReplacedByWatched =
                 file = dir </> "sub" </> "file"
             createDirectory dir2
             createDirectory (dir2 </> "sub")
-            waitWatched recCfg w dir2
+            waitWatched w dir2
             _ <- recEventsBeforeAdd root w $ do
                 createDirectory dir
                 renameDirectory dir dir1
                 renameDirectory dir2 dir
-            evs <- recEventsOf recCfg root w (createFile file)
+            evs <- recEventsOf root w (createFile file)
             pathsOf Event.isCreated evs
                 `shouldBe` [file, root </> "sentinel"]
             -- The scans and the removals made while reading the events of
@@ -2555,7 +2551,7 @@ recDeniedAtStart =
                         Event.closeWatch
                     $ \w -> do
                         createFile sentinel
-                        evs <- readUntil recCfg (isCreatedAt sentinel) w
+                        evs <- readUntil (isCreatedAt sentinel) w
                         accessDenied evs `shouldBe` [dir]
 
 -- The isAccessDenied event follows the create or move event of the
@@ -2603,9 +2599,9 @@ recDeniedAfterWatched =
         $ withRoot recCfg $ \root w -> do
             let dir = root </> "dir"
             createDirectory dir
-            waitWatched recCfg w dir
+            waitWatched w dir
             evs <- withMode 0o300 dir []
-                $ recEventsOf recCfg root w (createFile (dir </> "file"))
+                $ recEventsOf root w (createFile (dir </> "file"))
             pathsOf Event.isCreated evs
                 `shouldBe` [dir </> "file", root </> "sentinel"]
             accessDenied evs `shouldBe` []
@@ -2650,7 +2646,7 @@ recStartScanSilent =
                 Event.closeWatch
                 $ \w -> do
                     createFile sentinel
-                    evs <- readUntil recCfg (isCreatedAt sentinel) w
+                    evs <- readUntil (isCreatedAt sentinel) w
                     map getAbsPath evs `shouldBe` [sentinel]
 
 -- The events not requested during the scan are requested after it.
@@ -2668,7 +2664,7 @@ recTouchAfterScan =
                 Event.closeWatch
                 $ \w -> do
                     _ <- listDirectory sub
-                    evs <- readUntil recCfg (\ev ->
+                    evs <- readUntil (\ev ->
                         getAbsPath ev == sub && Event.isNonWriteClosed ev) w
                     pathsOf Event.isOpened evs `shouldContain` [sub]
 
@@ -2707,7 +2703,7 @@ overflowEnds mode cfg =
     where
 
     readToEnd w = do
-        r <- timeout 10000000 $ Stream.toList $ Event.watchToStream cfg w
+        r <- timeout 10000000 $ Stream.toList $ Event.watchToStream w
         maybe (error "overflowEnds: timed out") return r
 
 -------------------------------------------------------------------------------
@@ -2755,7 +2751,7 @@ overflowPaths =
                         $ Stream.toList
                         $ Stream.take 2
                         $ Stream.filter Event.isEventsLost
-                        $ Event.watchToStream watchCfg w
+                        $ Event.watchToStream w
                     evs <- maybe (error "overflowPaths: timed out") return r1
                     sort (map getRoot evs) `shouldBe` [root1, root2]
                     map getRelPath evs `shouldBe` [Nothing, Nothing]
