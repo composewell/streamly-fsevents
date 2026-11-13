@@ -60,6 +60,7 @@ module Streamly.Internal.FS.Event.Linux
     , Watch
     , openWatch
     , closeWatch
+    , readEvent
     , watchToStream
     , addToWatch
     , removeFromWatch
@@ -3194,32 +3195,32 @@ readEvents
             return st1 {fsFdOpen = False}
         else return st1
 
--- | Read the events from a 'Watch' as a stream. The 'Config' must be the one
--- used to open the watch. The stream does not close the watch, use
--- 'closeWatch' to close it. The stream ends when the watch is closed.
+-- | Read the next event from a 'Watch', wait for one if none is available.
+-- The 'Config' must be the one used to open the watch. Returns 'Nothing'
+-- when the watch is closed, and on every later call.
 --
--- While a thread reads the stream, other threads can use 'addToWatch',
--- 'removeFromWatch' and 'closeWatch' on the watch. An event is reported to
--- only one of the streams if more than one stream reads the same watch.
---
--- A stream can stop reading before the watch is closed. The next stream on
--- the watch starts with the first event not yet read. The scan of a new
--- directory continues in the next stream, see 'setScanNewDirs'.
+-- While a thread reads the watch, other threads can use 'addToWatch',
+-- 'removeFromWatch' and 'closeWatch' on it. If more than one thread reads
+-- the same watch, an event is returned to only one of them.
 --
 -- A read that is interrupted by an async exception while it waits for an
--- event, for example, by a timeout, does not lose any event.
+-- event, for example, by a timeout, does not lose any event. The next read
+-- returns the first event not yet read. The scan of a new directory
+-- continues in the next read, see 'setScanNewDirs'.
 --
--- If the stream raises an 'IOException', for example, when a directory
+-- If the read raises an 'IOException', for example, when a directory
 -- cannot be added because the process has reached the
 -- @max_user_watches@ limit or has no free file descriptor, the operation that
 -- failed is not tried again. The directory is not watched, and the next
--- stream on the watch continues after it.
+-- read continues after it.
 --
 -- /Pre-release/
 --
-watchToStream :: Config -> Watch -> Stream IO Event
-watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
-    S.unfoldrM step ()
+readEvent :: Config -> Watch -> IO (Maybe Event)
+readEvent cfg wtch@Watch {watchUndelivered = undeliveredRef} =
+    Exception.mask_ $ do
+        r <- takeMVar undeliveredRef
+        next (fromMaybe items r)
 
     where
 
@@ -3265,11 +3266,6 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
     --
     -- Any other exception leaves the stream in an unknown state. It is
     -- saved in place of the stream, every later read raises it again.
-    step () =
-        Exception.mask_ $ do
-            r <- takeMVar undeliveredRef
-            next (fromMaybe items r)
-
     next stream = do
         r <- try (Exception.uninterruptibleMask_ (S.uncons stream))
         case r of
@@ -3290,7 +3286,7 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
             -- when 'mask_' ends, and the event is lost. See
             -- dev/design-issues.md.
             Right (Just (ItemEvent ev, rest)) ->
-                save rest >> return (Just (ev, ()))
+                save rest >> return (Just ev)
             -- Similarly, the async exception replaces the 'IOException'
             -- when 'mask_' ends, and the failure is not reported.
             Right (Just (ItemFailed e, rest)) -> save rest >> ioError e
@@ -3298,6 +3294,21 @@ watchToStream cfg wtch@Watch {watchUndelivered = undeliveredRef} =
             Right (Just (ItemWait wait, rest)) -> do
                 wait `onException` save rest
                 next rest
+
+-- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
+-- 'Config' must be the one used to open the watch. The stream does not
+-- close the watch, use 'closeWatch' to close it. The stream ends when the
+-- watch is closed.
+--
+-- A stream can stop reading before the watch is closed. The next stream on
+-- the watch starts with the first event not yet read. See 'readEvent' for
+-- concurrent reads, async exceptions and failures.
+--
+-- /Pre-release/
+--
+watchToStream :: Config -> Watch -> Stream IO Event
+watchToStream cfg wtch =
+    S.unfoldrM (\() -> fmap (, ()) <$> readEvent cfg wtch) ()
 
 -- XXX We should not go across the mount points of network file systems or file
 -- systems that are known to not generate any events.
