@@ -3200,8 +3200,17 @@ readEvents
 -- Returns 'Nothing' when the watch is closed, and on every later call.
 --
 -- While a thread reads the watch, other threads can use 'addRoot',
--- 'removeRoot' and 'closeWatch' on it. If more than one thread reads
--- the same watch, an event is returned to only one of them.
+-- 'removeRoot' and 'closeWatch' on it.
+--
+-- More than one thread can read the same watch at the same time, using
+-- 'readEvent' or 'eventStream'. Each event is returned to exactly one of
+-- the readers. The reads run one at a time: while a thread reads, including
+-- while it waits for an event, the other readers wait for it to finish.
+-- Each reader gets its events in the order in which they occurred. Related
+-- events can go to different readers, for example, the 'isMovedFrom' and
+-- 'isMovedTo' events of a rename, or the 'isCreated' event of a directory
+-- and the 'isScanEvent' events of its entries. When the watch is closed,
+-- every reader gets 'Nothing'.
 --
 -- A read that is interrupted by an async exception while it waits for an
 -- event, for example, by a timeout, does not lose any event. The next read
@@ -3259,8 +3268,10 @@ readEvent
     --   blocks only on the lock of the watch, which is never held across a
     --   blocking call.
     -- * The step does not wait for events. It returns the wait as an item,
-    --   the wait runs after the rest of the stream is saved, and can be
-    --   interrupted.
+    --   the wait runs after the step, and can be interrupted. The rest of
+    --   the stream is saved if the wait is interrupted. Otherwise the
+    --   'MVar' stays empty during the wait, other readers of the watch
+    --   wait for the 'MVar', not for the fd.
     -- * An 'IOException' is returned as an item, by 'handleEvent' and by the
     --   stream of a scan, and is raised after the rest of the stream is
     --   saved.
@@ -3301,8 +3312,11 @@ readEvent
 -- ends when the watch is closed.
 --
 -- A stream can stop reading before the watch is closed. The next stream on
--- the watch starts with the first event not yet read. See 'readEvent' for
--- concurrent reads, async exceptions and failures.
+-- the watch starts with the first event not yet read.
+--
+-- More than one stream can read the same watch at the same time. See
+-- 'readEvent' for how the events are divided among the readers, and for
+-- async exceptions and failures.
 --
 -- /Pre-release/
 --
