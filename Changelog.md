@@ -39,10 +39,6 @@
   and close events of its own scan. These events overflowed the event queue
   at the start of a watch on a large tree.
 - Linux: close fd promptly on failure, make the fd close-on-exec.
-- Linux: `watchToStream` can be read again after a read is interrupted by
-  an async exception, for example, a timeout, or after the stream raises an
-  exception. Earlier the next read could use a directory that was already
-  closed, and the events already read from the kernel could be lost.
 - Linux: in recursive mode, the time taken to handle a rename, a move or a
   removal of a directory no longer grows with the number of directories
   watched. On a watch of 24000 directories, 2000 renames of a directory took
@@ -74,13 +70,28 @@
   and `getRelPath` to `Streamly.FileSystem.Event`.
 - Add `showEvent` to `Streamly.FileSystem.Event` and the platform specific
   modules, for debugging. Its output format can change at any time.
-- Linux: `addToWatch`, `removeFromWatch` and `closeWatch` in
-  `Streamly.Internal.FS.Event.Linux` no longer wait for the next event.
-  Earlier they could block indefinitely on a watched tree with no activity.
-  They can be called from any thread while another thread reads the events;
-  `closeWatch` ends that thread's event stream.
 - macOS: support non-recursive `watch`, it raised an exception earlier.
 - macOS: add `setRecursiveMode`, `getRoot` and `getRelPath`.
+
+### Internal API
+
+These changes are to the handle API in `Streamly.Internal.FS.Event.Linux`.
+Internal modules can change in any release, these changes do not affect the
+public modules.
+
+- `watchToStream`, `addToWatch` and `removeFromWatch` are renamed to
+  `eventStream`, `addRoot` and `removeRoot`. The `Config` is passed only to
+  `openWatch`, `eventStream` and `addRoot` do not take one. `addRoot` takes
+  a `Path` instead of a `PathRep`.
+- Add `readEvent` to read one event from a `Watch`.
+- `eventStream` can be read again after a read is interrupted by an async
+  exception, for example, a timeout, or after the stream raises an
+  exception. Earlier the next read could use a directory that was already
+  closed, and the events already read from the kernel could be lost.
+- `addRoot`, `removeRoot` and `closeWatch` no longer wait for the next
+  event. Earlier they could block indefinitely on a watched tree with no
+  activity. They can be called from any thread while another thread reads
+  the events; `closeWatch` ends that thread's event stream.
 
 ## 0.1.1
 

@@ -482,7 +482,7 @@ runCase base w ops1 split ops2 = do
             reader = do
                 r <- try
                     $ Stream.fold (Fold.drainMapM onEvent)
-                    $ Event.watchToStream wtch
+                    $ Event.eventStream wtch
                 case r of
                     Left (e :: SomeException) -> do
                         _ <- tryPutMVar failed ("exception: " ++ show e)

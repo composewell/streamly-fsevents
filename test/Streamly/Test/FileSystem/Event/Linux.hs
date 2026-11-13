@@ -159,7 +159,7 @@ readUntilWith action p w = do
         $ Stream.takeEndBy p
         $ Stream.trace action
         $ Stream.trace (putStrLn . Event.showEvent)
-        $ Event.watchToStream w
+        $ Event.eventStream w
     maybe (error "readUntil: timed out") return r
 
 readUntil :: (Event -> Bool) -> Event.Watch -> IO [Event]
@@ -177,7 +177,7 @@ getAbsPath :: Event -> FilePath
 getAbsPath = Path.toString . Event.getAbsPath
 
 -- | Whether @\/proc\/self\/fd@ can be listed. The library falls back to a
--- lax removal of a shared root without it, see 'Event.removeFromWatch'.
+-- lax removal of a shared root without it, see 'Event.removeRoot'.
 procAvailable :: IO Bool
 procAvailable = do
     r <- try (listDirectory "/proc/self/fd")
@@ -193,29 +193,29 @@ shouldEndUnwatched evs root1 = do
 
     lastMaybe = foldl (\_ x -> Just x) Nothing
 
--- The events queued before removeFromWatch, including isRootUnwatched, have
+-- The events queued before removeRoot, including isRootUnwatched, have
 -- the watch descriptor of the removed root.
 removeQueuedEvents :: Spec
 removeQueuedEvents =
-    it "removeFromWatch reports the queued events and isRootUnwatched"
+    it "removeRoot reports the queued events and isRootUnwatched"
         $ withTwoRoots $ \root1 _ w -> do
             let file = root1 </> "file"
             openFile file WriteMode >>= hClose
-            Event.removeFromWatch w =<< Path.fromString root1
+            Event.removeRoot w =<< Path.fromString root1
             evs <- readUntilUnwatched w
             any (\ev -> Event.isCreated ev && getAbsPath ev == file) evs
                 `shouldBe` True
             shouldEndUnwatched evs root1
 
--- The second removeFromWatch runs before the isRootUnwatched event is read,
+-- The second removeRoot runs before the isRootUnwatched event is read,
 -- inotify_rm_watch fails with EINVAL.
 removeTwice :: Spec
 removeTwice =
-    it "removeFromWatch twice does not throw an exception"
+    it "removeRoot twice does not throw an exception"
         $ withTwoRoots $ \root1 _ w -> do
             p <- Path.fromString root1
-            Event.removeFromWatch w p
-            Event.removeFromWatch w p
+            Event.removeRoot w p
+            Event.removeRoot w p
             evs <- readUntilUnwatched w
             shouldEndUnwatched evs root1
 
@@ -229,7 +229,7 @@ removeDeleted =
             any (\ev -> Event.isRootDeleted ev && getRoot ev == root1) evs
                 `shouldBe` True
             shouldEndUnwatched evs root1
-            Event.removeFromWatch w =<< Path.fromString root1
+            Event.removeRoot w =<< Path.fromString root1
 
 -------------------------------------------------------------------------------
 -- Overlapping roots tests
@@ -280,13 +280,13 @@ overlapFanOut =
                 (\ev -> isCreatedAt file ev && getRoot ev == sub) w
             createdRoots file evs `shouldBe` [root, sub]
 
--- The watch descriptor of sub is still used by root, removeFromWatch queues a
+-- The watch descriptor of sub is still used by root, removeRoot queues a
 -- marker event instead of removing the kernel watch.
 overlapRemoveInner :: Spec
 overlapRemoveInner =
     it "removing the inner root keeps the outer root watching"
         $ withNestedRoots $ \root sub w -> do
-            Event.removeFromWatch w =<< Path.fromString sub
+            Event.removeRoot w =<< Path.fromString sub
             evs <- readUntil Event.isRootUnwatched w
             unwatched evs `shouldBe` [(sub, sub)]
             let file1 = sub </> "file1"
@@ -307,7 +307,7 @@ overlapRemoveQueued =
             hasProc <- procAvailable
             let file = sub </> "file"
             createFile file
-            Event.removeFromWatch w =<< Path.fromString sub
+            Event.removeRoot w =<< Path.fromString sub
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev
                     || (isCreatedAt file ev && getRoot ev == root)) w
@@ -328,7 +328,7 @@ overlapRemoveOuter =
     it "removing the outer root keeps the inner root watching"
         $ withNestedRoots $ \root sub w -> do
             hasProc <- procAvailable
-            Event.removeFromWatch w =<< Path.fromString root
+            Event.removeRoot w =<< Path.fromString root
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
             if hasProc
@@ -352,8 +352,8 @@ overlapRemoveBoth :: Spec
 overlapRemoveBoth =
     it "removing both the roots reports isRootUnwatched for each path"
         $ withNestedRoots $ \root sub w -> do
-            Event.removeFromWatch w =<< Path.fromString sub
-            Event.removeFromWatch w =<< Path.fromString root
+            Event.removeRoot w =<< Path.fromString sub
+            Event.removeRoot w =<< Path.fromString root
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getRoot ev == root
                     && getAbsPath ev == sub) w
@@ -1175,14 +1175,14 @@ whileReading p w action = do
 -- The reader thread is blocked reading the watch fd.
 addWhileReading :: Spec
 addWhileReading =
-    it "addToWatch does not block while another thread reads the events"
+    it "addRoot does not block while another thread reads the events"
         $ withRoot watchCfg $ \root w -> do
             let root2 = takeDirectory root </> "root2"
                 file = root2 </> "file"
             createDirectory root2
             p <- Path.fromString root2
             (r, evs) <- whileReading (isCreatedAt file) w $ do
-                r <- timeout 2000000 $ Event.addToWatch w (p, Nothing)
+                r <- timeout 2000000 $ Event.addRoot w p
                 -- Unblock the reader
                 createFile file
                 return r
@@ -1191,12 +1191,12 @@ addWhileReading =
 
 removeWhileReading :: Spec
 removeWhileReading =
-    it "removeFromWatch does not block while another thread reads the events"
+    it "removeRoot does not block while another thread reads the events"
         $ withRoot watchCfg $ \root w -> do
             p <- Path.fromString root
             (r, evs) <- whileReading Event.isRootUnwatched w $ do
-                r <- timeout 2000000 $ Event.removeFromWatch w p
-                -- Unblock the reader if removeFromWatch did not
+                r <- timeout 2000000 $ Event.removeRoot w p
+                -- Unblock the reader if removeRoot did not
                 createFile (root </> "file")
                 return r
             r `shouldBe` Just ()
@@ -1212,7 +1212,7 @@ removeSharedWhileReading =
             hasProc <- procAvailable
             p <- Path.fromString sub
             (r, evs) <- whileReading Event.isRootUnwatched w $ do
-                r <- timeout 2000000 $ Event.removeFromWatch w p
+                r <- timeout 2000000 $ Event.removeRoot w p
                 unless (hasProc || rtsSupportsBoundThreads)
                     $ createFile (root </> "file")
                 return r
@@ -1226,7 +1226,7 @@ closeWhileReading =
     it "closeWatch does not block while another thread reads the events"
         $ withRoot watchCfg $ \_ w -> do
             mv <- newEmptyMVar
-            let reader = Stream.drain (Event.watchToStream w)
+            let reader = Stream.drain (Event.eventStream w)
             bracket
                 (forkIO (try reader >>= putMVar mv))
                 killThread
@@ -1363,16 +1363,16 @@ recDeepMovedIn =
 -- fails with EMFILE.
 removeFailRetry :: Spec
 removeFailRetry =
-    it "removeFromWatch can be retried after it fails"
+    it "removeRoot can be retried after it fails"
         $ withNestedRoots $ \_ sub w -> do
             p <- Path.fromString sub
-            r <- withFdsExhausted (try (Event.removeFromWatch w p))
+            r <- withFdsExhausted (try (Event.removeRoot w p))
             case r of
                 Nothing -> pendingWith "the open file limit is too high"
                 Just (Right ()) ->
-                    expectationFailure "removeFromWatch did not fail"
+                    expectationFailure "removeRoot did not fail"
                 Just (Left (_ :: IOException)) -> do
-                    Event.removeFromWatch w p
+                    Event.removeRoot w p
                     evs <- readUntil Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
 
@@ -1386,7 +1386,7 @@ readAfterTimeout desc cfg =
                 file = root </> "file"
                 drain =
                     timeout 500000
-                        $ Stream.fold Fold.drain (Event.watchToStream w)
+                        $ Stream.fold Fold.drain (Event.eventStream w)
             createDirectory dir
             createFile (dir </> "file")
             drain `shouldReturn` Nothing
@@ -1412,7 +1412,7 @@ readTimeoutsNoLoss =
                 drain t =
                     timeout t
                         $ Stream.fold (Fold.drainMapM collect)
-                        $ Event.watchToStream w
+                        $ Event.eventStream w
             mapM_ createFile files
             mapM_ (\i -> drain (1 + i `mod` 200)) [1 .. 2000 :: Int]
             _ <- drain 500000
@@ -1553,7 +1553,7 @@ closeFailFallback =
     it "closeWatch ends the stream without a free fd"
         $ withRoot watchCfg $ \root w -> do
             mv <- newEmptyMVar
-            let reader = Stream.drain (Event.watchToStream w)
+            let reader = Stream.drain (Event.eventStream w)
             bracket
                 (forkIO (try reader >>= putMVar mv))
                 killThread
@@ -2703,7 +2703,7 @@ overflowEnds mode cfg =
     where
 
     readToEnd w = do
-        r <- timeout 10000000 $ Stream.toList $ Event.watchToStream w
+        r <- timeout 10000000 $ Stream.toList $ Event.eventStream w
         maybe (error "overflowEnds: timed out") return r
 
 -------------------------------------------------------------------------------
@@ -2751,7 +2751,7 @@ overflowPaths =
                         $ Stream.toList
                         $ Stream.take 2
                         $ Stream.filter Event.isEventsLost
-                        $ Event.watchToStream w
+                        $ Event.eventStream w
                     evs <- maybe (error "overflowPaths: timed out") return r1
                     sort (map getRoot evs) `shouldBe` [root1, root2]
                     map getRelPath evs `shouldBe` [Nothing, Nothing]
@@ -2762,7 +2762,7 @@ watchTests =
     hspec
         $ describe moduleName
         $ do
-            describe "removeFromWatch" $ do
+            describe "removeRoot" $ do
                 removeQueuedEvents
                 removeTwice
                 removeDeleted
