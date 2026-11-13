@@ -251,8 +251,8 @@ isModified = Event.isModified
 -- therefore, we need to take some recovery action.
 --
 -- The tree under the path returned by 'getAbsPath' has to be scanned again to
--- know its current state. See @docs\/platform-differences.md@ in this package
--- for the path reported on each platform.
+-- know its current state. See @docs\/robustness.md@ in this package for the
+-- path reported on each platform and for the recovery.
 --
 -- On Linux the watch is closed and the stream ends after this event, a new
 -- watch has to be opened to continue.
