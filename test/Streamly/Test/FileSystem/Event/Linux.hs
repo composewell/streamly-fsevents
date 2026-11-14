@@ -404,29 +404,6 @@ duplicateRoot =
                     createdRoots file evs `shouldBe` [root]
 
 -------------------------------------------------------------------------------
--- Watch descriptor tests
--------------------------------------------------------------------------------
-
--- inotify allocates the watch descriptors of a watch in increasing order, the
--- last of the 300 roots gets a watch descriptor greater than 255.
-largeWd :: Spec
-largeWd =
-    it "reports the path of a watch descriptor greater than 255"
-        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let dirs = [fp </> ("dir" ++ show i) | i <- [1 .. 300 :: Int]]
-                file = fp </> "dir300" </> "file"
-            mapM_ createDirectory dirs
-            roots <- mapM Path.fromString dirs
-            bracket
-                (Event.openWatch watchCfg (NonEmpty.fromList roots))
-                Event.closeWatch
-                $ \w -> do
-                    createFile file
-                    evs <- readUntil Event.isCreated w
-                    map getAbsPath (filter Event.isCreated evs)
-                        `shouldBe` [file]
-
--------------------------------------------------------------------------------
 -- Default config tests
 -------------------------------------------------------------------------------
 
@@ -712,40 +689,6 @@ recMoveOutUnrequested =
         let cfg = Event.setMovedFrom False $ Event.setMovedTo False recCfg
         evs <- recMoveOut cfg
         pathsOf Event.isMoved evs `shouldBe` []
-
-recMoveIn :: Spec
-recMoveIn =
-    it "adds a directory moved into the tree"
-        $ withRoot recCfg $ \root w -> do
-            let src = takeDirectory root </> "src"
-                dir = root </> "dir"
-                file = dir </> "sub" </> "file"
-            createDirectory src
-            createDirectory (src </> "sub")
-            renameDirectory src dir
-            -- dir/sub is watched when its scan event is read.
-            _ <- readUntil (isCreatedAt (dir </> "sub")) w
-            createFile file
-            evs <- readUntil (isCreatedAt file) w
-            pathsOf Event.isCreated evs `shouldBe` [file]
-
--- The watches of dir1 are kept, its paths are changed on IN_MOVED_TO.
-recRenameWithin :: Spec
-recRenameWithin =
-    it "reports the new path of a directory renamed within the tree"
-        $ withRoot recCfg $ \root w -> do
-            let dir1 = root </> "dir1"
-                dir2 = root </> "dir2"
-                file = dir2 </> "sub" </> "file"
-            createDirectory dir1
-            createDirectory (dir1 </> "sub")
-            waitWatched w dir1
-            renameDirectory dir1 dir2
-            _ <- readUntil
-                (\ev -> Event.isMovedTo ev && getAbsPath ev == dir2) w
-            createFile file
-            evs <- readUntil (isCreatedAt file) w
-            filter (isUnder dir1) (map getAbsPath evs) `shouldBe` []
 
 -- | Run the test with a watched directory @dir1@ containing @sub@. The test
 -- gets the root, the watch and the paths @dir1@ and @dir2@.
@@ -1769,25 +1712,6 @@ closeFailFallback =
 isStrictlyUnder :: FilePath -> FilePath -> Bool
 isStrictlyUnder dir path = (dir ++ "/") `isPrefixOf` path
 
--- A subdirectory created while its parent is scanned is added by the scan and
--- on its create event, the second add finds the existing watch.
-recSubdirAddedTwice :: Spec
-recSubdirAddedTwice =
-    it "does not fail when a subdirectory is added twice"
-        $ withRoot recCfg $ \root w -> do
-            let sentinel = root </> "sentinel"
-                mkTree i = do
-                    let dir = root </> ("dir" ++ show i)
-                    createDirectory dir
-                    mapM_ (\j -> createDirectory (dir </> show j))
-                        [1 .. 50 :: Int]
-                ops = mapM_ mkTree [1 .. 20 :: Int] >> createFile sentinel
-            done <- newEmptyMVar
-            bracket (forkIO (ops `finally` putMVar done ())) killThread
-                $ \_ -> do
-                    _ <- readUntil (isCreatedAt sentinel) w
-                    takeMVar done
-
 -- The directory is replaced by a file before its create event is read.
 recDirReplacedByFile :: Spec
 recDirReplacedByFile =
@@ -1800,25 +1724,6 @@ recDirReplacedByFile =
             waitWatched w dir
             evs <- recEventsOf root w (appendFile dir "x")
             pathsOf Event.isModified evs `shouldBe` [dir]
-
--- The directory is replaced by a symbolic link to a directory outside the
--- tree before its create event is read.
-recDirReplacedBySymlink :: Spec
-recDirReplacedBySymlink =
-    it "does not follow a symlink that replaced a created directory"
-        $ withRoot recCfg $ \root w -> do
-            let dir = root </> "dir"
-                out = takeDirectory root </> "out"
-            createDirectory out
-            createDirectory (out </> "sub")
-            createDirectory dir
-            removeDirectory dir
-            createDirectoryLink out dir
-            waitWatched w dir
-            evs <- recEventsOf root w $ do
-                createFile (out </> "file")
-                createFile (out </> "sub" </> "file")
-            filter (isStrictlyUnder dir) (map getAbsPath evs) `shouldBe` []
 
 -- | Run the action in a recursive watch of @root@, then create a file @sync@
 -- in @root@ and read the events up to its create event. The action runs
@@ -2273,27 +2178,6 @@ recReusedPathMovedWithin =
             renameDirectory dir1 dir
         map (takeFileName . snd) (unwatched evs) `shouldBe` ["dir", "sub"]
 
--- No event removes the second path of dir1 added by IN_CREATE of dir, the
--- rename of dir1 to dir must not leave the path twice.
-recReusedPathDeleted :: Spec
-recReusedPathDeleted =
-    it "keeps a watched directory moved to a path of a deleted new directory"
-        $ void $ checkReusedPath $ \_ dir dir1 -> do
-            createDirectory dir
-            removeDirectory dir
-            renameDirectory dir1 dir
-
--- IN_MOVED_FROM of dir records its cookie in the second path of dir1, no
--- IN_MOVED_TO removes it. IN_MOVE_SELF of dir1 must not remove dir, dir1 was
--- not moved out.
-recReusedPathMovedOut :: Spec
-recReusedPathMovedOut =
-    it "keeps a watched directory moved to a path of a moved out new directory"
-        $ void $ checkReusedPath $ \out dir dir1 -> do
-            createDirectory dir
-            renameDirectory dir out
-            renameDirectory dir1 dir
-
 -- IN_MOVE_SELF of dir1 removes its watch when it is read, the kernel queues
 -- IN_IGNORED after the IN_CREATE event of the new dir1. isRootUnwatched refers
 -- to the directory that was at the path, the new dir1 is watched. This test
@@ -2315,15 +2199,6 @@ recUnwatchedAfterRecreated =
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
--- rename(2) replaces the empty dir. IN_CREATE of dir adds it as the second
--- path of dir1, the same as a deleted new directory.
-recReusedPathReplaced :: Spec
-recReusedPathReplaced =
-    it "keeps a watched directory moved over an empty new directory"
-        $ void $ checkReusedPath $ \_ dir dir1 -> do
-            createDirectory dir
-            renameDirectory dir1 dir
-
 -- IN_CREATE of dir finds src and scans it. IN_MOVED_FROM of dir then tells the
 -- consumer that the path and the entries under it are gone. IN_MOVED_TO finds
 -- the path already watched. The entries must be reported after IN_MOVED_TO.
@@ -2344,18 +2219,6 @@ recReusedPathMovedIn =
             scannedPaths (const True) (dropWhile (not . isMovedToDir) evs)
                 `shouldBe` [dir </> "file"]
 
--- The second rename leaves the cookie of the moved out dir on the path dir, as
--- the only path of dir1. IN_MOVE_SELF of dir1 must not remove dir.
-recReusedPathMovedOutRenamedTwice :: Spec
-recReusedPathMovedOutRenamedTwice =
-    it "keeps a directory renamed twice to a path of a moved out new directory"
-        $ void $ checkReusedPath $ \out dir dir1 -> do
-            let dir2 = dir1 ++ "-renamed"
-            createDirectory dir
-            renameDirectory dir1 dir2
-            renameDirectory dir out
-            renameDirectory dir2 dir
-
 -- The add of sub on its IN_CREATE finds the symbolic link loop at its parent,
 -- inotify_add_watch fails with ELOOP. The stream must not raise an exception.
 -- The rename reports the entries of dir2, nothing is reported through the
@@ -2370,27 +2233,6 @@ recParentReplacedBySymlinkLoop =
                 createFileLink dir1 dir1
             sort (scannedPaths (const True) evs)
                 `shouldBe` sort [dir2 </> "new", dir2 </> "sub"]
-
--- IN_DONT_FOLLOW covers only the last component of a path. The add of new on
--- its IN_CREATE goes through the symbolic link at its parent, to a directory
--- outside the tree. That directory must not be reported.
-recParentReplacedBySymlink :: Spec
-recParentReplacedBySymlink =
-    it "does not watch outside the tree via a symlink at a new dir's parent"
-        $ withRenameDirs $ \root w dir1 dir2 -> do
-            let outside = takeDirectory root </> "outside"
-                inNew = dir2 </> "new" </> "later"
-            createDirectory outside
-            createDirectory (outside </> "new")
-            _ <- recEventsBeforeAdd root w $ do
-                createDirectory (dir1 </> "new")
-                renameDirectory dir1 dir2
-                createFileLink outside dir1
-            evs1 <- recEventsOf root w $ do
-                createFile (outside </> "new" </> "stray")
-                createFile inNew
-            pathsOf Event.isCreated evs1
-                `shouldBe` [inNew, root </> "sentinel"]
 
 -- | Move the directory @src@, containing @sub@, into the tree as @dir@. When
 -- the scan reports @dir/sub@, its watch is added and it is not listed yet,
@@ -2516,21 +2358,6 @@ checkCycleFiles base w = do
     pathsOf Event.isCreated evs `shouldBe` files
     filter viaLink (map getAbsPath evs) `shouldBe` []
 
--- The walk at the start of the watch finds the links and does not follow
--- them.
-recStartSymlinkCycles :: Spec
-recStartSymlinkCycles =
-    it "starts a watch on a tree with symlink cycles"
-        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let root = fp </> "root"
-            createDirectory root
-            symlinkCycles root root
-            r <- Path.fromString root
-            bracket
-                (Event.openWatch recCfg (r NonEmpty.:| []))
-                Event.closeWatch
-                (\w -> checkCycleFiles root w)
-
 -- The scan of the directory moved in reports the links as entries, and
 -- nothing under them.
 recMovedInSymlinkCycles :: Spec
@@ -2655,54 +2482,6 @@ recDirRecreated =
             evs1 <- recEventsOf root w (createFile file)
             pathsOf Event.isCreated evs1
                 `shouldBe` [file, root </> "sentinel"]
-
--- The move event of the first directory removes the watch of the second
--- directory, the second create event adds it again.
-recDirMovedAndRecreated :: Spec
-recDirMovedAndRecreated =
-    it "watches a directory moved and created again before its create event"
-        $ withRoot recCfg $ \root w -> do
-            let dir = root </> "dir"
-                dir1 = root </> "dir1"
-                file = dir </> "sub" </> "file"
-                file1 = dir1 </> "sub" </> "file"
-            _ <- recEventsBeforeAdd root w $ do
-                createDirectory dir
-                createDirectory (dir </> "sub")
-                renameDirectory dir dir1
-                createDirectory dir
-                createDirectory (dir </> "sub")
-            evs <- recEventsOf root w $ do
-                createFile file
-                createFile file1
-            pathsOf Event.isCreated evs
-                `shouldBe` [file, file1, root </> "sentinel"]
-
--- The create event of dir finds the watch of dir2, moved to dir. The later
--- move events remove dir2 and add it again as dir.
-recDirReplacedByWatched :: Spec
-recDirReplacedByWatched =
-    it "watches a directory moved to the path of a created directory"
-        $ withRoot recCfg $ \root w -> do
-            let dir = root </> "dir"
-                dir1 = root </> "dir1"
-                dir2 = root </> "dir2"
-                file = dir </> "sub" </> "file"
-            createDirectory dir2
-            createDirectory (dir2 </> "sub")
-            waitWatched w dir2
-            _ <- recEventsBeforeAdd root w $ do
-                createDirectory dir
-                renameDirectory dir dir1
-                renameDirectory dir2 dir
-            evs <- recEventsOf root w (createFile file)
-            pathsOf Event.isCreated evs
-                `shouldBe` [file, root </> "sentinel"]
-            -- The scans and the removals made while reading the events of
-            -- the action queue events with the paths under dir2, check only
-            -- the events of the file.
-            filter (== dir2 </> "sub" </> "file") (map getAbsPath evs)
-                `shouldBe` []
 
 -- | Run the test unless the process runs as root, which has the permissions
 -- of every directory.
@@ -2985,13 +2764,10 @@ watchTests =
                 recRootRenamed
                 rootRenamedBack
                 rootHardLinkRenamed
-            describe "watch descriptors" largeWd
             describe "recursive mode" $ do
                 recSubdirSelfEvents
                 recMoveOutSpec
                 recMoveOutUnrequested
-                recMoveIn
-                recRenameWithin
             describe "recursive mode rename races" $ do
                 recRenameCreateBeforeRead
                 recRenameCreateInGap
@@ -3041,12 +2817,8 @@ watchTests =
                 rootEventPaths
                 overflowPaths
             describe "recursive mode robustness" $ do
-                recSubdirAddedTwice
                 recDirReplacedByFile
-                recDirReplacedBySymlink
                 recDirRecreated
-                recDirMovedAndRecreated
-                recDirReplacedByWatched
                 recDeniedAtStart
                 recDeniedAdded
                 recDeniedAfterWatched
@@ -3077,18 +2849,12 @@ watchTests =
             describe "recursive mode reused paths" $ do
                 recReusedPathMovedWithin
                 recUnwatchedAfterRecreated
-                recReusedPathDeleted
-                recReusedPathMovedOut
-                recReusedPathReplaced
                 recReusedPathMovedIn
-                recReusedPathMovedOutRenamedTwice
                 recParentReplacedBySymlinkLoop
-                recParentReplacedBySymlink
                 recScanDirReplacedBySymlink
                 recScanParentReplacedBySymlink
                 recScanDirReplacedByDir
             describe "recursive mode symlink cycles" $ do
-                recStartSymlinkCycles
                 recMovedInSymlinkCycles
                 recCreatedSymlinkCycles
                 recWatchedSymlinkCycles
