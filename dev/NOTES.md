@@ -8,6 +8,7 @@
 
 2. Things that might bite users
 
+- getAbsPath returns rel path in some cases
 - The 512-stream limit. Each watch uses one stream, two fds and a dispatch queue. It's better to use one watch with many roots (up to 4096).
 - Slow consumers. The callback blocks once the 64 KB pipe is full, so pressure goes back into fseventsd. It will eventually drop events and send isEventsLost with UserDropped/KernelDropped, so users must rescan on that event.
 - Flags accumulate. A single event can carry Created, Modified and Removed together; users should stat the path.
