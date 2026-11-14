@@ -50,6 +50,7 @@ import System.Process (readProcess)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
 import System.Win32.HardLink (createHardLink)
+import qualified System.Win32.File as Win32
 #endif
 import Streamly.Internal.FS.Event (Config, Event)
 
@@ -176,6 +177,20 @@ allowRead path = do
     setPermissions path (setOwnerReadable True perms)
 
 hardLink source link = void $ readProcess "ln" [source, link] ""
+#endif
+
+-- | @copyFile source copy@. On macOS the copy is a clone of the source.
+--
+-- The copy is created at its path. 'System.Directory.copyFile' is not used,
+-- it writes a temporary file and renames it to the destination, which is
+-- reported as a move.
+copyFile :: FilePath -> FilePath -> IO ()
+#if defined(CABAL_OS_DARWIN)
+copyFile source copy = void $ readProcess "/bin/cp" ["-c", source, copy] ""
+#elif defined(CABAL_OS_WINDOWS)
+copyFile source copy = Win32.copyFile source copy True
+#else
+copyFile source copy = void $ readProcess "cp" [source, copy] ""
 #endif
 
 -- | Change the metadata of a file, without changing its contents.
@@ -629,6 +644,56 @@ behaviors =
                 isNamed "file" ev && Event.isCreated ev && Event.isDeleted ev)
         , expected = onPlatform No Yes No
         }
+    , base
+        { title = "one event reports isCreated and isMoved for a file"
+        , paused = True
+        , ops = \p -> do
+            createFile (watchRoot p </> "file")
+            renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
+        , check = \_ ->
+            any (\ev ->
+                isNamed "file" ev && Event.isCreated ev && Event.isMoved ev)
+        , expected = onPlatform No Yes No
+        }
+    , base
+        { title = "deleted root reports isDeleted for a file in it"
+        , setup = withFile
+        , ops = removePathForcibly . watchRoot
+        , check = \_ ->
+            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , expected = onPlatform Yes No Exception
+        }
+    , base
+        { title = "deleted dir in the tree reports isDeleted for a file in it"
+        , config = Event.setRecursiveMode True
+        , setup = withDirFile
+        , ops = \p -> removePathForcibly (watchRoot p </> "dir")
+        , check = \_ ->
+            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , expected = onPlatform Yes Yes Yes
+        }
+    -- On macOS the copy is a clone, on APFS it reports 'Darwin.isCloned'.
+    , base
+        { title = "copy of a file reports isCreated for the copy"
+        , setup = withFile
+        , ops = \p ->
+            copyFile (watchRoot p </> "file") (watchRoot p </> "copy")
+        , check = const (createdNamed "copy")
+        , expected = onPlatform Yes Yes Yes
+        }
+#if defined(CABAL_OS_DARWIN)
+    , base
+        { title = "clone reports isCloned for the source and the clone"
+        , setup = withFile
+        , ops = \p ->
+            copyFile (watchRoot p </> "file") (watchRoot p </> "copy")
+        , check = \_ evs ->
+            let cloned name =
+                    any (\ev -> isNamed name ev && Darwin.isCloned ev) evs
+             in cloned "file" && cloned "copy"
+        , expected = Yes
+        }
+#endif
     ]
 
     where
