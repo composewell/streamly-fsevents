@@ -41,6 +41,7 @@ extra-source-files:
 extra-doc-files:
     Changelog.md
     README.md
+    docs/platform-differences.md
     docs/robustness.md
     docs/watch-limits.md
 
