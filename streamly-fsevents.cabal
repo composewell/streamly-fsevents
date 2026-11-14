@@ -41,6 +41,7 @@ extra-source-files:
 extra-doc-files:
     Changelog.md
     README.md
+    docs/robustness.md
     docs/watch-limits.md
 
 extra-tmp-files:
