@@ -30,7 +30,7 @@ import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (group, isPrefixOf, sort)
+import Data.List (group, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
 import System.Exit (exitFailure)
@@ -94,6 +94,8 @@ data Paths = Paths
 data Behavior = Behavior
     { title :: String
     , config :: Config -> Config
+    -- | Watched along with the watch root, after it.
+    , extraRoots :: Paths -> [FilePath]
     -- | Run before the watch starts.
     , setup :: Paths -> IO ()
     -- | Run after the watch ends, whatever the outcome.
@@ -219,6 +221,7 @@ base =
     Behavior
         { title = ""
         , config = id
+        , extraRoots = const []
         , setup = const (return ())
         , cleanup = const (return ())
         , skip = const (return Nothing)
@@ -681,6 +684,31 @@ behaviors =
         , check = const (createdNamed "copy")
         , expected = onPlatform Yes Yes Yes
         }
+    -- On macOS the library assigns an event to the innermost root that
+    -- contains its path. On Windows each root has its own watch.
+    , base
+        { title = "root listed twice reports a file created in it twice"
+        , extraRoots = \p -> [watchRoot p]
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = \_ evs ->
+            let created ev = isNamed "file" ev && Event.isCreated ev
+             in length (filter created evs) == 2
+        , expected = onPlatform No No Yes
+        }
+    , base
+        { title = "nested roots report a file in the inner root for both"
+        , config = Event.setRecursiveMode True
+        , setup = withDir
+        , extraRoots = \p -> [watchRoot p </> "dir"]
+        , ops = \p -> createFile (watchRoot p </> "dir/file")
+        , check = \_ evs ->
+            let roots =
+                    [ Path.toString (Event.getRoot ev)
+                    | ev <- evs, isNamed "file" ev, Event.isCreated ev
+                    ]
+             in length (nub roots) == 2
+        , expected = onPlatform Yes No Yes
+        }
 #if defined(CABAL_OS_DARWIN)
     , base
         { title = "clone reports isCloned for the source and the clone"
@@ -828,8 +856,9 @@ runWatch Behavior{..} paths control = do
             return ev
         consumer = do
             rootPath <- Path.fromString root
+            extraPaths <- mapM Path.fromString (extraRoots paths)
             controlPath <- Path.fromString control
-            Event.watchWith config (rootPath :| [controlPath])
+            Event.watchWith config (rootPath :| extraPaths ++ [controlPath])
                 & Stream.mapM observe
                 & Stream.takeWhile (not . isNamed "stop")
                 & Stream.fold Fold.toList
