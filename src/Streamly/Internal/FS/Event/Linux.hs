@@ -364,8 +364,10 @@ foreign import capi
 
 -- | If the pathname to be watched is a symbolic link then watch the target of
 -- the symbolic link instead of the symbolic link itself. Applies to the watch
--- roots only. When this is 'False', in recursive mode the directory tree of
--- the target is not watched.
+-- roots only, and only to the last component of the root path: symbolic
+-- links in the parent components are always resolved. When this is 'False',
+-- in recursive mode the directory tree of the target of a symlink is not
+-- watched.
 --
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
