@@ -6,57 +6,8 @@
 -- Stability   : pre-release
 -- Portability : GHC
 --
--- =BUGS
---
--- XXX Check the behavior for Windows/Linux where applicable. Mention these in
--- docs/platform-differences.md so that users are aware of the portability
--- issues.
---
--- There may be some idiosyncrasies in event reporting.
---
--- 1. Multiple events may be coalesced into a single event having multiple
--- flags set.  For example, on macOS 10.15.6, "touch x; rm x" or "touch x; mv x
--- y" produces an event with both "Created" and "Deleted/Moved" flags set.
---
--- 2. The same event can occur multiple times. For example, "touch x; sleep 1;
--- rm x" generates a "Created" event followed by an event with both "Created"
--- and "Deleted" flags set. Similarly, a cloned event can also occur multiple
--- times.
---
--- 3. Some events can go missing and only the latest one is reported. See
--- 'isCreated' for one such case.
---
--- XXX write a test case for this, and check on all platforms.
---
--- 4. When @rm -rf@ is used on the watched root directory, only one 'isDeleted'
--- event occurs and that is for the root. However, @rm -rf@ on a directory
--- inside the watch root produces 'isDeleted' events for all files.
---
--- XXX write a test case for this, and check on all platforms.
---
--- 5. When a file is moved, a move event occurs for both the source and the
--- destination files. There seems to be no way to distinguish the source and
--- the destination. Perhaps the lower eventId can be considered as source.
---
--- XXX cloned event is specific to macOS.  Translate it to the same events as
--- on copying.
---
--- 6. When a file is cloned both source and destination generate a cloned
--- event, however the source has lower eventId and destination may have
--- OwnerGroupModeChanged, InodeAttrsChanged, Created flags as well.
---
--- You may have to stat the path of the event to know more information about
--- what might have happened.  It may be a good idea to watch the behavior of
--- events you are handling before you can rely on it. See the individual event
--- APIs for some of the known issues marked with `BUGS`. Also see the "Handling
--- Events" section in the "Apple FS Events Programming Guide".
---
--- * "<https://stackoverflow.com/questions/18415285/osx-fseventstreameventflags-not-working-correctly Stack overflow question on event coalescing>"
---
--- =TODO
---
--- APIs for persistent event-id related functionality, to get events from
--- specific event-id etc are not implemented.
+-- The differences in event reporting from Linux and Windows, such as the
+-- coalescing of events, are listed in docs/platform-differences.md.
 
 #include <config.h>
 
@@ -966,7 +917,9 @@ foreign import ccall safe
 
 -- | Determine whether the event indicates cloning of an object within the
 -- monitored path. The "Duplicate" command in the "File" menu of the "Finder"
--- application generates a "clone" event.
+-- application generates a "clone" event, and so does @cp -c@ on APFS. The
+-- source and the clone both report 'isCloned', the clone also reports
+-- 'isCreated'.
 --
 -- Applicable only when 'setFileEvents' is 'True'.
 --
