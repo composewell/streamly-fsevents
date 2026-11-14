@@ -410,18 +410,20 @@ A new directory is added on its `IN_CREATE` event, using the path. The operation
 below happen before the events are read, so the path refers to a different
 directory when the event is read. `f` is a watched directory containing `sub`.
 `/out` is outside the tree. `m` is outside the tree and contains `file`. The tests
-are in `test/Streamly/Test/FileSystem/Event/Linux.hs`.
+named by an identifier are in `test/Streamly/Test/FileSystem/Event/Linux.hs`, the
+tests named by a title are in the portable test suite,
+`test/Streamly/Test/FileSystem/Event.hs`, and run on all platforms.
 
 | Operations | Behavior | Test |
 |------------|----------|------|
 | `mkdir d; mv d e; mv f d` | `d` and `d/sub` report each event once, and report `isRootUnwatched` although they stay watched, see below | `recReusedPathMovedWithin` |
-| `mkdir d; rmdir d; mv f d` | Each event in the tree of `d` is reported once | `recReusedPathDeleted` |
-| `mkdir d; mv f d` | Each event in the tree of `d` is reported once | `recReusedPathReplaced` |
-| `mkdir d; mv d /out; mv f d` | `d` and `d/sub` stay watched | `recReusedPathMovedOut` |
-| `mkdir d; mv f g; mv d /out; mv g d` | `d` and `d/sub` stay watched, their entries are reported again | `recReusedPathMovedOutRenamedTwice` |
+| `mkdir d; rmdir d; mv f d` | Each event in the tree of `d` is reported once | "watched directory moved to the path of a deleted new dir" |
+| `mkdir d; mv f d` | Each event in the tree of `d` is reported once | "watched directory moved over an empty new directory" |
+| `mkdir d; mv d /out; mv f d` | `d` and `d/sub` stay watched | "watched directory moved to the path of a new dir moved out" |
+| `mkdir d; mv f g; mv d /out; mv g d` | `d` and `d/sub` stay watched, their entries are reported again | "watched directory renamed twice to a moved out new dir path" |
 | `mkdir d; mv d /out; mv m d` | `d/file` is reported after `isMovedTo` of `d` | `recReusedPathMovedIn` |
 | `mkdir f/new; mv f g; ln -s f f` | The add of `f/new` is ignored, `g/new` is added and reported on the rename | `recParentReplacedBySymlinkLoop` |
-| `mkdir f/new; mv f g; ln -s /out f` | `/out/new` is not watched, `g/new` is added on the rename | `recParentReplacedBySymlink` |
+| `mkdir f/new; mv f g; ln -s /out f` | `/out/new` is not watched, `g/new` is added on the rename | "parent of a new dir replaced by a symlink to outside" |
 
 How each case is handled:
 

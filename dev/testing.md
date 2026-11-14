@@ -1,5 +1,28 @@
 # Tests
 
+## Portable tests
+
+`test/Streamly/Test/FileSystem/Event.hs`, the test suite `FileSystem.Event`,
+uses only `Streamly.Internal.FS.Event` and expects the same events on Linux,
+macOS and Windows. A thread reads the stream of a watch into a channel. A watch
+is known to have started only after it reports an event, so the test creates a
+file `startN` in each root until the watch reports one in every root.
+
+The recursive mode tests make a sequence of changes to the tree without reading
+the events in between, for example, a new directory renamed twice. They then
+create files in the tree and check that each file reports `isCreated` once,
+and that no change is reported under a path that no longer exists. On macOS a
+later event for a path can repeat `isCreated`, there the check is that each
+file reports at least one `isCreated`. Symbolic link cycles, and a directory
+renamed over an empty directory, are not tested on Windows.
+
+`test/Streamly/Test/FileSystem/Event/Linux.hs` keeps the tests of the Linux
+API that the other platforms do not have: the scan events, `isRootUnwatched`,
+the handle API of a watch, file descriptor limits and the inotify queue
+overflow. A root listed twice and nested roots are also tested on Linux only,
+macOS reports an event once, for the innermost root that contains the path,
+Linux and Windows report it once for each root.
+
 The large tree and stress tests run on all platforms. The exhaustive test of
 the recursive watch on Linux is described in `dev/design.linux.md`.
 
