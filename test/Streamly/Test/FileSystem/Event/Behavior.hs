@@ -12,8 +12,11 @@
 -- docs/platform-differences.md record the results printed on each platform in
 -- the CI logs.
 --
--- An outcome that is not known on a platform is not asserted there, it is
--- recorded from the CI logs.
+-- A racy outcome, one that depends on a race or on the OS version, is not
+-- asserted, it is recorded from the CI logs.
+--
+-- The expected outcomes were observed on Linux 6.12 and Ubuntu 24.04,
+-- macOS 26 (arm64), Windows Server 2025 and Windows Server 2012 R2.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where
 
@@ -103,9 +106,8 @@ data Behavior = Behavior
     , laterOps :: Paths -> IO ()
     , check :: Paths -> [Event] -> Bool
     , expected :: Outcome
-    -- | The outcome depends on a race or on the OS version, or it is not known
-    -- on this platform. It is printed but does not fail the test when it
-    -- differs from 'expected'.
+    -- | The outcome depends on a race or on the OS version. It is printed but
+    -- does not fail the test when it differs from 'expected'.
     , racy :: Bool
     }
 
@@ -270,7 +272,6 @@ behaviors =
             let isRoot ev = absPath ev `elem` [watchRoot p, renamedRoot p]
              in any (\ev -> isRoot ev && Event.isMoved ev)
         , expected = onPlatform No Yes Exception
-        , racy = onDarwin
         }
     -- On Linux the root is removed only if its path no longer refers to the
     -- watched directory when the rename event is read.
@@ -283,7 +284,6 @@ behaviors =
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Exception
-        , racy = notLinux
         }
     , base
         { title = "root renamed back after the event is read is watched"
@@ -294,7 +294,6 @@ behaviors =
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform No Yes Exception
-        , racy = notLinux
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
@@ -313,7 +312,6 @@ behaviors =
         , check = \_ ->
             any (\ev -> isNamed "file" ev && Event.isModified ev)
         , expected = onPlatform No Yes Yes
-        , racy = notLinux
         }
     , newDir
         { title = "file deleted in a new dir before it is read is reported"
@@ -324,7 +322,6 @@ behaviors =
             removeFile file
         , check = \_ -> any (isNamed "file")
         , expected = onPlatform No Yes Yes
-        , racy = notLinux
         }
     -- The consumer reads the events while the files are created. On Linux,
     -- some of the files are created after the watch of a directory is added
@@ -372,7 +369,6 @@ behaviors =
             renameDirectory (watchRoot p </> "dir") (watchRoot p </> "dir2")
         , check = \_ -> any (isNamed "file")
         , expected = onPlatform Yes No No
-        , racy = notLinux
         }
     , base
         { title = "file in a dir moved out of the tree is reported"
@@ -381,7 +377,6 @@ behaviors =
         , ops = \p -> renameDirectory (watchRoot p </> "dir") (renamedRoot p)
         , check = \_ -> any (isNamed "file")
         , expected = onPlatform No No No
-        , racy = notLinux
         }
     , newDir
         { title = "subdir created in a new dir before it is read is watched"
@@ -419,7 +414,6 @@ behaviors =
         , ops = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
-        , racy = notLinux
         }
     , base
         { title = "unreadable dir moved into a recursive root is skipped"
@@ -437,7 +431,6 @@ behaviors =
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
-        , racy = notLinux
         }
     , base
         { title = "regular file as a root is watched"
@@ -449,7 +442,6 @@ behaviors =
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isModified ev)
         , expected = onPlatform Yes Yes WatchException
-        , racy = onWindows
         }
     , base
         { title = "deleted symbolic link root reports isDeleted for the root"
@@ -494,7 +486,6 @@ behaviors =
                 absPath ev == watchRoot p </> "dir3/file"
                     && Event.isModified ev)
         , expected = onPlatform No Yes No
-        , racy = notLinux
         }
     , base
         { title = "rename reports isMoved for the source and the destination"
@@ -537,7 +528,6 @@ behaviors =
     , deletedOpenFile
         { title = "write to an open file after its deletion is reported"
         , expected = onPlatform No Yes Exception
-        , racy = onWindows
         }
 #if defined(CABAL_OS_LINUX)
     , deletedOpenFile
@@ -596,7 +586,6 @@ behaviors =
             let modified ev = isNamed "file" ev && Event.isModified ev
              in length (filter modified evs) == 1
         , expected = onPlatform Yes Yes No
-        , racy = notLinux
         }
     -- On Linux only adjacent identical events are merged.
     , base
@@ -614,7 +603,6 @@ behaviors =
             let modified ev = isNamed "file" ev && Event.isModified ev
              in length (filter modified evs) == 2
         , expected = onPlatform Yes No Yes
-        , racy = notLinux
         }
     -- Overwriting truncates the file and then writes it.
     , base
@@ -640,17 +628,12 @@ behaviors =
             any (\ev ->
                 isNamed "file" ev && Event.isCreated ev && Event.isDeleted ev)
         , expected = onPlatform No Yes No
-        , racy = notLinux
         }
     ]
 
     where
 
     onWindows = platformName == "Windows"
-
-    notLinux = platformName /= "Linux"
-
-    onDarwin = platformName == "macOS"
 
     withDir p = do
         createDirectory (watchRoot p </> "dir")
@@ -844,6 +827,14 @@ outcomeWithin seconds action = do
         Right Nothing -> Failed "timed out"
         Left e -> Failed (show (e :: SomeException))
 
+-- | The expected outcome printed after the observed one. A racy behavior
+-- accepts any outcome. Nothing is printed if the outcome is the expected one.
+expectedNote :: Behavior -> Outcome -> String
+expectedNote b outcome
+    | racy b = " (expected any)"
+    | outcome == expected b = ""
+    | otherwise = " (expected " ++ show (expected b) ++ ")"
+
 main :: IO ()
 main = do
     resultsRef <- newIORef []
@@ -861,8 +852,6 @@ main = do
     putStrLn $ "Behavior results on " ++ platformName ++ ":"
     forM_ results $ \(b, outcome) ->
         putStrLn $ "  " ++ title b ++ ": " ++ show outcome
-            ++ if outcome == expected b
-               then ""
-               else " (expected " ++ show (expected b) ++ ")"
+            ++ expectedNote b outcome
 
     when (summaryFailures summary > 0) exitFailure
