@@ -1,0 +1,209 @@
+In doc/ dir docs refer to design docs for details, and remove the details
+covered by design.
+---
+rename setFollowSymlinks to setFollowRootSymlinks -- so that follow symlinks
+can later be used for follow under the root.
+---
+On linux and windows as well, a non-existing path can be watched by adding a
+watch on the last existing component, and the next no-existing component
+appears, a watch can be added on it. We can add this to issues/proposals.
+--
+On macOS and Windows the tree size costs nothing.: we need to use the same
+linux tests on other platforms to measure this.
+
+test macOS/Windows reporting all events after a dir create.
+
+On Linux a watch costs time, memory and inotify watches in proportion to the
+number of directories.: we need to check this behavior on other platforms.
+--
+Add an event reading API which can used in unfoldr to make the streaming API.
+---
+Instead of using wide DFS fallback, we can always use wide DFS to keep the
+design simple? Will that make it more inefficient in the common case?
+---
+the maxopenlevels change should probably go to streamly traversals.
+---
+replace proc.sh with haskell code using streamly-process/coreutils
+---
+break Linux.hs into multiple modules
+---
+design streamly dir traversal such that we can use that directly here.
+---
+In streamly use openAt for reading dir. the advantage may not be performance
+difference but stability against path modifications. checking paths each
+component every time for finding symlinks is slow.
+---
+upstream streamly: a binary stream merging operation: priority non-blocking
+read, keep reading from the first stream until it returns Nothing. If it
+returns Nothing read from the second stream, then again start reading from the
+first stream. The first stream is a non-blocking stream, Nothing means it would
+block.
+
+newStreamAndCallback, should provide a way for non-blocking read. The callback
+may block on writing to the queue because the queue is full. But the read from
+the stream would not block, it would generate Just or Nothing.
+
+We could provide non-blocking stream read versions of common operations which
+return Just or Nothing.
+
+For polling the second stream could just block for a time period.
+
+---
+put the scanChildren as a design pattern in upstream doc
+---
+By default do not scan on moved-in on linux. we do not do that on windows
+also, and on macos too. if we have it on all platforms then we can have a
+common option.
+---
+in tests look for "known bugs", pending tests, duplicate tests etc. 
+consolidate and orgainize the tests.
+---
+isEventsLost => isOverflowEvent
+---
+the scans can be concurrent, especially the initial one, so the watch starts
+quickly even on large directories. this can perhaps help in cold cache case
+more. But may not be worth it.
+---
+test without proc
+---
+does the order in which the scan events emitted matter to the user? will the
+pre or post ordering be useful?
+---
+we can have an API to list-and-watch which pretty much like tail utility for
+listing. this will just add a scan of the entire tree before watching.
+
+lsTail/findTail can report the n newest entries and any entries added from now on.
+we can use bottomBy or topBy to maintain n newest until the scan is done.
+
+---
+
+Mark /Portable/, /Linux only/ etc on all APIs.
+
+---
+
+review naming: setCreated => emitCreated or reportCreated
+
+---
+
+Look at inotify/fsevents/fsnotify haskell packages testsuites and add any
+missing tests from those. Also look at packages from other languages and check
+their API and testsuites to improve things.
+
+---
+
+remove DEVBUILD, move it to regular tests. just undef DEVBUILD and if it stays
+stable remove it.
+
+    -- XXX these tests fails intermittently for recursive case
+    -- FS.Event.Linux.recursive, Root type SymLinkOrigPath, File deleted (subdir/file1)
+    -- FS.Event.Linux.recursive, Root type SymLinkOrigPath, File modified (subdir/file1)
+    -- FS.Event.Linux.recursive, Root type SymLinkOrigPath, File moved (subdir/file1 subdir/file2)
+    -- FS.Event.Linux.recursive, Root type DirType, File moved (file1 file2)
+    -- FS.Event.Linux.recursive, Root type DirType, File created (file)
+    --      uncaught exception: IOException of type ResourceBusy
+    --      /tmp/fsevent_dir-a5bd0df64c44ab27/watch-root/file: openFile: resource busy (file is locked)
+
+---
+
+move the user pitfalls in dev to user docs?
+
+---
+
+review all Path related ops and use the operations from streamly instead of
+coding them yourself. if something is note present  in streamly put a
+requirement as upstream-fixes.
+
+----
+
+check for XXX comments
+
+---
+
+Is the API correct if we were to design it from scratch?
+
+Are the names of the functions appropriate and intuitive, compare with
+other libraries and popular libraries in other languages.
+
+Are the API signatures best possible, can they be improved?
+
+Is the API across different modules consistent and has the same beahvior? Where
+behavior is different is it noted in the docs?
+
+Is the common subset of the API in the portable module? Is there more
+functionality that is common? is their functionality which is not the same but
+exported as common and not noted in the docs, especially behavior of the
+functions should be same on all platforms?
+
+
+---
+
+async exception safety.
+
+---
+
+----
+
+the subdir scan could be concurrent. but are there other limits that can hit
+sooner on large directories? how many subdirs can we add to the watch?
+
+----
+
+Add this to streamly-core?
+repeatWhileJust :: Monad m => m (Maybe a) -> Stream m a
+repeatWhileJust act = S.unfoldrM (\() -> fmap (, ()) <$> act) ()
+
+In streamly:
+
+{-# INLINE_NORMAL readChunksWith #-}
+readChunksWith :: MonadIO m => Int -> Handle -> Stream m (Array Word8)
+readChunksWith size h = D.Stream step ()
+  where
+    {-# INLINE_LATE step #-}
+    step _ _ = do
+        arr <- getChunk size h
+        return $
+            case byteLength arr of
+                0 -> D.Stop
+                _ -> D.Yield arr ()
+
+replace with idiomatic way: unfoldrM/repeatWhileJust, the Maybe should get
+removed and we should get equivalent core, we can check the core.
+
+
+we can implement a mechanism similar to readEvent in streamly.
+
+----
+
+On darwin/Windows performing watch operations in a thread-safe manner.
+
+Watch Handle is the concurrent channel to sync across watch stream and other
+watch operations, we should not need a Command stream input.
+
+Add and merge watches dynamically using the Scanl module.
+
+The best option for dynamic watches is to use a Handle. We can inspect what is
+being watched and we can add or remove watches dynamically.
+
+A rescan operation, so that if permissions change, we can add the new
+directories. We can also have an option to watch ATTRIB changes and add to
+watch if permissions change.
+
+Add to watch based on patterns. Though this is probably better done using find
+and then add to watch.
+
+----
+
+stop using directory and filepath where possible.
+
+---
+
+should IO be made MonadIO?
+
+isRootUnwatched rename?
+
+---
+
+coalescing of events on macOS. do we report coalesced events to the user or
+split them into separate events? on macOS touch x; sleep 1; rm x; reports
+"created" and then coalesced "created+deleted", how should we interpret that
+last event "created then deleted" or "deleted then created"?
