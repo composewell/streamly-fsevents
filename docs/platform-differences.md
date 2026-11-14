@@ -230,8 +230,8 @@ the file is open.
 | Metadata changes are reported by default | Yes | Yes | No |
 | Metadata change reporting can be disabled | Yes | No | Yes |
 | Creating a hard link reports a metadata change on the directory | No | Yes | No |
-| Two writes to a file before the consumer reads the first report one `isModified` | Yes | Yes | No |
-| Interleaved writes to two files report each `isModified` | Yes | No | Yes |
+| Two writes to a file before the consumer reads the first report one `isModified` | Yes | Usually | No |
+| Interleaved writes to two files report each `isModified` | Yes | Usually not | Yes |
 | One overwrite of a file reports several `isModified` | No | No | Yes |
 | One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
 | One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
@@ -244,6 +244,10 @@ of events in a non-recursive watch has no test, it is based on the platform
 documentation and the library code. The coalescing of the events of a directory
 and its subdirectory into `isEventsLost` on macOS is also based on the platform
 documentation.
+
+On macOS two writes to a file are merged into one event only if FSEvents
+reports them in the same batch. The macOS entries of the two rows for writes
+are from several runs in the CI, the test suite does not assert them.
 
 Lost events and the recovery are described in
 [robustness.md](robustness.md), the limits of each platform in

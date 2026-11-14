@@ -588,7 +588,8 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- On Linux, the kernel merges the second write into the first because the
-    -- first is the last event in the queue and it has not been read.
+    -- first is the last event in the queue and it has not been read. On macOS
+    -- FSEvents merges the writes only if they are reported in the same batch.
     , base
         { title = "two writes to a file before the read report one isModified"
         , setup = withFile
@@ -601,8 +602,10 @@ behaviors =
             let modified ev = isNamed "file" ev && Event.isModified ev
              in length (filter modified evs) == 1
         , expected = onPlatform Yes Yes No
+        , racy = onDarwin
         }
-    -- On Linux only adjacent identical events are merged.
+    -- On Linux only adjacent identical events are merged. On macOS FSEvents
+    -- merges the writes to "file" only if they are reported in the same batch.
     , base
         { title = "interleaved writes to two files report each isModified"
         , setup = \p -> do
@@ -618,6 +621,7 @@ behaviors =
             let modified ev = isNamed "file" ev && Event.isModified ev
              in length (filter modified evs) == 2
         , expected = onPlatform Yes No Yes
+        , racy = onDarwin
         }
     -- Overwriting truncates the file and then writes it.
     , base
@@ -699,6 +703,8 @@ behaviors =
     where
 
     onWindows = platformName == "Windows"
+
+    onDarwin = platformName == "macOS"
 
     withDir p = do
         createDirectory (watchRoot p </> "dir")
