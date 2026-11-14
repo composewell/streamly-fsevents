@@ -149,6 +149,11 @@ On Windows the watch keeps the root open.
   the rest of the tree stays watched. On macOS the watch continues. On
   Windows it is expected to continue, this is not tested.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
+* A root listed twice: Linux and macOS report a change in it once, Windows
+  reports it twice.
+* Nested roots, a root and a subdirectory of it, in a recursive watch: Linux
+  and Windows report a change in the subdirectory once for each root. macOS
+  reports it once, for the innermost root that contains the path.
 
 ## Platform specific features
 
@@ -206,6 +211,8 @@ the file is open.
 | A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 | A watch of a path without read permission raises an exception | Yes | No | Not tested |
 | A regular file can be a watch root | Yes | Yes | No |
+| A root listed twice reports a change in it twice | No | No | Yes |
+| Nested roots report a change in the inner root for each root | Yes | No | Yes |
 
 ### Recursive watches
 
