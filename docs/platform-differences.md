@@ -76,6 +76,13 @@ on Linux.
 * Hard links: creating a hard link reports `isCreated` on all platforms, and
   on macOS also `isAttrsModified` on the directory. Deleting a hard link
   reports `isDeleted` on all platforms.
+* A deleted directory: deleting a directory in a recursive watch, as with
+  `rm -rf dir`, reports `isDeleted` for each entry in it on all platforms.
+  Deleting a watch root reports `isDeleted` for each entry in the root on
+  Linux. On macOS FSEvents reports one event, for the root only, and does
+  not report the entries in the root, in recursive and non-recursive
+  watches. On Windows deleting a watch root raises an exception, because the
+  watch keeps the root open.
 * A non-recursive watch on macOS: FSEvents can only watch a tree. The library
   starts a recursive watch and drops the events more than one level below a
   watch root, the process still receives the events of the whole tree.
@@ -97,13 +104,23 @@ first true predicate misses the other changes reported by the event.
 * macOS: FSEvents can merge events of different types for a path into one
   event. A file created and deleted can report one event for which both
   `isCreated` and `isDeleted` are true, and the event does not give the order
-  of the two operations. Events in a directory and its subdirectory can be
-  coalesced into one event for which `isEventsLost` is true, without an
-  overflow.
+  of the two operations. A file created and renamed reports one event for
+  the old path for which both `isCreated` and `isMoved` are true. Events in
+  a directory and its subdirectory can be coalesced into one event for which
+  `isEventsLost` is true, without an overflow.
 * Windows: the documentation does not say whether identical changes are
   merged. Each event has one type. One save of a file can report several
   `isModified` events, because the write and the truncate are separate
   changes.
+
+An event reports what changed, not the state of the path after the
+change. A consumer that needs the state, for example whether a path
+reported with both `isCreated` and `isDeleted` exists, calls `stat` on the
+path. The coalescing of FSEvents is described in the "Handling Events"
+section of Apple's
+[File System Events Programming Guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
+and in
+[this Stack Overflow question](https://stackoverflow.com/questions/18415285/osx-fseventstreameventflags-not-working-correctly).
 
 ## Watch roots
 
@@ -114,8 +131,9 @@ On Windows the watch keeps the root open.
   library reports `isRootUnwatched`, because the kernel does not report the
   new path. On Windows renaming the root raises an exception.
 * A deleted root: macOS reports `isDeleted`, unless the root is a symbolic
-  link. Linux reports `isRootDeleted`. On Windows deleting the root raises an
-  exception.
+  link. FSEvents does not report the entries in the root. Linux reports
+  `isDeleted` for each entry in the root and then `isRootDeleted`. On
+  Windows deleting the root raises an exception.
 * A new object at the path of a deleted or renamed root: macOS watches it.
   Linux does not; the consumer must add the path to the watch again after
   `isRootUnwatched`. A root renamed back, as in `mv d d.bak; mv d.bak d`,
@@ -132,6 +150,17 @@ On Windows the watch keeps the root open.
   Windows it is expected to continue, this is not tested.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
 
+## Platform specific features
+
+### macOS
+
+* Clones: on APFS a file can be copied by cloning it, as `cp -c` and the
+  Finder's "Duplicate" command do. The source and the clone report
+  `isCloned`, and the clone also reports `isCreated`. `isCloned` is in
+  `Streamly.FileSystem.Event.Darwin` only. Through the portable module, the
+  event of the source matches no predicate, and the clone is reported as a
+  created file, as a copy is on all platforms.
+
 ## Behavior common to all platforms
 
 The test suite `FileSystem.Event.Behavior` also checks these behaviors, which
@@ -146,6 +175,9 @@ are the same on Linux, macOS and Windows:
 * A file in a directory moved out of the tree is not reported.
 * A rename of a file reports `isMoved` for both the source and the
   destination.
+* Deleting a directory in a recursive watch reports `isDeleted` for a file
+  in it.
+* A copy of a file reports `isCreated` for the copy.
 * Creating a hard link reports `isCreated`, and deleting one reports
   `isDeleted`.
 * A non-recursive watch does not report a file created in a subdirectory.
@@ -164,6 +196,7 @@ the file is open.
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A deleted watch root reports `isDeleted` | No | Yes | Exception |
+| A deleted watch root reports `isDeleted` for a file in it | Yes | No | Exception |
 | A watch root deleted and created again is watched | No | Yes | Exception |
 | A renamed watch root is watched | No | No | Exception |
 | A renamed watch root reports `isMoved` | No | Yes | Exception |
@@ -201,6 +234,7 @@ the file is open.
 | Interleaved writes to two files report each `isModified` | Yes | No | Yes |
 | One overwrite of a file reports several `isModified` | No | No | Yes |
 | One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
+| One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
 | A file deleted after its create event is read reports `isCreated` again | No | Yes | No |
 | A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
 
