@@ -2447,6 +2447,31 @@ recScanParentReplacedBySymlink =
                 createDirectoryLink outside dir
             scanned `shouldNotContain` [root </> "dir" </> "sub" </> "stray"]
 
+-- The listing of sub, through its fd, adds c under the old path sub/c. The
+-- move events of sub then rename it to sub2/c, IN_CREATE of sub adds the new
+-- directory.
+recScanDirReplacedByDir :: Spec
+recScanDirReplacedByDir =
+    it "watches a directory moved and replaced by a new one during its scan"
+        $ withRoot recCfg $ \root w -> do
+            let src = takeDirectory root </> "src"
+                sub = root </> "dir" </> "sub"
+                sub2 = root </> "dir" </> "sub2"
+                created =
+                    [sub </> "new", sub2 </> "new", sub2 </> "c" </> "new"]
+            createDirectory src
+            createDirectory (src </> "sub")
+            createDirectory (src </> "sub" </> "c")
+            createFile (src </> "sub" </> "file")
+            _ <- scanReplacedDuringScan root w src $ \_ _ -> do
+                renameDirectory sub sub2
+                createDirectory sub
+            evs <- recEventsOf root w $ mapM_ createFile created
+            pathsOf Event.isCreated evs
+                `shouldBe` created ++ [root </> "sentinel"]
+            filter ((sub </> "c") `isPrefixOf`) (map getAbsPath evs)
+                `shouldBe` []
+
 -- | The directories of 'symlinkCycles', relative to its base.
 cycleDirs :: [FilePath]
 cycleDirs = ["a", "a" </> "b", "x", "z"]
@@ -3061,6 +3086,7 @@ watchTests =
                 recParentReplacedBySymlink
                 recScanDirReplacedBySymlink
                 recScanParentReplacedBySymlink
+                recScanDirReplacedByDir
             describe "recursive mode symlink cycles" $ do
                 recStartSymlinkCycles
                 recMovedInSymlinkCycles
