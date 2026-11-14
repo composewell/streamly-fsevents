@@ -130,6 +130,10 @@ exists.
   these events, as a hint that the path may be one end of a rename. The
   portable `isMoved` is never true. On Linux, `isRootMoved` also reports
   `isDeleted` for the root, enabled by default in the portable `watchWith`.
+* macOS: FSEvents numbers events in order, so the source of a rename may
+  be the path with the lower event ID, `getEventId`, of the two `isMoved`
+  events. This is not documented and not tested. Two renames reported in the
+  same batch cannot be paired this way.
 * macOS: an event with only one of `ItemCreated`, `ItemRemoved` and
   `ItemRenamed` is reported as `isCreated`, `isDeleted` and `isMoved`
   respectively. An event with two or more of them is reported as `isMoved`,
@@ -180,6 +184,34 @@ Alternative: on macOS the library reports `isCreated` if the path exists when
 the event of a rename or of combined flags is processed and `isDeleted`
 otherwise, and `isMoved` is removed from the portable module. The path can
 change after the check, and the check costs one `stat` per such event.
+
+Status: open.
+
+## macOS: report a clone as a copy
+
+On APFS a clone, as with `cp -c` or the Finder's "Duplicate", reports
+`isCloned` for the source and for the clone, and `isCreated` for the clone.
+A copy on Linux and Windows reports `isCreated` and `isModified` for the
+copy. `isCloned` is in the macOS module only, so in the portable module the
+event of the source matches no predicate, and the clone matches
+`isCreated`. FSEvents can also report `isCloned` more than once for one
+clone.
+
+Proposed change: in the portable module, drop an event whose only item change
+flag is `ItemCloned`, and report the clone as `isCreated`, which it already is.
+Check whether the clone reports `ItemModified` as well; a copy does on
+Linux and Windows.
+
+Status: open.
+
+## macOS: start a watch from a past event ID
+
+`since` is always `kFSEventStreamEventIdSinceNow`, so a watch cannot report
+the events that happened while the program was not running, and
+`setFullHistory` and `isHistoryDone` have no effect. A `setSinceEventId`
+setting and an accessor for the latest event ID of a volume would allow it.
+An event ID is valid for one volume only, so resuming also needs the volume
+UUID (`FSEventsCopyUUIDForDevice`).
 
 Status: open.
 
