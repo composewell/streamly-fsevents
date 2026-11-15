@@ -260,7 +260,7 @@ behaviors =
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
-        , expected = onPlatform No Yes Exception
+        , expected = onPlatform No Yes WatchException
         }
     , base
         { title = "root deleted and created again is watched"
@@ -271,13 +271,13 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Exception
+        , expected = onPlatform No Yes WatchException
         }
     , base
         { title = "renamed root is watched"
         , ops = renameRootAndCreate
         , check = const (createdNamed "file")
-        , expected = onPlatform No No Exception
+        , expected = onPlatform No No Yes
         }
     -- On Linux the rename of a root is reported by 'Linux.isRootMoved' only.
     , base
@@ -286,7 +286,7 @@ behaviors =
         , check = \p ->
             let isRoot ev = absPath ev `elem` [watchRoot p, renamedRoot p]
              in any (\ev -> isRoot ev && Event.isMoved ev)
-        , expected = onPlatform No Yes Exception
+        , expected = onPlatform No Yes No
         }
     -- On Linux the root is removed only if its path no longer refers to the
     -- watched directory when the rename event is read.
@@ -298,7 +298,7 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p)
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Exception
+        , expected = onPlatform Yes Yes Yes
         }
     , base
         { title = "root renamed back after the event is read is watched"
@@ -308,7 +308,7 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p)
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Exception
+        , expected = onPlatform No Yes Yes
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
@@ -665,7 +665,7 @@ behaviors =
         , ops = removePathForcibly . watchRoot
         , check = \_ ->
             any (\ev -> isNamed "file" ev && Event.isDeleted ev)
-        , expected = onPlatform Yes No Exception
+        , expected = onPlatform Yes No WatchException
         }
     , base
         { title = "deleted dir in the tree reports isDeleted for a file in it"
