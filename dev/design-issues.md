@@ -342,3 +342,121 @@ library would still need the threaded RTS, or option 1, for programs that
 use the default I/O manager.
 
 Status: open.
+
+## A renamed watch root
+
+On Linux a renamed root is removed from the watch and reports
+`isRootUnwatched`; the kernel does not report the new path. On macOS the
+watch is attached to the path, the renamed root is no longer watched, and an
+object created at the path later is watched. On Windows the watch keeps a
+handle to the root open with `FILE_SHARE_DELETE`. After `mv d d.bak` the
+watch continues, and the events report paths under `d`, for example, `d\x`
+for the file `d.bak\x`. A consumer that opens, copies or deletes `d\x` acts
+on a path that does not exist, or on another object created at `d` later.
+`ReadDirectoryChangesW` does not report changes to the watched directory
+itself, so the library does not know that the root was renamed.
+
+### Option 1: remove the watch, as on Linux
+
+End the watch of a renamed or deleted root with an event, `isRootUnwatched`
+as on Linux. Windows has no such event yet.
+
+* The user names a path, not an object. A directory replaced by renames, as
+  in `mv d d.old; mv d.new d`, leaves a watch that follows the object on
+  `d.old`.
+* `getRoot` does not change during a watch, a consumer can keep its state
+  by root.
+* A deleted root ends the watch on all platforms, a rename then ends it the
+  same way and the consumer handles both with one event.
+* macOS can do the same, FSEvents watches a path.
+
+To detect the rename on Windows:
+
+* Record `GetFinalPathNameByHandleW` of the handle when the watch starts, and
+  call it again after each `ReadDirectoryChangesW` call returns. If the path
+  is different, report the event, close the handle and end the stream of the
+  root. This costs one system call per read and no thread. The rename is
+  detected only when the next event under the root arrives, never in an idle
+  tree. A read cannot be split at the rename, the events of the read in
+  which the rename is detected are all kept or all dropped. The final path is
+  compared, not the user path, so a root reached through a symbolic link or
+  a junction is not reported as renamed. This cannot tell a rename from a
+  delete.
+* Also watch the parent of the root, non-recursive with
+  `FILE_NOTIFY_CHANGE_DIR_NAME`. `FILE_ACTION_RENAMED_OLD_NAME` or
+  `FILE_ACTION_REMOVED` for the name of the root reports the change when it
+  happens, and tells a rename from a delete. This needs a handle and a
+  thread per root, fails if the parent cannot be read, and a drive root such
+  as `C:\` has no parent.
+* An overlapped call with a timeout, see "Windows: support the non-threaded
+  RTS", lets the first check run in an idle tree too.
+
+Optionally report the new path in the event on Linux and Windows, so that a
+consumer can add the new path to follow the object. Linux can get the path
+by keeping an `O_PATH` fd of the root and reading `/proc/self/fd/N`, Windows
+from `GetFinalPathNameByHandleW`.
+
+### Option 2: continue the watch, on all platforms
+
+Continue the watch of a renamed root and report the events under the new
+path. Linux keeps the inotify watch on the inode after `IN_MOVE_SELF`, and
+can get the new path as in option 1. macOS has to start a new FSEvents
+stream on the new path, `fcntl(F_GETPATH)` on an fd of the root gives it,
+and the events between the rename and the new stream are lost. `getRoot`
+changes during the watch, which needs a new event to tell the consumer the
+new root.
+
+### Option 3: watch the path, as on macOS, on all platforms
+
+On Linux and Windows, also watch the parent of each root, non-recursive,
+for name changes only, and keep only the events for the name of the root:
+
+* The name deleted or moved away: report `isRootDeleted` or `isRootMoved`
+  and remove the watch of the root.
+* An object created or moved in at the name: add a watch on it and scan it.
+  The scan finds the entries created before the watch was added, as in
+  `mkdir d; touch d/f`, and the entries of a directory moved in. Linux
+  already does this for a new subdirectory, see `setScanNewDirs`.
+* A root that does not exist when the watch starts: watch its deepest
+  existing ancestor and move the watch down as each component of the path
+  is created. macOS watches such a root, Linux and Windows raise an
+  exception today.
+
+A watch on the parent covers a rename of the last component of the root path
+only. FSEvents watches the whole path, `mv /a /a.old; mkdir -p /a/b/d`
+watches the new `/a/b/d`. Doing the same needs a watch on each ancestor up
+to the volume root, and a rename of an ancestor moves all the watches below
+it.
+
+Costs and limits:
+
+* The parent watch receives the name changes of all the entries of the
+  parent, for example, of a home directory or `/tmp`, and the reader drops
+  all but those of the root. On Windows the filter can be
+  `FILE_NOTIFY_CHANGE_DIR_NAME`, with `FILE_NOTIFY_CHANGE_FILE_NAME` for a
+  file root.
+* Linux: one more inotify watch per parent, counted in `max_user_watches`.
+  Roots with the same parent can share it. Windows: one more handle and one
+  more blocked thread per parent.
+* The parent needs read permission on Linux and `FILE_LIST_DIRECTORY` on
+  Windows. `/`, `C:\` and a UNC share root have no parent, and the parent of
+  a mount point is on another file system. These roots need option 1.
+* The events under a new object at the root path before its watch is added
+  are reported only by the scan. macOS does not report the existing entries
+  of a directory moved in at the root path either.
+* A symbolic link root replaced, as in `ln -sfn new d`, changes the watched
+  object, the watch of the root has to follow it.
+
+The behavior of option 1 can then be a setting, for example,
+`setFollowRootPath False`.
+
+Option 1 is preferred. It is the simplest, and costs nothing per root.
+Option 3 gives the behavior a user who names a path expects, including
+for a directory replaced by renames, but it adds a watch, a thread on
+Windows and a second event source per root, and is complete only with a
+watch on every ancestor.
+
+What a pending `ReadDirectoryChangesW` call returns when the root is deleted
+is not tested, see `dev/todo.windows.md`.
+
+Status: open.
