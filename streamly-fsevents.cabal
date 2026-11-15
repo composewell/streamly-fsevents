@@ -182,13 +182,14 @@ common optimization-options
 
 
 -- The tests run with a heap limit of 1 GB, a space leak fails the test
--- instead of exhausting the memory of the machine.
+-- instead of exhausting the memory of the machine. -T collects the RTS
+-- statistics, the LargeTree test reports the live heap from them.
 common threading-options
   if flag(threaded)
     ghc-options:  -threaded
-                  "-with-rtsopts=-N -M1G"
+                  "-with-rtsopts=-N -M1G -T"
   else
-    ghc-options:  -with-rtsopts=-M1G
+    ghc-options:  "-with-rtsopts=-M1G -T"
 
 -- We need optimization options here to optimize internal (non-inlined)
 -- versions of functions. Also, we have some benchmarking inspection tests
