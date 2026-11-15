@@ -223,8 +223,7 @@ macOS:
 Windows:
 
 * Stopping a stream interrupts the blocked `ReadDirectoryChangesW`
-  call, so the stream does not wait for the next change. This requires the
-  threaded RTS.
+  call, so the stream does not wait for the next change.
 
 ## Unusual names on Windows
 
