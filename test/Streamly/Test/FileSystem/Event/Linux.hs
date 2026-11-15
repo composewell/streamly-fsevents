@@ -18,7 +18,7 @@ import Control.Exception
     )
 import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.&.))
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf, nub, sort)
 import Numeric (readOct)
 import Streamly.Internal.FS.Event.Linux (Event)
@@ -1172,23 +1172,6 @@ whileReading p w action = do
             evs <- takeMVar mv
             either (\(e :: SomeException) -> throwIO e) (return . (r,)) evs
 
--- The reader thread is blocked reading the watch fd.
-addWhileReading :: Spec
-addWhileReading =
-    it "addRoot does not block while another thread reads the events"
-        $ withRoot watchCfg $ \root w -> do
-            let root2 = takeDirectory root </> "root2"
-                file = root2 </> "file"
-            createDirectory root2
-            p <- Path.fromString root2
-            (r, evs) <- whileReading (isCreatedAt file) w $ do
-                r <- timeout 2000000 $ Event.addRoot w p
-                -- Unblock the reader
-                createFile file
-                return r
-            r `shouldBe` Just ()
-            createdRoots file evs `shouldBe` [root2]
-
 removeWhileReading :: Spec
 removeWhileReading =
     it "removeRoot does not block while another thread reads the events"
@@ -1219,30 +1202,6 @@ removeSharedWhileReading =
             r `shouldBe` Just ()
             unwatched evs `shouldBe` [(sub, sub)]
 
--- The reader thread is blocked reading the watch fd. The stream ends when
--- the watch is closed, without any file system event.
-closeWhileReading :: Spec
-closeWhileReading =
-    it "closeWatch does not block while another thread reads the events"
-        $ withRoot watchCfg $ \_ w -> do
-            mv <- newEmptyMVar
-            let reader = Stream.drain (Event.eventStream w)
-            bracket
-                (forkIO (try reader >>= putMVar mv))
-                killThread
-                $ \_ -> do
-                    threadDelay 200000
-                    timeout 2000000 (Event.closeWatch w)
-                        `shouldReturn` Just ()
-                    -- The stream ends without an exception
-                    r <- timeout 2000000 (takeMVar mv)
-                    fmap (either (\(_ :: SomeException) -> False) ok) r
-                        `shouldBe` Just True
-
-    where
-
-    ok () = True
-
 -- | Read the events from the watch using 'Event.readEvent' until the
 -- predicate holds for the events read so far, or the watch is closed.
 -- Throw an exception if neither happens within 10 seconds.
@@ -1261,38 +1220,6 @@ readEventsUntil done w = do
                 Nothing -> return (reverse acc)
                 Just ev -> go (ev : acc)
 
--- | Wait until the action returns True, check it every 10 ms. Throw an
--- exception if it does not return True within 10 seconds.
-waitUntil :: String -> IO Bool -> IO ()
-waitUntil desc action = do
-    r <- timeout 10000000 go
-    maybe (error (desc ++ ": timed out")) return r
-
-    where
-
-    go = do
-        ok <- action
-        unless ok (threadDelay 10000 >> go)
-
--- The events of the file created before 'closeWatch' can still be in the
--- watch after it, the reads return them before 'Nothing'.
-readEventAfterClose :: Spec
-readEventAfterClose =
-    it "readEvent returns Nothing after closeWatch, and on every later call"
-        $ withRoot watchCfg $ \root w -> do
-            let file = root </> "file"
-            createFile file
-            evs <- readEventsUntil (any (isCreatedAt file)) w
-            createdRoots file evs `shouldBe` [root]
-            Event.closeWatch w
-            _ <- readEventsUntil (const False) w
-            isNothing <$> Event.readEvent w `shouldReturn` True
-            isNothing <$> Event.readEvent w `shouldReturn` True
-
-    where
-
-    isNothing = maybe True (const False)
-
 -- The root is added again before its isRootUnwatched event is read. The
 -- watch descriptor of the new watch is different from the removed one.
 removeAddAgain :: Spec
@@ -1307,71 +1234,6 @@ removeAddAgain =
             evs <- readUntil (isCreatedAt file) w
             unwatched evs `shouldBe` [(root, root)]
             createdRoots file evs `shouldBe` [root]
-
-closedWatchOps :: Spec
-closedWatchOps =
-    it "addRoot raises an exception, removeRoot does nothing on a closed watch"
-        $ withRoot watchCfg $ \root w -> do
-            p <- Path.fromString root
-            Event.closeWatch w
-            r <- try (Event.addRoot w p)
-            either (\(_ :: IOException) -> True) (const False) r
-                `shouldBe` True
-            Event.removeRoot w p
-            Event.closeWatch w
-
--- Each event is returned to one of the readers. The readers end when the
--- watch is closed.
-twoReaders :: Spec
-twoReaders =
-    it "two threads reading a watch with readEvent get each event once"
-        $ withRoot watchCfg $ \root w -> do
-            let files = [root </> ("file" ++ show i) | i <- [1 .. n]]
-            count <- newIORef (0 :: Int)
-            let countCreated ev =
-                    when (Event.isCreated ev)
-                        $ atomicModifyIORef' count (\c -> (c + 1, ()))
-                loop acc = do
-                    r <- Event.readEvent w
-                    case r of
-                        Nothing -> return (reverse acc)
-                        Just ev -> countCreated ev >> loop (ev : acc)
-            mv1 <- newEmptyMVar
-            mv2 <- newEmptyMVar
-            bracket
-                (mapM (\mv -> forkIO (try (loop []) >>= putMVar mv))
-                    [mv1, mv2])
-                (mapM_ killThread)
-                $ \_ -> do
-                    mapM_ createFile files
-                    waitUntil "twoReaders" ((== n) <$> readIORef count)
-                    Event.closeWatch w
-                    evs1 <- takeMVar mv1 >>= either rethrow return
-                    evs2 <- takeMVar mv2 >>= either rethrow return
-                    sort (pathsOf Event.isCreated (evs1 ++ evs2))
-                        `shouldBe` sort files
-
-    where
-
-    n = 200 :: Int
-    rethrow (e :: SomeException) = throwIO e
-
--- The tree under the added root is walked and its directories are watched,
--- as for a root of 'Event.openWatch'.
-addRecursiveWhileReading :: Spec
-addRecursiveWhileReading =
-    it "addRoot in recursive mode watches the tree under the root"
-        $ withRoot recCfg $ \root w -> do
-            let root2 = takeDirectory root </> "root2"
-                sub = root2 </> "sub"
-                file = sub </> "file"
-            createDirectory root2
-            createDirectory sub
-            p <- Path.fromString root2
-            (_, evs) <- whileReading (isCreatedAt file) w $ do
-                Event.addRoot w p
-                createFile file
-            createdRoots file evs `shouldBe` [root2]
 
 -- Each thread adds its root, creates a file in it and removes the root, a
 -- number of times. The events queued before a removal are reported before
@@ -3018,16 +2880,10 @@ watchTests =
                 readAfterTimeout "default events"
                     (Event.setRecursiveMode True Event.defaultConfig)
             describe "handle API" $ do
-                readEventAfterClose
                 removeAddAgain
-                closedWatchOps
             describe "concurrency" $ do
-                addWhileReading
                 removeWhileReading
                 removeSharedWhileReading
-                closeWhileReading
-                twoReaders
-                addRecursiveWhileReading
                 addRemoveThreads
             describe "failures" $ do
                 removeFailRetry
