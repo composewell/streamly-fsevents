@@ -44,3 +44,18 @@
   which has `openAt` and `setNoFollow` on master but not those two flags.
   On Linux 5.6 and later, `openat2` with `RESOLVE_NO_SYMLINKS` does the
   same in one system call. Not reported yet.
+* On Windows, `Streamly.FileSystem.Path.fromArray` (streamly-core 0.3.1 to
+  0.3.3, and master) rejects a path that has a component whose base name
+  is a reserved device name: `CON`, `PRN`, `AUX`, `NUL`, `CLOCK$`,
+  `COM1`-`COM9` or `LPT1`-`LPT9`. The base name is the component without
+  its last extension, so `aux.c` is rejected as well as `aux`. The file
+  system can hold such names, they can be created using a `\\?\` path.
+  From the code, the check also applies to the part after the root of a
+  `\\?\` path, which does not interpret device names; this is not tested.
+  `peekFNI` in `src/Streamly/Internal/FS/Event/Windows.hs` uses
+  `unsafeFromArray` for the names reported by `ReadDirectoryChangesW`.
+  That use is correct for names reported by the system and stays after an
+  upstream change.
+
+  Proposed upstream: skip the reserved name check for `\\?\` paths. Not
+  reported yet.
