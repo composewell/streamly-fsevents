@@ -34,7 +34,8 @@
 -- A watch keeps its watch root open. The watch root can be renamed or
 -- deleted while it is watched. After a rename, the watch continues and the
 -- events report paths under the original root path. On Linux and macOS a
--- renamed watch root is no longer watched.
+-- renamed watch root is no longer watched. When a watch root is deleted,
+-- 'isDeleted' is reported for the root and the watch of the root ends.
 --
 -- When recursive mode is True, the whole directory tree under the path is
 -- watched recursively.  When recursive mode is False, only the files and

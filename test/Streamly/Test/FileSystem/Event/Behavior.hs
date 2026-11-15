@@ -260,7 +260,7 @@ behaviors =
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
-        , expected = onPlatform No Yes WatchException
+        , expected = onPlatform No Yes Yes
         }
     , base
         { title = "root deleted and created again is watched"
@@ -271,7 +271,7 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes WatchException
+        , expected = onPlatform No Yes No
         }
     , base
         { title = "renamed root is watched"
@@ -665,7 +665,7 @@ behaviors =
         , ops = removePathForcibly . watchRoot
         , check = \_ ->
             any (\ev -> isNamed "file" ev && Event.isDeleted ev)
-        , expected = onPlatform Yes No WatchException
+        , expected = onPlatform Yes No Yes
         }
     , base
         { title = "deleted dir in the tree reports isDeleted for a file in it"

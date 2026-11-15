@@ -81,8 +81,8 @@ on Linux.
   Deleting a watch root reports `isDeleted` for each entry in the root on
   Linux. On macOS FSEvents reports one event, for the root only, and does
   not report the entries in the root, in recursive and non-recursive
-  watches. On Windows the watch raises an exception when the watch root is
-  deleted.
+  watches. On Windows `ReadDirectoryChangesW` does not report the deletion
+  of the watch root, the library reports `isDeleted` for the root.
 * A non-recursive watch on macOS: FSEvents can only watch a tree. The library
   starts a recursive watch and drops the events more than one level below a
   watch root, the process still receives the events of the whole tree.
@@ -136,7 +136,9 @@ On Windows the watch keeps the root open.
   link. FSEvents does not report the entries in the root. Linux reports
   `isDeleted` for each entry in the root and then `isRootDeleted`. On
   Windows the watch opens the root with `FILE_SHARE_DELETE`, so the root
-  can be deleted; the watch then raises an exception.
+  can be deleted. A read of the deleted root fails with
+  `ERROR_ACCESS_DENIED` and the directory is delete pending; the library
+  then reports `isDeleted` for the root and ends the watch of the root.
 * A new object at the path of a deleted or renamed root: macOS watches it.
   Linux does not; the consumer must add the path to the watch again after
   `isRootUnwatched`. A root renamed back, as in `mv d d.bak; mv d.bak d`,
@@ -197,9 +199,9 @@ because the file is open.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` | No | Yes | No, the watch raises an exception |
-| A deleted watch root reports `isDeleted` for a file in it | Yes | No | No, the watch raises an exception |
-| A watch root deleted and created again is watched | No | Yes | No, the watch raises an exception |
+| A deleted watch root reports `isDeleted` | No | Yes | Yes |
+| A deleted watch root reports `isDeleted` for a file in it | Yes | No | Yes |
+| A watch root deleted and created again is watched | No | Yes | No |
 | A renamed watch root is watched | No | No | Yes |
 | A renamed watch root reports `isMoved` | No | Yes | No |
 | A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
@@ -242,9 +244,8 @@ because the file is open.
 
 On Windows the test suite does not remove the read permission of a path, so
 the three tests that need it are skipped there. The Windows rows for a
-deleted or renamed watch root have not been tested since the watch opens the
-root with `FILE_SHARE_DELETE`. Before that change, deleting or renaming the
-root raised an exception. The row for the delivery
+deleted watch root are based on the library code, they have not been
+tested. The row for the delivery
 of events in a non-recursive watch has no test, it is based on the platform
 documentation and the library code. The coalescing of the events of a directory
 and its subdirectory into `isEventsLost` on macOS is also based on the platform
