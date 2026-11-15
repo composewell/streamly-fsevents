@@ -245,6 +245,9 @@ behaviors =
              in any Event.isDeleted named && any Event.isModified named
         , expected = onPlatform Yes Yes Yes
         }
+    -- On macOS FSEvents can report the flags of earlier changes to a path
+    -- with a later event of the path. Whether the delete, one second after
+    -- the create, reports isCreated varies between runs.
     , base
         { title = "file deleted after its create is read reports isCreated"
         , ops = \p -> do
@@ -254,6 +257,7 @@ behaviors =
             removeFile file
         , check = const fileCreatedTwice
         , expected = onPlatform No Yes No
+        , racy = onDarwin
         }
     , base
         { title = "deleted root reports isDeleted for the root"

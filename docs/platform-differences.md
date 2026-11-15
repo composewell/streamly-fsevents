@@ -239,13 +239,11 @@ because the file is open.
 | One overwrite of a file reports several `isModified` | No | No | Yes |
 | One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
 | One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
-| A file deleted after its create event is read reports `isCreated` again | No | Yes | No |
+| A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
 | A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
 
 On Windows the test suite does not remove the read permission of a path, so
-the three tests that need it are skipped there. The Windows rows for a
-deleted watch root are based on the library code, they have not been
-tested. The row for the delivery
+the three tests that need it are skipped there. The row for the delivery
 of events in a non-recursive watch has no test, it is based on the platform
 documentation and the library code. The coalescing of the events of a directory
 and its subdirectory into `isEventsLost` on macOS is also based on the platform
@@ -253,7 +251,11 @@ documentation.
 
 On macOS two writes to a file are merged into one event only if FSEvents
 reports them in the same batch. The macOS entries of the two rows for writes
-are from several runs in the CI, the test suite does not assert them.
+are from several runs in the CI, the test suite does not assert them. The
+same holds for the macOS entry of the row for a file deleted after its
+create event is read: FSEvents can report the flags of earlier changes to a
+path with a later event of the path, and the delete reported `isCreated` in
+most CI runs but not in all of them.
 
 Lost events and the recovery are described in
 [robustness.md](robustness.md), the limits of each platform in
