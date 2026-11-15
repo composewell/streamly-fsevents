@@ -127,6 +127,9 @@ data Overflow = Overflow
     , burst :: Bool
     , judge :: Int -> Int -> Outcome
     , expected :: Outcome
+    -- | The expected outcome is the same on all platforms. Otherwise it is
+    -- asserted on Linux only.
+    , certain :: Bool
     }
 
 -- | The number of directories in a large tree, in a small tree, and the
@@ -210,6 +213,8 @@ overflowCases =
         , burst = False
         , judge = judgeOnce
         , expected = No
+        -- macOS and Windows do not list the tree at the start.
+        , certain = True
         }
     , Overflow
         { title = "isEventsLost events stop after a burst of events"
@@ -218,6 +223,7 @@ overflowCases =
         , burst = True
         , judge = judgeStopped
         , expected = Yes
+        , certain = False
         }
     ]
 #if defined(CABAL_OS_LINUX)
@@ -236,6 +242,7 @@ overflowCases =
         , burst = True
         , judge = judgeOnce
         , expected = Yes
+        , certain = False
         }
     , Overflow
         { title = "reopen: one overflow after a burst in a small tree"
@@ -244,12 +251,13 @@ overflowCases =
         , burst = True
         , judge = judgeOnce
         , expected = Yes
+        , certain = False
         }
     ]
 #endif
 
--- | The outcome is asserted on Linux only. An overflow is not certain on
--- macOS and Windows.
+-- | The outcome is asserted on Linux, and on the other platforms if it is
+-- 'certain'. An overflow is not certain on macOS and Windows.
 overflowSpec :: Overflow -> Spec
 overflowSpec o =
     it (title o) $ case overflowSkip of
@@ -260,7 +268,8 @@ overflowSpec o =
             case outcome of
                 Skipped reason -> pendingWith reason
                 Failed reason -> expectationFailure reason
-                _ -> when isLinux $ outcome `shouldBe` expected o
+                _ -> when (isLinux || certain o)
+                        $ outcome `shouldBe` expected o
 
 -------------------------------------------------------------------------------
 -- A tree created as fast as possible

@@ -66,8 +66,11 @@ event in its queue at a time, and until that event is read it can drop more
 events without another overflow event, so the events after an overflow do not
 give a complete picture of the changes.
 
-The Linux column is tested by the test suite `FileSystem.Event.Stress`. The
-macOS and Windows columns are based on the platform documentation.
+The Linux column is tested by the test suite `FileSystem.Event.Stress`. On
+macOS the suite tests that the stream continues after the loss, and that
+starting a watch on a tree of 6000 directories does not report a loss. The
+other macOS cells and the Windows column are based on the platform
+documentation.
 
 ## Handling queue overflow on Linux
 

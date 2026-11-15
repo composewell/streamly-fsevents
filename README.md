@@ -14,6 +14,16 @@ make full use of each operating system’s native capabilities.
 The library is designed to be fast, light on resources, scalable and
 reliable.
 
+On macOS and Windows the operating system implements the recursive watch:
+FSEvents and `ReadDirectoryChangesW` watch the whole tree, with no limit on
+its size. On Linux, inotify watches one directory at a time, and the library
+implements the recursive watch. It adds a watch for each directory, limited
+by `max_user_watches`, scans each directory added to the tree, and handles the
+races between a scan and the changes made to the tree during it. macOS and
+Windows therefore start a watch on a large tree faster and with less memory
+than Linux. The Linux items below describe this implementation; on macOS and
+Windows the operating system does this work.
+
 ### Functionality
 
 * Events are a streamly `Stream IO Event`, processed with streamly combinators.
@@ -53,6 +63,12 @@ Notes for the table above:
 * Traversing the tree alone takes 0.32 s during the startup
 * Moving in or renaming a directory scans it and reports its contents
 * Memory is about 320 bytes per directory
+
+The times and memory include the work done for the guarantees listed under
+Reliability: the scan that reports every entry of a directory moved into the
+tree, and the tracking of the paths of the watched directories that keeps
+renames within the tree from losing events. When comparing these numbers with
+another implementation, check that it gives the same guarantees.
 
 ### Reliability
 

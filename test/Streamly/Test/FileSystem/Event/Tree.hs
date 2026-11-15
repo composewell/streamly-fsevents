@@ -274,6 +274,9 @@ data Watch = Watch
     , trackCreated :: Bool
     -- | The number of 'Event.isCreated' events of each file named @probe@.
     , probes :: IORef (Map FilePath Int)
+    -- | The names of the entries of the root that an event was reported
+    -- for.
+    , rootEntries :: IORef (Set FilePath)
     , markers :: Chan FilePath
     -- | The marker names already read, an event can be repeated on macOS.
     , seen :: IORef (Set FilePath)
@@ -296,6 +299,8 @@ observe Watch{..} ev = do
         name = takeFileName path
         marker prefix = Event.isCreated ev && prefix `isPrefixOf` name
     when (Event.isEventsLost ev) $ modifyIORef' lost (+ 1)
+    when (takeDirectory path == root)
+        $ modifyIORef' rootEntries (Set.insert name)
     when (Event.isCreated ev) $ do
         when (isScanDir ev) $ modifyIORef' scanDirs (+ 1)
         when trackCreated $ modifyIORef' created (Set.insert path)
@@ -384,6 +389,7 @@ startWatch cfg track dir = do
     scanRef <- newIORef 0
     createdRef <- newIORef Set.empty
     probesRef <- newIORef Map.empty
+    entriesRef <- newIORef Set.empty
     chan <- newChan
     seenRef <- newIORef Set.empty
     pausedVar <- newEmptyMVar
@@ -397,6 +403,7 @@ startWatch cfg track dir = do
             , created = createdRef
             , trackCreated = track
             , probes = probesRef
+            , rootEntries = entriesRef
             , markers = chan
             , seen = seenRef
             , paused = pausedVar
