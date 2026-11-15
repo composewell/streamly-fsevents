@@ -39,6 +39,15 @@ module Streamly.Internal.FS.Event.Darwin
     , watchRecursive
     , watchWith
 
+    -- Low level watch APIs
+    , Watch
+    , openWatch
+    , closeWatch
+    , readEvent
+    , eventStream
+    , addRoot
+    , removeRoot
+
     -- * Handling Events
     , Event
     , getEventId
@@ -85,33 +94,45 @@ module Streamly.Internal.FS.Event.Darwin
     )
 where
 
-import Control.Concurrent (MVar, newMVar, takeMVar, putMVar)
-import Control.Monad (when)
+import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
+import Control.Concurrent.MVar
+    (MVar, modifyMVar, modifyMVar_, newMVar, putMVar, takeMVar)
+import Control.Exception (SomeException, finally, onException, throwIO, try)
+import Control.Monad (void, when)
 import Control.Monad.Cont (runCont, cont)
 import Data.Bits ((.|.), (.&.), complement)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (dropWhileEnd, sortOn, stripPrefix)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Word (Word8, Word32, Word64)
+import Foreign.C.Error (eAGAIN, eINTR, eWOULDBLOCK, getErrno, throwErrno)
 import Foreign.C.Types (CInt(..), CDouble(..), CSize(..), CUChar(..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (withArray)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable(..))
-import GHC.IO.Handle.FD (fdToHandle)
-import Streamly.Internal.Data.Stream (Stream)
-import Streamly.Internal.Data.Parser (Parser)
-import Streamly.Internal.Data.Array (Array(..))
+import GHC.Conc (atomically, closeFdWith, threadWaitReadSTM)
+import Streamly.Data.Array (Array)
+import Streamly.Data.Stream (Stream)
+import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
+import Streamly.Internal.FS.Event.Darwin.Replace (Gen, Since(..))
 import Streamly.Internal.FileSystem.Path (Path)
 import System.Directory (canonicalizePath)
-import System.IO (Handle, hClose)
+import System.IO.Error (catchIOError)
+import System.Posix.Types (CSsize(..), Fd(..))
 
+import qualified Control.Exception as Exception
+    (interruptible, mask, mask_, uninterruptibleMask_)
 import qualified Data.List.NonEmpty as NonEmpty
-import qualified Streamly.Internal.Data.Parser as PR
-import qualified Streamly.Internal.Data.Stream as S
-import qualified Streamly.Internal.FileSystem.Handle as FH
+import qualified Streamly.Data.Array as A (createOf, read)
+import qualified Streamly.Data.Stream as S
 import qualified Streamly.Internal.Data.Array as A
+    (byteLength, unsafePinnedAsPtr, unsafeSliceOffLen)
+import qualified Streamly.Internal.Data.MutArray as MArray
+    (unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.Path as Path
+import qualified Streamly.Internal.FS.Event.Darwin.Replace as Replace
 
 -------------------------------------------------------------------------------
 -- Utils
@@ -335,12 +356,14 @@ defaultConfig = setFileEvents True $ Config
     }
 
 -------------------------------------------------------------------------------
--- Open an event stream (C FFI)
+-- C FFI
 -------------------------------------------------------------------------------
 
 -- See FS/Event/Darwin.h
 
 data CWatch
+
+data CStream
 
 -- Representation of "struct pathName" in "FS/Event/Darwin.h"
 data PathName = PathName
@@ -359,86 +382,41 @@ instance Storable PathName where
         pokeByteOff ptr 0 pathBytes
         pokeByteOff ptr (sizeOf (undefined :: Ptr CUChar)) pathLen
 
-foreign import ccall safe "FS/Event/Darwin.h createWatch" createWatch
-    :: Ptr PathName
-    -> CInt
-    -> Word32
-    -> Word64
-    -> CDouble
+foreign import ccall safe "FS/Event/Darwin.h createWatch" c_createWatch
+    :: CDouble
     -> Ptr CInt
     -> Ptr (Ptr CWatch)
     -> IO CInt
 
-foreign import ccall safe "FS/Event/Darwin.h destroyWatch" destroyWatch
+foreign import ccall safe "FS/Event/Darwin.h startStream" c_startStream
+    :: Ptr CWatch
+    -> Ptr PathName
+    -> CInt
+    -> Word64
+    -> Word64
+    -> Word32
+    -> IO (Ptr CStream)
+
+foreign import ccall safe "FS/Event/Darwin.h stopStream" c_stopStream
+    :: Ptr CStream -> IO ()
+
+foreign import ccall unsafe "FS/Event/Darwin.h currentEventId"
+    c_currentEventId :: IO Word64
+
+foreign import ccall unsafe "FS/Event/Darwin.h eventIdSinceNow"
+    c_eventIdSinceNow :: IO Word64
+
+foreign import ccall safe "FS/Event/Darwin.h destroyWatch" c_destroyWatch
     :: Ptr CWatch -> IO ()
 
--------------------------------------------------------------------------------
--- Open an event stream
--------------------------------------------------------------------------------
+foreign import ccall unsafe "unistd.h read"
+    c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
 
--- | A handle for a watch.
-data Watch = Watch Handle (Ptr CWatch) (MVar Bool)
-
--- | Given a 'Config' and @paths@ start monitoring the paths for file system
--- events. Returns a 'Watch' handle which can then be used to read the event
--- stream or to close the watch.
---
--- Implementation Note: This API creates an OS level thread where an event loop
--- runs and writes the events to the write side fd of a POSIX pipe. Event
--- stream APIs read the events from the read end of this pipe.  Since an OS
--- level thread is forked, creating a new watch stream is expensive. It is
--- advised to minimize the number of watches.
---
--- /Pre-release/
---
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch Config{..} paths = do
-    -- XXX write a test case when path does not exist
-    -- XXX write a test case when there are no permissions
-    -- XXX check whether the path exists. If the path does not exist and
-    -- is created later it cannot be properly monitored. Also a user may
-    -- inadvertently provide a path for which the user may not have permission
-    -- and then later wonder why events are not being reported.
-    withPathNames (NonEmpty.toList paths) $ \arraysPtr ->
-        alloca $ \fdPtr -> do
-        alloca $ \watchPPtr -> do
-            let nArrays = fromIntegral (NonEmpty.length paths)
-                seconds = realToFrac latency
-            r <- createWatch
-                    arraysPtr nArrays createFlags 0 seconds fdPtr watchPPtr
-            when (r /= 0) $
-                ioError (userError "openWatch: failed to create watch.")
-            fd <- peek fdPtr
-            -- fdToHandle locks the fd if it is a regular file. This fd is
-            -- the read end of a pipe, therefore, it is not locked.
-            h <- fdToHandle fd
-            watchPtr <- peek watchPPtr
-            closeLock <- newMVar False
-            return $ Watch h watchPtr closeLock
-
-    where
-
-    withPathName :: Path -> (PathName -> IO a) -> IO a
-    withPathName path act = do
-        A.unsafePinnedAsPtr (Path.toArray path) $ \ptr byteLen ->
-            let pname = PathName (castPtr ptr) (fromIntegral byteLen)
-            in act pname
-
-    withPathNames = contListMap withPathName withArray
-
--- | Close a 'Watch' handle.
---
--- /Pre-release/
---
-closeWatch :: Watch -> IO ()
-closeWatch (Watch h watchPtr mvar) = do
-    hClose h
-    closed <- takeMVar mvar
-    when (not closed) $ destroyWatch watchPtr
-    putMVar mvar True
+foreign import ccall unsafe "unistd.h close"
+    c_close :: CInt -> IO CInt
 
 -------------------------------------------------------------------------------
--- Raw events read from the watch file handle
+-- Events
 -------------------------------------------------------------------------------
 
 -- | An Event generated by the file system. Use the accessor functions to
@@ -451,31 +429,9 @@ data Event = Event
    , eventRelPath :: Maybe Path -- relative to eventRoot
    }
 
--- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
--- to measure the perf.
---
--- XXX should we use a magic in the header to avoid any issues due to
--- misalignment of records? Can that ever happen?
---
-readOneEvent :: Parser Word8 IO Event
-readOneEvent = do
-    arr <- PR.takeEQ 24 (A.createOf 24)
-    let arr1 = A.unsafeCast arr :: Array Word64
-        eid = A.unsafeGetIndex 0 arr1
-        eflags = A.unsafeGetIndex 1 arr1
-        pathLen = fromIntegral $ A.unsafeGetIndex 2 arr1
-    path <- PR.takeEQ pathLen (A.createOf pathLen)
-    return $ Event
-        { eventId = eid
-        , eventFlags = fromIntegral eflags
-        , eventPath = Path.unsafeFromArray path
-        , eventRoot = Nothing
-        , eventRelPath = Nothing
-        }
-
-watchToStream :: Watch -> Stream IO Event
-watchToStream (Watch handle _ _) =
-    S.catRights $ S.parseMany readOneEvent $ S.unfold FH.reader handle
+-------------------------------------------------------------------------------
+-- Watch roots
+-------------------------------------------------------------------------------
 
 -- | A watch root as supplied by the user, and its canonical path without
 -- trailing separators. The OS reports the event paths with symbolic links
@@ -518,29 +474,636 @@ setRoot roots ev = do
         | path == canonical = Just ""
         | otherwise = stripPrefix (canonical ++ "/") path
 
--- | Drop the events for paths more than one level below the watch roots. See
--- 'setRecursiveMode'. The argument is 'True' when the file events are
+-- | Whether the event is reported in the non-recursive mode, see
+-- 'setRecursiveMode'. The first argument is 'True' when the file events are
 -- enabled, see 'setFileEvents'.
-filterNonRecursive :: Bool -> Stream IO Event -> Stream IO Event
-filterNonRecursive fileEvents = S.filter isWatched
+isNonRecursiveEvent :: Bool -> Event -> Bool
+isNonRecursiveEvent fileEvents ev =
+       isRootPathEvent ev
+    || isEventsLost ev
+    || isHistoryDone ev
+    || isEventIdWrapped ev
+    || isChild
 
     where
 
     -- Without the file events the path is the directory in which an item
     -- changed, a child directory reports the changes to its own children.
-    isChild ev =
+    isChild =
         case (eventRoot ev, eventRelPath ev) of
             (Nothing, _) -> False
             (Just _, Nothing) -> True
             (Just _, Just rel) ->
                 fileEvents && '/' `notElem` Path.toString rel
 
-    isWatched ev =
-           isRootPathEvent ev
-        || isEventsLost ev
-        || isHistoryDone ev
-        || isEventIdWrapped ev
-        || isChild ev
+-------------------------------------------------------------------------------
+-- Records read from the pipe
+-------------------------------------------------------------------------------
+
+-- | A record written to the pipe by "Darwin.c", with the generation of the
+-- stream that wrote it.
+data Record =
+      RecordEvent !Word64 Event
+      -- | The stream of the generation is released, it writes no more
+      -- records.
+    | RecordRetired !Word64
+
+recordHeaderLen :: Int
+recordHeaderLen = 5 * sizeOf (undefined :: Word64)
+
+-- | The header of a record, five 'Word64' fields in this order.
+data Header = Header
+    { hdrKind :: !Word64 -- ^ 0 for an event, non-zero for a retired stream
+    , hdrGen :: !Word64
+    , hdrEventId :: !Word64
+    , hdrEventFlags :: !Word64
+    , hdrPathLen :: !Word64 -- ^ The length of the path after the header
+    }
+
+-- | Decode the header at the start of the bytes. The bytes must hold at
+-- least 'recordHeaderLen' bytes.
+peekHeader :: Array Word8 -> IO Header
+peekHeader arr =
+    A.unsafePinnedAsPtr arr $ \p _ ->
+        let field :: Int -> IO Word64
+            field i = peekByteOff p (i * sizeOf (undefined :: Word64))
+         in Header
+                <$> field 0 <*> field 1 <*> field 2 <*> field 3 <*> field 4
+
+-- | Parse the record at the start of the bytes. Returns the record and the
+-- bytes after it, or 'Nothing' if the bytes do not hold a complete record.
+parseRecord :: Array Word8 -> IO (Maybe (Record, Array Word8))
+parseRecord arr
+    | len < recordHeaderLen = return Nothing
+    | otherwise = do
+        Header{..} <- peekHeader arr
+        let plen = fromIntegral hdrPathLen
+            total = recordHeaderLen + plen
+        if len < total
+        then return Nothing
+        else do
+            -- An empty slice would keep the whole read buffer alive.
+            let rest =
+                    if len == total
+                    then mempty
+                    else A.unsafeSliceOffLen total (len - total) arr
+            rec <-
+                if hdrKind /= 0
+                then return (RecordRetired hdrGen)
+                else do
+                    -- Copy the path, a slice would keep the whole read
+                    -- buffer alive.
+                    path <-
+                        S.fold (A.createOf plen)
+                            $ A.read
+                            $ A.unsafeSliceOffLen recordHeaderLen plen arr
+                    return
+                        $ RecordEvent hdrGen
+                        $ Event
+                            { eventId = hdrEventId
+                            , eventFlags = fromIntegral hdrEventFlags
+                            , eventPath = Path.unsafeFromArray path
+                            , eventRoot = Nothing
+                            , eventRelPath = Nothing
+                            }
+            return (Just (rec, rest))
+
+    where
+
+    len = A.byteLength arr
+
+-------------------------------------------------------------------------------
+-- Watch handle
+-------------------------------------------------------------------------------
+
+-- Adding a root:
+--
+-- The paths of an FSEvents stream cannot be changed after it is created.
+-- 'addRoot' and 'removeRoot' replace the stream of the watch by a new stream
+-- with the new list of roots. Each stream has a generation number, the
+-- records written by a stream to the pipe carry its generation, the reader
+-- uses the roots of that generation to find the root of an event.
+--
+-- The new stream starts from an event id already read, the FSEvents
+-- history replays the events after that id. The old stream keeps reporting
+-- until the reader reads the end of the replay, then it is stopped. An
+-- event reported by both streams is reported once. The state machine in
+-- "Streamly.Internal.FS.Event.Darwin.Replace" decides which streams to
+-- start and stop, and which events to report.
+--
+-- Until the replay ends, usually within milliseconds, the old stream
+-- reports the events of a removed root. The events of a new root that occur
+-- before 'addRoot' returns may not be reported.
+
+-- | The state of the read end of the pipe of a watch.
+data FdState = FdState
+    { fsWatchClosed :: !Bool -- ^ 'closeWatch' was called
+    , fsFdOpen :: !Bool -- ^ The fd is not closed yet
+    -- | The threads waiting for the fd to become readable, counted in the
+    -- non-threaded RTS only.
+    , fsFdWaiters :: !Int
+    }
+
+-- | The roots of a watch.
+data RootState = RootState
+    { rsClosed :: !Bool -- ^ 'closeWatch' was called
+    , rsRoots :: [Root] -- ^ In the order in which they were added
+    , rsGen :: !Word64 -- ^ The generation of the current stream
+    }
+
+-- | The FSEvents streams of a watch. Taken by the reader to process the
+-- records it read, and by the root changes. Not held across a blocking
+-- call.
+data StreamState = StreamState
+    { ssReplace :: Replace.State
+      -- | The streams that are not stopped
+    , ssHandles :: [(Gen, Ptr CStream)]
+      -- | The roots of each generation whose stream may still write records.
+    , ssRoots :: [(Gen, [Root])]
+    , ssClosed :: !Bool -- ^ The streams are stopped by 'closeWatch'
+    }
+
+-- | The records read from the pipe and not yet returned.
+data ReadState = ReadState
+    { -- | The bytes read from the pipe and not yet parsed, the last record
+      -- may be incomplete.
+      rdBuffer :: Array Word8
+    , rdEnded :: !Bool -- ^ The watch is closed
+    }
+
+-- | A handle for a watch.
+data Watch = Watch
+    { watchConfig :: Config -- ^ The config used to open the watch
+    , watchFd :: CInt -- ^ The read end of the pipe, non-blocking
+    , watchPtr :: Ptr CWatch
+      -- | Held during a system call on the fd, 'closeWatch' cannot close the
+      -- fd while the call is in progress. The calls made with the lock held
+      -- must not block.
+    , watchFdLock :: MVar FdState
+      -- | Held while the stream is replaced or destroyed.
+    , watchRootLock :: MVar RootState
+    , watchStreamState :: MVar StreamState
+    , watchReadState :: MVar ReadState
+    }
+
+-- | Create a watch with no root.
+createWatch :: Config -> IO Watch
+createWatch cfg@Config{..} =
+    alloca $ \fdPtr ->
+    alloca $ \watchPPtr -> do
+        r <- c_createWatch (realToFrac latency) fdPtr watchPPtr
+        when (r /= 0)
+            $ ioError (userError "openWatch: failed to create watch.")
+        fd <- peek fdPtr
+        ptr <- peek watchPPtr
+        fdLock <-
+            newMVar
+                FdState
+                    {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
+        rootLock <-
+            newMVar RootState {rsClosed = False, rsRoots = [], rsGen = 0}
+        streams <-
+            newMVar
+                StreamState
+                    { ssReplace = Replace.initial
+                    , ssHandles = []
+                    , ssRoots = []
+                    , ssClosed = False
+                    }
+        readState <-
+            newMVar
+                ReadState {rdBuffer = mempty, rdEnded = False}
+        return
+            Watch
+                { watchConfig = cfg
+                , watchFd = fd
+                , watchPtr = ptr
+                , watchFdLock = fdLock
+                , watchRootLock = rootLock
+                , watchStreamState = streams
+                , watchReadState = readState
+                }
+
+-- | Stop the streams of the generations, the lock of the streams must be
+-- held.
+stopStreams :: [Gen] -> StreamState -> IO StreamState
+stopStreams gens ss = do
+    mapM_ c_stopStream [h | (g, h) <- ssHandles ss, g `elem` gens]
+    return ss {ssHandles = filter ((`notElem` gens) . fst) (ssHandles ss)}
+
+-- | Replace the stream of the watch by a stream on @roots@ with the
+-- generation @gen@. Must be called with the root lock held. Raise an
+-- exception if the stream cannot be started, the watch keeps its stream.
+setRoots :: String -> Watch -> Gen -> [Root] -> IO ()
+setRoots name Watch{..} gen roots =
+    modifyMVar_ watchStreamState $ \ss ->
+        if null roots
+        then do
+            let (stops, rs) = Replace.stopAll (ssReplace ss)
+            ss1 <- stopStreams stops ss
+            return ss1 {ssReplace = rs}
+        else do
+            now <- c_currentEventId
+            let (since, stops, rs) = Replace.replace gen now (ssReplace ss)
+                flags = createFlags watchConfig
+            (sinceId, flags1) <-
+                case since of
+                    SinceNow -> (, flags) <$> c_eventIdSinceNow
+                    -- The full history flag reports all the events of the
+                    -- chunk of the start id, otherwise some events after
+                    -- it may be skipped.
+                    SinceId eid ->
+                        let full = kFSEventStreamCreateFlagFullHistory
+                        in return (eid, flags .|. full)
+            h <- withPathNames (map fst roots) $ \arraysPtr ->
+                    c_startStream
+                        watchPtr arraysPtr (fromIntegral (length roots))
+                        gen sinceId flags1
+            when (h == nullPtr)
+                $ ioError (userError (name ++ ": failed to create watch."))
+            -- The reader cannot read the records of the new stream before
+            -- the lock is released, its roots are known by then.
+            ss1 <- stopStreams stops ss
+            return
+                ss1
+                    { ssReplace = rs
+                    , ssHandles = (gen, h) : ssHandles ss1
+                    , ssRoots = (gen, roots) : ssRoots ss1
+                    }
+
+    where
+
+    withPathName :: Path -> (PathName -> IO a) -> IO a
+    withPathName path act =
+        A.unsafePinnedAsPtr (Path.toArray path) $ \ptr byteLen ->
+            act (PathName (castPtr ptr) (fromIntegral byteLen))
+
+    withPathNames = contListMap withPathName withArray
+
+deleteGen :: Gen -> [(Gen, a)] -> [(Gen, a)]
+deleteGen gen = filter ((/= gen) . fst)
+
+-- | @addRoot watch root@ adds the path @root@ as a root of the watch
+-- @watch@, with the 'Config' used to open the watch.
+--
+-- The events of @root@ that occur before 'addRoot' returns may not be
+-- reported. The events of the other roots of the watch are not lost or
+-- duplicated by the call, except on a volume that does not keep a history
+-- of file system events, e.g. a read-only or a network volume. On such a
+-- volume the events of the other roots that occur during the call may be
+-- lost, an 'isEventsLost' event may be reported in their place.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event. Raise an exception if the watch is closed, or if the new stream
+-- cannot be started, e.g. when the watch would have more than 4096 roots.
+--
+-- /Pre-release/
+--
+addRoot :: Watch -> Path -> IO ()
+addRoot wtch@Watch{..} root = do
+    -- Canonicalize before starting the stream, the OS resolves the symbolic
+    -- links in the roots when the stream is started.
+    r <- toRoot root
+    modifyMVar_ watchRootLock $ \st -> do
+        when (rsClosed st)
+            $ ioError (userError "addRoot: the watch is closed.")
+        let roots = rsRoots st ++ [r]
+            gen = rsGen st + 1
+        setRoots "addRoot" wtch gen roots
+        return st {rsRoots = roots, rsGen = gen}
+
+-- | Remove a root path from a 'Watch'. The path must be the same as the
+-- one used to add the root.
+--
+-- The events of the root that are queued before the call are reported. The
+-- events of the root may still be reported for a short time after the call
+-- returns, usually a few milliseconds. There is no event to mark the end of
+-- the events of the root, unlike the @isRootUnwatched@ event on Linux. A
+-- directory that is also watched via another root remains watched for that
+-- root.
+--
+-- The events of the other roots of the watch are not lost or duplicated by
+-- the call, except on a volume that does not keep a history of file system
+-- events, e.g. a read-only or a network volume. On such a volume the events
+-- of the other roots that occur during the call may be lost, an
+-- 'isEventsLost' event may be reported in their place.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event. Does nothing if the watch is closed or if the path is not a root
+-- of the watch.
+--
+-- /Pre-release/
+--
+removeRoot :: Watch -> Path -> IO ()
+removeRoot wtch@Watch{..} root =
+    modifyMVar_ watchRootLock $ \st -> do
+        let name = Path.toString root
+            roots = filter ((/= name) . Path.toString . fst) (rsRoots st)
+            gen = rsGen st + 1
+        if rsClosed st || length roots == length (rsRoots st)
+        then return st
+        else do
+            setRoots "removeRoot" wtch gen roots
+            return st {rsRoots = roots, rsGen = gen}
+
+-- | Close the read end of the pipe. closeFdWith wakes up the threads
+-- waiting for the fd to become readable, in the threaded RTS.
+closeReadFd :: CInt -> IO ()
+closeReadFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
+
+-- | Close a 'Watch' handle. The event streams of the watch end, a thread
+-- waiting for events in 'eventStream' is woken up. Closing a closed watch
+-- does nothing.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event.
+--
+-- With the non-threaded RTS, a thread waiting for events is not woken up
+-- while a child process created by @fork@ without @exec@ is running, unless
+-- the child has closed the file descriptors that it inherited.
+--
+-- /Pre-release/
+--
+closeWatch :: Watch -> IO ()
+closeWatch Watch{..} =
+    modifyMVar_ watchRootLock $ \st ->
+        if rsClosed st
+        then return st
+        else do
+            modifyMVar_ watchStreamState $ \ss -> do
+                let (stops, rs) = Replace.stopAll (ssReplace ss)
+                ss1 <- stopStreams stops ss
+                return ss1 {ssReplace = rs, ssClosed = True}
+            -- Waits for the stopped streams and closes the write end of the
+            -- pipe
+            c_destroyWatch watchPtr
+            modifyMVar_ watchFdLock $ \fs ->
+                -- The non-threaded RTS waits for the fds in select, select
+                -- fails with EBADF if a waited fd is closed, and the RTS
+                -- terminates the program. The last waiting thread closes
+                -- the fd.
+                if rtsSupportsBoundThreads || fsFdWaiters fs == 0
+                then do
+                    closeReadFd watchFd
+                    return fs {fsWatchClosed = True, fsFdOpen = False}
+                else return fs {fsWatchClosed = True}
+            return st {rsClosed = True}
+
+-- The FSEvents callbacks of a watch run on a dispatch queue and write the
+-- events to a POSIX pipe. 'readEvent' reads the events from the read end of
+-- the pipe.
+
+-- | Given a 'Config' and @paths@ start monitoring the paths for file system
+-- events. Returns a 'Watch' handle which can then be used to read the event
+-- stream or to close the watch.
+--
+-- The 'Config' is kept in the 'Watch', 'readEvent', 'eventStream' and
+-- 'addRoot' use it.
+--
+-- A process can use at most 512 FSEvents streams. A watch uses one of them,
+-- and more than one for a short time during 'addRoot' and 'removeRoot'.
+--
+-- Raise an exception if the watch cannot be started.
+--
+-- /Pre-release/
+--
+openWatch :: Config -> NonEmpty Path -> IO Watch
+openWatch cfg paths = do
+    -- XXX write a test case when path does not exist
+    -- XXX write a test case when there are no permissions
+    -- XXX check whether the path exists. If the path does not exist and
+    -- is created later it cannot be properly monitored. Also a user may
+    -- inadvertently provide a path for which the user may not have permission
+    -- and then later wonder why events are not being reported.
+    roots <- mapM toRoot (NonEmpty.toList paths)
+    -- The handle is not returned to the caller if starting the stream
+    -- fails, the caller cannot close it. 'mask' ensures that an async
+    -- exception cannot arrive between creating the watch and installing the
+    -- handler.
+    Exception.mask $ \restore -> do
+        w <- createWatch cfg
+        let start st = do
+                setRoots "openWatch" w 1 roots
+                return st {rsRoots = roots, rsGen = 1}
+        restore (modifyMVar_ (watchRootLock w) start)
+            `onException` closeWatch w
+        return w
+
+-------------------------------------------------------------------------------
+-- Reading events
+-------------------------------------------------------------------------------
+
+-- | The result of a read of the pipe.
+data ReadResult =
+      ReadClosed -- ^ The watch is closed
+    | ReadData (Array Word8)
+      -- | No data is available. The action waits for it, it must be run.
+    | ReadWait (IO ())
+
+-- | Read the bytes available in the pipe of a watch, without waiting. If
+-- none are available, returns an action that waits for them.
+--
+-- The wait is registered, or counted, before the action is returned. The
+-- caller must mask async exceptions and must run the action. The action can
+-- be interrupted by an async exception.
+readPipe :: Watch -> IO ReadResult
+readPipe Watch{watchFd = fd, watchFdLock = lock} =
+    modifyMVar lock $ \st ->
+        if fsWatchClosed st
+        then return (st, ReadClosed)
+        else do
+            resRef <- newIORef 0
+            arr <- MArray.unsafeCreateWithPtr' bufSize $ \p -> do
+                n <- c_read fd p (fromIntegral bufSize)
+                writeIORef resRef n
+                return (max 0 (fromIntegral n))
+            n <- readIORef resRef
+            if n > 0
+            then return (st, ReadData (unsafeFreezeWithShrink arr))
+            -- The write end is closed only by 'closeWatch'
+            else if n == 0
+            then return (st, ReadClosed)
+            else do
+                errno <- getErrno
+                if errno == eAGAIN || errno == eWOULDBLOCK || errno == eINTR
+                then fmap ReadWait <$> register st
+                else throwErrno "readEvent"
+
+    where
+
+    bufSize = 32 * 1024
+
+    -- In the threaded RTS, the wait is registered with the IO manager with
+    -- the lock held, if 'closeWatch' closes the fd after that, the wait
+    -- raises an exception. If the fd were closed before the registration, the
+    -- registration could wait on a reused fd number.
+    --
+    -- In the non-threaded RTS, the waiting thread is counted with the lock
+    -- held, 'closeWatch' does not close the fd while the thread waits.
+    register st =
+        if rtsSupportsBoundThreads
+        then do
+            (wait, unregister) <- threadWaitReadSTM (Fd fd)
+            -- The next read returns 'ReadClosed' if the exception is due to
+            -- 'closeWatch'.
+            let waitTh =
+                    Exception.interruptible (atomically wait)
+                        `catchIOError` (\_ -> return ())
+                        `onException` unregister
+            return (st, waitTh)
+        else do
+            -- The lock is never held across a blocking call, taking it
+            -- uninterruptibly cannot block for long.
+            let waitNonTh =
+                    Exception.interruptible (threadWaitRead (Fd fd))
+                        `finally` Exception.uninterruptibleMask_
+                            (modifyMVar_ lock unregisterNonTh)
+            return (st {fsFdWaiters = fsFdWaiters st + 1}, waitNonTh)
+
+    unregisterNonTh st = do
+        let st1 = st {fsFdWaiters = fsFdWaiters st - 1}
+        if fsWatchClosed st1 && fsFdOpen st1 && fsFdWaiters st1 == 0
+        then do
+            closeReadFd fd
+            return st1 {fsFdOpen = False}
+        else return st1
+
+-- | Process a record: forget the generation of a retired stream, stop the
+-- streams that are replaced, and find the root of an event. Returns
+-- 'Nothing' for a retired stream, for an event not reported while the
+-- streams are replaced, and for an event not reported in the non-recursive
+-- mode.
+processRecord :: Watch -> Record -> IO (Maybe Event)
+processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
+    modifyMVar streams $ \ss -> go ss rec
+
+    where
+
+    fileEvents = createFlags cfg .&. kFSEventStreamCreateFlagFileEvents /= 0
+
+    go ss (RecordRetired gen) =
+        return
+            ( ss
+                { ssReplace = Replace.onRetired gen (ssReplace ss)
+                , ssRoots = deleteGen gen (ssRoots ss)
+                }
+            , Nothing
+            )
+    go ss (RecordEvent gen ev) = do
+        let (report, stops, rs) =
+                Replace.onEvent
+                    gen (eventId ev) (isHistoryDone ev) (ssReplace ss)
+        -- After 'closeWatch' the streams are stopped already
+        ss1 <-
+            if ssClosed ss
+            then return ss {ssReplace = rs}
+            else (\x -> x {ssReplace = rs}) <$> stopStreams stops ss
+        if not report
+        then return (ss1, Nothing)
+        else do
+            ev1 <- setRoot (fromMaybe [] (lookup gen (ssRoots ss1))) ev
+            if watchRec cfg || isNonRecursiveEvent fileEvents ev1
+            then return (ss1, Just ev1)
+            else return (ss1, Nothing)
+
+-- | The result of a step of 'readEvent'.
+data ReadStep =
+      StepEvent Event ReadState
+    | StepContinue ReadState -- ^ No event yet, run the next step
+      -- | No data is available. The action waits for it, it must be run.
+    | StepWait (IO ())
+    | StepEnd -- ^ The watch is closed and all the records are returned
+
+-- | Read the next event from a 'Watch', wait for one if none is available.
+-- Returns 'Nothing' when the watch is closed, and on every later call.
+--
+-- While a thread reads the watch, other threads can use 'addRoot',
+-- 'removeRoot' and 'closeWatch' on it.
+--
+-- More than one thread can read the same watch at the same time, using
+-- 'readEvent' or 'eventStream'. Each event is returned to exactly one of
+-- the readers. The reads run one at a time: while a thread reads, including
+-- while it waits for an event, the other readers wait for it to finish.
+-- Each reader gets its events in the order in which they occurred. When the
+-- watch is closed, every reader gets 'Nothing'.
+--
+-- A read that is interrupted by an async exception while it waits for an
+-- event, for example, by a timeout, does not lose any event. The next read
+-- returns the first event not yet read.
+--
+-- /Pre-release/
+--
+readEvent :: Watch -> IO (Maybe Event)
+readEvent wtch@Watch{watchReadState = stRef} =
+    Exception.mask_ $ takeMVar stRef >>= loop
+
+    where
+
+    loop st = do
+        -- The step does not block, see 'readPipe'. Running it
+        -- uninterruptibly does not lose the bytes read from the pipe, and
+        -- does not process a record without removing it from the buffer.
+        r <- try (Exception.uninterruptibleMask_ (step st))
+        case r of
+            Left (e :: SomeException) -> putMVar stRef st >> throwIO e
+            Right (StepEvent ev st1) -> putMVar stRef st1 >> return (Just ev)
+            Right (StepContinue st1) -> loop st1
+            Right (StepWait wait) -> do
+                wait `onException` putMVar stRef st
+                loop st
+            Right StepEnd -> putMVar stRef st >> return Nothing
+
+    -- Parse and process one record of the buffer. Read the pipe only when
+    -- the buffer does not hold a complete record.
+    step st = do
+        r <- parseRecord (rdBuffer st)
+        case r of
+            Just (rec, rest) -> do
+                mev <- processRecord wtch rec
+                let st1 = st {rdBuffer = rest}
+                return $ maybe (StepContinue st1) (`StepEvent` st1) mev
+            Nothing | rdEnded st -> return StepEnd
+            Nothing -> do
+                res <- readPipe wtch
+                case res of
+                    -- We do not use StepEnd here because it does not carry the
+                    -- state, the next step returns StepEnd after this state is
+                    -- passed on and updated.
+                    ReadClosed ->
+                        return
+                            $ StepContinue
+                                st {rdBuffer = mempty, rdEnded = True}
+                    ReadWait wait -> return (StepWait wait)
+                    ReadData chunk ->
+                        return
+                            $ StepContinue st {rdBuffer = rdBuffer st <> chunk}
+
+-- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
+-- stream does not close the watch, use 'closeWatch' to close it. The stream
+-- ends when the watch is closed.
+--
+-- A stream can stop reading before the watch is closed. The next stream on
+-- the watch starts with the first event not yet read.
+--
+-- The stream reports the events of the current roots of the watch: after
+-- 'addRoot' it reports the events of the new root, after 'removeRoot' it
+-- stops reporting the events of the removed root. See those functions for
+-- the events reported while the roots change.
+--
+-- More than one stream can read the same watch at the same time. See
+-- 'readEvent' for how the events are divided among the readers.
+--
+-- /Pre-release/
+--
+eventStream :: Watch -> Stream IO Event
+eventStream wtch = S.unfoldrM step ()
+
+    where
+
+    step () = fmap (\ev -> (ev, ())) <$> readEvent wtch
 
 -- | Start monitoring a list of file system paths for file system events with
 -- the supplied configuration operation over the 'defaultConfig'. The paths
@@ -554,30 +1117,20 @@ filterNonRecursive fileEvents = S.filter isWatched
 --      ('setIgnoreSelf' 'True' . 'setRootPathEvents' 'True')
 --      [Path.fromString "path"]
 -- @
+--
+-- Each run of the stream opens a new watch and closes it when the stream
+-- ends. The handle of the watch is not exposed, so the roots of the watch
+-- are the given paths for as long as the stream runs. To add or remove
+-- roots while reading the events, open the watch using 'openWatch', read it
+-- using 'eventStream' and change the roots using 'addRoot' and
+-- 'removeRoot'.
 watchWith ::
     (Config -> Config) -> NonEmpty Path -> Stream IO Event
-watchWith f paths = S.bracketIO before after toStream
+watchWith f paths = S.bracketIO before closeWatch eventStream
 
     where
 
-    cfg = f defaultConfig
-
-    before = do
-        -- Canonicalize before starting the watch, the OS resolves the
-        -- symbolic links in the roots when the watch is started.
-        roots <- mapM toRoot (NonEmpty.toList paths)
-        w <- openWatch cfg paths
-        return (w, roots)
-
-    after (w, _) = closeWatch w
-
-    toStream (w, roots) =
-        let events = S.mapM (setRoot roots) (watchToStream w)
-            fileEvents =
-                createFlags cfg .&. kFSEventStreamCreateFlagFileEvents /= 0
-         in if watchRec cfg
-            then events
-            else filterNonRecursive fileEvents events
+    before = openWatch (f defaultConfig) paths
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --

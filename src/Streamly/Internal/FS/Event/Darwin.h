@@ -1,6 +1,7 @@
 #include <config.h>
 
 struct watch;
+struct streamCtx;
 
 struct pathName {
     const UInt8 *pathBytes;
@@ -8,16 +9,26 @@ struct pathName {
 };
 
 int createWatch
-    ( struct pathName* folders
-    , int n  /* number of entries in "folders" */
-    , UInt32 createFlags
-    , UInt64 since
-    , double latency
+    ( double latency
     , int* fd
     , void** wp
     );
 
+void *startStream
+    ( struct watch* w
+    , struct pathName* folders
+    , int n  /* number of entries in "folders" */
+    , UInt64 gen
+    , UInt64 since
+    , UInt32 createFlags
+    );
+
+void stopStream(struct streamCtx* ctx);
+
 void destroyWatch(struct watch* w);
+
+UInt64 currentEventId(void);
+UInt64 eventIdSinceNow(void);
 
 /******************************************************************************
  * Create Flags

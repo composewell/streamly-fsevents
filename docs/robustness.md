@@ -219,6 +219,22 @@ macOS:
 * Closing a watch waits for a running callback to finish. A callback
   blocked on a full event pipe does not raise `SIGPIPE`, and closing the
   watch does not hang if a child process holds the pipe.
+* Handle API: `addRoot` and `removeRoot` do not lose the events of the
+  other roots of the watch and do not report them twice. A model test
+  checks this for random interleavings of root changes and events. In a
+  test, 2000 files created while 20 roots were added and removed were
+  all reported once. On a volume that does not keep a history of file
+  system events, e.g. a read-only or a network volume, the events of the
+  other roots that occur during the call may be lost, an `isEventsLost`
+  event may be reported in their place.
+* Handle API: after `removeRoot`, the events of the root can be reported
+  for a short time after the call returns, usually a few milliseconds.
+  There is no `isRootUnwatched` event.
+* Handle API: `addRoot`, `removeRoot` and `closeWatch` do not wait for the
+  thread reading the watch. A thread waiting in `readEvent` is woken up by
+  `closeWatch`. With the non-threaded RTS it is not woken up while a child
+  process created by `fork` without `exec` is running, unless the child
+  has closed the file descriptors that it inherited.
 
 Windows:
 

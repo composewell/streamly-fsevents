@@ -12,7 +12,8 @@
 #include <CoreServices/CoreServices.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <FS/Event/Darwin.h>
 
@@ -21,9 +22,8 @@
  * https://developer.apple.com/documentation/coreservices/file_system_events?language=objc
  * https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html
  *
- * An OS thread is started which runs the event loop. A pipe is created
- * and the events are sent to the pipes. The receiver can read the pipe
- * output end to get the events.
+ * The FSEvents callbacks run on a dispatch queue. They write the events to
+ * a pipe, the receiver reads them from the read end of the pipe.
  */
 
 /******************************************************************************
@@ -145,6 +145,38 @@ UInt32 FSEventStreamEventFlagItemIsLastHardlink () {
  * Event watch
  *****************************************************************************/
 
+/*
+ * A watch is a dispatch queue and a pipe. The streams of a watch are
+ * started and stopped by the Haskell code, see the Haskell module
+ * Streamly.Internal.FS.Event.Darwin.Replace. The callbacks of all the
+ * streams of a watch run on the serial queue and write the events to the
+ * pipe. The receiver reads the events from the read end of the pipe.
+ *
+ * Each stream has a generation number, given by the caller of
+ * startStream. A record in the pipe is five UInt64 values: the record
+ * kind, the generation, the event id, the event flags, the path length,
+ * followed by the path bytes. RECORD_EVENT is an event. RECORD_RETIRED is
+ * written after the last event of a stopped stream, its other fields
+ * except the generation are 0.
+ */
+
+#define RECORD_EVENT 0
+#define RECORD_RETIRED 1
+
+struct watch
+{
+    dispatch_queue_t queue;
+    int writefd;
+    double latency;
+};
+
+struct streamCtx
+{
+    struct watch *w;
+    FSEventStreamRef stream;
+    UInt64 gen;
+};
+
 /* Write all the bytes, give up on an error, e.g. EPIPE */
 static void writeAll(int fd, const void *buf, size_t len)
 {
@@ -162,28 +194,28 @@ static void writeAll(int fd, const void *buf, size_t len)
     }
 }
 
-/* Write an event to the pipe input fd */
-static void writeEvent(int fd, UInt64 eventId, UInt64 eventFlags, char* path)
+static void writeRecord
+    ( int fd
+    , UInt64 kind
+    , UInt64 gen
+    , UInt64 eventId
+    , UInt64 eventFlags
+    , const char *path
+    )
 {
-    UInt64 buf[3];
+    UInt64 buf[5];
     /* XXX Is the path string in UTF-8? */
-    size_t len = strlen(path);
+    size_t len = path ? strlen(path) : 0;
 
-    buf[0] = eventId;
-    buf[1] = eventFlags;
-    buf[2] = (UInt64)len;
-    writeAll(fd, buf, 3 * sizeof(UInt64));
+    buf[0] = kind;
+    buf[1] = gen;
+    buf[2] = eventId;
+    buf[3] = eventFlags;
+    buf[4] = (UInt64)len;
+    writeAll(fd, buf, sizeof buf);
     writeAll(fd, path, len);
 }
 
-struct watch
-{
-    FSEventStreamRef eventStream;
-    dispatch_queue_t queue;
-    int writefd;
-};
-
-/* Just writes the event to the pipe input fd */
 static void watchCallback
     ( ConstFSEventStreamRef streamRef
     , void *clientCallBackInfo
@@ -194,11 +226,13 @@ static void watchCallback
     )
 {
     int i;
-    struct watch *w = clientCallBackInfo;
+    struct streamCtx *ctx = clientCallBackInfo;
     char **paths = eventPaths;
 
     for (i = 0; i < n; i++) {
-        writeEvent(w->writefd, eventIds[i], eventFlags[i], paths[i]);
+        writeRecord
+            ( ctx->w->writefd, RECORD_EVENT, ctx->gen, eventIds[i]
+            , eventFlags[i], paths[i]);
     }
 }
 
@@ -212,20 +246,143 @@ static void free_cffolders(CFStringRef *cffolders, int n) {
     free(cffolders);
 }
 
-int createWatch
-    ( struct pathName* folders
-    , int n  /* number of entries in folders */
-    , UInt32 createFlags
+static CFArrayRef makePathArray(struct pathName *folders, int n)
+{
+    int i;
+    CFStringRef *cffolders = malloc(n * sizeof(CFStringRef));
+    if (!cffolders) {
+      return NULL;
+    }
+
+    for(i = 0; i < n; i++) {
+      cffolders[i] = CFStringCreateWithBytes
+          ( NULL
+          , folders[i].pathBytes
+          , folders[i].pathLen
+          , kCFStringEncodingUTF8
+          , false
+          );
+      if (!cffolders[i]) {
+          free_cffolders(cffolders, i);
+          return NULL;
+      }
+    }
+    /* The array retains the strings */
+    CFArrayRef paths =
+        CFArrayCreate
+            (NULL, (const void **)cffolders, n, &kCFTypeArrayCallBacks);
+    free_cffolders(cffolders, n);
+    return paths;
+}
+
+UInt64 currentEventId(void)
+{
+    return FSEventsGetCurrentEventId();
+}
+
+UInt64 eventIdSinceNow(void)
+{
+    return kFSEventStreamEventIdSinceNow;
+}
+
+/*
+ * Create and start a stream on the n paths in folders, on the queue of the
+ * watch, with the generation number gen. Returns NULL on failure.
+ */
+void *startStream
+    ( struct watch *w
+    , struct pathName* folders
+    , int n
+    , UInt64 gen
     , UInt64 since
-    , double latency
+    , UInt32 createFlags
+    )
+{
+    if (n <= 0 || n > MAX_WATCH_PATHS) {
+      return NULL;
+    }
+
+    struct streamCtx *ctx = malloc(sizeof(struct streamCtx));
+    if (!ctx) {
+      return NULL;
+    }
+    ctx->w = w;
+    ctx->gen = gen;
+
+    CFArrayRef paths = makePathArray(folders, n);
+    if (!paths) {
+      goto cleanup_ctx;
+    }
+
+    FSEventStreamContext fsctx;
+    fsctx.version = 0;
+    fsctx.info = (void*)ctx;
+    fsctx.retain = NULL;
+    fsctx.release = NULL;
+    fsctx.copyDescription = NULL;
+
+    ctx->stream = FSEventStreamCreate
+        ( NULL, &watchCallback, &fsctx, paths, since, w->latency
+        , createFlags);
+    CFRelease(paths);
+
+    if (ctx->stream == NULL) {
+      goto cleanup_ctx;
+    }
+
+    FSEventStreamSetDispatchQueue(ctx->stream, w->queue);
+    /*
+     * Start fails e.g. for the streams beyond the 512th in a process.
+     */
+    if (!FSEventStreamStart(ctx->stream)) {
+      /* Stop is not allowed on a stream that is not started */
+      FSEventStreamInvalidate(ctx->stream);
+      FSEventStreamRelease(ctx->stream);
+      goto cleanup_ctx;
+    }
+    return ctx;
+
+cleanup_ctx:
+    free(ctx);
+    return NULL;
+}
+
+/* Runs on the queue, after the last callback of the stream */
+static void retireStream(void *p)
+{
+    struct streamCtx *ctx = p;
+
+    FSEventStreamRelease(ctx->stream);
+    writeRecord(ctx->w->writefd, RECORD_RETIRED, ctx->gen, 0, 0, NULL);
+    free(ctx);
+}
+
+/*
+ * Stop a stream started by startStream. The stream is released, and its
+ * retired record is written, on the queue after its last callback. Does
+ * not wait for the queue. Must not be called after destroyWatch.
+ */
+void stopStream(struct streamCtx *ctx)
+{
+    /*
+     * Stop and invalidate do not wait for a callback running on the queue,
+     * it may run after they return. The callbacks already queued run
+     * before retireStream.
+     */
+    FSEventStreamStop(ctx->stream);
+    FSEventStreamInvalidate(ctx->stream);
+    dispatch_async_f(ctx->w->queue, ctx, retireStream);
+}
+
+/*
+ * Create a watch without any stream. startStream starts the streams.
+ */
+int createWatch
+    ( double latency
     , int* fd
     , void** wp
     )
 {
-    if (n > MAX_WATCH_PATHS) {
-      return -1;
-    }
-
     int pfds[2];
     if (pipe (pfds)) {
       return -1;
@@ -238,20 +395,19 @@ int createWatch
     }
 
     /*
-     * The read end is closed before the stream is stopped, the callback may
-     * write to the pipe after that. Return EPIPE instead of raising SIGPIPE,
-     * which terminates the process unless it is ignored.
+     * The receiver waits for the read end to become readable via the RTS.
      */
-    if (fcntl(pfds[1], F_SETNOSIGPIPE, 1)) {
+    if (fcntl(pfds[0], F_SETFL, O_NONBLOCK)) {
       goto cleanup_pipe;
     }
 
     /*
-     * XXX We can possibly use since == 0 to get all events since
-     * beginning of time
+     * The read end may be closed before the streams are stopped, the
+     * callback may write to the pipe after that. Return EPIPE instead of
+     * raising SIGPIPE, which terminates the process unless it is ignored.
      */
-    if (!since) {
-      since = kFSEventStreamEventIdSinceNow;
+    if (fcntl(pfds[1], F_SETNOSIGPIPE, 1)) {
+      goto cleanup_pipe;
     }
 
     struct watch *w = malloc(sizeof(struct watch));
@@ -259,73 +415,18 @@ int createWatch
       goto cleanup_pipe;
     }
 
-    /* Setup paths array */
-    CFStringRef *cffolders = malloc(n * sizeof(CFStringRef));
-    if (!cffolders) {
-      goto cleanup_watch;
-    }
-
-    /* Create event stream using paths and context*/
-    int i;
-    for(i = 0; i < n; i++) {
-      cffolders[i] = CFStringCreateWithBytes
-          ( NULL
-          , folders[i].pathBytes
-          , folders[i].pathLen
-          , kCFStringEncodingUTF8
-          , false
-          );
-      if (!cffolders[i]) {
-          free_cffolders(cffolders, i);
-          goto cleanup_watch;
-      }
-    }
-    CFArrayRef paths = CFArrayCreate(NULL, (const void **)cffolders, n, NULL);
-    if (!paths) {
-      free_cffolders(cffolders, n);
-      goto cleanup_watch;
-    }
-
-    FSEventStreamContext ctx;
-    ctx.version = 0;
-    ctx.info = (void*)w;
-    ctx.retain = NULL;
-    ctx.release = NULL;
-    ctx.copyDescription = NULL;
-
-    w->eventStream = FSEventStreamCreate
-        (NULL, &watchCallback, &ctx, paths, since, latency, createFlags);
-    free_cffolders(cffolders, n);
-    CFRelease(paths);
-
-    if(w->eventStream == NULL) {
-      goto cleanup_watch;
-    }
-
     w->queue = dispatch_queue_create("com.composewell.streamly", NULL);
     if (!w->queue) {
-      goto cleanup_es;
+      free(w);
+      goto cleanup_pipe;
     }
 
     w->writefd = pfds[1];
+    w->latency = latency;
     *fd = pfds[0];
     *wp = w;
-    FSEventStreamSetDispatchQueue(w->eventStream, w->queue);
-    /*
-     * Start fails e.g. for the streams beyond the 512th in a process.
-     */
-    if (!FSEventStreamStart(w->eventStream)) {
-      /* Stop is not allowed on a stream that is not started */
-      FSEventStreamInvalidate(w->eventStream);
-      dispatch_release(w->queue);
-      goto cleanup_es;
-    }
     return 0;
 
-cleanup_es:
-    FSEventStreamRelease(w->eventStream);
-cleanup_watch:
-    free(w);
 cleanup_pipe:
     close(pfds[0]);
     close(pfds[1]);
@@ -341,28 +442,22 @@ static void noop(void *ctx) {
 }
 
 /*
- * The read end of the pipe must be closed before calling this, so that a
- * callback blocked writing to a full pipe fails with EPIPE.
+ * Destroy a watch. All its streams must have been stopped by stopStream.
+ * Waits for the callbacks and the retireStream of the streams to finish.
  */
 void destroyWatch(struct watch* w) {
     /*
-     * Stop and invalidate operations do not wait for a callback running
-     * on the queue, it may run after they return.
-     */
-    FSEventStreamStop(w->eventStream);
-    FSEventStreamInvalidate(w->eventStream);
-
-    /*
      * A write to a full pipe stays blocked as long as the read end is open
-     * in any process. Closing our read fd does not close the read end if
-     * a child process holds a copy of it. The read fd has FD_CLOEXEC, but
-     * a child can still hold a copy if it forked before FD_CLOEXEC was set
-     * on the fd (pipe and fcntl are separate calls), or if it forked
-     * without exec.
+     * in any process. The receiver may not be reading the pipe. Closing our
+     * read fd does not close the read end if a child process holds a copy
+     * of it. The read fd has FD_CLOEXEC, but a child can still hold a copy
+     * if it forked before FD_CLOEXEC was set on the fd (pipe and fcntl are
+     * separate calls), or if it forked without exec.
      *
      * Replacing the write fd with /dev/null wakes up the blocked write.
      * The remaining writes of the callback go to /dev/null and complete,
-     * and the callback returns.
+     * and the callback returns. The read end then reports end of file, if
+     * no child process holds a copy of the write end.
      *
      * We use dup2 instead of close. The callback writes to the fd number
      * in w->writefd. Close would free that number, and a file or socket
@@ -377,10 +472,12 @@ void destroyWatch(struct watch* w) {
         close(devnull);
     }
 
-    /* Wait for the callback running on the serial queue, if any */
+    /*
+     * Wait for the callback running on the serial queue, if any, and for
+     * the retireStream of the stopped streams, which release them.
+     */
     dispatch_sync_f(w->queue, NULL, noop);
     dispatch_release(w->queue);
-    FSEventStreamRelease(w->eventStream);
     close(w->writefd);
     free(w);
 }

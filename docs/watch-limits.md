@@ -55,9 +55,10 @@ limit costs nothing until that many watches are added.
 
 * Paths in one watch: `MAX_WATCH_PATHS` in this library. It counts the watch
   roots, not the directories in the tree.
-* Event streams: each watch uses one event stream. The limit of 512 for a
-  process is tested with this library. Third party reports also give a limit
-  of 1024 for the system, which is not tested.
+* Event streams: each watch uses one event stream, and more than one for a
+  short time while its roots are changed with the handle API. The limit of
+  512 for a process is tested with this library. Third party reports also
+  give a limit of 1024 for the system, which is not tested.
 * `isKernelDropped` and `isUserDropped`, in the macOS module, give the reason
   for an `isEventsLost` event if events were dropped.
 

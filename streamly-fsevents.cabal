@@ -243,6 +243,7 @@ library
           c-sources: src/Streamly/Internal/FS/Event/Darwin.c
           exposed-modules: Streamly.FileSystem.Event.Darwin
                            Streamly.Internal.FS.Event.Darwin
+          other-modules: Streamly.Internal.FS.Event.Darwin.Replace
 
     if os(linux)
           exposed-modules: Streamly.FileSystem.Event.Linux
@@ -255,14 +256,11 @@ library
     build-depends:
                        base              >= 4.12  && < 4.23
                      , streamly-core     >= 0.3.1 && < 0.3.4
+                     , containers        >= 0.6.0 && < 0.9
 
     if flag(fusion-plugin)
       build-depends:
         fusion-plugin     >= 0.2   && < 0.3
-
-    -- For FS.Event module
-    if os(linux)
-      build-depends: containers >= 0.6.0 && < 0.9
 
     if os(windows)
       build-depends: Win32 >= 2.6 && < 2.15

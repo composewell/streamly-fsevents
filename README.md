@@ -30,10 +30,10 @@ Windows the operating system does this work.
 * `Streamly.FileSystem.Event` has the same API on Linux, macOS and Windows.
 * The `.Linux`, `.Darwin` and `.Windows` modules add OS-specific features.
 * Streaming API: `watch` returns a stream; the watch is opened and closed for you.
-* Handle API (Linux, internal): `openWatch` opens a watch, `addRoot` and
-  `removeRoot` add or remove paths, `readEvent` reads one event,
-  `eventStream` reads the events as a stream, `closeWatch` closes the watch.
-  Several threads can read one watch.
+* Handle API (Linux and macOS, internal): `openWatch` opens a watch,
+  `addRoot` and `removeRoot` add or remove paths, `readEvent` reads one
+  event, `eventStream` reads the events as a stream, `closeWatch` closes the
+  watch. Several threads can read one watch.
 * On Linux, moving a directory into the tree reports every file in it as created.
 * On Linux, an unreadable subdirectory is reported and skipped; the rest of the
   tree stays watched.
