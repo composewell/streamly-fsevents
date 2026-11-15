@@ -49,8 +49,6 @@ to test it on Windows. Delete an entry when it is fixed.
   stream.
 - Deleting the watch root or removing the volume produces no event for
   the root; the stream most likely ends with an exception.
-- With the non-threaded RTS each blocking call stalls all Haskell threads
-  until the next change.
 
 ## Unverified suspicions
 
@@ -79,5 +77,5 @@ to test it on Windows. Delete an entry when it is fixed.
    missing-root test should time out before the commit "Windows: make the
    ReadDirectoryChangesW call interruptible".
 4. Manually: delete the watch root during a watch, force an overflow on
-   an SMB share, unplug a USB volume, and build with the non-threaded
-   RTS.
+   an SMB share, unplug a USB volume, and check that a watch built with
+   the non-threaded RTS raises an exception when it starts.

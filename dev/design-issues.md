@@ -311,3 +311,34 @@ Proposed options:
   off, a link whose target is outside the root is not followed.
 
 Status: open.
+
+## Windows: support the non-threaded RTS
+
+Each watch root is read by a thread blocked in a synchronous
+`ReadDirectoryChangesW` call. With the non-threaded RTS the call blocks all
+the Haskell threads until a change occurs under that root: the program does
+not do anything else while waiting, a watch of several roots delays the
+events of the other roots until a change occurs under the blocked root, and
+a stopped watch is cleaned up only after the next change, because the RTS
+cannot cancel the call with `CancelSynchronousIo` from another OS thread.
+`watchWith` raises an exception when the stream starts if the program uses
+the non-threaded RTS.
+
+### Option 1: overlapped call with polling
+
+Issue an overlapped `ReadDirectoryChangesW` call and poll the `OVERLAPPED`
+structure with `HasOverlappedIoCompleted`, with a `threadDelay` between the
+polls. A stopped watch cancels the call with `CancelIoEx`. This works with
+both the RTS kinds, at the cost of the polling interval in latency and one
+wakeup per interval for each root, even when nothing changes.
+
+### Option 2: the native Windows I/O manager
+
+GHC's native I/O manager (WinIO) completes overlapped I/O through an I/O
+completion port without blocking the RTS. It is used only when the program
+runs with `+RTS --io-manager=native`, and its API is in `GHC.Event.Windows`,
+which is internal to `base` and has changed between GHC versions. The
+library would still need the threaded RTS, or option 1, for programs that
+use the default I/O manager.
+
+Status: open.
