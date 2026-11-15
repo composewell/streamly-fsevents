@@ -24,6 +24,24 @@ module Streamly.Internal.FS.Event
     , watchRecursive
     , watchWith
 
+#if !defined(CABAL_OS_WINDOWS)
+    -- ** Handle APIs
+    -- XXX Windows does not have the handle API yet.
+    -- TODO: When these are exported from Streamly.FileSystem.Event, add a
+    -- "Handle API" section to docs/platform-differences.md: no
+    -- isRootUnwatched event on macOS, the events of a removed root can be
+    -- reported until the FSEvents replay ends; no FSEvents history on
+    -- read-only and network volumes, a root change may report isEventsLost;
+    -- no handle API on Windows.
+    , Watch
+    , openWatch
+    , closeWatch
+    , readEvent
+    , eventStream
+    , addRoot
+    , removeRoot
+#endif
+
     -- * Handling Events
     , Event
     , getRoot
@@ -49,10 +67,10 @@ import Streamly.Data.Stream (Stream)
 import Streamly.FileSystem.Path (Path)
 
 #if defined(CABAL_OS_DARWIN)
-import Streamly.Internal.FS.Event.Darwin (Config, Event)
+import Streamly.Internal.FS.Event.Darwin (Config, Event, Watch)
 import qualified Streamly.Internal.FS.Event.Darwin as Event
 #elif defined(CABAL_OS_LINUX)
-import Streamly.Internal.FS.Event.Linux (Config, Event)
+import Streamly.Internal.FS.Event.Linux (Config, Event, Watch)
 import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
 import Streamly.Internal.FS.Event.Windows (Config, Event)
@@ -110,6 +128,13 @@ setRecursiveMode = Event.setRecursiveMode
 -- @
 -- watchWith (setRecursiveMode True . Linux.setFollowSymLinks False) paths
 -- @
+--
+-- Each run of the stream opens a new watch and closes it when the stream ends.
+-- The handle of the watch is not exposed, so the roots of the watch remain
+-- fixed for as long as the stream runs. To add or remove roots while reading
+-- the events, open the watch using 'openWatch', read it using 'eventStream'
+-- and change the roots using 'addRoot' and 'removeRoot'. The handle API is
+-- available on Linux and macOS only.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith = Event.watchWith
 
@@ -140,6 +165,8 @@ watchWith = Event.watchWith
 -- in the subdirectories of the watch root are not watched. Use
 -- 'watchRecursive' to watch the whole directory tree.
 --
+-- The roots cannot be changed while the stream runs, see 'watchWith'.
+--
 -- >>> watch = watchWith id
 watch :: NonEmpty Path -> Stream IO Event
 watch = Event.watch
@@ -150,6 +177,81 @@ watch = Event.watch
 -- >>> watchRecursive = watchWith (setRecursiveMode True)
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = Event.watchRecursive
+
+#if !defined(CABAL_OS_WINDOWS)
+-------------------------------------------------------------------------------
+-- Handle APIs
+-------------------------------------------------------------------------------
+
+-- | Start monitoring the paths, with the supplied modifications applied to
+-- the default 'Config', and return a handle to the watch. The watch is
+-- active when the call returns: a change made after it is reported. Use
+-- 'closeWatch' to close the watch.
+--
+-- Raise an exception if the watch cannot be started.
+--
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
+openWatch f = Event.openWatch (f Event.defaultConfig)
+
+-- | Close a watch. The streams reading the watch end, a thread waiting in
+-- 'readEvent' returns 'Nothing'. Closing a closed watch does nothing. Can be
+-- called from any thread.
+--
+closeWatch :: Watch -> IO ()
+closeWatch = Event.closeWatch
+
+-- | Read the next event of a watch, wait for one if none is available.
+-- Returns 'Nothing' when the watch is closed. Several threads can read the
+-- same watch, each event is returned to one of them.
+--
+readEvent :: Watch -> IO (Maybe Event)
+readEvent = Event.readEvent
+
+-- | The events of a watch as a stream, using 'readEvent'. The stream ends
+-- when the watch is closed, it does not close the watch.
+--
+-- The stream reports the events of the current roots of the watch: after
+-- 'addRoot' it reports the events of the new root, after 'removeRoot' it
+-- stops reporting the events of the removed root. See those functions for
+-- the events reported while the roots change.
+--
+eventStream :: Watch -> Stream IO Event
+eventStream = Event.eventStream
+
+-- | Add a root to a watch. Can be called from any thread, including while
+-- another thread reads the watch. The events of the root that occur before
+-- the call returns may not be reported. Raise an exception if the watch is
+-- closed.
+--
+-- The events of the other roots of the watch are not lost or duplicated by
+-- the call. On macOS this does not hold on a volume that does not keep a
+-- history of file system events, e.g. a read-only or a network volume: the
+-- events of the other roots that occur during the call may be lost, an
+-- 'isEventsLost' event may be reported in their place.
+--
+-- /Linux and macOS only/
+addRoot :: Watch -> Path -> IO ()
+addRoot = Event.addRoot
+
+-- | Remove a root from a watch, the path must be the same as the one used to
+-- add it. The events of the root queued before the call are reported. Does
+-- nothing if the watch is closed or the path is not a root.
+--
+-- On Linux the end of the events of the root is reported by @isRootUnwatched@
+-- events. On macOS there is no such event, and the events of the root may be
+-- reported for a short time after the call returns, usually a few
+-- milliseconds.
+--
+-- The events of the other roots of the watch are not lost or duplicated by
+-- the call. On macOS this does not hold on a volume that does not keep a
+-- history of file system events, e.g. a read-only or a network volume: the
+-- events of the other roots that occur during the call may be lost, an
+-- 'isEventsLost' event may be reported in their place.
+--
+-- /Linux and macOS only/
+removeRoot :: Watch -> Path -> IO ()
+removeRoot = Event.removeRoot
+#endif
 
 -------------------------------------------------------------------------------
 -- Handling Events

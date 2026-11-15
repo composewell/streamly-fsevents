@@ -3316,6 +3316,11 @@ readEvent
 -- A stream can stop reading before the watch is closed. The next stream on
 -- the watch starts with the first event not yet read.
 --
+-- The stream reports the events of the current roots of the watch: after
+-- 'addRoot' it reports the events of the new root, after 'removeRoot' it
+-- stops reporting the events of the removed root. See those functions for
+-- the events reported while the roots change.
+--
 -- More than one stream can read the same watch at the same time. See
 -- 'readEvent' for how the events are divided among the readers, and for
 -- async exceptions and failures.
@@ -3341,6 +3346,13 @@ eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 --      ('setFollowSymLinks' True . 'setExcludeUnlinked' False)
 --      [Path.fromString "dir"]
 -- @
+--
+-- Each run of the stream opens a new watch and closes it when the stream
+-- ends. The handle of the watch is not exposed, so the roots of the watch
+-- are the given paths for as long as the stream runs. To add or remove
+-- roots while reading the events, open the watch using 'openWatch', read it
+-- using 'eventStream' and change the roots using 'addRoot' and
+-- 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before after eventStream
 
