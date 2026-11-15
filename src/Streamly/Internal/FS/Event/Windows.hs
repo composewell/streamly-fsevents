@@ -59,6 +59,8 @@ module Streamly.Internal.FS.Event.Windows
     )
 where
 
+import Control.Concurrent (rtsSupportsBoundThreads)
+import Control.Monad (unless)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.List.NonEmpty (NonEmpty)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
@@ -420,9 +422,22 @@ eventStreamAggr cfg rootPath =
 -- based on the configured code page?
 -- https://docs.microsoft.com/en-us/windows/uwp/design/globalizing/use-utf8-code-page
 
+-- | Each watch root is read by a thread blocked in a ReadDirectoryChangesW
+-- foreign call. With the non-threaded RTS the call blocks all the Haskell
+-- threads until a change occurs under that root.
+checkThreadedRTS :: IO ()
+checkThreadedRTS =
+    unless rtsSupportsBoundThreads
+        $ ioError $ userError
+        $ "Streamly.FileSystem.Event.Windows: watching requires the "
+            ++ "threaded RTS, link the program with -threaded"
+
 -- | Start monitoring a list of directory paths for file system events with the
 -- supplied configuration modifier operation over the' defaultConfig'. The
 -- paths could be directories or symbolic links to directories.
+--
+-- Raise an exception when the stream starts if the program uses the
+-- non-threaded RTS.
 --
 -- @
 -- watchWith
@@ -431,7 +446,8 @@ eventStreamAggr cfg rootPath =
 -- @
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths =
-    S.parConcatMap (eager True) (eventStreamAggr (f defaultConfig))
+    S.before checkThreadedRTS
+        $ S.parConcatMap (eager True) (eventStreamAggr (f defaultConfig))
         $ S.fromList (NonEmpty.toList paths)
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
