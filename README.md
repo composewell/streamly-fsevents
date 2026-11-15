@@ -46,23 +46,32 @@ On Linux:
 * Tree size is limited only by `max_user_watches`, one per directory.
 * Starting a watch on a tree of any size cannot overflow the event queue.
 * Moving a huge directory into the tree does not load the entire tree into memory.
-* The watch keeps up with 5000 renames/s on a tree of 24200 dirs.
+* The watch keeps up with more than 16000 renames/s of a directory on a tree
+  of 20000 directories.
 
-On a tree of 28259 directories on Linux, ext4, 2 CPUs, with warm caches:
+On a tree of 20000 directories, 10 subdirectories in each directory, with warm
+caches, on the GitHub Actions runners:
 
-| Measurement | Result |
-|---|---|
-| Start of the watch | ~0.82 s |
-| Moving in or renaming 14129 directories | ~0.50 s |
-| Memory after the start | ~8.7 MB |
-| Memory after 3 move and rename cycles | ~8.7 MB |
-| Peak memory, during the start | ~9.8 MB |
+| Measurement | Linux | macOS | Windows |
+|---|---|---|---|
+| Listing the tree, without a watch | 0.21 s | 0.43 s | 2.21 s |
+| Start of the watch | 0.60 s | 36 ms | 0.10 s |
+| Moving in 10000 directories | 0.37 s | 13 ms | 6.0 ms |
+| Renaming 10000 directories | 0.32 s | 15 ms | 5.7 ms |
+| 2000 renames of an empty directory | 0.12 s | 0.15 s | 1.80 s |
+| Runner | ubuntu-24.04, 4 CPUs | macos-26-arm64, 3 CPUs | windows-2025, 4 CPUs |
+| GHC | 9.14.1 | 9.12.4 | 9.14.1 |
 
 Notes for the table above:
 
-* Traversing the tree alone takes 0.32 s during the startup
-* Moving in or renaming a directory scans it and reports its contents
-* Memory is about 320 bytes per directory
+* On Linux the start of the watch lists the tree, and moving in or renaming a
+  directory scans it and reports its contents. macOS and Windows report only
+  the moved directory.
+* The moves and renames are the mean of 3 moves in and 6 renames.
+* On Linux the watch uses about 320 bytes per directory, 8.7 MB on a tree of
+  28259 directories.
+* The numbers are printed by the test suite `FileSystem.Event.LargeTree` in
+  the CI logs.
 
 The times and memory include the work done for the guarantees listed under
 Reliability: the scan that reports every entry of a directory moved into the
