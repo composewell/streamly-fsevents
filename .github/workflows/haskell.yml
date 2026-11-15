@@ -79,9 +79,17 @@ jobs:
 
       # If this option is enabled packcheck clears out the environment
       # and only uses the options explicitly set on the command line,
-      # implicit environment won't affect the build. if you find this
-      # annoying comment this.
-      CHECK_ENV: "y"
+      # implicit environment won't affect the build. It is disabled so
+      # that LARGETREE_DIRS below reaches the tests. packcheck checks if
+      # the value is non-empty, "n" would still enable it.
+      CHECK_ENV: ""
+
+      # The tree sizes of the LargeTree test. On macOS and Windows, which
+      # have no limit on the number of watched directories, the test runs on
+      # the default tree of 20000 directories, the tree of the measurements
+      # in the docs, and on 100000. Empty elsewhere, the test then uses only
+      # the default.
+      LARGETREE_DIRS: ${{ matrix.largetree_dirs }}
 
       # NOTE: by capturing the options in env variables here quotes
       # are presrved, if we expand them directly into the script
@@ -183,6 +191,7 @@ jobs:
             runner: macos-latest
             command: cabal
             ghc_version: 9.12.4
+            largetree_dirs: "20000,100000"
             # autoreconf required by SDIST build when a configure script
             # is present, is not available by default on macOS, so
             # disable it.
@@ -228,6 +237,7 @@ jobs:
             runner: windows-latest
             command: cabal
             ghc_version: 9.14.1
+            largetree_dirs: "20000,100000"
             # On Windows, DISABLE_SDIST_BUILD is useful for (1) avoiding
             # path length restriction, (2) avoid installing autoreconf
             # for configure builds.
@@ -288,8 +298,9 @@ jobs:
     # Xcode (e.g. CLT 27.0 with Xcode 26.6). Linking against the CLT SDK then
     # fails with "tapi error: malformed file ... unknown architecture
     # arm64e.x1-macos". Select the default Xcode so that the compiler, linker
-    # and SDK come from the same toolchain. packcheck clears the environment,
-    # so SDKROOT or DEVELOPER_DIR cannot be used instead.
+    # and SDK come from the same toolchain. xcode-select applies to the whole
+    # runner, it does not depend on SDKROOT or DEVELOPER_DIR reaching the
+    # build.
     #
     # The GHC bindists for macOS hardcode the CLT SDK path from their build
     # machine, e.g. the rts and ghci package confs of GHC 9.14.1 have

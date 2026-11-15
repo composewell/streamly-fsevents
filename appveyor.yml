@@ -17,6 +17,10 @@ environment:
     # ------------------------------------------------------------------------
     CABAL_REINIT_CONFIG: "y"
     LC_ALL: "C.UTF-8"
+    # The tree sizes of the LargeTree test: the default tree of 20000
+    # directories, the tree of the measurements in the docs, and 100000.
+    # Windows has no limit on the number of watched directories.
+    LARGETREE_DIRS: "20000,100000"
 
     # ------------------------------------------------------------------------
     # How to build
