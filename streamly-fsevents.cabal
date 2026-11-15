@@ -352,6 +352,18 @@ test-suite FileSystem.Event.LinuxModel
   if impl(ghc < 9.4) || !os(linux)
     buildable: False
 
+test-suite FileSystem.Event.Darwin.Replace
+  import: test-options
+  type: exitcode-stdio-1.0
+  main-is: Streamly/Test/FileSystem/Event/Darwin/Replace.hs
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.Darwin.Replace
+  -- The module is hidden in the library. It has no FFI, the test compiles
+  -- it from the source so that the test runs on all platforms.
+  hs-source-dirs: src
+  other-modules: Streamly.Internal.FS.Event.Darwin.Replace
+  build-depends: containers
+               , QuickCheck
+
 test-suite FileSystem.Event.Windows
   import: test-options
   type: exitcode-stdio-1.0
