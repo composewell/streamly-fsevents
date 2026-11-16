@@ -66,6 +66,24 @@ event in its queue at a time, and until that event is read it can drop more
 events without another overflow event, so the events after an overflow do not
 give a complete picture of the changes.
 
+On macOS and Windows the stream continues after an `isEventsLost` event,
+for two reasons:
+
+* Each loss is reported. On Windows the loss is reported by the read that
+  follows it, so every change that was lost occurred before the
+  `isEventsLost` event, and the events after it are complete. On macOS
+  FSEvents reports each drop of events with the `MustScanSubDirs` flag.
+* The watch keeps no state for the directories of the tree. The system
+  watches the tree, and the library passes the events through, so a lost
+  event does not leave the watch with a wrong state. On Linux the library
+  watches each directory of the tree and keeps a map of them, which a lost
+  event can make wrong.
+
+A program that runs on all platforms can use one recovery: on an
+`isEventsLost` event, close the watch, open a new watch on the same roots,
+then scan the tree. On macOS and Windows this scans more than needed, the
+tree under the path of the event is enough.
+
 The Linux column is tested by the test suite `FileSystem.Event.Stress`. On
 macOS the suite tests that the stream continues after the loss, and that
 starting a watch on a tree of 6000 directories does not report a loss. The
@@ -97,6 +115,23 @@ test which overflows the queue and then changes a tree of 10000
 directories for 10 seconds while the consumer opens a new watch after
 each overflow; one run had 13 overflows. After the changes stopped, a
 file created in every directory was always reported exactly once.
+
+## Handling queue overflow on macOS and Windows
+
+If you receive an `isEventsLost`:
+
+* Do not open a new watch, the watch continues after the event.
+* Scan the tree under the path returned by `getAbsPath` for the event. On
+  Windows this is the watch root, on macOS it can be a subdirectory of the
+  root. A change made during the scan is reported by the watch, by the scan
+  or by both.
+* Scan the tree in a thread other than the one reading the stream. If a
+  single thread scans the tree and reads the stream, it reads the stream only
+  after the scan, and by then the system buffer may have overflowed again.
+* Under sustained load an overflow can follow another, and each one is
+  reported by its own `isEventsLost` event. If an `isEventsLost` event is
+  read while a scan of the same tree is running, start one more scan after
+  the running scan ends, instead of a scan for each event.
 
 ## Symlink safety on Linux
 

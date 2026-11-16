@@ -1126,13 +1126,13 @@ isMoved ev = isMovedFrom ev || isMovedTo ev
 isModified :: Event -> Bool
 isModified = getFlag fILE_ACTION_MODIFIED
 
--- | If the kernel event buffer overflows, entire contents of the buffer are
--- discarded, therefore, events are lost.  The user application must scan
--- everything under the watched paths to know the current state of the file
--- system tree.
+-- | The system buffer of a watch root overflowed and the changes in it were
+-- lost. The overflow occurs when the application does not read the events
+-- fast enough.
 --
--- The overflow occurs when the application does not consume the events fast
--- enough.
+-- The watch continues after this event. The application scans the tree
+-- under the watch root to know its current state. See
+-- @docs\/robustness.md@ in this package for the recovery.
 --
 -- For this event, 'getRoot' and 'getAbsPath' return the watch root whose
 -- events were lost, and 'getRelPath' returns 'Nothing'.
