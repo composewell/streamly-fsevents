@@ -12,16 +12,14 @@
 module Streamly.Test.FileSystem.Event (main) where
 
 import Control.Concurrent
-    ( Chan, forkIO, killThread, newChan, newEmptyMVar, putMVar, readChan
+    ( forkIO, killThread, newChan, newEmptyMVar, putMVar, readChan
     , takeMVar, threadDelay, writeChan
     )
 import Control.Exception
-    ( IOException, SomeException, bracket, finally, throwIO, toException
-    , try
-    )
+    (IOException, SomeException, bracket, finally, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn, (\\))
+import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn)
 import Streamly.Internal.FS.Event (Config, Event)
 import System.Directory
     ( createDirectory
@@ -30,7 +28,10 @@ import System.Directory
     , removeDirectory
     , renameDirectory
     )
-import System.FilePath ((</>), pathSeparator, takeDirectory, takeFileName)
+import System.FilePath ((</>), pathSeparator, takeDirectory)
+#if defined(CABAL_OS_DARWIN)
+import System.FilePath (takeFileName)
+#endif
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -99,7 +100,7 @@ isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
 --
 -- On macOS a later event for a path can repeat 'Event.isCreated', there must
 -- be at least one for each path, and only the events of the given paths are
--- checked, the markers of 'waitStarted' and 'syncOn' can be reported again.
+-- checked, the markers of 'skipEarlier' and 'syncOn' can be reported again.
 shouldCreate :: [Event] -> [FilePath] -> Expectation
 shouldCreate evs paths =
 #if defined(CABAL_OS_LINUX)
@@ -133,23 +134,16 @@ notOnWindows reason test =
 -- Running a watch
 -------------------------------------------------------------------------------
 
--- | The events of a watch, written by the thread that reads the stream. The
--- exception that ends the stream, or an exception for the end of the stream,
--- is the last item.
-data Watch = Watch
-    { watchEvents :: Chan (Either SomeException Event)
-    -- | The events read by 'waitStarted'.
-    , startEvents :: [Event]
-    }
-
--- | The next event of the watch. Throw an exception if the stream ended.
-nextEvent :: Watch -> IO Event
-nextEvent w = readChan (watchEvents w) >>= either throwIO return
+-- The tests open the watch using 'Event.openWatch' and read it using
+-- 'Event.readEvent' in the test thread. On Linux the watch adds, removes and
+-- scans the directories of an event when the event is read. The changes that
+-- a test makes without reading the watch are all done before the watch
+-- handles the event of the first of them.
 
 -- | Read the events of the watch up to and including the first event that
 -- satisfies the predicate. Throw an exception if it does not occur within 10
--- seconds.
-readUntil :: (Event -> Bool) -> Watch -> IO [Event]
+-- seconds or the watch is closed.
+readUntil :: (Event -> Bool) -> Event.Watch -> IO [Event]
 readUntil p w = do
     r <- timeout 10000000 (go [])
     maybe (error "readUntil: timed out") return r
@@ -157,73 +151,40 @@ readUntil p w = do
     where
 
     go acc = do
-        ev <- nextEvent w
-        if p ev
-        then return (reverse (ev : acc))
-        else go (ev : acc)
+        r <- Event.readEvent w
+        case r of
+            Nothing -> error "readUntil: the watch is closed"
+            Just ev
+                | p ev -> return (reverse (ev : acc))
+                | otherwise -> go (ev : acc)
 
--- | Read the events that arrive within 100 ms of each other.
-readAvailable :: Watch -> IO [Event]
-readAvailable w = go []
-
-    where
-
-    go acc = do
-        r <- timeout 100000 (nextEvent w)
-        maybe (return (reverse acc)) (go . (: acc)) r
-
--- | Create a file @startN@ in each root until the watch reports one in every
--- root, then create a file @ready@ in each root and read the events up to the
--- last of them, and the events that follow within 100 ms. A watch is not
--- known to have started until it reports an event, on macOS the start is
--- asynchronous. Returns the events read.
-waitStarted :: [FilePath] -> Watch -> IO [Event]
-waitStarted roots w = start (0 :: Int) (nub roots) []
+-- | On macOS a watch reports changes made shortly before it was opened.
+-- Create a file @ready@ in each root, read the events up to the last of
+-- them, and the events that follow within 100 ms of each other. On Linux and
+-- Windows nothing is read, the test gets every event of the watch.
+skipEarlier :: [FilePath] -> Event.Watch -> IO ()
+#if defined(CABAL_OS_DARWIN)
+skipEarlier roots w = do
+    forM_ (nub roots) $ \r -> createFile (r </> "ready")
+    wait (nub roots)
 
     where
-
-    start n notSeen acc
-        | null notSeen = ready (nub roots) acc
-        | n >= 100 = error "waitStarted: the watch did not start"
-        | otherwise = do
-            forM_ notSeen $ \r -> createFile (r </> ("start" ++ show n))
-            evs <- readAvailable w
-            let isStart ev = "start" `isPrefixOf` takeFileName (absPath ev)
-                seen = map rootPath (filter isStart evs)
-            start (n + 1) (notSeen \\ seen) (acc ++ evs)
-
-    ready notSeen acc = do
-        forM_ notSeen $ \r -> createFile (r </> "ready")
-        wait notSeen acc
-
-    -- On macOS a marker can be reported again after it is read.
-    wait [] acc = (acc ++) <$> readAvailable w
-    wait notSeen acc = do
-        evs <- readUntil isReady w
-        wait (notSeen \\ map rootPath (filter isReady evs)) (acc ++ evs)
 
     isReady ev = Event.isCreated ev && takeFileName (absPath ev) == "ready"
 
--- | Whether the event is for a file created by 'waitStarted' in one of the
--- roots.
-isStartMarker :: [FilePath] -> Event -> Bool
-isStartMarker roots ev =
-    takeDirectory path `elem` roots
-        && (name == "ready" || "start" `isPrefixOf` name)
+    wait [] = drain
+    wait notSeen = do
+        evs <- readUntil isReady w
+        let seen = map rootPath (filter isReady evs)
+        wait (filter (`notElem` seen) notSeen)
 
-    where
-
-    path = absPath ev
-    name = takeFileName path
-
--- | The events read by 'waitStarted' that a test checks. On macOS a watch
--- reports changes made shortly before it started, and on Windows the start is
--- not tested, the test checks them on Linux only.
-startChecked :: Watch -> [Event]
-#if defined(CABAL_OS_LINUX)
-startChecked = startEvents
+    drain = do
+        r <- timeout 100000 (Event.readEvent w)
+        case r of
+            Just (Just _) -> drain
+            _ -> return ()
 #else
-startChecked = const []
+skipEarlier _ _ = return ()
 #endif
 
 -- | On Linux the watch reports all the events, as the Linux test suite does.
@@ -234,30 +195,19 @@ allEvents = Linux.setAllEvents True
 allEvents = id
 #endif
 
--- | Watch the roots, read the stream in another thread, and run the action
--- after the watch has started on all the roots.
-withWatch :: (Config -> Config) -> [FilePath] -> (Watch -> IO a) -> IO a
+-- | Open a watch on the roots, run the action and close the watch.
+withWatch ::
+    (Config -> Config) -> [FilePath] -> (Event.Watch -> IO a) -> IO a
 withWatch cfg roots action = do
-    ch <- newChan
     paths <- mapM Path.fromString roots
-    let run =
-            Stream.fold (Fold.drainMapM (writeChan ch . Right))
-                $ Event.watchWith (cfg . allEvents) (NonEmpty.fromList paths)
-        end r = writeChan ch (Left (either id (const ended) r))
-        w = Watch {watchEvents = ch, startEvents = []}
     bracket
-        (forkIO (try run >>= end))
-        killThread
-        $ \_ -> do
-            evs <- waitStarted roots w
-            action w {startEvents = evs}
-
-    where
-
-    ended = toException (userError "the stream ended")
+        (Event.openWatch (cfg . allEvents) (NonEmpty.fromList paths))
+        Event.closeWatch
+        $ \w -> skipEarlier roots w >> action w
 
 -- | Watch the directory @root@ in a temporary directory.
-withRoot :: (Config -> Config) -> (FilePath -> Watch -> IO a) -> IO a
+withRoot ::
+    (Config -> Config) -> (FilePath -> Event.Watch -> IO a) -> IO a
 withRoot cfg action =
     withSystemTempDirectory "fsevent_dir" $ \fp -> do
         let root = fp </> "root"
@@ -270,7 +220,7 @@ recursive = Event.setRecursiveMode True
 -- | Create the file @name@ in @root@ and read the events up to its create
 -- event. The events of the file system operations done before are read
 -- before it.
-syncOn :: FilePath -> String -> Watch -> IO [Event]
+syncOn :: FilePath -> String -> Event.Watch -> IO [Event]
 syncOn root name w = do
     let file = root </> name
     createFile file
@@ -802,8 +752,8 @@ runTreeChange TreeChange{..} =
                 `shouldBe` []
 
 -- The tree is watched from the start, no event is reported through a link.
--- On Linux the events read while the watch starts are checked too, the scan
--- at the start of the watch does not report the entries.
+-- On Linux every event from the open of the watch is checked, the scan at
+-- the start of the watch does not report the entries.
 recStartSymlinkCycles :: Spec
 recStartSymlinkCycles =
     it "watches a tree with symlink cycles"
@@ -817,12 +767,9 @@ recStartSymlinkCycles =
             withWatch recursive [root] $ \w -> do
                 mapM_ createFile files
                 evs <- readUntil (isCreatedAt (last files)) w
-                let evsAll =
-                        filter (not . isStartMarker [root])
-                            (startChecked w ++ evs)
-                    viaLink p = any (`isUnder` p) (cycleStale root)
-                evsAll `shouldCreate` files
-                filter viaLink (map absPath (checkedEvents True evsAll))
+                let viaLink p = any (`isUnder` p) (cycleStale root)
+                evs `shouldCreate` files
+                filter viaLink (map absPath (checkedEvents True evs))
                     `shouldBe` []
 
 -------------------------------------------------------------------------------
@@ -861,25 +808,7 @@ readEventsUntil done w = do
                 Nothing -> return (reverse acc)
                 Just ev -> go (ev : acc)
 
--- | Read the events of the watch up to and including the first event that
--- satisfies the predicate. Throw an exception if it does not occur within 10
--- seconds or the watch is closed.
-readUntilH :: (Event -> Bool) -> Event.Watch -> IO [Event]
-readUntilH p w = do
-    r <- timeout 10000000 (go [])
-    maybe (error "readUntilH: timed out") return r
-
-    where
-
-    go acc = do
-        r <- Event.readEvent w
-        case r of
-            Nothing -> error "readUntilH: the watch is closed"
-            Just ev
-                | p ev -> return (reverse (ev : acc))
-                | otherwise -> go (ev : acc)
-
--- | Like 'readUntilH' but read the events using 'Event.eventStream'.
+-- | Like 'readUntil' but read the events using 'Event.eventStream'.
 readUntilS :: (Event -> Bool) -> Event.Watch -> IO [Event]
 readUntilS p w = do
     r <- timeout 10000000
@@ -939,7 +868,7 @@ openActive =
                     $ \w -> do
                         let file = fp </> ("file" ++ show i)
                         createFile file
-                        evs <- readUntilH (isCreatedAt file) w
+                        evs <- readUntil (isCreatedAt file) w
                         createdRoots file evs `shouldBe` [fp]
 
 -- The reader thread is blocked reading the watch.
@@ -1040,7 +969,7 @@ removeStops =
                         marker = root </> ("marker" ++ show i)
                     createFile file
                     createFile marker
-                    evs <- readUntilH (isCreatedAt marker) w
+                    evs <- readUntil (isCreatedAt marker) w
                     return (file `notElem` pathsOf Event.isCreated evs)
                 go i
                     | i > (100 :: Int) =
@@ -1053,7 +982,7 @@ removeStops =
                         marker = root </> ("marker" ++ show i)
                     createFile file
                     createFile marker
-                    evs <- readUntilH (isCreatedAt marker) w
+                    evs <- readUntil (isCreatedAt marker) w
                     filter (isUnder root2) (pathsOf isChange evs)
                         `shouldBe` []
             go 1
@@ -1068,7 +997,7 @@ removeAddAgain =
             Event.removeRoot w p
             Event.addRoot w p
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
 
 closedWatchOps :: Spec
@@ -1115,7 +1044,7 @@ readEventAfterClose =
         $ withRootHandle id $ \root w -> do
             let file = root </> "file"
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
             Event.closeWatch w
             _ <- readEventsUntil (const False) w
@@ -1138,7 +1067,7 @@ readTimeout =
             forM_ [1 .. 20 :: Int] $ \_ -> readUntilTimeout w
             let file = root </> "file"
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
 
     where
