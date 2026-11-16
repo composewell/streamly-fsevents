@@ -2415,8 +2415,8 @@ unwatchPaths
 -- next event arrives in the non-threaded RTS.
 --
 -- Removing a root that shares a directory with another root requires a free
--- fd for a pipe, throw an exception if not. The shared directories remain
--- watched for the root in that case, the call can be retried.
+-- file descriptor, raise an exception if none is free. The shared directories
+-- remain watched for the root in that case, the call can be retried.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
@@ -2446,10 +2446,9 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- events of the watch using 'eventStream'. The call does not wait for an
 -- event.
 --
--- With the non-threaded RTS, the fd is closed when no thread is waiting for
--- events. To wake up the waiting threads, 'closeWatch' queues an event, which
--- requires @\/proc@ to be mounted and a free fd for a pipe. If the event
--- cannot be queued, the waiting threads wake up when the next event arrives,
+-- With the non-threaded RTS, waking up the threads waiting for events
+-- requires @\/proc@ to be mounted and a free file descriptor. If either is
+-- not available, the waiting threads wake up when the next event arrives,
 -- their streams end then.
 --
 -- /Pre-release/
