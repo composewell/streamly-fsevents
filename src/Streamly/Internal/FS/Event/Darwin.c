@@ -10,6 +10,7 @@
 #if HAVE_DECL_KFSEVENTSTREAMCREATEFLAGFILEEVENTS
 
 #include <CoreServices/CoreServices.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -144,6 +145,23 @@ UInt32 FSEventStreamEventFlagItemIsLastHardlink () {
  * Event watch
  *****************************************************************************/
 
+/* Write all the bytes, give up on an error, e.g. EPIPE */
+static void writeAll(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+}
+
 /* Write an event to the pipe input fd */
 static void writeEvent(int fd, UInt64 eventId, UInt64 eventFlags, char* path)
 {
@@ -154,8 +172,8 @@ static void writeEvent(int fd, UInt64 eventId, UInt64 eventFlags, char* path)
     buf[0] = eventId;
     buf[1] = eventFlags;
     buf[2] = (UInt64)len;
-    write(fd, buf, 3 * sizeof(UInt64));
-    write(fd, path, len);
+    writeAll(fd, buf, 3 * sizeof(UInt64));
+    writeAll(fd, path, len);
 }
 
 struct watch
