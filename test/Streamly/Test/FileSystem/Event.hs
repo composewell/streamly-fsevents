@@ -418,7 +418,9 @@ recManyNewDirs =
             evs `shouldCreate` [file]
 
 -- On Linux the directory is replaced before its create event is read, the
--- file must not be watched as a directory: the write is reported once.
+-- file must not be watched as a directory: the write is reported once. The
+-- close of "sync" can be reported after its create event, so only the events
+-- of @dir@ are checked.
 recDirReplacedByFile :: Spec
 recDirReplacedByFile =
     it "reports a file that replaced a new directory"
@@ -430,7 +432,7 @@ recDirReplacedByFile =
             _ <- syncOn root "sync" w
             appendFile dir "x"
             evs <- syncOn root "sentinel" w
-            evs `shouldModify` [dir]
+            filter ((== dir) . absPath) evs `shouldModify` [dir]
 
 -- The create event of the first @dir@ is read after the second @dir@ is
 -- created. The second @dir@ stays watched when it is renamed later.
