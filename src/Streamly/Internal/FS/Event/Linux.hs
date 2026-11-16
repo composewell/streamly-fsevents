@@ -145,10 +145,10 @@ import Foreign.C.Error (eEXIST)
 #endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
-import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek, peekByteOff, sizeOf)
 #if !defined(CABAL_OS_FREEBSD)
+import Foreign.Marshal.Array (allocaArray)
 import Foreign.Storable (peekElemOff)
 #endif
 import GHC.Conc
@@ -1448,6 +1448,16 @@ addWatchByPath fd flags pRep =
 
     absPath = combinePathRep pRep
 
+#if defined(CABAL_OS_FREEBSD)
+-- | Call inotify_add_watch on a subdirectory opened by 'openDirAt'. FreeBSD
+-- has no @\/proc\/self\/fd@, the watch is added using the path, as on Linux
+-- when @\/proc@ is not available. See 'addWatchFor'.
+--
+-- TODO: inotify_add_watch_at with the fd of the directory would not resolve
+-- the path again.
+addWatchViaFd :: CInt -> Word32 -> PathRep -> CInt -> IO CInt
+addWatchViaFd fd flags pRep _ = addWatchByPath fd flags pRep
+#else
 foreign import ccall unsafe "unistd.h readlink"
     c_readlink :: CString -> CString -> CSize -> IO CSsize
 
@@ -1503,6 +1513,8 @@ addWatchViaFd fd flags pRep dirFd = do
                 ("add watch: " ++ Path.toString (combinePathRep pRep))
                 errno Nothing Nothing
 
+#endif
+
 -- | Call inotify_add_watch on a path and return the watch descriptor. Raise an
 -- exception on failure.
 --
@@ -1515,10 +1527,10 @@ addWatchViaFd fd flags pRep dirFd = do
 -- a gap between the two.
 --
 -- A root is added using its path, a symbolic link can be used to reach a root.
--- If @\/proc@ is not mounted, or access to it is denied, a subdirectory is
--- also added using its path, the check of the components by 'openDirAt'
--- still applies. A subdirectory without read permission fails with EACCES
--- when @\/proc@ is available, it is not added by path.
+-- If @\/proc@ is not mounted, or access to it is denied, and on FreeBSD, a
+-- subdirectory is also added using its path, the check of the components by
+-- 'openDirAt' still applies. A subdirectory without read permission fails
+-- with EACCES when @\/proc@ is available, it is not added by path.
 addWatchFor :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchFor fd flags pRep =
     case pRep of
