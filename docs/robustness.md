@@ -247,23 +247,35 @@ All platforms:
 * The streaming API opens the watch in a bracket around the
   stream. The watch is closed when the stream ends, when it raises an
   exception, or on garbage collection if the stream is abandoned.
-
-Linux:
-
-* A watch that fails to start closes its inotify fd.
 * Killing a thread waiting for events closes the watch at once. An
   exception that arrives during the start of the watch or in the
   consumer of the stream, or a stream terminated by `take`, leaves the
   watch to be closed by garbage collection. In a kill test, 2000 kills at
-  varying points leave no inotify fd open and no thread blocked, with
-  the threaded and the non-threaded RTS.
-* The inotify fd is close-on-exec, so a child process does not keep a
-  closed watch alive.
+  varying points leave no watch open and no thread blocked.
 * Handle API: `addRoot`, `removeRoot` and `closeWatch` return without
-  waiting for the thread reading the stream, and can be called from any
-  thread while another thread reads the watch. `closeWatch` ends the
-  stream of that thread. With the non-threaded RTS, and no free fd or
-  no `/proc`, the stream ends when the next event arrives.
+  waiting for the thread reading the watch, and can be called from any
+  thread while another thread reads the watch. `closeWatch` wakes up a
+  thread waiting in `readEvent` or `eventStream` and ends its stream.
+* Handle API: `removeRoot` of a root that is already removed does
+  nothing.
+* Handle API: a stream returned by `eventStream` does not close the
+  watch when it ends. After a read is interrupted by a timeout, the next
+  read continues with the remaining events. On Linux and macOS an event
+  is lost if the timeout arrives after the read has taken the event from
+  the watch and before the program has received it. In a test on macOS,
+  2000 reads interrupted after 1 to 200 microseconds lost 3 to 18 of the
+  events of 300 files. This is not measured on Windows.
+
+Linux:
+
+* A watch that fails to start closes its inotify fd.
+* The kill test leaves no inotify fd open, with the threaded and the
+  non-threaded RTS.
+* The inotify fd is close-on-exec, so a child process does not inherit
+  it and does not keep a closed watch alive.
+* Handle API: with the non-threaded RTS, and no free fd or no `/proc`,
+  the stream of a thread reading the watch ends when the next event
+  arrives after `closeWatch`.
 * Handle API: after `removeRoot`, the events queued for the root before
   the removal are reported, up to its `isRootUnwatched` event. For a
   directory that the root shares with another root, this requires `/proc`
@@ -272,18 +284,16 @@ Linux:
   event is reported before the next event. If no fd is free, `removeRoot`
   throws an exception, the directory stays watched for the root, and the
   call can be retried.
-* Handle API: a stream returned by `eventStream` does not close the
-  watch when it ends. After a timeout, or after an `IOException` from
-  adding or reading a directory, for example when no fd is free, the
-  next stream on the watch continues with the remaining events. The
-  directory that failed is not watched. An event is lost if the timeout
-  arrives during the step that produces it. Any other exception is
-  raised again by every later read.
+* Handle API: after an `IOException` from adding or reading a
+  directory, for example when no fd is free, the next stream on the
+  watch continues with the remaining events. The directory that failed
+  is not watched. Any other exception is raised again by every later
+  read.
 
 macOS:
 
-* The event pipe is close-on-exec, so a child process does not keep it
-  alive.
+* The event pipe is close-on-exec, so a child process does not inherit
+  it and does not keep it alive.
 * A watch beyond the 512 event streams of a process raises an
   exception, instead of starting a watch that reports no events.
 * Closing a watch waits for a running callback to finish. A callback
@@ -300,19 +310,15 @@ macOS:
 * Handle API: after `removeRoot`, the events of the root can be reported
   for a short time after the call returns, usually a few milliseconds.
   There is no `isRootUnwatched` event.
-* Handle API: `addRoot`, `removeRoot` and `closeWatch` do not wait for the
-  thread reading the watch. A thread waiting in `readEvent` is woken up by
-  `closeWatch`. With the non-threaded RTS it is not woken up while a child
-  process created by `fork` without `exec` is running, unless the child
-  has closed the file descriptors that it inherited.
+* Handle API: with the non-threaded RTS, `closeWatch` does not wake up a
+  thread waiting in `readEvent` while a child process created by `fork`
+  without `exec` is running, unless the child has closed the file
+  descriptors that it inherited.
 
 Windows:
 
 * Stopping a stream closes the watch and the directory handles of its
   roots, the stream does not wait for the next change.
-* Handle API: `addRoot`, `removeRoot` and `closeWatch` do not wait for the
-  thread reading the watch. A thread waiting in `readEvent` is woken up by
-  `closeWatch`.
 * Handle API: `removeRoot` closes the directory handle of the root. No
   event of the root is reported for a change made after the call returns.
   The changes of the root that the watch has not yet read from the system

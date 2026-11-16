@@ -10,22 +10,13 @@ module Streamly.Test.FileSystem.Event.Windows (main) where
 
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
-import Control.Exception (SomeException, evaluate, throwIO, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
 import System.Directory (createDirectory, makeAbsolute, renameDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Mem (performMajorGC)
 import System.Timeout (timeout)
-import System.Win32.File
-    ( closeHandle
-    , createFile
-    , fILE_FLAG_BACKUP_SEMANTICS
-    , fILE_LIST_DIRECTORY
-    , fILE_SHARE_NONE
-    , oPEN_EXISTING
-    )
 import Test.Hspec
 
 import qualified Streamly.Data.Fold as Fold
@@ -48,47 +39,6 @@ withRoot act =
         let root = fp </> "watch-root"
         createDirectory root
         act root
-
--- | Run the action every 100 ms until it succeeds, at most @n@ times. Raise
--- the exception of the last attempt if all the attempts fail.
-retrying :: Int -> IO () -> IO ()
-retrying n act = do
-    r <- try act
-    case r of
-        Right () -> return ()
-        Left (e :: SomeException) ->
-            if n <= 1
-            then throwIO e
-            else threadDelay 100000 >> retrying (n - 1) act
-
--- | Open the directory with no sharing. Raises an exception if any other
--- handle with data access to the directory is open.
-openExclusive :: FilePath -> IO ()
-openExclusive dir = do
-    h <- createFile dir
-        fILE_LIST_DIRECTORY
-        fILE_SHARE_NONE
-        Nothing
-        oPEN_EXISTING
-        fILE_FLAG_BACKUP_SEMANTICS
-        Nothing
-    closeHandle h
-
--- | Run the watch until the first event and abandon the stream. The directory
--- handle of the watch must be closed after the stream is garbage collected.
-handleClosedOnGC :: Spec
-handleClosedOnGC =
-    it "closes the directory handle after the stream is abandoned" $
-        withRoot $ \root -> do
-            p <- Path.fromString root
-            void $ forkIO $ do
-                threadDelay 500000
-                writeFile (root </> "file1") ""
-            r <- Stream.fold Fold.one (Event.watch (p :| []))
-            fmap (const ()) r `shouldBe` Just ()
-            performMajorGC
-            writeFile (root </> "file2") ""
-            retrying 50 (performMajorGC >> openExclusive root)
 
 -- | Rename the watch root, then create a file in it. The watch reports the
 -- event with the original root path.
@@ -192,7 +142,6 @@ unpairedSurrogate =
 robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
-        handleClosedOnGC
         eventsLost
         missingRoot
         unpairedSurrogate
@@ -225,18 +174,11 @@ main = do
     run DirType (nestedOpsTest : regularRootTests)
     run SymLinkOrigPath (nestedOpsTest : commonTests)
 
-    let recTests =
-            [ dirCreateWithParent "subdir\\dir"
-                (\dir -> [(dir, dirEvent Event.isCreated)])
-            , fileCreateWithParent "subdir\\file"
-                (\file -> [(file, fileEvent Event.isCreated)])
-            ] ++ commonRecTests
-
     let recw = Event.watchWith
                 (Event.setAllEvents True . Event.setRecursiveMode True)
         runRec = runTests moduleName "recursive" recw
 
-    runRec DirType (regularRootTests ++ recTests)
-    runRec SymLinkOrigPath (commonTests ++ recTests)
+    runRec DirType (regularRootTests ++ commonRecTests)
+    runRec SymLinkOrigPath (commonTests ++ commonRecTests)
 
     hspec robustnessTests
