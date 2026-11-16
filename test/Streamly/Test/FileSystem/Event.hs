@@ -109,11 +109,6 @@ recursive = Event.setRecursiveMode True
 -- Handle API
 -------------------------------------------------------------------------------
 
-#if defined(CABAL_OS_WINDOWS)
-handleTests :: Spec
-handleTests =
-    it "handle API" $ pendingWith "the handle API is not implemented"
-#else
 -- | Open a watch on the directory @root@ in a temporary directory, run the
 -- action with the root and the watch, and close the watch.
 withRootHandle ::
@@ -489,7 +484,6 @@ handleTests = do
     readEventAfterClose
     readTimeout
     twoReaders
-#endif
 
 -------------------------------------------------------------------------------
 -- Main

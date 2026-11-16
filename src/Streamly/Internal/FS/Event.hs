@@ -24,15 +24,15 @@ module Streamly.Internal.FS.Event
     , watchRecursive
     , watchWith
 
-#if !defined(CABAL_OS_WINDOWS)
     -- ** Handle APIs
-    -- XXX Windows does not have the handle API yet.
     -- TODO: When these are exported from Streamly.FileSystem.Event, add a
     -- "Handle API" section to docs/platform-differences.md: no
-    -- isRootUnwatched event on macOS, the events of a removed root can be
-    -- reported until the FSEvents replay ends; no FSEvents history on
-    -- read-only and network volumes, a root change may report isEventsLost;
-    -- no handle API on Windows.
+    -- isRootUnwatched event on macOS and Windows, on macOS the events of a
+    -- removed root can be reported until the FSEvents replay ends; no
+    -- FSEvents history on read-only and network volumes, a root change may
+    -- report isEventsLost; on Windows removeRoot drops the changes of the
+    -- root not yet read from the system, and a deleted root is removed from
+    -- the watch.
     , Watch
     , openWatch
     , closeWatch
@@ -40,7 +40,6 @@ module Streamly.Internal.FS.Event
     , eventStream
     , addRoot
     , removeRoot
-#endif
 
     -- * Handling Events
     , Event
@@ -73,7 +72,7 @@ import qualified Streamly.Internal.FS.Event.Darwin as Event
 import Streamly.Internal.FS.Event.Linux (Config, Event, Watch)
 import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
-import Streamly.Internal.FS.Event.Windows (Config, Event)
+import Streamly.Internal.FS.Event.Windows (Config, Event, Watch)
 import qualified Streamly.Internal.FS.Event.Windows as Event
 #else
 #error "FS Events not supported on this platform"
@@ -133,8 +132,7 @@ setRecursiveMode = Event.setRecursiveMode
 -- The handle of the watch is not exposed, so the roots of the watch remain
 -- fixed for as long as the stream runs. To add or remove roots while reading
 -- the events, open the watch using 'openWatch', read it using 'eventStream'
--- and change the roots using 'addRoot' and 'removeRoot'. The handle API is
--- available on Linux and macOS only.
+-- and change the roots using 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith = Event.watchWith
 
@@ -178,7 +176,6 @@ watch = Event.watch
 watchRecursive :: NonEmpty Path -> Stream IO Event
 watchRecursive = Event.watchRecursive
 
-#if !defined(CABAL_OS_WINDOWS)
 -------------------------------------------------------------------------------
 -- Handle APIs
 -------------------------------------------------------------------------------
@@ -188,7 +185,8 @@ watchRecursive = Event.watchRecursive
 -- active when the call returns: a change made after it is reported. Use
 -- 'closeWatch' to close the watch.
 --
--- Raise an exception if the watch cannot be started.
+-- Raise an exception if the watch cannot be started. On Windows the program
+-- must be linked with the threaded RTS.
 --
 openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
 openWatch f = Event.openWatch (f Event.defaultConfig)
@@ -229,7 +227,6 @@ eventStream = Event.eventStream
 -- events of the other roots that occur during the call may be lost, an
 -- 'isEventsLost' event may be reported in their place.
 --
--- /Linux and macOS only/
 addRoot :: Watch -> Path -> IO ()
 addRoot = Event.addRoot
 
@@ -238,9 +235,10 @@ addRoot = Event.addRoot
 -- nothing if the watch is closed or the path is not a root.
 --
 -- On Linux the end of the events of the root is reported by @isRootUnwatched@
--- events. On macOS there is no such event, and the events of the root may be
--- reported for a short time after the call returns, usually a few
--- milliseconds.
+-- events. On macOS and Windows there is no such event. On macOS the events of
+-- the root may be reported for a short time after the call returns, usually a
+-- few milliseconds. On Windows the changes of the root that the watch has not
+-- yet read from the system are not reported.
 --
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call. On macOS this does not hold on a volume that does not keep a
@@ -248,10 +246,8 @@ addRoot = Event.addRoot
 -- events of the other roots that occur during the call may be lost, an
 -- 'isEventsLost' event may be reported in their place.
 --
--- /Linux and macOS only/
 removeRoot :: Watch -> Path -> IO ()
 removeRoot = Event.removeRoot
-#endif
 
 -------------------------------------------------------------------------------
 -- Handling Events

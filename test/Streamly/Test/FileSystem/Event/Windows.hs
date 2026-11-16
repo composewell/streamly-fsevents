@@ -87,8 +87,6 @@ handleClosedOnGC =
             r <- Stream.fold Fold.one (Event.watch (p :| []))
             fmap (const ()) r `shouldBe` Just ()
             performMajorGC
-            -- A worker blocked in a read is killed only after the read
-            -- returns, the next event makes the read return.
             writeFile (root </> "file2") ""
             retrying 50 (performMajorGC >> openExclusive root)
 
@@ -105,9 +103,9 @@ rootRenamed =
     )
 
 -- | Block the consumer at the first event while creating enough files to
--- overflow both the stream buffer (1500 events) and the event buffer of the
--- system. The watch must report isEventsLost instead of raising an exception
--- or parsing an empty buffer.
+-- overflow both the event queue of the watch (1024 events) and the event
+-- buffer of the system. The watch must report isEventsLost instead of
+-- raising an exception or parsing an empty buffer.
 eventsLost :: Spec
 eventsLost =
     it "reports isEventsLost when the event buffer overflows" $
@@ -152,13 +150,9 @@ reservedName =
     , [("aux.c", Event.isCreated)]
     )
 
--- | When the open of one root fails, the watch kills the workers of the other
--- roots, which are blocked in a read with no changes occurring. The exception
--- must be raised without waiting for a change in the other roots.
---
--- If the exception arrives before the other workers start their reads the
--- test passes even if the reads are not interruptible. The missing root is
--- the last one so that the other workers are likely to be reading by then.
+-- | When the open of one root fails, the watch closes the other roots, whose
+-- reads are in progress with no changes occurring. The exception must be
+-- raised without waiting for a change in the other roots.
 missingRoot :: Spec
 missingRoot =
     it "raises an exception for a missing root while the others are idle" $

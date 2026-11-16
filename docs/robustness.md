@@ -238,8 +238,18 @@ macOS:
 
 Windows:
 
-* Stopping a stream interrupts the blocked `ReadDirectoryChangesW`
-  call, so the stream does not wait for the next change.
+* Stopping a stream closes the watch and the directory handles of its
+  roots, the stream does not wait for the next change.
+* Handle API: `addRoot`, `removeRoot` and `closeWatch` do not wait for the
+  thread reading the watch. A thread waiting in `readEvent` is woken up by
+  `closeWatch`.
+* Handle API: `removeRoot` closes the directory handle of the root. No
+  event of the root is reported for a change made after the call returns.
+  The changes of the root that the watch has not yet read from the system
+  are not reported. There is no `isRootUnwatched` event.
+* Handle API: `addRoot` and `removeRoot` do not lose or duplicate the
+  events of the other roots. Each root has its own directory handle and its
+  own event buffer.
 
 ## Unusual names on Windows
 
