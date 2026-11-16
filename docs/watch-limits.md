@@ -68,6 +68,13 @@ limit costs nothing until that many watches are added.
 |-------|-------|---------------|
 | Event buffer | 63 KB for each watch root | Events are lost, `isEventsLost` is reported |
 
-If the buffer overflows between two reads, all the events in the buffer are
-lost. Each watch root uses one directory handle, Windows has no specific
-limit on the number of these handles.
+The system holds the changes under each root in a buffer of 63 KB until the
+watch reads them. If the program does not read events fast enough and the
+buffer overflows, all the changes in it are lost. The watch then reports one
+`isEventsLost` event for that root and continues. The program scans the tree
+under the root to learn its current state; [robustness.md](robustness.md)
+describes the recovery.
+
+Each watch root uses one directory handle, Windows has no specific limit on
+the number of these handles. Each watch also uses one thread and one I/O
+completion port.

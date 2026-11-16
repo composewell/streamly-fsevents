@@ -8,8 +8,9 @@
 --
 -- Helpers for the tests of a recursive watch on a large or busy tree: the
 -- limits on the size of a tree, a consumer that records the events, marker
--- files to synchronize with the consumer, and a check that every directory
--- of the tree is watched.
+-- files to synchronize with the consumer, a check that every directory of
+-- the tree is watched, and a model of the tree built by the consumer from
+-- the events.
 
 module Streamly.Test.FileSystem.Event.Tree
     (
@@ -30,6 +31,7 @@ module Streamly.Test.FileSystem.Event.Tree
     , treePaths
 
     -- * Watch
+    , Track (..)
     , Watch (..)
     , startWatch
     , stopWatch
@@ -44,6 +46,10 @@ module Streamly.Test.FileSystem.Event.Tree
     , ProbeResult (..)
     , probeTree
     , probeOk
+
+    -- * Model
+    , ModelResult (..)
+    , checkModel
     )
 where
 
@@ -52,7 +58,8 @@ import Control.Concurrent
     , putMVar, readChan, takeMVar, threadDelay, tryReadMVar, tryTakeMVar
     , writeChan
     )
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception
+    (IOException, SomeException, bracket, evaluate, try)
 import Control.Monad (forM_, unless, when)
 import Data.Function ((&))
 import Data.IORef
@@ -63,9 +70,9 @@ import Data.List (isPrefixOf, sortOn)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Map.Strict (Map)
 import Data.Set (Set)
-import System.Directory (doesDirectoryExist, listDirectory)
+import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath
-    ((</>), makeRelative, takeDirectory, takeFileName)
+    ((</>), makeRelative, pathSeparator, takeDirectory, takeFileName)
 import System.Timeout (timeout)
 import Streamly.FileSystem.Event (Config, Event)
 
@@ -75,6 +82,8 @@ import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.FileSystem.Event as Event
 import qualified Streamly.FileSystem.Path as Path
+import qualified Streamly.Internal.FS.Event as Handle
+    (closeWatch, eventStream, openWatch)
 #if defined(CABAL_OS_LINUX)
 import qualified Streamly.FileSystem.Event.Linux as Linux
 #endif
@@ -255,8 +264,81 @@ treePaths top n = take n (go [top])
     go xs = xs ++ go [x </> ("d" ++ show i) | x <- xs, i <- [0 .. 9 :: Int]]
 
 -------------------------------------------------------------------------------
+-- Model of the tree
+-------------------------------------------------------------------------------
+
+-- The model is the set of the absolute paths of the entries under the root,
+-- as a consumer learns them from the events. For each event the consumer
+-- checks the path on the disk, the flags of the event are not used: on
+-- macOS the flags of several changes are merged. On 'Event.isEventsLost' it
+-- lists the tree under the path of the event again.
+
+-- | The entries under @dir@, recursively. An entry removed during the
+-- listing is skipped.
+listTree :: FilePath -> IO [FilePath]
+listTree dir = do
+    r <- try (listDirectory dir)
+    case r of
+        Left (_ :: IOException) -> return []
+        Right xs -> concat <$> mapM entry xs
+
+    where
+
+    entry x = do
+        let path = dir </> x
+        isDir <- doesDirectoryExist path
+        (path :) <$> if isDir then listTree path else return []
+
+-- | 'True' if @path@ is under @dir@.
+isUnder :: FilePath -> FilePath -> Bool
+isUnder dir path = (dir ++ [pathSeparator]) `isPrefixOf` path
+
+-- | Remove the paths under @dir@. These paths are contiguous in the set.
+removeUnder :: FilePath -> Set FilePath -> Set FilePath
+removeUnder dir s =
+    let prefix = dir ++ [pathSeparator]
+        (before, after) = Set.spanAntitone (< prefix) s
+     in Set.union before (Set.dropWhileAntitone (prefix `isPrefixOf`) after)
+
+-- | Update the model for an event of @path@ under @top@. A directory not in
+-- the model is listed, its entries may have been created before it was
+-- moved into the tree.
+updateModel :: IORef (Set FilePath) -> FilePath -> FilePath -> IO ()
+updateModel ref top path =
+    when (isUnder top path) $ do
+        isDir <- doesDirectoryExist path
+        isFile <- doesFileExist path
+        known <- Set.member path <$> readIORef ref
+        if isDir
+        then unless known $ do
+            xs <- listTree path
+            modifyIORef' ref (Set.union (Set.fromList (path : xs)))
+        else if isFile
+        then modifyIORef' ref (Set.insert path)
+        else modifyIORef' ref (Set.delete path . removeUnder path)
+
+-- | List the tree under @path@ again, after an 'Event.isEventsLost' event.
+rescanModel :: IORef (Set FilePath) -> FilePath -> FilePath -> IO ()
+rescanModel ref top path = do
+    modifyIORef' ref (Set.delete path . removeUnder path)
+    if path == top
+    then do
+        xs <- listTree top
+        modifyIORef' ref (Set.union (Set.fromList xs))
+    else updateModel ref top path
+
+-------------------------------------------------------------------------------
 -- Watch
 -------------------------------------------------------------------------------
+
+-- | What the consumer records besides the counts and the probes.
+data Track =
+      TrackNothing
+    -- | The paths reported by 'Event.isCreated'.
+    | TrackCreated
+    -- | A model of the tree, see 'checkModel'.
+    | TrackModel
+    deriving Eq
 
 -- | A watch whose events are recorded by a consumer thread.
 --
@@ -272,6 +354,8 @@ data Watch = Watch
     -- | The paths reported by 'Event.isCreated', if 'trackCreated'.
     , created :: IORef (Set FilePath)
     , trackCreated :: Bool
+    -- | The model of the tree, if 'TrackModel'.
+    , model :: Maybe (IORef (Set FilePath))
     -- | The number of 'Event.isCreated' events of each file named @probe@.
     , probes :: IORef (Map FilePath Int)
     -- | The names of the entries of the root that an event was reported
@@ -299,6 +383,12 @@ observe Watch{..} ev = do
         name = takeFileName path
         marker prefix = Event.isCreated ev && prefix `isPrefixOf` name
     when (Event.isEventsLost ev) $ modifyIORef' lost (+ 1)
+    -- On Linux the stream ends after the event, the tree is listed again
+    -- after a new watch is opened, see 'startWatch'.
+    forM_ model $ \ref ->
+        if Event.isEventsLost ev
+        then unless isLinux $ rescanModel ref root path
+        else updateModel ref root path
     when (takeDirectory path == root)
         $ modifyIORef' rootEntries (Set.insert name)
     when (Event.isCreated ev) $ do
@@ -378,16 +468,20 @@ pause Watch{..} name = go (0 :: Int)
 resume :: Watch -> IO ()
 resume Watch{..} = putMVar resumed ()
 
--- | Start a watch of @dir@ and wait until the consumer reads events. If
--- @track@ is true, the paths of the 'Event.isCreated' events are recorded.
+-- | Start a watch of @dir@ and wait until the consumer reads events.
 --
 -- On Linux the stream ends after an overflow, the consumer then opens a new
--- watch, as an application does.
-startWatch :: (Config -> Config) -> Bool -> FilePath -> IO Watch
+-- watch, as an application does. With 'TrackModel' the consumer lists the
+-- tree after it opens a watch.
+startWatch :: (Config -> Config) -> Track -> FilePath -> IO Watch
 startWatch cfg track dir = do
     lostRef <- newIORef 0
     scanRef <- newIORef 0
     createdRef <- newIORef Set.empty
+    modelRef <-
+        if track == TrackModel
+        then Just <$> newIORef Set.empty
+        else return Nothing
     probesRef <- newIORef Map.empty
     entriesRef <- newIORef Set.empty
     chan <- newChan
@@ -401,7 +495,8 @@ startWatch cfg track dir = do
             , lost = lostRef
             , scanDirs = scanRef
             , created = createdRef
-            , trackCreated = track
+            , trackCreated = track == TrackCreated
+            , model = modelRef
             , probes = probesRef
             , rootEntries = entriesRef
             , markers = chan
@@ -414,11 +509,17 @@ startWatch cfg track dir = do
         consumer = do
             w <- mk <$> takeMVar started
             rootPath <- Path.fromString dir
-            let run = do
-                    n0 <- lostCount w
-                    Event.watchWith
+            let open =
+                    Handle.openWatch
                         (Event.setRecursiveMode True . cfg) (rootPath :| [])
-                        & Stream.fold (Fold.drainMapM (observe w))
+                -- The tree is listed after the watch is open, a change made
+                -- during the listing is reported by the watch.
+                run = do
+                    n0 <- lostCount w
+                    bracket open Handle.closeWatch $ \h -> do
+                        forM_ (model w) $ \ref -> rescanModel ref dir dir
+                        Handle.eventStream h
+                            & Stream.fold (Fold.drainMapM (observe w))
                     n1 <- lostCount w
                     when (isLinux && n1 > n0) run
             run
@@ -548,3 +649,50 @@ probeOk ProbeResult{..} =
     && probeExtra == 0
     && probeLost == 0
     && (probeRepeated == 0 || platformName == "macOS")
+
+-------------------------------------------------------------------------------
+-- Model
+-------------------------------------------------------------------------------
+
+data ModelResult = ModelResult
+    { modelEntries :: Int
+    -- | Entries on the disk that are not in the model.
+    , modelMissing :: Int
+    -- | Entries in the model that are not on the disk.
+    , modelStale :: Int
+    } deriving Show
+
+-- | Sync, then compare the model of the tree with the tree on the disk.
+-- 'Nothing' if the watch does not track a model. The marker files are not
+-- compared, a marker created after the one that a 'sync' read may not have
+-- been read yet. Up to 5 of the paths that differ are printed.
+checkModel :: Watch -> String -> IO (Maybe ModelResult)
+checkModel w name =
+    case model w of
+        Nothing -> return Nothing
+        Just ref -> do
+            sync w (name ++ "-model")
+            m <- Set.filter keep <$> readIORef ref
+            disk <- Set.filter keep . Set.fromList <$> listTree (root w)
+            let missing = Set.toList (Set.difference disk m)
+                stale = Set.toList (Set.difference m disk)
+            printPaths "missing from the model" missing
+            printPaths "stale in the model" stale
+            return $ Just ModelResult
+                { modelEntries = Set.size disk
+                , modelMissing = length missing
+                , modelStale = length stale
+                }
+
+    where
+
+    keep path =
+        let file = takeFileName path
+         in not ("sync-" `isPrefixOf` file || "pause-" `isPrefixOf` file)
+
+    printPaths label paths =
+        unless (null paths) $
+            putStrLn $ "  " ++ label ++ ": "
+                ++ show (take 5 (sortOn length (map rel paths)))
+
+    rel = makeRelative (root w)

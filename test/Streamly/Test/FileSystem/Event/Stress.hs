@@ -9,7 +9,12 @@
 -- Recursive watches under a high rate of events: overflows of the event
 -- queue, a tree created as fast as possible, changes to the tree during an
 -- overflow, and overflows that repeat while the tree changes. After the
--- activity stops, every directory of the tree must be watched.
+-- activity stops, every directory of the tree must be watched. In the tests
+-- that overflow the queue while the tree changes, the consumer also keeps a
+-- model of the tree from the events, and lists the tree again after an
+-- 'isEventsLost' event. The model must then match the tree on the disk:
+-- every change is reported by an event, or by an 'isEventsLost' event read
+-- after the change.
 --
 -- On Linux the overflows are certain and their number is asserted. On macOS
 -- and Windows an overflow is not certain, the number of 'isEventsLost'
@@ -63,16 +68,6 @@ touchEvents =
 touchEvents = id
 #endif
 
--- | The overflow event is parsed from an uninitialized buffer on Windows on
--- this branch.
---
--- XXX Run the overflow tests on Windows when the fix on the
--- windows-robustness branch is merged.
-overflowSkip :: Maybe String
-overflowSkip
-    | isWindows = Just "enable when windows-robustness is merged"
-    | otherwise = Nothing
-
 say :: String -> IO ()
 say msg = putStrLn ("  " ++ msg) >> hFlush stdout
 
@@ -88,14 +83,18 @@ createFiles :: FilePath -> String -> Int -> IO ()
 createFiles dir prefix n =
     forM_ [1 .. n] $ \i -> createFile (dir </> (prefix ++ show i))
 
--- | Check the probes, and that the stream has not ended.
+-- | Check the probes, the model if the watch has one, and that the stream
+-- has not ended.
 checkTree :: Watch -> IO ()
 checkTree w = do
     r <- probeTree w "final"
     say $ show r
+    m <- checkModel w "final"
+    mapM_ (say . show) m
     ended <- streamEnded w
     ended `shouldSatisfy` (== Nothing) . fmap (either show show)
     probeOk r `shouldBe` True
+    forM_ m $ \x -> (modelMissing x, modelStale x) `shouldBe` (0, 0)
 
 -- | Number of overflows: at least @n@ on Linux, printed elsewhere.
 checkLost :: Int -> Int -> IO ()
@@ -186,7 +185,7 @@ runOverflow Overflow{..} base =
             createDirectory root
             forM_ [1 .. dirs] $ \i ->
                 createDirectory (root </> ("d" ++ show i))
-            w <- startWatch config False root
+            w <- startWatch config TrackNothing root
             when burst $ do
                 pause w "burst"
                 createFiles root "f" files
@@ -260,16 +259,14 @@ overflowCases =
 -- 'certain'. An overflow is not certain on macOS and Windows.
 overflowSpec :: Overflow -> Spec
 overflowSpec o =
-    it (title o) $ case overflowSkip of
-        Just reason -> pendingWith reason
-        Nothing -> withBase 300 $ \base -> do
-            outcome <- runOverflow o base
-            say $ "outcome: " ++ show outcome
-            case outcome of
-                Skipped reason -> pendingWith reason
-                Failed reason -> expectationFailure reason
-                _ -> when (isLinux || certain o)
-                        $ outcome `shouldBe` expected o
+    it (title o) $ withBase 300 $ \base -> do
+        outcome <- runOverflow o base
+        say $ "outcome: " ++ show outcome
+        case outcome of
+            Skipped reason -> pendingWith reason
+            Failed reason -> expectationFailure reason
+            _ -> when (isLinux || certain o)
+                    $ outcome `shouldBe` expected o
 
 -------------------------------------------------------------------------------
 -- A tree created as fast as possible
@@ -326,7 +323,8 @@ generatedTree blocked base = do
     else do
         say $ "directories: " ++ show (length (filter snd paths))
             ++ ", files: " ++ show (length (filter (not . snd) paths))
-        w <- startWatch id (not blocked) root
+        w <- startWatch id
+            (if blocked then TrackModel else TrackCreated) root
         t0 <- getMonotonicTime
         if blocked
         then do
@@ -359,7 +357,7 @@ generatedTreeSpecs = do
     it "a tree created as fast as possible is watched completely"
         $ withBase 600 (generatedTree False)
     it "a tree created with the consumer blocked is watched after overflow"
-        $ maybe (withBase 600 (generatedTree True)) pendingWith overflowSkip
+        $ withBase 600 (generatedTree True)
 
 -------------------------------------------------------------------------------
 -- Changes to the tree during an overflow
@@ -404,7 +402,7 @@ overflowChanges base = do
     then pendingWith "the limits do not allow the test"
     else do
         (root, out) <- setupTrees base 2000
-        w <- startWatch id False root
+        w <- startWatch id TrackModel root
         pause w "changes"
         createFiles root "burst" (queued + 1000)
         changeTree root out
@@ -468,7 +466,7 @@ cascade dirs base = do
     else do
         (root, out) <- setupTrees base budget
         say $ "directories: " ++ show budget
-        w <- startWatch id False root
+        w <- startWatch id TrackModel root
         pause w "cascade-0"
         createFiles root "burst" (queued + 1000)
         done <- newEmptyMVar
@@ -505,6 +503,6 @@ main = hspec $ describe moduleName $ do
     mapM_ overflowSpec overflowCases
     generatedTreeSpecs
     it "the tree is watched after changes during an overflow"
-        $ maybe (withBase 600 overflowChanges) pendingWith overflowSkip
+        $ withBase 600 overflowChanges
     it "the tree is watched after overflows that repeat while it changes"
-        $ maybe (withBase 600 (cascade 10000)) pendingWith overflowSkip
+        $ withBase 600 (cascade 10000)

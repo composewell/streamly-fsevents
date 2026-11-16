@@ -1,5 +1,3 @@
-{-# LANGUAGE InterruptibleFFI #-}
-
 -- Some code snippets are adapted from the fsnotify package.
 -- http://hackage.haskell.org/package/fsnotify-0.3.0.1/
 --
@@ -37,6 +35,15 @@ module Streamly.Internal.FS.Event.Windows
     , watchRecursive
     , watchWith
 
+    -- Low level watch APIs
+    , Watch
+    , openWatch
+    , closeWatch
+    , readEvent
+    , eventStream
+    , addRoot
+    , removeRoot
+
     -- * Handling Events
     , Event(..)
     , getRoot
@@ -59,21 +66,30 @@ module Streamly.Internal.FS.Event.Windows
     )
 where
 
-import Control.Concurrent (rtsSupportsBoundThreads)
-import Control.Monad (unless)
+import Control.Concurrent (forkIO, rtsSupportsBoundThreads)
+import Control.Concurrent.MVar
+    (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
+import Control.Exception (IOException, onException, try)
+import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.List.NonEmpty (NonEmpty)
+import Data.Map.Strict (Map)
+import Data.Sequence (Seq)
 import Data.Word (Word8)
-import Foreign.C.Types (CInt(..))
-import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.Storable (peekByteOff)
+import Foreign.C.Types (CInt(..), CUIntPtr(..))
+import Foreign.Marshal.Alloc (alloca, allocaBytes, free, mallocBytes)
+import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Storable (peek, peekByteOff, poke)
 import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr)
+import GHC.Conc
+    (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
+import System.IO.Error (catchIOError)
 import System.Win32.File
-    ( FileNotificationFlag
-    , LPOVERLAPPED
+    ( LPOVERLAPPED
     , closeHandle
     , createFile
     , fILE_FLAG_BACKUP_SEMANTICS
+    , fILE_FLAG_OVERLAPPED
     , fILE_LIST_DIRECTORY
     , fILE_NOTIFY_CHANGE_FILE_NAME
     , fILE_NOTIFY_CHANGE_DIR_NAME
@@ -95,15 +111,17 @@ import System.Win32.Types
     , LPDWORD
     , failWith
     , getLastError
+    , iNVALID_HANDLE_VALUE
     )
 
 import Streamly.Data.Stream (Stream)
-import Streamly.Data.Stream.Prelude (eager)
 import Streamly.Internal.FileSystem.Path (Path)
 
+import qualified Control.Exception as Exception (mask_)
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Map.Strict as Map
+import qualified Data.Sequence as Seq
 import qualified Streamly.Data.Stream as S
-import qualified Streamly.Data.Stream.Prelude as S
 import qualified Streamly.Internal.Data.Array as Array
 import qualified Streamly.Internal.FileSystem.Path as Path
 
@@ -270,10 +288,15 @@ openDirHandle dir = do
         Nothing
         -- Create mode, we want to look at an existing directory
         oPEN_EXISTING
-        -- File attribute, NOT using OVERLAPPED since we work synchronously
-        fILE_FLAG_BACKUP_SEMANTICS
+        -- File attribute, OVERLAPPED since the changes are read
+        -- asynchronously
+        (fILE_FLAG_BACKUP_SEMANTICS .|. fILE_FLAG_OVERLAPPED)
         -- No template file
         Nothing
+
+-- | Close a handle, ignore a failure.
+closeQuietly :: HANDLE -> IO ()
+closeQuietly h = closeHandle h `catchIOError` \_ -> return ()
 
 -- For reference documentation see:
 --
@@ -282,11 +305,9 @@ openDirHandle dir = do
 -- 1. https://docs.microsoft.com/en-us/windows/win32/intl/unicode-in-the-windows-api
 -- 2. https://docs.microsoft.com/en-us/windows/win32/intl/unicode
 --
--- The call blocks until a change occurs. It is interruptible so that an
--- exception thrown to the calling thread, e.g. when the stream is stopped,
--- does not wait for the next change: the RTS cancels the call with
--- CancelSynchronousIo and the call fails with ERROR_OPERATION_ABORTED.
-foreign import ccall interruptible
+-- The handle is opened with FILE_FLAG_OVERLAPPED, the call starts a read and
+-- returns without waiting for a change.
+foreign import ccall unsafe
     "windows.h ReadDirectoryChangesW" c_ReadDirectoryChangesW ::
            HANDLE
         -> LPVOID
@@ -297,6 +318,28 @@ foreign import ccall interruptible
         -> LPOVERLAPPED
         -> LPOVERLAPPED_COMPLETION_ROUTINE
         -> IO BOOL
+
+-- See https://learn.microsoft.com/en-us/windows/win32/fileio/createiocompletionport
+foreign import ccall unsafe
+    "windows.h CreateIoCompletionPort" c_CreateIoCompletionPort ::
+        HANDLE -> HANDLE -> CUIntPtr -> DWORD -> IO HANDLE
+
+-- See https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
+--
+-- The call blocks until a completion packet is queued to the port.
+foreign import ccall safe
+    "windows.h GetQueuedCompletionStatus" c_GetQueuedCompletionStatus ::
+           HANDLE
+        -> LPDWORD
+        -> Ptr CUIntPtr
+        -> Ptr LPOVERLAPPED
+        -> DWORD
+        -> IO BOOL
+
+-- See https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-postqueuedcompletionstatus
+foreign import ccall unsafe
+    "windows.h PostQueuedCompletionStatus" c_PostQueuedCompletionStatus ::
+        HANDLE -> DWORD -> CUIntPtr -> LPOVERLAPPED -> IO BOOL
 
 -- See https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfileinformationbyhandleex
 foreign import ccall unsafe
@@ -335,47 +378,10 @@ isDeletePending h =
 eRROR_ACCESS_DENIED :: ErrCode
 eRROR_ACCESS_DENIED = 5
 
--- | An asynchronous ReadDirectoryChangesW call reports this error code when
--- the system was unable to record all the changes to the directory.
+-- | A ReadDirectoryChangesW call reports this error code when the system
+-- was unable to record all the changes to the directory.
 eRROR_NOTIFY_ENUM_DIR :: ErrCode
 eRROR_NOTIFY_ENUM_DIR = 1022
-
--- | The result of a ReadDirectoryChangesW call.
-data ReadResult
-    = ReadChanges -- ^ The call succeeded.
-    | ReadEnumDir -- ^ The call failed with 'eRROR_NOTIFY_ENUM_DIR'.
-    | ReadRootDeleted -- ^ The watched directory has been deleted.
-
--- | Returns 'ReadEnumDir' if the call failed with 'eRROR_NOTIFY_ENUM_DIR',
--- in that case the number of bytes returned is not set. Returns
--- 'ReadRootDeleted' if the call failed with 'eRROR_ACCESS_DENIED' and the
--- directory of the handle is delete pending. Throws an exception on any
--- other failure.
-readDirectoryChangesW ::
-       HANDLE
-    -> Ptr FILE_NOTIFY_INFORMATION
-    -> DWORD
-    -> BOOL
-    -> FileNotificationFlag
-    -> LPDWORD
-    -> IO ReadResult
-readDirectoryChangesW h buf bufSize wst f br = do
-    res <- c_ReadDirectoryChangesW
-                h (castPtr buf) bufSize wst f br nullPtr nullFunPtr
-    if res
-    then return ReadChanges
-    else do
-        err <- getLastError
-        if err == eRROR_NOTIFY_ENUM_DIR
-        then return ReadEnumDir
-        else do
-            deleted <-
-                if err == eRROR_ACCESS_DENIED
-                then isDeletePending h
-                else return False
-            if deleted
-            then return ReadRootDeleted
-            else failWith "ReadDirectoryChangesW" err
 
 peekFNI :: Ptr FILE_NOTIFY_INFORMATION -> IO FILE_NOTIFY_INFORMATION
 peekFNI buf = do
@@ -448,53 +454,317 @@ eventsLostEvent root =
         , totalBytes = 0
         }
 
--- | The changes that occur between two ReadDirectoryChangesW calls are held
--- in a buffer that the system allocates on the first call. This function
--- calls ReadDirectoryChangesW with a 63 KiB buffer.
---
--- On overflow of the system's change buffer, a synchronous call succeeds
--- with zero bytes returned. An asynchronous call reports the same condition
--- as 'eRROR_NOTIFY_ENUM_DIR'; handle that error code too in case a
--- synchronous call also reports it. The buffer has no records in either
--- case.
---
--- The 'Bool' in the result is 'False' if the watched directory has been
--- deleted; no more changes can be read from the handle after that.
-readDirectoryChanges ::
-    Path -> HANDLE -> Bool -> FileNotificationFlag -> IO ([Event], Bool)
-readDirectoryChanges root h wst mask = do
-    let maxBuf = 63 * 1024
-    allocaBytes maxBuf $ \buffer -> do
-        alloca $ \bret -> do
-            r <- readDirectoryChangesW h buffer (toEnum maxBuf) wst mask bret
-            case r of
-                ReadChanges -> do
-                    bytesRet <- peekByteOff bret 0
-                    if bytesRet == 0
-                    then return ([eventsLostEvent root], True)
-                    else do
-                        evs <- readChangeEvents buffer root bytesRet
-                        return (evs, True)
-                ReadEnumDir -> return ([eventsLostEvent root], True)
-                ReadRootDeleted -> return ([rootDeletedEvent root], False)
+-------------------------------------------------------------------------------
+-- Watch handle
+-------------------------------------------------------------------------------
 
--- | The events of one watch root. The stream ends after the event for the
--- deletion of the root. The directory handle is opened when the stream
--- starts and closed when it ends, on an exception, or on garbage collection.
--- A deleted root is removed from the file system only after the handle is
--- closed. The handle is never closed while a read on it is in progress: on an
--- exception, the worker thread reading the handle closes it after the read
--- returns; the stream is garbage collected only after the worker thread has
--- stopped running it.
-eventStreamAggr :: Config -> Path -> Stream IO Event
-eventStreamAggr cfg rootPath =
-    S.bracketIO (openDirHandle rootPath) closeHandle $ \handle ->
-        let recMode = getConfigRecMode cfg
-            flagMasks = getConfigFlag cfg
-            read1 = readDirectoryChanges rootPath handle recMode flagMasks
-            step False = return Nothing
-            step True = Just <$> read1
-         in S.concatMap S.fromList $ S.unfoldrM step True
+-- Reading the changes:
+--
+-- Each root has a directory handle associated with the I/O completion port
+-- of the watch, and at most one asynchronous ReadDirectoryChangesW call in
+-- progress. The system starts recording the changes of a root on the first
+-- call. The changes that occur between two calls are held in a buffer that
+-- the system allocates on the first call, of the size of the buffer passed
+-- to that call.
+--
+-- One thread for each watch waits for the completion packets of the port,
+-- adds the events of a completed read to the event queue of the watch, and
+-- then starts the next read of the root. It waits while the queue is full.
+-- If the reader does not read the events fast enough the buffer of the
+-- system overflows, the next read completes with no records and an
+-- 'isEventsLost' event is reported.
+--
+-- A read completes with no records in two more cases, when the handle is
+-- closed and when the buffer overflows. The completion status does not
+-- tell them apart, the state of the root in the watch does.
+--
+-- From Windows Vista onwards, a read on a handle associated with a
+-- completion port is not cancelled when the thread that started it exits.
+
+-- | The size of the memory reserved for the OVERLAPPED structure of a root.
+-- The structure is 32 bytes on a 64-bit system.
+overlappedSize :: Int
+overlappedSize = 64
+
+-- | The size of the buffer passed to ReadDirectoryChangesW. On overflow of
+-- the buffer of the system, the read completes with zero bytes or with
+-- 'eRROR_NOTIFY_ENUM_DIR'.
+changeBufferSize :: Int
+changeBufferSize = 63 * 1024
+
+-- | The number of events in the queue of a watch above which the reads of
+-- the roots are not started.
+maxQueued :: Int
+maxQueued = 1024
+
+-- | A root of a watch.
+data Root = Root
+    { rootPath :: Path -- ^ As supplied by the user
+    , rootHandle :: HANDLE
+      -- | 'overlappedSize' bytes for the OVERLAPPED structure followed by
+      -- 'changeBufferSize' bytes for the changes. The system writes to it
+      -- while a read is in progress.
+    , rootMem :: Ptr Word8
+    }
+
+-- | The roots of a watch. A root in 'rsActive' has a read in progress,
+-- except the 'rsBusy' root.
+data Roots = Roots
+    { rsClosed :: !Bool -- ^ 'closeWatch' was called
+    , rsNextKey :: !CUIntPtr -- ^ The completion key of the next root
+    , rsActive :: Map CUIntPtr Root -- ^ The roots, by completion key
+      -- | The root whose completed read is being processed by the thread
+      -- of the watch. The thread frees its memory if the root is removed
+      -- meanwhile.
+    , rsBusy :: Maybe CUIntPtr
+      -- | The memory of the removed roots whose read is yet to complete,
+      -- by completion key. Their handles are closed.
+    , rsRetired :: Map CUIntPtr (Ptr Word8)
+    }
+
+-- | An item of the event queue of a watch.
+data Item =
+      ItemEvent Event
+      -- | A read of a root failed, the exception is raised to the reader.
+    | ItemFailed IOException
+
+data Queue = Queue
+    { qClosed :: !Bool -- ^ 'closeWatch' was called
+    , qItems :: Seq Item
+    }
+
+-- | A handle for a watch.
+data Watch = Watch
+    { watchConfig :: Config -- ^ The config used to open the watch
+    , watchPort :: HANDLE -- ^ The I/O completion port
+      -- | Held while the roots are changed and while the handle or the
+      -- memory of a root is used. Not held across a blocking call.
+    , watchRoots :: MVar Roots
+    , watchQueue :: TVar Queue
+    }
+
+-- | Start a read on the root. Returns the error code if the call fails, no
+-- completion packet is queued in that case.
+startRead :: Config -> Root -> IO (Maybe ErrCode)
+startRead cfg Root{..} = do
+    fillBytes rootMem 0 overlappedSize
+    ok <- c_ReadDirectoryChangesW
+            rootHandle
+            (castPtr (rootMem `plusPtr` overlappedSize))
+            (fromIntegral changeBufferSize)
+            (getConfigRecMode cfg)
+            (getConfigFlag cfg)
+            nullPtr
+            (castPtr rootMem)
+            nullFunPtr
+    if ok then return Nothing else Just <$> getLastError
+
+-- | The 'IOException' for a Windows error code.
+errorToException :: String -> ErrCode -> IO IOException
+errorToException name err = do
+    r <- try (failWith name err)
+    return $ either id (\() -> userError name) r
+
+-- | The result of a read of a root.
+data Outcome =
+      Changes DWORD -- ^ The buffer holds this many bytes of records
+    | ChangesLost
+    | RootDeleted
+    | ReadFailed IOException
+
+-- | Classify the result of a read: the error code, or the number of bytes
+-- returned. The handle of the root must be open. A deleted root reports
+-- 'eRROR_ACCESS_DENIED' and its directory is delete pending.
+classify :: HANDLE -> Either ErrCode DWORD -> IO Outcome
+classify _ (Right 0) = return ChangesLost
+classify _ (Right n) = return (Changes n)
+classify h (Left err)
+    | err == eRROR_NOTIFY_ENUM_DIR = return ChangesLost
+    | otherwise = do
+        deleted <-
+            if err == eRROR_ACCESS_DENIED
+            then isDeletePending h
+            else return False
+        if deleted
+        then return RootDeleted
+        else ReadFailed <$> errorToException "ReadDirectoryChangesW" err
+
+-- | Whether the root is not watched after the outcome.
+isTerminal :: Outcome -> Bool
+isTerminal (Changes _) = False
+isTerminal ChangesLost = False
+isTerminal RootDeleted = True
+isTerminal (ReadFailed _) = True
+
+-- | The queue items for the outcome of a read. The read must be complete,
+-- and the memory of the root must not be freed during the call.
+outcomeItems :: Root -> Outcome -> IO [Item]
+outcomeItems Root{..} outcome =
+    case outcome of
+        Changes n ->
+            let buf = castPtr (rootMem `plusPtr` overlappedSize)
+             in map ItemEvent <$> readChangeEvents buf rootPath n
+        ChangesLost -> return [ItemEvent (eventsLostEvent rootPath)]
+        RootDeleted -> return [ItemEvent (rootDeletedEvent rootPath)]
+        ReadFailed e -> return [ItemFailed e]
+
+-- | Add the items to the event queue of the watch. Wait while the queue
+-- holds 'maxQueued' items or more. The items are dropped if the watch is
+-- closed.
+enqueue :: Watch -> [Item] -> IO ()
+enqueue Watch{..} items =
+    atomically $ do
+        q <- readTVar watchQueue
+        if qClosed q
+        then return ()
+        else if Seq.length (qItems q) >= maxQueued
+        then retry
+        else writeTVar watchQueue q {qItems = qItems q <> Seq.fromList items}
+
+-- | Remove the roots that satisfy the predicate and close their handles.
+-- The lock of the roots must be held. The memory of a root is freed when
+-- its read completes.
+retireRoots :: (Root -> Bool) -> Roots -> IO Roots
+retireRoots p rs = do
+    let (gone, kept) = Map.partition p (rsActive rs)
+        -- The busy root has no read in progress
+        reading = Map.filterWithKey (\k _ -> Just k /= rsBusy rs) gone
+    mapM_ (closeQuietly . rootHandle) (Map.elems gone)
+    return
+        rs
+            { rsActive = kept
+            , rsRetired = Map.union (Map.map rootMem reading) (rsRetired rs)
+            }
+
+-- | Close a 'Watch' handle. The event streams of the watch end, a thread
+-- waiting for events in 'readEvent' or 'eventStream' is woken up. The
+-- events already in the event queue of the watch are still returned by
+-- the reads, followed by 'Nothing'. Closing a closed watch does nothing.
+--
+-- The directory handles of the roots are closed when the call returns.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event.
+--
+-- /Pre-release/
+--
+closeWatch :: Watch -> IO ()
+closeWatch Watch{..} =
+    modifyMVar_ watchRoots $ \rs ->
+        if rsClosed rs
+        then return rs
+        else do
+            atomically $ do
+                q <- readTVar watchQueue
+                writeTVar watchQueue q {qClosed = True}
+            rs1 <- retireRoots (const True) rs
+            -- Wake up the thread of the watch, the roots may not have any
+            -- read in progress.
+            void $ c_PostQueuedCompletionStatus watchPort 0 0 nullPtr
+            return rs1 {rsClosed = True}
+
+-- | A completion packet of the port of a watch.
+data Completion =
+      -- | The packet posted by 'closeWatch'
+      Wake
+      -- | The read of the root with this completion key is complete, with
+      -- an error code or the number of bytes returned.
+    | Completed CUIntPtr (Either ErrCode DWORD)
+      -- | No packet could be read from the port
+    | PortFailed ErrCode
+
+-- | Wait for a completion packet of the port.
+getCompletion :: HANDLE -> IO Completion
+getCompletion port =
+    alloca $ \pBytes ->
+    alloca $ \pKey ->
+    alloca $ \pOverlapped -> do
+        poke pOverlapped nullPtr
+        ok <- c_GetQueuedCompletionStatus
+                port pBytes pKey pOverlapped 0xFFFFFFFF
+        err <- if ok then return 0 else getLastError
+        overlapped <- peek pOverlapped
+        -- The packet of a read has the OVERLAPPED pointer of the read
+        if overlapped == nullPtr
+        then return (if ok then Wake else PortFailed err)
+        else do
+            key <- peek pKey
+            if ok
+            then Completed key . Right <$> peek pBytes
+            else return (Completed key (Left err))
+
+-- | The thread of a watch. Processes the completion packets of the port
+-- until the watch is closed and the reads of all its roots are complete,
+-- then closes the port.
+pumpEvents :: Watch -> IO ()
+pumpEvents w@Watch{..} = loop
+
+    where
+
+    -- Take the root of a completed read, with the lock held.
+    takeRoot key res rs =
+        case Map.lookup key (rsRetired rs) of
+            Just mem -> do
+                free mem
+                let retired = Map.delete key (rsRetired rs)
+                return (rs {rsRetired = retired}, Nothing)
+            Nothing ->
+                case Map.lookup key (rsActive rs) of
+                    Nothing -> return (rs, Nothing)
+                    Just root -> do
+                        outcome <- classify (rootHandle root) res
+                        return (rs {rsBusy = Just key}, Just (root, outcome))
+
+    -- Start the next read of the busy root or release the root, with the
+    -- lock held. If the read cannot be started, returns the outcome and the
+    -- root remains busy.
+    releaseRoot key root outcome rs
+        -- The root was removed, or the watch was closed, the handle is
+        -- closed.
+        | not (Map.member key (rsActive rs)) = do
+            free (rootMem root)
+            return (rs {rsBusy = Nothing}, Nothing)
+        | isTerminal outcome = do
+            closeQuietly (rootHandle root)
+            free (rootMem root)
+            let active = Map.delete key (rsActive rs)
+            return (rs {rsBusy = Nothing, rsActive = active}, Nothing)
+        | otherwise = do
+            r <- startRead watchConfig root
+            case r of
+                Nothing -> return (rs {rsBusy = Nothing}, Nothing)
+                Just err -> do
+                    outcome1 <- classify (rootHandle root) (Left err)
+                    return (rs, Just outcome1)
+
+    process key root outcome = do
+        items <- outcomeItems root outcome
+        enqueue w items
+        r <- modifyMVar watchRoots (releaseRoot key root outcome)
+        mapM_ (process key root) r
+
+    isDone rs = rsClosed rs && Map.null (rsRetired rs)
+
+    next = do
+        done <- withMVar watchRoots (return . isDone)
+        if done then closeQuietly watchPort else loop
+
+    loop = do
+        c <- getCompletion watchPort
+        case c of
+            Wake -> next
+            Completed key res -> do
+                r <- modifyMVar watchRoots (takeRoot key res)
+                mapM_ (uncurry (process key)) r
+                next
+            -- Not expected. The reads in progress cannot be completed, the
+            -- memory of their roots is not freed.
+            PortFailed err -> do
+                e <- errorToException "GetQueuedCompletionStatus" err
+                enqueue w [ItemFailed e]
+                closeWatch w
+                closeQuietly watchPort
 
 -- XXX
 -- Remove the encoding requirement of paths? It can be encoding agnostic
@@ -503,9 +773,9 @@ eventStreamAggr cfg rootPath =
 -- based on the configured code page?
 -- https://docs.microsoft.com/en-us/windows/uwp/design/globalizing/use-utf8-code-page
 
--- | Each watch root is read by a thread blocked in a ReadDirectoryChangesW
+-- | The thread of a watch waits for the completion packets in a blocking
 -- foreign call. With the non-threaded RTS the call blocks all the Haskell
--- threads until a change occurs under that root.
+-- threads.
 checkThreadedRTS :: IO ()
 checkThreadedRTS =
     unless rtsSupportsBoundThreads
@@ -513,23 +783,244 @@ checkThreadedRTS =
         $ "Streamly.FileSystem.Event.Windows: watching requires the "
             ++ "threaded RTS, link the program with -threaded"
 
+-- | Create a watch with no root.
+createWatch :: Config -> IO Watch
+createWatch cfg = do
+    port <- c_CreateIoCompletionPort iNVALID_HANDLE_VALUE nullPtr 0 1
+    when (port == nullPtr)
+        $ getLastError >>= failWith "CreateIoCompletionPort"
+    roots <-
+        newMVar
+            Roots
+                { rsClosed = False
+                -- 0 is the key of the packet posted by 'closeWatch'
+                , rsNextKey = 1
+                , rsActive = Map.empty
+                , rsBusy = Nothing
+                , rsRetired = Map.empty
+                }
+    queue <- newTVarIO Queue {qClosed = False, qItems = Seq.empty}
+    let w =
+            Watch
+                { watchConfig = cfg
+                , watchPort = port
+                , watchRoots = roots
+                , watchQueue = queue
+                }
+    void $ forkIO (pumpEvents w)
+    return w
+
+-- | @addRoot watch root@ adds the directory @root@ as a root of the watch
+-- @watch@, with the 'Config' used to open the watch. The root is watched
+-- when the call returns: a change made after it is reported.
+--
+-- A directory added more than once, via the same path or via different
+-- roots, reports its events once for each root.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event. Raise an exception if the watch is closed, or if the directory
+-- cannot be opened or watched.
+--
+-- /Pre-release/
+--
+addRoot :: Watch -> Path -> IO ()
+addRoot Watch{..} root =
+    modifyMVar_ watchRoots $ \rs -> do
+        when (rsClosed rs)
+            $ ioError (userError "addRoot: the watch is closed.")
+        let key = rsNextKey rs
+        h <- openDirHandle root
+        flip onException (closeQuietly h) $ do
+            port <- c_CreateIoCompletionPort h watchPort key 0
+            when (port == nullPtr)
+                $ getLastError >>= failWith "CreateIoCompletionPort"
+            mem <- mallocBytes (overlappedSize + changeBufferSize)
+            let r = Root {rootPath = root, rootHandle = h, rootMem = mem}
+            res <- startRead watchConfig r
+            case res of
+                Nothing -> return ()
+                Just err -> do
+                    free mem
+                    failWith "ReadDirectoryChangesW" err
+            return
+                rs
+                    { rsNextKey = key + 1
+                    , rsActive = Map.insert key r (rsActive rs)
+                    }
+
+-- | Remove a root path from a 'Watch'. The path must be the same as the
+-- one used to add the root. If the path was added more than once, all the
+-- roots added using it are removed.
+--
+-- The directory handle of the root is closed when the call returns. The
+-- events of the root already in the event queue of the watch are reported,
+-- the changes that the watch has not yet read from the system are not
+-- reported. No event of the root is reported for a change made after the
+-- call returns. There is no event to mark the end of the events of the
+-- root, unlike the @isRootUnwatched@ event on Linux. A directory that is
+-- also watched via another root remains watched for that root.
+--
+-- The events of the other roots of the watch are not lost or duplicated by
+-- the call.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. The call does not wait for an
+-- event. Does nothing if the watch is closed or if the path is not a root
+-- of the watch.
+--
+-- /Pre-release/
+--
+removeRoot :: Watch -> Path -> IO ()
+removeRoot Watch{..} root =
+    modifyMVar_ watchRoots (retireRoots isRoot)
+
+    where
+
+    name = Path.toString root
+    isRoot = (== name) . Path.toString . rootPath
+
+-- | Given a 'Config' and @paths@ start monitoring the directories for file
+-- system events. Returns a 'Watch' handle which can then be used to read
+-- the event stream or to close the watch. The watch is active when the call
+-- returns: a change made after it is reported.
+--
+-- The 'Config' is kept in the 'Watch', 'addRoot' uses it.
+--
+-- The watch holds up to 1024 events that are not yet read, and the events
+-- of one more read of each root. Beyond that the changes are held by the
+-- system, in a buffer of 63 KiB for each root. An 'isEventsLost' event is
+-- reported for a root if its buffer overflows.
+--
+-- A watch uses one thread, an I/O completion port, and a directory handle
+-- for each root.
+--
+-- Raise an exception if the program uses the non-threaded RTS. If adding a
+-- path fails, the watch is closed and the exception is rethrown.
+--
+-- /Pre-release/
+--
+openWatch :: Config -> NonEmpty Path -> IO Watch
+openWatch cfg paths = do
+    checkThreadedRTS
+    -- The handle is not returned to the caller if adding a root fails, the
+    -- caller cannot close it.
+    Exception.mask_ $ do
+        w <- createWatch cfg
+        mapM_ (addRoot w) (NonEmpty.toList paths) `onException` closeWatch w
+        return w
+
+-------------------------------------------------------------------------------
+-- Reading events
+-------------------------------------------------------------------------------
+
+-- | Read the next event from a 'Watch', wait for one if none is available.
+-- Returns 'Nothing' when the watch is closed and the events in its event
+-- queue are read, and on every later call.
+--
+-- While a thread reads the watch, other threads can use 'addRoot',
+-- 'removeRoot' and 'closeWatch' on it.
+--
+-- More than one thread can read the same watch at the same time, using
+-- 'readEvent' or 'eventStream'. Each event is returned to exactly one of
+-- the readers. Each reader gets its events in the order in which they
+-- occurred. Related events can go to different readers, for example, the
+-- 'isMovedFrom' and 'isMovedTo' events of a rename. When the watch is
+-- closed, every reader gets 'Nothing'.
+--
+-- A read that is interrupted by an async exception while it waits for an
+-- event, for example, by a timeout, does not lose any event. The next read
+-- returns the first event not yet read.
+--
+-- When a root is deleted, an 'isDeleted' event is returned for the root
+-- and the root is removed from the watch.
+--
+-- If the system fails to report the changes of a root, the read raises
+-- the 'IOException' once and the root is removed from the watch. The next
+-- read continues with the events of the other roots.
+--
+-- /Pre-release/
+--
+readEvent :: Watch -> IO (Maybe Event)
+readEvent Watch{..} =
+    -- An async exception cannot arrive after the item is removed from the
+    -- queue and before it is returned.
+    Exception.mask_ $ do
+        r <- atomically $ do
+            q <- readTVar watchQueue
+            case Seq.viewl (qItems q) of
+                item Seq.:< rest -> do
+                    writeTVar watchQueue q {qItems = rest}
+                    return (Just item)
+                Seq.EmptyL -> if qClosed q then return Nothing else retry
+        case r of
+            Nothing -> return Nothing
+            Just (ItemEvent ev) -> return (Just ev)
+            Just (ItemFailed e) -> ioError e
+
+-- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
+-- stream does not close the watch, use 'closeWatch' to close it. The stream
+-- ends when the watch is closed.
+--
+-- A stream can stop reading before the watch is closed. The next stream on
+-- the watch starts with the first event not yet read.
+--
+-- The stream reports the events of the current roots of the watch: after
+-- 'addRoot' it reports the events of the new root, after 'removeRoot' it
+-- stops reporting the events of the removed root. See those functions for
+-- the events reported while the roots change.
+--
+-- More than one stream can read the same watch at the same time. See
+-- 'readEvent' for how the events are divided among the readers, and for
+-- async exceptions and failures.
+--
+-- /Pre-release/
+--
+eventStream :: Watch -> Stream IO Event
+eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
+
+-- | Whether the event is the one reported when a watch root is deleted.
+isRootDeletedEvent :: Event -> Bool
+isRootDeletedEvent Event{..} =
+    totalBytes == 0 && eventFlags == fILE_ACTION_REMOVED
+
 -- | Start monitoring a list of directory paths for file system events with the
 -- supplied configuration modifier operation over the' defaultConfig'. The
 -- paths could be directories or symbolic links to directories.
 --
 -- Raise an exception when the stream starts if the program uses the
--- non-threaded RTS.
+-- non-threaded RTS, or if a path cannot be watched.
 --
 -- @
 -- watchWith
 --  ('setAttrsModified' True . 'setLastWriteTimeModified' False)
 --  [Path.fromString "dir"]
 -- @
+--
+-- Each run of the stream opens a new watch and closes it when the stream
+-- ends. The stream ends after the 'isDeleted' event of the last root when
+-- all the roots are deleted. The handle of the watch is not exposed, so the
+-- roots of the watch are the given paths for as long as the stream runs. To
+-- add or remove roots while reading the events, open the watch using
+-- 'openWatch', read it using 'eventStream' and change the roots using
+-- 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
-watchWith f paths =
-    S.before checkThreadedRTS
-        $ S.parConcatMap (eager True) (eventStreamAggr (f defaultConfig))
-        $ S.fromList (NonEmpty.toList paths)
+watchWith f paths = S.bracketIO before closeWatch events
+
+    where
+
+    before = openWatch (f defaultConfig) paths
+
+    -- The state is the number of roots that are not deleted
+    step _ 0 = return Nothing
+    step w n = do
+        r <- readEvent w
+        return $ case r of
+            Nothing -> Nothing
+            Just ev | isRootDeletedEvent ev -> Just (ev, n - 1)
+            Just ev -> Just (ev, n)
+
+    events w = S.unfoldrM (step w) (NonEmpty.length paths)
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
@@ -635,13 +1126,13 @@ isMoved ev = isMovedFrom ev || isMovedTo ev
 isModified :: Event -> Bool
 isModified = getFlag fILE_ACTION_MODIFIED
 
--- | If the kernel event buffer overflows, entire contents of the buffer are
--- discarded, therefore, events are lost.  The user application must scan
--- everything under the watched paths to know the current state of the file
--- system tree.
+-- | The system buffer of a watch root overflowed and the changes in it were
+-- lost. The overflow occurs when the application does not read the events
+-- fast enough.
 --
--- The overflow occurs when the application does not consume the events fast
--- enough.
+-- The watch continues after this event. The application scans the tree
+-- under the watch root to know its current state. See
+-- @docs\/robustness.md@ in this package for the recovery.
 --
 -- For this event, 'getRoot' and 'getAbsPath' return the watch root whose
 -- events were lost, and 'getRelPath' returns 'Nothing'.
