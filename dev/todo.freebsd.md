@@ -4,7 +4,13 @@ The FreeBSD backend has not been built or run on FreeBSD. It was built on
 Linux in two configurations: the normal Linux build, and a build where
 cabal treats Linux as FreeBSD (`CABAL_OS_FREEBSD` defined, the FreeBSD
 modules and the FreeBSD test-suite built, the FreeBSD code paths run
-against Linux inotify). See `dev/FreeBSD-design.md` for the design.
+against Linux inotify). See `dev/design.freebsd.md` for the design.
+
+The second build uses a copy of the package with `os(linux)` replaced by a
+name that matches no OS and `os(freebsd)` replaced by `os(linux)` in the
+cabal file. Linux has no `sysctlbyname`, the copy adds a C file to the
+FreeBSD test-suite that defines it and reads
+`/proc/sys/fs/inotify/max_queued_events`.
 
 ## Testing on FreeBSD
 
@@ -13,7 +19,7 @@ must stop with the error "streamly-fsevents requires inotify".
 
 ```
 pkg install -y ghc hs-cabal-install git
-git clone -b freebsd-impl https://github.com/composewell/streamly-fsevents
+git clone -b freebsd-impl-1 https://github.com/composewell/streamly-fsevents
 cd streamly-fsevents
 cabal update
 cabal build --flags=limit-build-mem --enable-tests all
@@ -30,8 +36,8 @@ Check after the build:
    and `max_user_watches`.
 3. Run the tests on UFS, ZFS and tmpfs (`TMPDIR` on each), on 15.0 or 15.1
    and on 14.5 or stable/15. 15.0 and 15.1 have the `IN_IGNORED` bug that
-   `alwaysEvents` works around; the test "reports isRootUnwatched for a
-   deleted root" must fail on them with `alwaysEvents = 0`.
+   `IN_DELETE_SELF` in `rootEvents` works around; the test "reports
+   isRootUnwatched for a deleted root" must fail on them without it.
 4. Run the FreeBSD test-suite about 20 times to find flaky tests.
 5. Build with the non-threaded RTS and run the concurrency tests.
 
@@ -73,7 +79,8 @@ action supports.
   from reading `vn_inotify_add_watch`. A test would need a directory whose
   entries are deleted while the watch is added.
 - **The `/dev` marker.** In a jail without devfs, `/dev` may be missing;
-  the marker then fails when `/` is watched by the same watch.
+  the marker is then not queued when `/` is watched by the same watch, and
+  a shared root is removed at once.
 - **GHC IO manager.** The inotify fd supports kqueue `EVFILT_READ`, which
   the threaded RTS uses. `closeFdWith` waking a waiting thread is not
   tested on FreeBSD.
@@ -81,9 +88,13 @@ action supports.
   through hsc2hs, which FreeBSD has; not built on FreeBSD here.
 - **Queue overflow tests.** They create `max_queued_events + 1000` files,
   17384 with the FreeBSD default.
-- **The marker test** ("removeFromWatch can be retried after it fails")
-  watches `/` and `/dev` in the test process. The events of `/` are read
-  and dropped by the test.
+- **The marker test** ("removeRoot removes a shared root at once without
+  the marker") watches `/` and `/dev` in the test process. The events of
+  `/` are read and dropped by the test.
+- **`inotify_add_watch_at`.** A subdirectory is added by path on FreeBSD,
+  see "Subdirectories are added by path" in `dev/design.freebsd.md`.
+  Whether `inotify_add_watch_at(fd, dirfd, "", ...)` or `"."` works with an
+  `O_PATH` fd is not checked.
 
 ## Possible follow-ups
 

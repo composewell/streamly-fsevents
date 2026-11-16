@@ -24,13 +24,13 @@ that names the required release.
 * `Streamly.Internal.FS.Event` imports `Config`, `Event` and the portable
   functions from the platform module selected by these macros, and has an
   `#error` for other platforms.
-* `configure` (autoconf) writes `src/config.h`. On Linux it defines
-  `HAVE_DECL_IN_EXCL_UNLINK` and `HAVE_DECL_IN_MASK_CREATE`. When
-  `HAVE_DECL_IN_EXCL_UNLINK` is 0 the Linux modules compile to empty
-  modules with a `#warning`.
+* `configure` (autoconf) writes `src/config.h`, it defines
+  `HAVE_DECL_IN_EXCL_UNLINK`. When it is 0 the Linux module defines
+  `IN_EXCL_UNLINK` as 0 with a `#warning`. The FreeBSD modules raise a
+  compile time error when it is 0, the release has no inotify.
 * Each platform has a test-suite that is buildable only on that platform.
-  The portable test-suite `FileSystem.Event` is buildable on Linux with
-  GHC 9.4 or later, macOS and Windows.
+  The portable test-suite `FileSystem.Event` is buildable on Linux and
+  FreeBSD with GHC 9.4 or later, macOS and Windows.
 
 ### The contract of a backend
 
@@ -55,20 +55,29 @@ The portable module requires from each backend:
 * When the kernel drops events, `isEventsLost` is reported once per watch
   root.
 
-The Linux module also exports the low level API `openWatch`,
-`closeWatch`, `watchToStream`, `addToWatch` and `removeFromWatch`. Its
-behaviour is specified by the Linux test-suite: removing a root reports
-the queued events and then `isRootUnwatched`; roots that share a
-directory share one watch descriptor; recursive mode adds a directory on
-`IN_CREATE` and `IN_MOVED_TO`, removes it on `IN_MOVED_FROM`, and scans
-the tree again after `IN_Q_OVERFLOW`; `closeWatch` from another thread
-ends the stream.
+The Linux module also exports the handle API `openWatch`, `closeWatch`,
+`readEvent`, `eventStream`, `addRoot` and `removeRoot`. Its behaviour is
+specified by the Linux test-suite and the portable test-suite: removing a
+root reports the queued events and then `isRootUnwatched`; roots that
+share a directory share one watch descriptor; recursive mode adds a
+directory on `IN_CREATE` and `IN_MOVED_TO` and removes it on
+`IN_MOVED_FROM`; after `IN_Q_OVERFLOW` the stream reports `isEventsLost`
+and ends; `closeWatch` from another thread ends the stream.
 
 The Linux module queues a private marker event to report
 `isRootUnwatched` in order for a root that shares a watch descriptor with
-another root. The marker is an inotify watch on a private pipe, added
-through `/proc/self/fd/N` and removed at once; its `IN_IGNORED` event
-follows the events already queued.
+another root, and to wake up the threads waiting for events when
+`closeWatch` is called with the non-threaded RTS. The marker is an
+inotify watch on a private pipe, added through `/proc/self/fd/N` and
+removed at once; its `IN_IGNORED` event follows the events already
+queued. If `/proc` is not available the marker is not queued: a shared
+root is removed at once, the events queued for it and not yet read are
+not reported.
+
+The Linux module adds the watch of a subdirectory through
+`/proc/self/fd/N` of the fd opened by `openDirAt`, so that a symbolic link
+that replaced a parent directory is not followed. If the link cannot be
+read, the watch is added by path.
 
 ## FreeBSD mechanisms compared
 
@@ -157,10 +166,10 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
    recursive mode a deleted subdirectory stays in the watch descriptor
    map and keeps its vnode referenced until `closeWatch`.
 
-   The backend always adds `IN_DELETE_SELF` to the kernel mask on
-   FreeBSD and drops the `IN_DELETE_SELF` events the configuration did not
-   request. The recursive mode already does the same for `IN_CREATE`,
-   `IN_MOVED_FROM` and `IN_MOVED_TO`. No API change.
+   On FreeBSD `rootEvents`, the events every kernel watch has, is
+   `IN_MOVE_SELF | IN_DELETE_SELF`; on Linux it is `IN_MOVE_SELF`. The
+   events of `rootEvents` that the configuration did not request are not
+   reported, as for the events added in recursive mode. No API change.
 
 2. **No `/proc/self/fd`.** FreeBSD has no `/proc/self/fd`, and a pipe is
    not a vnode, so it cannot be watched. The marker uses a directory
@@ -173,18 +182,18 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
    queued between the add and the remove have the marker's wd and are
    dropped, as on Linux.
 
-   The marker is needed when `removeFromWatch` removes a root that shares
-   a directory with another root, and after `IN_Q_OVERFLOW`. If both `/`
-   and `/dev` are watched by the same `Watch`, for example by a recursive
-   watch of `/`, the marker fails: `removeFromWatch` on a shared root
-   raises an exception and can be retried, as on Linux when `/proc` is not
-   mounted.
+   The marker is implemented in `queueIgnored`. If both `/` and `/dev` are
+   watched by the same `Watch`, for example by a recursive watch of `/`,
+   or access to both is denied, the marker is not queued, as on Linux when
+   `/proc` is not available. The marker needs no fd on FreeBSD.
 
    Side effects: adding the watch reads `/` and looks up each entry. The
    read generates `IN_ACCESS` on `/`, and on main the kernel also opens and
    closes `/` to read it. A watch of `/` in another process with
    `setAccessed`, `setOpened` or `setNonWriteClosed` enabled may see these
-   events.
+   events. When the same `Watch` watches `/`, the marker watches `/dev`,
+   and the watch of `/` reports the read of `/dev` if `setAccessed` is
+   enabled.
 
 3. **`IN_EXCL_UNLINK` has no effect.** FreeBSD never reports the events
    of an unlinked file, as if `IN_EXCL_UNLINK` were always set. The default
@@ -226,7 +235,15 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
    (main). tmpfs mounted with `nonc` and other file systems that
    bypass the name cache may miss events. Documented.
 
-8. **Limits.** `vfs.inotify.max_user_instances` (256) limits the inotify
+8. **Subdirectories are added by path.** FreeBSD has no
+   `/proc/self/fd`. `addWatchViaFd` adds the watch of a subdirectory by
+   path, as on Linux when `/proc` is not available: the check of the
+   components by `openDirAt` applies, but `inotify_add_watch` resolves the
+   path again and follows a symbolic link that replaced a parent in
+   between. `inotify_add_watch_at` with the fd of the directory would
+   close this gap, not done.
+
+9. **Limits.** `vfs.inotify.max_user_instances` (256) limits the inotify
    fds per user, Linux has 128; `vfs.inotify.max_user_watches` (one third
    of `kern.maxvnodes` at boot) limits the watched objects per user.
    Exceeding the second fails with `ENOSPC`, as on Linux. Each watch keeps
@@ -255,7 +272,7 @@ is unmounted or the vnode is revoked.
 ## Code organisation
 
 * `src/Streamly/Internal/FS/Event/Linux.hs`: `CABAL_OS_FREEBSD` blocks
-  for differences 1, 2 and 6.
+  for differences 1, 2, 6 and 8.
 * `src/Streamly/Internal/FS/Event/FreeBSD.hs`: new, re-exports the Linux
   module, FreeBSD documentation.
 * `src/Streamly/FileSystem/Event/FreeBSD.hs`: new, the released API, the
@@ -268,12 +285,14 @@ is unmounted or the vnode is revoked.
 * `configure.ac`: no change, the inotify checks already run on all
   platforms.
 * `test/Streamly/Test/FileSystem/Event/Linux.hs` and `Common.hs`: build
-  on FreeBSD, with FreeBSD replacements for the `/proc` helpers and for
-  the expected event lists.
+  on FreeBSD as the test-suite `FileSystem.Event.FreeBSD`, with FreeBSD
+  replacements for the `/proc` helpers and for the expected event lists.
+* `test/Streamly/Test/FileSystem/Event.hs`: the portable test-suite
+  expects the events of Linux on FreeBSD (`INOTIFY_BACKEND`).
 * README and Changelog: platform list, FreeBSD entry.
 
 The FreeBSD module re-exports the Linux module instead of copying it. A
-copy would duplicate 1700 lines and every later fix. The alternative,
+copy would duplicate 3800 lines and every later fix. The alternative,
 renaming the Linux module to a shared `Inotify` module with two re-export
 modules, moves all the Linux code in the diff; it is not chosen. The
 Linux module stays hidden on FreeBSD (`other-modules`), so a FreeBSD
