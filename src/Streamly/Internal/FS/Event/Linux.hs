@@ -3047,26 +3047,25 @@ parseEvents =
 -- see the NOTE above 'clearMoved'. 'orderMoves' moves IN_MOVE_SELF after
 -- IN_MOVED_TO, or after IN_MOVED_FROM if there is no IN_MOVED_TO.
 --
--- On FreeBSD 14.5 and 15.1, IN_MOVE_SELF has the cookie of the rename. On
--- FreeBSD 15.0, if D is watched by any inotify fd, IN_MOVE_SELF and
--- IN_MOVED_FROM have cookie 0 and IN_MOVED_TO has the cookie of the rename.
--- An IN_MOVED_FROM with cookie 0 followed by an IN_MOVED_TO is given the
--- cookie of the IN_MOVED_TO, and so is an IN_MOVE_SELF with cookie 0 just
--- before the two, see 'fixCookies'.
+-- IN_MOVE_SELF has cookie 0, as on Linux. On FreeBSD 15.0, if D is watched
+-- by any inotify fd, IN_MOVED_FROM also has cookie 0, IN_MOVED_TO has the
+-- cookie of the rename. An IN_MOVED_FROM with cookie 0 followed by an
+-- IN_MOVED_TO is given the cookie of the IN_MOVED_TO, see 'fixCookies'.
 --
 -- The three events are queued one after the other by the same system call,
--- the events of other operations can be queued in between. Events with a
--- non-zero cookie are matched by the cookie. An event with cookie 0 is
--- matched only to the next event.
+-- the events of other operations can be queued in between. An IN_MOVE_SELF
+-- is matched only to an IN_MOVED_FROM that is the next event. An
+-- IN_MOVED_TO is matched by the cookie of the IN_MOVED_FROM, or, for cookie
+-- 0, only if it is the next event.
 --
 -- The events of a rename can be split across two reads of the fd. If the
 -- last event of a read is IN_MOVE_SELF or IN_MOVED_FROM, the fd is read again
 -- before the events are handled, up to 3 more times, see 'readEvents'.
 --
 -- The IN_MOVE_SELF is not matched if the queue is found empty before its
--- IN_MOVED_FROM is queued, or, with cookie 0, if another event is queued
--- between the two. It is then handled before the IN_MOVED_FROM records the
--- cookie, and does not remove a directory moved out of the tree. Therefore,
+-- IN_MOVED_FROM is queued, or if another event is queued between the two.
+-- It is then handled before the IN_MOVED_FROM records the cookie, and does
+-- not remove a directory moved out of the tree. Therefore,
 -- after the events of a read that found the queue empty are handled, the
 -- directories that still have the cookie of an IN_MOVED_FROM have no
 -- IN_MOVED_TO, they are removed as moved out, see 'unwatchMovedOut'.
@@ -3096,13 +3095,9 @@ rawHas flag ev = rawFlags ev .&. flag /= 0
 sameKind :: RawEvent -> RawEvent -> Bool
 sameKind e1 e2 = rawHas iN_ISDIR e1 == rawHas iN_ISDIR e2
 
--- | Give the IN_MOVE_SELF and IN_MOVED_FROM events of a rename that have
--- cookie 0 the cookie of the IN_MOVED_TO event that follows them, see the
--- NOTE above.
+-- | Give an IN_MOVED_FROM event with cookie 0 the cookie of the IN_MOVED_TO
+-- event that follows it, see the NOTE above.
 fixCookies :: [RawEvent] -> [RawEvent]
-fixCookies (s : es@(f : t : _))
-    | rawHas iN_MOVE_SELF s && rawCookie s == 0 && isPair f t && sameKind s f =
-        setRawCookie (rawCookie t) s : fixCookies es
 fixCookies (f : es@(t : _))
     | isPair f t = setRawCookie (rawCookie t) f : fixCookies es
 fixCookies (e : es) = e : fixCookies es
@@ -3130,29 +3125,33 @@ orderMoves = go . map ((,) False) . fixCookies
         , Just es1 <- moveAfter s es = go es1
         | otherwise = s : go es
 
-    -- The first event that satisfies the predicate, for cookie 0 only the
-    -- next event.
-    findNext cookie p xs
-        | cookie /= 0 =
-            case break (p . snd) xs of
+    -- The IN_MOVED_TO of the IN_MOVED_FROM f: the first event with its
+    -- cookie, for cookie 0 only the next event.
+    findTo f xs
+        | rawCookie f /= 0 =
+            case break (isTo . snd) xs of
                 (before, x : after) -> Just (before, x, after)
                 _ -> Nothing
         | otherwise =
             case xs of
-                x : after | p (snd x) -> Just ([], x, after)
+                x : after | isTo (snd x) -> Just ([], x, after)
                 _ -> Nothing
 
-    isMove flag cookie s e =
-        rawHas flag e && rawCookie e == cookie && sameKind s e
+        where
 
-    moveAfter s es = do
-        let cookie = rawCookie s
-            s1 = (True, s)
-        (b1, f, a1) <- findNext cookie (isMove iN_MOVED_FROM cookie s) es
-        return
-            $ case findNext cookie (isMove iN_MOVED_TO cookie s) a1 of
-                Just (b2, t, a2) -> b1 ++ f : b2 ++ t : s1 : a2
-                Nothing -> b1 ++ f : s1 : a1
+        isTo e =
+            rawHas iN_MOVED_TO e && rawCookie e == rawCookie f && sameKind f e
+
+    moveAfter s es =
+        case es of
+            fx@(_, f) : a1
+                | rawHas iN_MOVED_FROM f && sameKind s f ->
+                    let s1 = (True, s)
+                    in Just
+                        $ case findTo f a1 of
+                            Just (b2, t, a2) -> fx : b2 ++ t : s1 : a2
+                            Nothing -> fx : s1 : a1
+            _ -> Nothing
 
 -- | Whether the last event may be followed by the rest of its rename, see the
 -- NOTE above 'orderMoves'.
@@ -3423,7 +3422,8 @@ readEvents
     where
 
     readArray =
-        unsafeFreezeWithShrink <$> MArray.unsafeCreateWithPtr' readBufSize readFd
+        unsafeFreezeWithShrink
+            <$> MArray.unsafeCreateWithPtr' readBufSize readFd
 
 #if defined(CABAL_OS_FREEBSD)
     -- Read again if the events of a rename may be split, see the NOTE above
