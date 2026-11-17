@@ -29,7 +29,7 @@ import Control.Exception
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (group, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
@@ -44,7 +44,8 @@ import System.Directory
 #endif
     )
 import System.FilePath ((</>), takeFileName)
-import System.IO (IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
+import System.IO
+    (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (readProcess)
 import System.Timeout (timeout)
@@ -89,6 +90,8 @@ data Outcome =
 data Paths = Paths
     { watchRoot :: FilePath
     , renamedRoot :: FilePath
+    -- | The files opened by 'holdFile', closed after the behavior.
+    , heldFiles :: IORef [Handle]
     }
 
 data Behavior = Behavior
@@ -140,6 +143,9 @@ isNamed name ev = takeFileName (absPath ev) == name
 createdNamed :: String -> [Event] -> Bool
 createdNamed name = any (\ev -> isNamed name ev && Event.isCreated ev)
 
+modifiedNamed :: String -> [Event] -> Bool
+modifiedNamed name = any (\ev -> isNamed name ev && Event.isModified ev)
+
 -- | Whether a path whose name starts with "file" has two 'Event.isCreated'
 -- events.
 fileCreatedTwice :: [Event] -> Bool
@@ -151,11 +157,28 @@ fileCreatedTwice =
     isFileCreate ev =
         Event.isCreated ev && "file" `isPrefixOf` takeFileName (absPath ev)
 
+-- | Open a file for appending. A file held open can be written after the
+-- permissions of its directory are removed.
+holdFile :: Paths -> FilePath -> IO ()
+holdFile p path = do
+    h <- openFile path AppendMode
+    modifyIORef' (heldFiles p) (h :)
+
+-- | Append to the files opened by 'holdFile'.
+writeHeldFiles :: Paths -> IO ()
+writeHeldFiles p =
+    readIORef (heldFiles p) >>= mapM_ (\h -> hPutStr h "x" >> hFlush h)
+
 -- | Remove the permission to list a directory, keep the permission to create
 -- a file in it.
 denyRead :: FilePath -> IO ()
 -- | Undo 'denyRead'.
 allowRead :: FilePath -> IO ()
+-- | Remove all the permissions of a directory, the directory cannot be
+-- reached.
+denyAll :: FilePath -> IO ()
+-- | Undo 'denyAll'.
+allowAll :: FilePath -> IO ()
 -- | @hardLink source link@
 hardLink :: FilePath -> FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
@@ -168,6 +191,11 @@ denyRead path = void $ readProcess "icacls" [path, "/deny", everyone] ""
 allowRead path =
     void $ readProcess "icacls" [path, "/remove:d", "*S-1-1-0"] ""
 
+denyAll path =
+    void $ readProcess "icacls" [path, "/deny", "*S-1-1-0:(OI)(CI)(F)"] ""
+
+allowAll = allowRead
+
 hardLink = createHardLink
 #else
 denyRead path =
@@ -177,6 +205,14 @@ denyRead path =
 allowRead path = do
     perms <- getPermissions path
     setPermissions path (setOwnerReadable True perms)
+
+denyAll path = setPermissions path emptyPermissions
+
+allowAll path =
+    setPermissions path
+        $ setOwnerReadable True
+        $ setOwnerWritable True
+        $ setOwnerSearchable True emptyPermissions
 
 hardLink source link = void $ readProcess "ln" [source, link] ""
 #endif
@@ -473,7 +509,7 @@ behaviors =
     , base
         { title = "root watched before its read permission is removed"
         , cleanup = allowRead . watchRoot
-        , skip = permissionNotRemovable
+        , skip = permissionNotRemovable denyRead allowRead
         , ops = \p -> do
             denyRead (watchRoot p)
             settle
@@ -486,13 +522,72 @@ behaviors =
         , config = Event.setRecursiveMode True
         , setup = createDirectory . deniedDir
         , cleanup = allowRead . deniedDir
-        , skip = permissionNotRemovable
+        , skip = permissionNotRemovable denyRead allowRead
         , ops = \p -> do
             denyRead (deniedDir p)
             settle
             createFile (deniedDir p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
+        }
+    -- A directory that cannot be reached: FSEvents does not report its events
+    -- to a process that is not root. The file is written through a handle
+    -- opened before the permissions are removed. On macOS and Windows the
+    -- outcomes are expected, not yet observed.
+    , base
+        { title = "unreachable root reports its changes"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denyAll (watchRoot p)
+        , cleanup = allowAll . watchRoot
+        , skip = stillReadable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform WatchException No WatchException
+        }
+    , base
+        { title = "unreachable subdir of a recursive root reports its changes"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+        , cleanup = allowAll . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform No No Yes
+        }
+    , base
+        { title = "root watched before it becomes unreachable"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , cleanup = allowAll . watchRoot
+        , skip = permissionNotRemovable denyAll allowAll
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            denyAll (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No Yes
+        }
+    , base
+        { title = "subdir watched before it becomes unreachable"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+        , cleanup = allowAll . deniedDir
+        , skip = permissionNotRemovable denyAll allowAll
+        , ops = \p -> do
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No Yes
         }
     , base
         { title = "regular file as a root is watched"
@@ -809,12 +904,17 @@ behaviors =
 
     -- The permission is removed by 'ops', after the watch starts. The probe
     -- directory is not watched.
-    permissionNotRemovable p = do
+    permissionNotRemovable ::
+           (FilePath -> IO ())
+        -> (FilePath -> IO ())
+        -> Paths
+        -> IO (Maybe String)
+    permissionNotRemovable deny allow p = do
         let probe = renamedRoot p
         createDirectory probe
-        denyRead probe
+        deny probe
         r <- stillReadable probe
-        allowRead probe
+        allow probe
         removeDirectory probe
         return r
 
@@ -973,11 +1073,18 @@ runBehavior b =
     withSystemTempDirectory "fsevent_behavior" $ \dir -> do
         let root = dir </> "root"
             control = dir </> "control"
-            paths = Paths {watchRoot = root, renamedRoot = dir </> "renamed"}
+        held <- newIORef []
+        let paths =
+                Paths
+                    { watchRoot = root
+                    , renamedRoot = dir </> "renamed"
+                    , heldFiles = held
+                    }
+            closeHeld = readIORef held >>= mapM_ hClose
         createDirectory root
         createDirectory control
         setup b paths
-        flip finally (cleanup b paths) $ do
+        flip finally (cleanup b paths >> closeHeld) $ do
             reason <- skip b paths
             maybe (runWatch b paths control) (return . Skipped) reason
 
