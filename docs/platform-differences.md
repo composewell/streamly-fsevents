@@ -167,6 +167,9 @@ On Windows the watch keeps the root open.
   the rest of the tree stays watched. On macOS the watch continues. On
   Windows it is expected to continue, this is not tested.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
+* A FIFO as a root: on Linux the watch reports the events of the FIFO, it
+  does not open the FIFO. On macOS it is expected to be watched like a
+  regular file, this is not tested. Not allowed on Windows.
 * A root listed twice: all platforms report a change in it once. Paths
   that differ only in redundant separators and `.` components, for
   example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
