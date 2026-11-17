@@ -118,6 +118,7 @@ import Streamly.Data.Stream (Stream)
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FS.Event.Darwin.Replace (Gen, Since(..))
 import Streamly.Internal.FileSystem.Path (Path)
+import Streamly.Internal.FS.Event.RootPath (isDotPath, normalizeRoot)
 import System.Directory (canonicalizePath, getCurrentDirectory)
 import System.IO.Error (catchIOError)
 import System.Posix.Types (CSsize(..), Fd(..))
@@ -434,7 +435,7 @@ data Event = Event
 
 -- | A watch root.
 data Root = Root
-    { rootPath :: Path -- ^ As supplied by the user
+    { rootPath :: Path -- ^ As supplied by the user, see 'normalizeRoot'
       -- | The absolute path of the root: a relative 'rootPath' joined to
       -- the working directory at the time the root was added. Symbolic
       -- links are not resolved. The FSEvents streams are created with this
@@ -450,15 +451,20 @@ data Root = Root
 dropTrailingSeparators :: String -> String
 dropTrailingSeparators = dropWhileEnd (== '/')
 
+-- | The 'Root' of a path supplied by the user, the path is normalized by
+-- 'normalizeRoot'. 'Path.isRooted' is true for @.@, the absolute path of
+-- @.@ is the working directory. A path starting with @.\/@ is not rooted
+-- after 'normalizeRoot'.
+--
 -- XXX Use OsPath or streamly's canonicalize
 toRoot :: Path -> IO Root
-toRoot p = do
+toRoot p0 = do
     absPath <-
-        if Path.isRooted p
+        if Path.isRooted p && not (isDotPath p)
         then return p
         else do
             cwd <- getCurrentDirectory >>= Path.fromString
-            return (Path.join cwd p)
+            return (if isDotPath p then cwd else Path.join cwd p)
     canonical <- canonicalizePath (Path.toString absPath)
     return
         Root
@@ -467,11 +473,14 @@ toRoot p = do
             , rootCanonical = dropTrailingSeparators canonical
             }
 
--- | Whether the two roots were supplied as the same path.
+    where
+
+    p = normalizeRoot p0
+
+-- | Whether the two roots were supplied as the same path, after
+-- normalization.
 isSameRoot :: Root -> Root -> Bool
-isSameRoot r1 r2 =
-    Path.eqPath
-        (Path.allowRelativeEquality True) (rootPath r1) (rootPath r2)
+isSameRoot r1 r2 = Path.eqPathBytes (rootPath r1) (rootPath r2)
 
 -- | The event with its watch root and the path relative to the root set. If
 -- the event path is under more than one root, for example, a root and a
@@ -789,10 +798,12 @@ deleteGen gen = filter ((/= gen) . fst)
 -- relative to the working directory at the time of the call, a later change
 -- of the working directory does not affect the watch.
 --
--- A path that is already a root of the watch is not added again. Two paths
--- are the same if their components are equal, ignoring redundant separators
--- and @.@ components. Case is significant even on a case-insensitive file
--- system, @\/tmp\/Foo@ and @\/tmp\/foo@ are two roots.
+-- The path is normalized: redundant separators and @.@ components are
+-- removed, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. 'getRoot'
+-- reports the normalized path. A path that is already a root of the watch is
+-- not added again. Symbolic links are not resolved, case is significant even
+-- on a case-insensitive file system: @\/tmp\/Foo@ and @\/tmp\/foo@ are two
+-- roots, and so are a symbolic link and its target.
 --
 -- The events of @root@ that occur before 'addRoot' returns may not be
 -- reported. The events of the other roots of the watch are not lost or
@@ -826,7 +837,8 @@ addRoot wtch@Watch{..} root = do
             return st {rsRoots = roots, rsGen = gen}
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
--- one used to add the root, with the same case.
+-- one used to add the root, with the same case, ignoring redundant
+-- separators and @.@ components.
 --
 -- The events of the root that are queued before the call are reported. The
 -- events of the root may still be reported for a short time after the call
@@ -851,9 +863,10 @@ addRoot wtch@Watch{..} root = do
 removeRoot :: Watch -> Path -> IO ()
 removeRoot wtch@Watch{..} root =
     modifyMVar_ watchRootLock $ \st -> do
-        let name = Path.toString root
+        let path = normalizeRoot root
             roots =
-                filter ((/= name) . Path.toString . rootPath) (rsRoots st)
+                filter
+                    (not . Path.eqPathBytes path . rootPath) (rsRoots st)
             gen = rsGen st + 1
         if rsClosed st || length roots == length (rsRoots st)
         then return st
@@ -1252,8 +1265,9 @@ isEventIdWrapped :: Event -> Bool
 isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 
 -- | Get the watch root to which this event belongs, as it was supplied to the
--- watch API. If a path is under more than one root, for example, a root and
--- a root inside it, its events are reported once for each root.
+-- watch API, with redundant separators and @.@ components removed. If a
+-- path is under more than one root, for example, a root and a root inside
+-- it, its events are reported once for each root.
 --
 -- If the event path is not under any watch root, the path reported by the OS
 -- is returned. For example, the 'isRootPathEvent' event for a non-existing

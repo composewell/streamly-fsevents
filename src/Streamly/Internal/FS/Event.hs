@@ -280,8 +280,8 @@ removeRoot = Event.removeRoot
 -------------------------------------------------------------------------------
 
 -- | Get the watch root to which the event belongs, as it was supplied to the
--- watch API. On Linux redundant separators and @.@ components are removed
--- from the path.
+-- watch API. On Linux and macOS redundant separators and @.@ components are
+-- removed from the path.
 --
 -- For an 'isEventsLost' event, this is the watch root whose events may have
 -- been lost.
