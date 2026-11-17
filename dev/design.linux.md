@@ -635,6 +635,19 @@ The step never goes back to an earlier stream:
   kernel event are reported before the exception.
 * Any other exception is saved in place of the stream, every later read
   raises it again.
+* An async exception that arrived during the step is pending when the step
+  ends. `readEvent` raises it before it returns the event of the step, and
+  saves the event in the `Watch` next to the rest of the stream. The next
+  read returns the event. If the exception were raised when the mask of
+  `readEvent` ends, the event would be lost. The event is not put back in
+  the stream with `cons`: each `cons` adds a layer that all the later steps
+  of the stream run through.
+
+A reader that masks async exceptions around `readEvent` and the code that
+records the event does not lose an event. The read is then interrupted only
+while it waits, and at the check for a pending exception before it returns
+an event. Without the mask, an exception that arrives after `readEvent`
+returns and before the reader records the event loses the event.
 
 The operation that failed is not tried again. A directory that could not
 be added, for example, at the `max_user_watches` limit (`ENOSPC`) or
@@ -650,8 +663,8 @@ is not raised, the directory is reported as `isAccessDenied`.
 The rest of the handling of that kernel event is skipped, the map can keep
 a path that the event would have changed.
 
-The tests are `readAfterTimeout`, `readAfterFailure` and
-`readAfterScanFailure`.
+The tests are `readAfterTimeout`, `readAfterFailure`,
+`readAfterScanFailure`, `pendingException` and `readTimeoutsNoLoss`.
 
 ## Deep trees
 
@@ -745,7 +758,7 @@ reached at the start of the watch.
 
 ## Symbolic link roots
 
-With `setFollowSymLinks False`, the kernel watch of a root that is a symbolic
+With `setFollowRootSymLinks False`, the kernel watch of a root that is a symbolic
 link is on the link itself. The root is opened with `O_NOFOLLOW` in that
 case, `openDirAt`, and is handled as a root that is not a directory: its
 target is not listed. Earlier the root was opened without `O_NOFOLLOW`, and
@@ -760,8 +773,9 @@ A kernel watch belongs to an inode, a renamed root stays watched by the kernel.
 Its events would report the old path, which no longer exists or refers to
 another object, and the kernel does not report the new path. On `IN_MOVE_SELF`
 the root and the paths under it are removed and report `isRootUnwatched`, in
-both modes. `IN_MOVE_SELF` is requested for every root, and is not reported
-unless `setRootMoved` is enabled. macOS watches the path, a renamed root is not
+both modes. `IN_MOVE_SELF` is requested for every root. It is reported as an
+event for which `isRootMoved` and `isMoved` are true, unless `setRootMoved` is
+disabled. macOS watches the path, a renamed root reports `isMoved` and is not
 watched there either.
 
 The root is removed only if its path no longer refers to the watched object
@@ -772,6 +786,59 @@ stays watched.
 
 The `IN_MOVE_SELF` or `IN_IGNORED` event of a root can be dropped in an
 overflow. The stream ends on the overflow, see "Overflow: the stream ends".
+
+## Deleted roots
+
+`IN_DELETE_SELF` is requested for a root by default, `setRootDeleted`. It is
+reported as an event for which `isRootDeleted` and `isDeleted` are true, macOS
+and Windows report `isDeleted` for a deleted root. The `IN_IGNORED` event of
+the root follows and reports `isRootUnwatched`.
+
+The watch of a subdirectory does not request `IN_DELETE_SELF`, see
+`subdirConfig`. The watch of the parent reports the deletion, and the kernel
+queues `IN_IGNORED` for a deleted directory whatever the mask. The event
+would use one more slot of the kernel queue for each deleted directory, and
+it is not reported for a subdirectory. On FreeBSD it is requested for every
+watch, see `rootEvents`.
+
+A subdirectory that is also a root shares one kernel watch with the root. A
+scan replaces the mask of the watch of a directory with `scanFlags` of the
+subdirectory config, without `IN_MASK_ADD`. If a parent of an inner root is
+renamed, the scan of the new path replaces the mask of the inner root and its
+`IN_DELETE_SELF` is no longer requested. The inner root then reports only
+`isRootUnwatched` when it is deleted. Its paths are stale after the rename of
+the parent in any case.
+
+## The end of the stream
+
+The stream of `watchWith` ends when no path is watched and no event is left
+to report, for example, after all the roots are deleted or renamed. No event
+can arrive after that: a watch descriptor stays in the map until its
+`IN_IGNORED` event is handled, and a marker until its paths are reported.
+`readEvents` returns the end instead of the wait when it finds the queue and
+the map empty. On Windows the stream ends when all the roots are deleted.
+
+The handle API does not end the stream, `addRoot` can add a root later. The
+flag is `watchEndsUnwatched` in the `Watch`.
+
+## Relative roots
+
+A root has two paths, `Root` in `src/Streamly/Internal/FS/Event/Linux.hs`: the
+path supplied by the user, which `getRoot` reports and `removeRoot` takes,
+and the absolute path, the supplied path joined to the working directory
+when the root is added. The system calls and `getAbsPath` use the absolute
+path. Symbolic links are not resolved.
+
+Earlier the supplied path was used in every system call. After a change of
+the working directory, the add of a new subdirectory resolved a relative
+root against the new directory and failed, the failure was taken as a
+directory deleted before its watch was added, and the subdirectory was not
+watched. The test is `relativeRoot` in
+`test/Streamly/Test/FileSystem/Event.hs`.
+
+Two roots are the same root if both their paths are equal. The same relative
+path added from two working directories gives two roots, `removeRoot` with
+that path removes both.
 
 ## Subdirectory without permission
 
