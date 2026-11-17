@@ -30,27 +30,27 @@
   `Streamly.FileSystem.Path`. It is used by `subComponents` in
   `src/Streamly/Internal/FS/Event/Linux.hs` to split a subdirectory path
   into the components that `openSubdir` opens one at a time, and by
-  `normalizeRoot` in the same file.
+  `normalizeRoot` in `src/Streamly/Internal/FS/Event/RootPath.hs`.
 * `Streamly.Internal.FileSystem.Path.normalize` (streamly-core 0.3.3) is
   `undefined`. Master (0.4.0) implements it as `normalise`, exported only by
   the Internal module. `normalizeRoot` in
-  `src/Streamly/Internal/FS/Event/Linux.hs` removes the redundant
-  separators and the `.` components of a root path with `splitPath_` and
-  `join` instead. Replace it with `Path.normalise` when 0.4 is released.
-  `normalise` keeps a leading `./` (`allowRelativeEquality` does not change
-  the normalization of the root), `normalizeRoot` drops it, to match
-  `eqPath` with `allowRelativeEquality` on macOS and Windows.
+  `src/Streamly/Internal/FS/Event/RootPath.hs`, used on Linux and macOS,
+  removes the redundant separators and the `.` components of a root path
+  with `splitPath_` and `join` instead. Replace it with `Path.normalise`
+  when 0.4 is released. `normalise` keeps a leading `./`
+  (`allowRelativeEquality` does not change the normalization of the root),
+  `normalizeRoot` drops it, to match `eqPath` with `allowRelativeEquality`
+  on Windows.
 
-  Plan for 0.4: normalize the root path with `Path.normalise` when a root
-  is added on all three platforms, in `normalizeRoot` on Linux and in
-  `addRoot` and `openWatch` on macOS and Windows. Today `getRoot` reports
-  the normalized path on Linux, `x/y` for `./x//y`, and the path as
-  supplied on macOS and Windows, the first one if a root is supplied twice
-  in different forms. With the plan `getRoot` reports the normalized path
-  on all three. On Windows `normalise` also upper-cases the drive letter
-  and converts `/` to `\`. A leading `./` still has to be dropped after
-  `normalise`. macOS and Windows can then compare the normalized paths by
-  their bytes instead of with `eqPath`.
+  Plan for 0.4: implement `normalizeRoot` with `Path.normalise`, and use
+  it on Windows too, in `addRoot`. Today `getRoot` reports the normalized
+  path on Linux and macOS, `x/y` for `./x//y`, and the path as supplied on
+  Windows, the first one if a root is supplied twice in different forms.
+  With the plan `getRoot` reports the normalized path on all three. On
+  Windows `normalise` also upper-cases the drive letter and converts `/`
+  to `\`. A leading `./` still has to be dropped after `normalise`.
+  Windows can then compare the normalized paths by their bytes instead of
+  with `eqPath`.
 * No API opens a path without following a symbolic link in any of its
   components (streamly-core 0.3.0). `O_NOFOLLOW` applies only to the last
   component. `openSubdir` in `src/Streamly/Internal/FS/Event/Linux.hs`

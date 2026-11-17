@@ -824,9 +824,10 @@ flag is `watchEndsUnwatched` in the `Watch`.
 ## Relative roots
 
 A root has two paths, `Root` in `src/Streamly/Internal/FS/Event/Linux.hs`: the
-path supplied by the user, which `getRoot` reports and `removeRoot` takes,
-and the absolute path, the supplied path joined to the working directory
-when the root is added. The system calls and `getAbsPath` use the absolute
+path supplied by the user, normalized by `normalizeRoot`, which `getRoot`
+reports and `removeRoot` takes, and the absolute path, the normalized path
+joined to the working directory when the root is added. The root `.` has
+the working directory as its absolute path. The system calls and `getAbsPath` use the absolute
 path. Symbolic links are not resolved.
 
 Earlier the supplied path was used in every system call. After a change of
@@ -836,9 +837,9 @@ directory deleted before its watch was added, and the subdirectory was not
 watched. The test is `relativeRoot` in
 `test/Streamly/Test/FileSystem/Event.hs`.
 
-Two roots are the same root if both their paths are equal. The same relative
-path added from two working directories gives two roots, `removeRoot` with
-that path removes both.
+Two roots are the same root if both their paths are equal, compared by
+their bytes. The same relative path added from two working directories
+gives two roots, `removeRoot` with that path removes both.
 
 ## Subdirectory without permission
 

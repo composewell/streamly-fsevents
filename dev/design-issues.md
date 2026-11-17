@@ -227,8 +227,8 @@ See `dev/design-issues/dynamic-watches.md`.
 
 `addRoot` skips a path that is already a root, and `removeRoot` finds the
 root by its path. The paths are compared by their components, with case
-significant (`Path.eqPath` on macOS and Windows, byte equality of the
-normalized paths on Linux).
+significant (`Path.eqPath` on Windows, byte equality of the normalized
+paths on Linux and macOS).
 Case sensitivity is a property of the file system, or of a directory, not
 of the OS: NTFS is case-insensitive by default but a directory can be made
 case-sensitive (`fsutil file setCaseSensitiveInfo`), APFS and HFS+ can be
@@ -296,7 +296,10 @@ path.
 * `getRoot` still reports the path as supplied, the canonical path is
   only used for the comparison.
 
-Status: open.
+Status: rejected. The user adds and removes a root by its path, two
+different paths are two roots for the user even if they reach the same
+directory. Roots are identified by their normalized paths, see "Watch
+roots are identified by their normalized paths" in `dev/design.md`.
 
 ## Linux: restart a watch on request
 
