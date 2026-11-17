@@ -41,7 +41,7 @@ import System.Directory
     , renameDirectory
     , setCurrentDirectory
     )
-import System.FilePath ((</>), pathSeparator, takeDirectory)
+import System.FilePath ((</>), normalise, pathSeparator, takeDirectory)
 #if defined(CABAL_OS_DARWIN)
 import System.FilePath (takeFileName)
 #endif
@@ -441,13 +441,16 @@ relativeRoot = do
 -- created again, the stream ends when none of the roots is watched. On
 -- macOS the watch is on the path of a root, the stream does not end.
 --
--- @names@ are the roots given to the watch, a name can be listed twice.
+-- @names@ are the roots given to the watch, a name can be listed twice, or
+-- via two paths that differ only in redundant separators and @.@
+-- components. The first of such paths must be normalized, Windows reports
+-- the root as the first path supplied.
 deletedRootsEnd :: String -> [FilePath] -> Spec
 deletedRootsEnd title names =
     it title
         $ notOnDarwin "the watch of a deleted root continues"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let roots = map (fp </>) (nub names)
+            let roots = nub (map (normalise . (fp </>)) names)
             mapM_ createDirectory roots
             paths <- mapM (Path.fromString . (fp </>)) names
             ref <- newIORef []
@@ -487,6 +490,9 @@ deletedRootsEndStream = do
     deletedRootsEnd
         "the stream ends when a root listed twice is deleted"
         ["root1", "root1"]
+    deletedRootsEnd
+        "the stream ends when a root listed via two equal paths is deleted"
+        ["root1", "." </> "root1"]
 
 -------------------------------------------------------------------------------
 -- Recursive mode
