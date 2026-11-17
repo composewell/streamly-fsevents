@@ -454,6 +454,32 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- The permission is checked when a watch is added, not afterwards. On
+    -- macOS and Windows the outcomes are expected, not yet observed.
+    , base
+        { title = "root watched before its read permission is removed"
+        , cleanup = allowRead . watchRoot
+        , skip = permissionNotRemovable
+        , ops = \p -> do
+            denyRead (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title = "subdir watched before its read permission is removed"
+        , config = Event.setRecursiveMode True
+        , setup = createDirectory . deniedDir
+        , cleanup = allowRead . deniedDir
+        , skip = permissionNotRemovable
+        , ops = \p -> do
+            denyRead (deniedDir p)
+            settle
+            createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
     , base
         { title = "regular file as a root is watched"
         , setup = \p -> do
@@ -766,6 +792,17 @@ behaviors =
         return $ case r of
             Left (_ :: IOException) -> Nothing
             Right _ -> Just "the permission was not removed"
+
+    -- The permission is removed by 'ops', after the watch starts. The probe
+    -- directory is not watched.
+    permissionNotRemovable p = do
+        let probe = renamedRoot p
+        createDirectory probe
+        denyRead probe
+        r <- stillReadable probe
+        allowRead probe
+        removeDirectory probe
+        return r
 
     deniedDir p = watchRoot p </> "denied"
 
