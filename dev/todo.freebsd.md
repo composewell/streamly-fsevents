@@ -41,31 +41,6 @@ Check after the build:
 4. Run the FreeBSD test-suite about 20 times to find flaky tests.
 5. Build with the non-threaded RTS and run the concurrency tests.
 
-## CI
-
-A GitHub Actions job with vmactions/freebsd-vm. Check the release names the
-action supports.
-
-```yaml
-  freebsd:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: vmactions/freebsd-vm@v1
-        with:
-          release: "15.0"
-          usesh: true
-          mem: 8192
-          prepare: |
-            pkg install -y ghc hs-cabal-install git
-          run: |
-            cabal update
-            cabal build --flags=limit-build-mem --enable-tests all
-            cabal test --flags=limit-build-mem --test-show-details=direct \
-              --test-options='+RTS -M1g -RTS' \
-              FileSystem.Event FileSystem.Event.FreeBSD
-```
-
 ## Not verified
 
 - **Linking.** The inotify functions are in `libsys` on FreeBSD 15 and in
