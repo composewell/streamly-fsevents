@@ -1081,11 +1081,10 @@ isRootDeletedEvent Event{..} =
 --  [Path.fromString "dir"]
 -- @
 --
--- Each run of the stream opens a new watch and closes it when the stream
--- ends. The stream ends after the 'isDeleted' event of the last root when
--- all the roots are deleted. The handle of the watch is not exposed, so the
--- roots of the watch are the given paths for as long as the stream runs. To
--- add or remove roots while reading the events, open the watch using
+-- Each run of the stream opens a new watch and closes it when the stream ends.
+-- The stream ends after the 'isDeleted' event of the last root when all the
+-- roots are deleted. The roots of the watch are fixed as long as the stream
+-- runs. To add or remove roots while reading the events, open the watch using
 -- 'openWatch', read it using 'eventStream' and change the roots using
 -- 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
@@ -1095,7 +1094,7 @@ watchWith f paths = S.bracketIO before closeWatch events
 
     before = openWatch f paths
 
-    -- A path listed more than once is one root
+    -- A path listed more than once is considered a single root
     rootCount = length (nub (map Path.toString (NonEmpty.toList paths)))
 
     -- The state is the number of roots that are not deleted
