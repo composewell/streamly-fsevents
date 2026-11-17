@@ -19,9 +19,10 @@ renamed over an empty directory, are not tested on Windows.
 `test/Streamly/Test/FileSystem/Event/Linux.hs` keeps the tests of the Linux
 API that the other platforms do not have: the scan events, `isRootUnwatched`,
 the handle API of a watch, file descriptor limits and the inotify queue
-overflow. A root listed twice and nested roots are also tested on Linux only,
-macOS reports an event once, for the innermost root that contains the path,
-Linux and Windows report it once for each root.
+overflow. A root listed twice and nested roots are also tested on Linux only.
+All platforms report a change in a root listed twice once, and a change in
+nested roots once for each root, the test suite `FileSystem.Event.Behavior`
+checks both.
 
 The large tree and stress tests run on all platforms. The exhaustive test of
 the recursive watch on Linux is described in `dev/design.linux.md`.
