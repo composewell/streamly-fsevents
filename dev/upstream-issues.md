@@ -29,7 +29,17 @@
   not exported by a public module, the export is commented out in
   `Streamly.FileSystem.Path`. It is used by `subComponents` in
   `src/Streamly/Internal/FS/Event/Linux.hs` to split a subdirectory path
-  into the components that `openSubdir` opens one at a time.
+  into the components that `openSubdir` opens one at a time, and by
+  `normalizeRoot` in the same file.
+* `Streamly.Internal.FileSystem.Path.normalize` (streamly-core 0.3.3) is
+  `undefined`. Master (0.4.0) implements it as `normalise`, exported only by
+  the Internal module. `normalizeRoot` in
+  `src/Streamly/Internal/FS/Event/Linux.hs` removes the redundant
+  separators and the `.` components of a root path with `splitPath_` and
+  `join` instead. Replace it with `Path.normalise` when 0.4 is released.
+  `normalise` keeps a leading `./` (`allowRelativeEquality` does not change
+  the normalization of the root), `normalizeRoot` drops it, to match
+  `eqPath` with `allowRelativeEquality` on macOS and Windows.
 * No API opens a path without following a symbolic link in any of its
   components (streamly-core 0.3.0). `O_NOFOLLOW` applies only to the last
   component. `openSubdir` in `src/Streamly/Internal/FS/Event/Linux.hs`

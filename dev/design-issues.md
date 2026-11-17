@@ -227,7 +227,8 @@ See `dev/design-issues/dynamic-watches.md`.
 
 `addRoot` skips a path that is already a root, and `removeRoot` finds the
 root by its path. The paths are compared by their components, with case
-significant (`Path.eqPath` on macOS and Windows, byte equality on Linux).
+significant (`Path.eqPath` on macOS and Windows, byte equality of the
+normalized paths on Linux).
 Case sensitivity is a property of the file system, or of a directory, not
 of the OS: NTFS is case-insensitive by default but a directory can be made
 case-sensitive (`fsutil file setCaseSensitiveInfo`), APFS and HFS+ can be
