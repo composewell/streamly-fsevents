@@ -1165,11 +1165,21 @@ newtype WD = WD CInt deriving Show
 foreign import ccall unsafe
     "sys/inotify.h inotify_init1" c_inotify_init1 :: CInt -> IO CInt
 
+#if defined(CABAL_OS_FREEBSD)
+-- The FreeBSD base sys/inotify.h defines IN_CLOEXEC and IN_NONBLOCK as
+-- O_CLOEXEC and O_NONBLOCK. The sys/inotify.h of the libinotify port, in
+-- /usr/local/include, shadows the base header and defines them with the
+-- Linux values, which the FreeBSD inotify_init1 rejects.
+foreign import capi "fcntl.h value O_CLOEXEC" iN_CLOEXEC :: CInt
+
+foreign import capi "fcntl.h value O_NONBLOCK" iN_NONBLOCK :: CInt
+#else
 foreign import capi
     "sys/inotify.h value IN_CLOEXEC" iN_CLOEXEC :: CInt
 
 foreign import capi
     "sys/inotify.h value IN_NONBLOCK" iN_NONBLOCK :: CInt
+#endif
 
 -- | Create a 'Watch' handle. 'addRoot' can be used to add paths being
 -- monitored by this watch.
@@ -2248,8 +2258,12 @@ concatStreams :: [Stream IO a] -> Stream IO a
 concatStreams = S.concatMap id . S.fromList
 
 #if defined(CABAL_OS_FREEBSD)
-foreign import capi
-    "sys/inotify.h value IN_MASK_CREATE" iN_MASK_CREATE :: Word32
+-- | IN_MASK_CREATE of the FreeBSD base sys/inotify.h. It is not imported from
+-- the header: the libinotify port installs a sys/inotify.h in
+-- /usr/local/include that shadows the base header and does not define it.
+-- The event and watch flags have the same values in both headers.
+iN_MASK_CREATE :: Word32
+iN_MASK_CREATE = 0x10000000
 #else
 foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
