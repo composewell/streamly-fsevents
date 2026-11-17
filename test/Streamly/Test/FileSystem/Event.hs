@@ -434,6 +434,41 @@ relativeRoot = do
             rootPath (last evs) `shouldBe` "root"
             absPath (last evs) `shouldBe` cwd </> "root" </> "file"
 
+-- | @normalizedRoot supplied expected@ watches the directory @root@ in a
+-- temporary directory @fp@, via the path @supplied fp@, and checks that
+-- 'Event.getRoot' reports @expected fp@. The working directory is @fp@.
+normalizedRoot ::
+    String -> (FilePath -> FilePath) -> (FilePath -> FilePath) -> Spec
+normalizedRoot title supplied expected =
+    it title
+        $ notOnWindows "getRoot reports the path as supplied"
+        $ withSystemTempDirectory "fsevent_dir" $ \tmp -> do
+            orig <- getCurrentDirectory
+            flip finally (setCurrentDirectory orig) $ do
+                setCurrentDirectory tmp
+                fp <- getCurrentDirectory
+                createDirectory (fp </> "root")
+                path <- Path.fromString (supplied fp)
+                bracket
+                    (Event.openWatch allEvents (path NonEmpty.:| []))
+                    Event.closeWatch
+                    $ \w -> do
+                        skipEarlier [expected fp] w
+                        createFile (fp </> "root" </> "file")
+                        evs <- readUntil (isCreatedRel "file") w
+                        rootPath (last evs) `shouldBe` expected fp
+
+normalizedRoots :: Spec
+normalizedRoots = do
+    normalizedRoot
+        "getRoot reports an absolute root without redundant components"
+        (\fp -> fp ++ "//./root/.")
+        (</> "root")
+    normalizedRoot
+        "getRoot reports a relative root without a leading ./"
+        (const "./root")
+        (const "root")
+
 -- The stream is read by another thread. The watch is open when it reports
 -- a file created in each root, the files are created until it does.
 --
@@ -1902,6 +1937,7 @@ watchTests =
                 manyRoots
                 eventPaths
                 relativeRoot
+                normalizedRoots
                 deletedRootsEndStream
             describe "overlapping roots" $ do
                 overlapRemoveInner
