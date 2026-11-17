@@ -171,13 +171,20 @@ On Windows the watch keeps the root open.
   reported as `isAccessDenied`, the rest of the tree stays watched. On macOS
   the watch continues, and the events of the subdirectory are reported if
   the process can reach it, as for a root. On Windows the events of the
-  subdirectory are expected to be reported, this is not tested.
+  subdirectory are expected to be reported, this is not tested. A process
+  has the "Bypass traverse checking" privilege, `SeChangeNotifyPrivilege`,
+  by default. Without it, NTFS is expected to check the traverse permission
+  of the watcher to the subdirectory for each change in it, and not to
+  report the change if the check fails. macOS also checks the access to a
+  directory for each change.
 * A permission removed during the watch: Linux checks the permission when
   the watch of a directory is added, and keeps reporting its events after
   the permission is removed. Windows is expected to do the same, the
-  permission is checked when the handle of the root is opened. macOS is
-  expected to stop reporting the events of a directory that the process can
-  no longer reach, this is not yet observed.
+  permission is checked when the handle of the root is opened. Without the
+  "Bypass traverse checking" privilege, the traverse permission of a
+  subdirectory on Windows is expected to be checked for each change. macOS
+  is expected to stop reporting the events of a directory that the process
+  can no longer reach, this is not yet observed.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
 * A FIFO as a root: on Linux the watch reports the events of the FIFO, it
   does not open the FIFO. On macOS it is expected to be watched like a
@@ -325,6 +332,7 @@ in a recursive watch.
 | A subdirectory reports its events after its read permission is removed | Yes | Expected Yes | Not tested, expected Yes |
 | A root reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
 | A subdirectory reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
+| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | Not tested, expected No |
 
 _Expected_ is the outcome asserted by the test suite that has not yet been
 recorded from the CI. On Windows the test suite cannot remove a permission
