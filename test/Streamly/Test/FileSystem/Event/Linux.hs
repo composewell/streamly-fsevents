@@ -584,27 +584,32 @@ renameRootUntil root path w = do
     renamePath root (root ++ "-moved")
     readUntil (\ev -> Event.isRootUnwatched ev && getAbsPath ev == path) w
 
+-- 'setRootMoved' is enabled by default, isMoved is true for the same event,
+-- as it is for a renamed root on macOS.
 rootRenamed :: Spec
 rootRenamed =
-    it "a renamed root reports isRootMoved and is unwatched"
-        $ withRoot cfg $ \root w -> do
+    it "a renamed root reports isRootMoved, isMoved and is unwatched"
+        $ withRoot Event.defaultConfig $ \root w -> do
             evs <- renameRootUntil root root w
             pathsOf Event.isRootMoved evs `shouldBe` [root]
+            pathsOf Event.isMoved evs `shouldBe` [root]
+            pathsOf Event.isMovedFrom evs `shouldBe` []
             unwatched evs `shouldBe` [(root, root)]
-
-    where
-
-    cfg = Event.setRootMoved True Event.defaultConfig
 
 -- IN_MOVE_SELF is requested for every root, it is not reported unless
 -- 'setRootMoved' is enabled.
 rootRenamedUnrequested :: Spec
 rootRenamedUnrequested =
     it "a renamed root is unwatched without setRootMoved"
-        $ withRoot Event.defaultConfig $ \root w -> do
+        $ withRoot cfg $ \root w -> do
             evs <- renameRootUntil root root w
             pathsOf Event.isRootMoved evs `shouldBe` []
+            pathsOf Event.isMoved evs `shouldBe` []
             unwatched evs `shouldBe` [(root, root)]
+
+    where
+
+    cfg = Event.setRootMoved False Event.defaultConfig
 
 recRootRenamed :: Spec
 recRootRenamed =

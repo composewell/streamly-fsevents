@@ -286,14 +286,14 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform No No Yes
         }
-    -- On Linux the rename of a root is reported by 'Linux.isRootMoved' only.
+    -- On Windows the rename of a root is not reported, the watch continues.
     , base
         { title = "renamed root reports isMoved for the root"
         , ops = \p -> renameDirectory (watchRoot p) (renamedRoot p)
         , check = \p ->
             let isRoot ev = absPath ev `elem` [watchRoot p, renamedRoot p]
              in any (\ev -> isRoot ev && Event.isMoved ev)
-        , expected = onPlatform No Yes No
+        , expected = onPlatform Yes Yes No
         }
     -- On Linux the root is removed only if its path no longer refers to the
     -- watched directory when the rename event is read.

@@ -15,8 +15,14 @@
   longer watched. Earlier, a process that still had the file open
   generated events for it.
 - Linux: when a watch root is deleted, `isDeleted` is reported for the
-  root, the same as on macOS and Windows. Use `setRootDeleted False` to
-  disable it.
+  root, the same as on macOS and Windows. When a watch root is renamed,
+  `isMoved` is reported for the root, the same as on macOS. Use
+  `setRootDeleted False` and `setRootMoved False` to disable them.
+- macOS: with a watch root inside another watch root, an event in the
+  inner root is reported once for each root, the same as on Linux and
+  Windows. Earlier it was reported for the inner root only.
+- Windows: a path listed twice in the watch roots is watched once, its
+  events are reported once, the same as on Linux and macOS.
 - Linux: the stream ends when none of its roots is watched any more, for
   example, when all the roots are deleted or renamed, the same as on
   Windows when all the roots are deleted. Earlier the stream waited

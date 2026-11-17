@@ -37,9 +37,9 @@
 -- * If a watch root is deleted, it reports an event for which 'isDeleted'
 -- and 'isRootDeleted' are true, and its watch ends with an 'isRootUnwatched'
 -- event.
--- * If a watch root is renamed, its watch ends with an 'isRootUnwatched'
--- event. The kernel does not report the new path of the root. Use
--- 'setRootMoved' to receive the 'isRootMoved' event.
+-- * If a watch root is renamed, it reports an event for which 'isMoved' and
+-- 'isRootMoved' are true, and its watch ends with an 'isRootUnwatched'
+-- event. The kernel does not report the new path of the root.
 -- * An object created at the path of a removed root later, or renamed to it,
 -- is not watched, including the root renamed back. Start a new watch to
 -- watch it.
