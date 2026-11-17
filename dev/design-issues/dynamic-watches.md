@@ -1,17 +1,18 @@
 # Adding and removing watch roots dynamically
 
-Not implemented. This note describes a portable API to add and remove watch
-roots while the events are being read, and how it can be implemented on each
-platform.
+The handle API is implemented on Linux, macOS and Windows, and exported
+only from `Streamly.Internal.FS.Event` and the internal platform modules.
+`watchDynamic` is not implemented. This note describes a portable API to add
+and remove watch roots while the events are being read, and how it can be
+implemented on each platform.
 
 ## API
 
 A handle based API. The roots are added and removed using the handle, from
-any thread, while other threads read the events from the handle as a stream.
-On Linux these functions exist in `Streamly.Internal.FS.Event.Linux`:
+any thread, while other threads read the events from the handle as a stream:
 
 ```haskell
-openWatch :: Config -> NonEmpty Path -> IO Watch
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
 addRoot :: Watch -> Path -> IO ()
 removeRoot :: Watch -> Path -> IO ()
 readEvent :: Watch -> IO (Maybe Event)
@@ -52,12 +53,11 @@ An inotify fd per root, with the streams of the roots merged, is not used:
 
 ## Windows
 
-One directory handle per root, each read by `ReadDirectoryChangesW` in its own
-thread. The streams of the roots are merged using `parConcatMap` over the
-stream of added roots.
-
-`killThread` cannot interrupt a synchronous `ReadDirectoryChangesW`. Removing a
-root needs `CancelIoEx` on the handle before `CloseHandle`, or overlapped IO.
+One directory handle per root, all associated with one I/O completion port.
+Each root has one overlapped `ReadDirectoryChangesW` call in progress, and
+one thread for the watch waits for the completion packets of the port.
+`removeRoot` closes the handle of the root, which completes its read. See
+"Reading the changes" in `src/Streamly/Internal/FS/Event/Windows.hs`.
 
 ## macOS
 
@@ -68,6 +68,10 @@ An `FSEventStream` watches a fixed list of paths. Two options:
 * One `FSEventStream` for all the roots, recreated with the new list of paths.
   The new stream starts from the last event id received (`sinceWhen`), so that
   no event is lost. The duplicate events are dropped by event id.
+
+The second option is implemented, see "Adding a root" in
+`src/Streamly/Internal/FS/Event/Darwin.hs` and
+`Streamly.Internal.FS.Event.Darwin.Replace`.
 
 ## Other libraries
 
