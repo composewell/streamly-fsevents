@@ -16,7 +16,8 @@
 -- asserted, it is recorded from the CI logs.
 --
 -- The expected outcomes were observed on Linux 6.12 and Ubuntu 24.04,
--- macOS 26 (arm64), Windows Server 2025 and Windows Server 2012 R2.
+-- macOS 26 (arm64) and Windows Server 2025. The suite is skipped on Windows
+-- older than Windows 10 and Windows Server 2016.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where
 
@@ -29,7 +30,7 @@ import Control.Exception
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (group, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
@@ -44,12 +45,22 @@ import System.Directory
 #endif
     )
 import System.FilePath ((</>), takeFileName)
-import System.IO (IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
+import System.IO
+    (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (readProcess)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
+import Data.Char (isDigit)
+import Data.Word (Word32)
+import Foreign.C.String (CWString, withCWString)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Storable (peek, poke, pokeByteOff)
+import System.Exit (exitSuccess)
+import System.Process (readCreateProcess, shell)
 import System.Win32.HardLink (createHardLink)
+import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
 import qualified System.Win32.File as Win32
 #endif
 import Streamly.Internal.FS.Event (Config, Event)
@@ -89,6 +100,8 @@ data Outcome =
 data Paths = Paths
     { watchRoot :: FilePath
     , renamedRoot :: FilePath
+    -- | The files opened by 'holdFile', closed after the behavior.
+    , heldFiles :: IORef [Handle]
     }
 
 data Behavior = Behavior
@@ -140,6 +153,14 @@ isNamed name ev = takeFileName (absPath ev) == name
 createdNamed :: String -> [Event] -> Bool
 createdNamed name = any (\ev -> isNamed name ev && Event.isCreated ev)
 
+modifiedNamed :: String -> [Event] -> Bool
+modifiedNamed name = any (\ev -> isNamed name ev && Event.isModified ev)
+
+-- | Whether each of the names is reported as deleted.
+deletedNamed :: [String] -> [Event] -> Bool
+deletedNamed names evs =
+    all (\name -> any (\ev -> isNamed name ev && Event.isDeleted ev) evs) names
+
 -- | Whether a path whose name starts with "file" has two 'Event.isCreated'
 -- events.
 fileCreatedTwice :: [Event] -> Bool
@@ -151,24 +172,125 @@ fileCreatedTwice =
     isFileCreate ev =
         Event.isCreated ev && "file" `isPrefixOf` takeFileName (absPath ev)
 
+-- | Open a file for appending. A file held open can be written after the
+-- permissions of its directory are removed.
+holdFile :: Paths -> FilePath -> IO ()
+holdFile p path = do
+    h <- openFile path AppendMode
+    modifyIORef' (heldFiles p) (h :)
+
+-- | Append to the files opened by 'holdFile' and keep them open.
+writeHeldFilesOpen :: Paths -> IO ()
+writeHeldFilesOpen p =
+    readIORef (heldFiles p) >>= mapM_ (\h -> hPutStr h "x" >> hFlush h)
+
+-- | Append to the files opened by 'holdFile' and close them. On macOS and
+-- Windows a write to a file that stays open may not be reported.
+writeHeldFiles :: Paths -> IO ()
+writeHeldFiles p = do
+    writeHeldFilesOpen p
+    readIORef (heldFiles p) >>= mapM_ hClose
+
 -- | Remove the permission to list a directory, keep the permission to create
 -- a file in it.
 denyRead :: FilePath -> IO ()
 -- | Undo 'denyRead'.
 allowRead :: FilePath -> IO ()
+-- | Remove all the permissions of a directory, the directory cannot be
+-- reached.
+denyAll :: FilePath -> IO ()
+-- | Undo 'denyAll'.
+allowAll :: FilePath -> IO ()
+-- | Remove the permission to reach the entries of a directory, keep the
+-- permission to list it. Undone by 'allowAll'. On Windows the traverse access
+-- is checked only without the "Bypass traverse checking" privilege, see
+-- 'bypassTraverse'.
+denySearch :: FilePath -> IO ()
+-- | On Windows, enable or disable the "Bypass traverse checking" privilege of
+-- the process. Does nothing on POSIX.
+bypassTraverse :: Bool -> IO ()
 -- | @hardLink source link@
 hardLink :: FilePath -> FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
+-- Deny the list access of the directory only, as on POSIX the traverse
+-- access is kept and the entries in the directory are not changed.
 denyRead path = void $ readProcess "icacls" [path, "/deny", everyone] ""
 
     where
 
-    everyone = "*S-1-1-0:(OI)(CI)(RX)"
+    everyone = "*S-1-1-0:(RD)"
 
 allowRead path =
     void $ readProcess "icacls" [path, "/remove:d", "*S-1-1-0"] ""
 
+denyAll path =
+    void $ readProcess "icacls" [path, "/deny", "*S-1-1-0:(OI)(CI)(F)"] ""
+
+allowAll = allowRead
+
+denySearch path =
+    void $ readProcess "icacls" [path, "/deny", "*S-1-1-0:(X)"] ""
+
 hardLink = createHardLink
+
+foreign import ccall unsafe "windows.h GetCurrentProcess"
+    c_GetCurrentProcess :: IO HANDLE
+
+foreign import ccall unsafe "windows.h OpenProcessToken"
+    c_OpenProcessToken :: HANDLE -> DWORD -> Ptr HANDLE -> IO BOOL
+
+foreign import ccall unsafe "windows.h LookupPrivilegeValueW"
+    c_LookupPrivilegeValueW :: CWString -> CWString -> Ptr () -> IO BOOL
+
+foreign import ccall unsafe "windows.h AdjustTokenPrivileges"
+    c_AdjustTokenPrivileges ::
+        HANDLE -> BOOL -> Ptr () -> DWORD -> Ptr () -> Ptr DWORD -> IO BOOL
+
+-- | Enable or disable a privilege of the process, for example
+-- @SeChangeNotifyPrivilege@ ("Bypass traverse checking"). Disabling a
+-- privilege that the process does not have succeeds.
+--
+-- TOKEN_PRIVILEGES with one privilege: the count at offset 0, the LUID at
+-- offset 4 and the attributes at offset 12, 16 bytes.
+setPrivilege :: String -> Bool -> IO ()
+setPrivilege privilege enable =
+    alloca $ \tokPtr -> do
+        process <- c_GetCurrentProcess
+        -- TOKEN_ADJUST_PRIVILEGES .|. TOKEN_QUERY
+        ok <- c_OpenProcessToken process 0x28 tokPtr
+        unless ok $ getLastError >>= failWith "OpenProcessToken"
+        tok <- peek tokPtr
+        flip finally (Win32.closeHandle tok) $ allocaBytes 16 $ \tp -> do
+            found <-
+                withCWString privilege $ \name ->
+                    c_LookupPrivilegeValueW nullPtr name (tp `plusPtr` 4)
+            unless found $ getLastError >>= failWith "LookupPrivilegeValueW"
+            poke (castPtr tp) (1 :: Word32)
+            -- SE_PRIVILEGE_ENABLED
+            pokeByteOff tp 12 (if enable then 2 else 0 :: Word32)
+            adjusted <- c_AdjustTokenPrivileges tok False tp 0 nullPtr nullPtr
+            -- The call succeeds with ERROR_NOT_ALL_ASSIGNED (1300) if the
+            -- process does not have the privilege.
+            err <- getLastError
+            unless (adjusted && (err == 0 || not enable && err == 1300))
+                $ failWith ("AdjustTokenPrivileges " ++ privilege) err
+
+-- | Enable or disable the "Bypass traverse checking" privilege,
+-- SeChangeNotifyPrivilege, of the process. A process has it enabled by
+-- default.
+setBypassTraverse :: Bool -> IO ()
+setBypassTraverse = setPrivilege "SeChangeNotifyPrivilege"
+
+bypassTraverse = setBypassTraverse
+
+-- | Disable the backup and restore privileges of the process. An
+-- administrator, such as the CI runner, has them enabled. A directory is
+-- always opened with FILE_FLAG_BACKUP_SEMANTICS, with these privileges the
+-- open is granted regardless of the ACL of the directory.
+disableBackupPrivileges :: IO ()
+disableBackupPrivileges = do
+    setPrivilege "SeBackupPrivilege" False
+    setPrivilege "SeRestorePrivilege" False
 #else
 denyRead path =
     setPermissions path
@@ -177,6 +299,20 @@ denyRead path =
 allowRead path = do
     perms <- getPermissions path
     setPermissions path (setOwnerReadable True perms)
+
+denyAll path = setPermissions path emptyPermissions
+
+allowAll path =
+    setPermissions path
+        $ setOwnerReadable True
+        $ setOwnerWritable True
+        $ setOwnerSearchable True emptyPermissions
+
+denySearch path =
+    setPermissions path
+        $ setOwnerReadable True $ setOwnerWritable True emptyPermissions
+
+bypassTraverse _ = return ()
 
 hardLink source link = void $ readProcess "ln" [source, link] ""
 #endif
@@ -416,8 +552,46 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform WatchException Yes WatchException
         }
+    -- A write to a file, without any permission change. The tests of
+    -- unreachable directories write to a file opened before the permissions
+    -- are removed, and close it after the write. On macOS the write to a file
+    -- kept open was reported in one run and not in others.
     , base
-        { title = "root without read permission is watched"
+        { title = "write is reported before the file is closed"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            writeHeldFilesOpen p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No No
+        , racy = onDarwin
+        }
+    , base
+        { title = "write is reported after the file is closed"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    -- A directory that cannot be reached: FSEvents does not report its events
+    -- to a process that is not root. The file is written through a handle
+    -- opened before the permissions are removed, and closed after the write.
+    , base
+        { title = "A root without READ and SEARCH reports its events"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denyAll (watchRoot p)
+        , cleanup = allowAll . watchRoot
+        , skip = stillReadable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform WatchException No WatchException
+        }
+    , base
+        { title = "A root with only SEARCH reports its events"
         , setup = denyRead . watchRoot
         , cleanup = allowRead . watchRoot
         , skip = rootStillReadable
@@ -425,8 +599,58 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform WatchException Yes WatchException
         }
+    -- On Windows the tests that deny SEARCH disable the "Bypass traverse
+    -- checking" privilege, with it the traverse access is not checked.
     , base
-        { title = "recursive root with an unreadable subdir is watched"
+        { title = "A root with only READ reports its events"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denySearch (watchRoot p)
+            bypassTraverse False
+        , cleanup = \p ->
+            allowAll (watchRoot p) `finally` bypassTraverse True
+        , skip = stillSearchable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No Yes
+        }
+    -- The required permission is READ on Linux and Windows, SEARCH on macOS.
+    , base
+        { title =
+            "A root stops reporting events after the required permission is "
+                ++ "removed"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , cleanup = allowAll . watchRoot
+        , skip = requiredNotRemovable
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            denyRequired (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = \_ -> not . modifiedNamed "file"
+        , expected = onPlatform No Yes No
+        }
+    , base
+        { title =
+            "A root starts reporting events after the required permission is "
+                ++ "enabled"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denyRequired (watchRoot p)
+        , cleanup = allowAll . watchRoot
+        , skip = requiredStillGranted . watchRoot
+        , ops = \p -> do
+            allowAll (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    , base
+        { title =
+            "A recursive watch with a subdirectory without READ is watched"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -437,8 +661,37 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- Linux reports the subdir as isAccessDenied and does not watch it.
     , base
-        { title = "unreadable dir moved into a recursive root is skipped"
+        { title = "A subdirectory without READ, with SEARCH reports its events"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            denyRead (deniedDir p)
+        , cleanup = allowRead . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform No Yes Yes
+        }
+    , base
+        { title = "A subdirectory without READ and SEARCH reports its events"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+        , cleanup = allowAll . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform No No Yes
+        }
+    , base
+        { title =
+            "A directory without READ moved into a recursive watch does not "
+                ++ "end the watch"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (renamedRoot p)
@@ -454,6 +707,104 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    , base
+        { title = "A subdirectory reports its events after its READ is removed"
+        , config = Event.setRecursiveMode True
+        , setup = createDirectory . deniedDir
+        , cleanup = allowRead . deniedDir
+        , skip = permissionNotRemovable denyRead allowRead
+        , ops = \p -> do
+            denyRead (deniedDir p)
+            settle
+            createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title =
+            "A subdirectory reports its events after its READ and SEARCH "
+                ++ "are removed"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+        , cleanup = allowAll . deniedDir
+        , skip = permissionNotRemovable denyAll allowAll
+        , ops = \p -> do
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No Yes
+        }
+    , base
+        { title =
+            "A subdirectory without READ and SEARCH reports its events "
+                ++ "after they are restored"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+        , cleanup = allowAll . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> do
+            allowAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform No Yes Yes
+        }
+    -- On Linux a subdirectory is opened through the root, which needs SEARCH
+    -- on the root. Windows checks the traverse access of the subdirectory
+    -- that changed, not of the root. The file "file" in the root is used by
+    -- the skip check.
+    , base
+        { title = "A subdirectory of a root with only READ reports its events"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createDirectory (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir" </> "subfile")
+            holdFile p (watchRoot p </> "dir" </> "subfile")
+            denySearch (watchRoot p)
+            bypassTraverse False
+        , cleanup = \p ->
+            allowAll (watchRoot p) `finally` bypassTraverse True
+        , skip = stillSearchable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "subfile")
+        , expected = onPlatform No No Yes
+        }
+#if defined(CABAL_OS_WINDOWS)
+    -- Without the "Bypass traverse checking" privilege NTFS checks the
+    -- traverse access of the watcher to a subdirectory for each change in
+    -- it, as macOS does. The privilege is disabled before the
+    -- watch starts.
+    , base
+        { title =
+            "Without the \"Bypass traverse checking\" privilege, a "
+                ++ "subdirectory reports its events after its READ and "
+                ++ "SEARCH are removed"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            setBypassTraverse False
+        , cleanup = \p ->
+            allowAll (deniedDir p) `finally` setBypassTraverse True
+        , skip = permissionNotRemovable denyAll allowAll
+        , ops = \p -> do
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = No
+        }
+#endif
     , base
         { title = "regular file as a root is watched"
         , setup = \p -> do
@@ -667,20 +1018,28 @@ behaviors =
         , expected = onPlatform No Yes No
         }
     , base
-        { title = "deleted root reports isDeleted for a file in it"
-        , setup = withFile
+        { title =
+            "A deleted watch root reports `isDeleted` for each file in it"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createFile (watchRoot p </> "file2")
+            settle
         , ops = removePathForcibly . watchRoot
-        , check = \_ ->
-            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , check = const (deletedNamed ["file", "file2"])
         , expected = onPlatform Yes No Yes
         }
     , base
-        { title = "deleted dir in the tree reports isDeleted for a file in it"
+        { title =
+            "Deleting a directory in a recursive watch reports `isDeleted` "
+                ++ "for each file in it"
         , config = Event.setRecursiveMode True
-        , setup = withDirFile
+        , setup = \p -> do
+            createDirectory (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir/file")
+            createFile (watchRoot p </> "dir/file2")
+            settle
         , ops = \p -> removePathForcibly (watchRoot p </> "dir")
-        , check = \_ ->
-            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , check = const (deletedNamed ["file", "file2"])
         , expected = onPlatform Yes Yes Yes
         }
     -- On macOS the copy is a clone, on APFS it reports 'Darwin.isCloned'.
@@ -766,6 +1125,46 @@ behaviors =
         return $ case r of
             Left (_ :: IOException) -> Nothing
             Right _ -> Just "the permission was not removed"
+
+    -- The permission is removed by 'ops', after the watch starts. The probe
+    -- directory is not watched.
+    permissionNotRemovable ::
+           (FilePath -> IO ())
+        -> (FilePath -> IO ())
+        -> Paths
+        -> IO (Maybe String)
+    permissionNotRemovable deny allow p = do
+        let probe = renamedRoot p
+        createDirectory probe
+        deny probe
+        r <- stillReadable probe
+        allow probe
+        removeDirectory probe
+        return r
+
+    -- Whether the entry "file" of the directory can be reached.
+    stillSearchable dir = do
+        r <- try (getPermissions (dir </> "file"))
+        return $ case r of
+            Left (_ :: IOException) -> Nothing
+            Right _ -> Just "the permission was not removed"
+
+    -- The permission required to watch a directory.
+    denyRequired = if onDarwin then denySearch else denyRead
+
+    requiredStillGranted dir =
+        if onDarwin then stillSearchable dir else stillReadable dir
+
+    -- As 'permissionNotRemovable', for 'denyRequired'.
+    requiredNotRemovable p = do
+        let probe = renamedRoot p
+        createDirectory probe
+        createFile (probe </> "file")
+        denyRequired probe
+        r <- requiredStillGranted probe
+        allowAll probe
+        removePathForcibly probe
+        return r
 
     deniedDir p = watchRoot p </> "denied"
 
@@ -922,11 +1321,18 @@ runBehavior b =
     withSystemTempDirectory "fsevent_behavior" $ \dir -> do
         let root = dir </> "root"
             control = dir </> "control"
-            paths = Paths {watchRoot = root, renamedRoot = dir </> "renamed"}
+        held <- newIORef []
+        let paths =
+                Paths
+                    { watchRoot = root
+                    , renamedRoot = dir </> "renamed"
+                    , heldFiles = held
+                    }
+            closeHeld = readIORef held >>= mapM_ hClose
         createDirectory root
         createDirectory control
         setup b paths
-        flip finally (cleanup b paths) $ do
+        flip finally (cleanup b paths >> closeHeld) $ do
             reason <- skip b paths
             maybe (runWatch b paths control) (return . Skipped) reason
 
@@ -947,8 +1353,36 @@ expectedNote b outcome
     | outcome == expected b = ""
     | otherwise = " (expected " ++ show (expected b) ++ ")"
 
+#if defined(CABAL_OS_WINDOWS)
+-- | The major version of Windows, from the output of @ver@, for example,
+-- @Microsoft Windows [Version 10.0.26100.1]@. 10 if @ver@ fails or its
+-- output cannot be parsed.
+windowsMajorVersion :: IO Int
+windowsMajorVersion = do
+    -- With readProcess "cmd" ["/c", "ver"] cmd receives the quoted
+    -- argument "ver" and fails, 'shell' passes the command unquoted.
+    r <- try (readCreateProcess (shell "ver") "")
+    return $ case r of
+        Left (_ :: IOException) -> 10
+        -- Not 'reads' on the rest of the output, it reads "6.3" as one
+        -- number and fails for an Int.
+        Right out ->
+            case takeWhile isDigit (dropWhile (not . isDigit) out) of
+                [] -> 10
+                digits -> read digits
+#endif
+
 main :: IO ()
 main = do
+#if defined(CABAL_OS_WINDOWS)
+    major <- windowsMajorVersion
+    putStrLn $ "Windows major version: " ++ show major
+    when (major < 10) $ do
+        putStrLn $ "Skipped on Windows version " ++ show major
+            ++ ", the suite needs Windows 10 or Windows Server 2016"
+        exitSuccess
+    disableBackupPrivileges
+#endif
     resultsRef <- newIORef []
     let spec seconds b runner = it (title b) $ do
             outcome <- outcomeWithin seconds runner

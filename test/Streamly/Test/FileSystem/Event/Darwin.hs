@@ -328,8 +328,9 @@ main = do
     runRec SymLinkOrigPath symLinkRecTests
     runRec FileType fileRootTests
 
-    hspec $ describe moduleName $ describe "robustness" $ do
-        closeWithSigPipe
-        closeWithReader
-        nestedDirEvents
-        manyWatches
+    hspec $ describe moduleName $ do
+        describe "robustness" $ do
+            closeWithSigPipe
+            closeWithReader
+            nestedDirEvents
+            manyWatches

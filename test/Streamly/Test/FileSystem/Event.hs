@@ -54,7 +54,12 @@ import System.Directory (getSymbolicLinkTarget, listDirectory)
 import System.Directory (listDirectory)
 #endif
 #if !defined(CABAL_OS_WINDOWS)
-import System.Posix.Process (executeFile, forkProcess, getProcessStatus)
+import Data.Bits ((.|.))
+import Data.List.NonEmpty (NonEmpty((:|)))
+import System.IO (IOMode(..), hClose, hPutStr, openFile, withFile)
+import System.Posix.Files
+    (createNamedPipe, ownerReadMode, ownerWriteMode)
+import System.Process (callProcess)
 #endif
 import Test.Hspec
 
@@ -1442,6 +1447,41 @@ fileRootRaises =
             createdRoots file2 evs `shouldBe` [root]
 #endif
 
+#if !defined(CABAL_OS_WINDOWS)
+-- Opening a FIFO for reading without O_NONBLOCK blocks until it has a
+-- writer, the timeout fails the test if openWatch opens the FIFO that way.
+-- System.IO opens the FIFO with O_NONBLOCK, the reader is opened first, an
+-- open for writing without a reader fails with ENXIO.
+--
+-- FreeBSD 14.5 and 15.0 add the watch but do not report a write to the
+-- FIFO, the test checks that no isModified event arrives in 3 seconds.
+fifoRoot :: Spec
+fifoRoot =
+    it "a FIFO as a root is watched without opening it"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let fifo = fp </> "fifo"
+            createNamedPipe fifo (ownerReadMode .|. ownerWriteMode)
+            p <- Path.fromString fifo
+            let open =
+                    timeout 10000000 (Event.openWatch allEvents (p :| []))
+                        >>= maybe (error "openWatch: timed out") return
+            bracket open Event.closeWatch $ \w ->
+                bracket (openFile fifo ReadMode) hClose $ \_ -> do
+                    withFile fifo WriteMode (`hPutStr` "x")
+#if defined(CABAL_OS_FREEBSD)
+                    r <- timeout 3000000 (readUntil (isModifiedAt fifo) w)
+                    fmap (const ()) r `shouldBe` Nothing
+#else
+                    evs <- readUntil (isModifiedAt fifo) w
+                    map absPath (filter (isModifiedAt fifo) evs)
+                        `shouldBe` [fifo]
+#endif
+
+    where
+
+    isModifiedAt file ev = Event.isModified ev && absPath ev == file
+#endif
+
 -- The reader thread is blocked reading the watch. The stream ends when the
 -- watch is closed, without any file system event.
 closeWhileReading :: Spec
@@ -1679,12 +1719,12 @@ gcClosed probe =
     retryUntil (performGC >> isWatchClosed probe) >>= (`shouldBe` True)
 
 #if !defined(CABAL_OS_WINDOWS)
--- | The number of fds open in a child process created with fork and exec.
+-- | The number of fds open in a child process. The child inherits the fds
+-- that are not close-on-exec. 'forkProcess' is not used, in a threaded
+-- program the forked child can fail before it runs the command.
 childFds :: FilePath -> IO Int
 childFds out = do
-    pid <- forkProcess $
-        executeFile "/bin/sh" False ["-c", "ls /dev/fd > " ++ out] Nothing
-    _ <- getProcessStatus True False pid
+    callProcess "/bin/sh" ["-c", "ls /dev/fd > " ++ out]
     s <- readFile out
     return $! length (lines s)
 
@@ -1962,6 +2002,9 @@ watchTests =
                 eventPaths
                 relativeRoot
                 normalizedRoots
+#if !defined(CABAL_OS_WINDOWS)
+                fifoRoot
+#endif
                 deletedRootsEndStream
             describe "overlapping roots" $ do
                 overlapRemoveInner
