@@ -867,6 +867,11 @@ toAbsolute path
 
     str = Path.toString path
 
+-- | Whether the root was added via a path equal to @path@.
+isRootPath :: Path -> Root -> Bool
+isRootPath path =
+    Path.eqPath (Path.allowRelativeEquality True) path . rootPath
+
 -- | @addRoot watch root@ adds the directory @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. The root is watched
 -- when the call returns: a change made after it is reported. A relative
@@ -890,14 +895,11 @@ addRoot Watch{..} root =
     modifyMVar_ watchRoots $ \rs -> do
         when (rsClosed rs)
             $ ioError (userError "addRoot: the watch is closed.")
-        if any isRoot (Map.elems (rsActive rs))
+        if any (isRootPath root) (Map.elems (rsActive rs))
         then return rs
         else add rs
 
     where
-
-    name = Path.toString root
-    isRoot = (== name) . Path.toString . rootPath
 
     add rs = do
         let key = rsNextKey rs
@@ -955,12 +957,7 @@ addRoot Watch{..} root =
 --
 removeRoot :: Watch -> Path -> IO ()
 removeRoot Watch{..} root =
-    modifyMVar_ watchRoots (retireRoots isRoot)
-
-    where
-
-    name = Path.toString root
-    isRoot = (== name) . Path.toString . rootPath
+    modifyMVar_ watchRoots (retireRoots (isRootPath root))
 
 -- | Open a watch on the paths with the given 'Config', see
 -- 'watchEndsUnwatched' for the 'Bool'.
