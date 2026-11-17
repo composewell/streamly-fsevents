@@ -3067,8 +3067,9 @@ parseEvents =
 -- It is then handled before the IN_MOVED_FROM records the cookie, and does
 -- not remove a directory moved out of the tree. Therefore,
 -- after the events of a read that found the queue empty are handled, the
--- directories that still have the cookie of an IN_MOVED_FROM have no
--- IN_MOVED_TO, they are removed as moved out, see 'unwatchMovedOut'.
+-- paths that still have the cookie of an IN_MOVED_FROM have no IN_MOVED_TO.
+-- A path that no longer refers to the directory of its watch descriptor is
+-- removed as moved out, see 'unwatchMovedOut'.
 --
 -- If the queue is found empty between IN_MOVED_FROM and IN_MOVED_TO, the
 -- directory is removed, by its reordered IN_MOVE_SELF or by
@@ -3177,26 +3178,43 @@ withEffects evs action = do
         `S.append` either (S.fromPure . ItemFailed) id r
 
 #if defined(CABAL_OS_FREEBSD)
--- | Remove the directories that still have the cookie of an IN_MOVED_FROM
--- event after all the events in the queue are handled, see the NOTE above
--- 'orderMoves'. Returns the paths removed without a marker as
+-- | Handle the paths that still have the cookie of an IN_MOVED_FROM event
+-- after all the events in the queue are handled, see the NOTE above
+-- 'orderMoves'. A path that refers to the directory of its watch descriptor
+-- is kept and its cookie is removed: the IN_MOVED_FROM was for another
+-- directory at the path, for example, in @mkdir d; mv d out; mkdir d@ read
+-- after all three, the create event watches the second @d@. The other paths
+-- are removed as moved out. Returns the paths removed without a marker as
 -- 'isRootUnwatched' events, see 'unwatchPaths'.
 unwatchMovedOut :: Watch -> IO (Stream IO StreamItem)
-unwatchMovedOut wtch = withEffects [] $ do
-    m <- readIORef (watchWdMap wtch)
-    let moved =
-            [ wpRep wp
-            | wd <- movedWds m
-            , wp <- wdUserPaths wd m
-            , not (wpRemoved wp)
-            , isJust (wpMoveCookie wp)
-            ]
-    removed <- concat <$> mapM (unwatchSubtree wtch) moved
-    return
-        $ S.fromList
-            [ ItemEvent (synthEvent (SynthUnwatched wd pRep))
-            | (wd, pRep) <- removed
-            ]
+unwatchMovedOut wtch@Watch {watchConfig = cfg, watchWdMap = wdMapRef} =
+    withEffects [] $ do
+        m <- readIORef wdMapRef
+        let moved =
+                [ (wd, wpRep wp)
+                | wd <- movedWds m
+                , wp <- wdUserPaths wd m
+                , isMovedPath wp
+                ]
+        removed <- concat <$> mapM unwatchGone moved
+        return
+            $ S.fromList
+                [ ItemEvent (synthEvent (SynthUnwatched wd pRep))
+                | (wd, pRep) <- removed
+                ]
+
+    where
+
+    isMovedPath wp = not (wpRemoved wp) && isJust (wpMoveCookie wp)
+
+    unwatchGone (wd, pRep) = do
+        r <- probeWatch (watchFlags (subdirConfig cfg)) wtch wd pRep
+        if r == ProbeSame
+        then do
+            let isPath wp = isMovedPath wp && eqPathRep (wpRep wp) pRep
+            atomicModifyIORef' wdMapRef (\m -> (clearMoved isPath m, ()))
+            return []
+        else unwatchSubtree wtch pRep
 
 -- | Whether a read of the given number of bytes found the queue empty. A
 -- read returns as many events as fit in the buffer, the largest event has a
