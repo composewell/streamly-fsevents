@@ -437,6 +437,20 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- Linux reports the subdir as isAccessDenied and does not watch it. On
+    -- macOS and Windows the outcome is expected, not yet observed.
+    , base
+        { title = "unreadable subdir of a recursive root reports its changes"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            denyRead (deniedDir p)
+        , cleanup = allowRead . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform No Yes Yes
+        }
     , base
         { title = "unreadable dir moved into a recursive root is skipped"
         , config = Event.setRecursiveMode True
