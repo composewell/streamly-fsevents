@@ -255,7 +255,7 @@ createDir dir parent =
 dirCreateWithParent ::
     String -> (String -> [([Char], Event -> Bool)]) -> TestDesc
 dirCreateWithParent dir events =
-    ( "dir created (" ++ dir ++ ")"
+    ( "dir created with its parent (" ++ dir ++ ")"
     , const (return ())
     , createDirWithParent dir
     , events dir
@@ -342,7 +342,7 @@ fileCreate file1 events =
 fileCreateWithParent ::
     String -> (String -> [(String, Event -> Bool)]) -> TestDesc
 fileCreateWithParent file1 events =
-    ( "File created (" ++ file1 ++ ")"
+    ( "File created with its parent (" ++ file1 ++ ")"
     , const (return ())
     , createFileWithParent  file1
     , (file1, fileEvent Event.isCreated) : events file1
@@ -452,8 +452,16 @@ testsWithParent p =
 commonTests :: [TestDesc]
 commonTests = testsWithParent ""
 
+-- | In a recursive watch, the directory @subdir@ is created along with the
+-- entry in it. The entry is reported as created, on Linux by the scan of
+-- @subdir@ if it is created before the watch of @subdir@ is added.
 commonRecTests :: [TestDesc]
-commonRecTests = testsWithParent "subdir"
+commonRecTests =
+      dirCreateWithParent
+        (withParent "subdir" "dir")
+        (\dir -> [(dir, dirEvent Event.isCreated)])
+    : fileCreateWithParent (withParent "subdir" "file") (const [])
+    : testsWithParent "subdir"
 
 -------------------------------------------------------------------------------
 -- Running tests

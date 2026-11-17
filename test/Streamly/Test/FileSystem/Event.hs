@@ -6,21 +6,49 @@
 -- Stability   : experimental
 -- Portability : GHC
 --
+-- Tests of the portable API, with the same expected events on all the
+-- platforms. Where a platform reports more, the helper used by the test
+-- states the difference, for example, 'shouldCreate' and 'shouldUnwatch'.
 
 module Streamly.Test.FileSystem.Event (main) where
 
 import Control.Concurrent
-    ( forkIO, killThread, newEmptyMVar, putMVar, takeMVar, threadDelay )
+    ( MVar, ThreadId, forkIO, killThread, newChan, newEmptyMVar, putMVar
+    , readChan, takeMVar, threadDelay, tryPutMVar, writeChan
+    )
 import Control.Exception
-    (IOException, SomeException, bracket, finally, throwIO, try)
+    ( AsyncException(ThreadKilled), IOException, SomeException, bracket
+    , finally, fromException, mask, throwIO, try
+    )
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn)
+import Data.List (elemIndex, isPrefixOf, sort, sortOn)
+#if !defined(CABAL_OS_LINUX)
+import Data.List (nub)
+#endif
 import Streamly.Internal.FS.Event (Config, Event)
-import System.Directory (createDirectory)
+import System.Directory
+    ( createDirectory
+    , createDirectoryLink
+    , createFileLink
+    , removeDirectory
+    , renameDirectory
+    )
 import System.FilePath ((</>), pathSeparator, takeDirectory)
+#if defined(CABAL_OS_DARWIN)
+import System.FilePath (takeFileName)
+#endif
 import System.IO.Temp (withSystemTempDirectory)
+import System.Mem (performGC)
 import System.Timeout (timeout)
+#if defined(CABAL_OS_LINUX)
+import System.Directory (getSymbolicLinkTarget, listDirectory)
+#elif defined(CABAL_OS_DARWIN)
+import System.Directory (listDirectory)
+#endif
+#if !defined(CABAL_OS_WINDOWS)
+import System.Posix.Process (executeFile, forkProcess, getProcessStatus)
+#endif
 import Test.Hspec
 
 import qualified Data.List.NonEmpty as NonEmpty
@@ -30,6 +58,8 @@ import qualified Streamly.Internal.FS.Event as Event
 import qualified Streamly.Internal.FileSystem.Path as Path
 #if defined(CABAL_OS_LINUX)
 import qualified Streamly.Internal.FS.Event.Linux as Linux
+#elif defined(CABAL_OS_WINDOWS)
+import qualified System.Win32.File as Win32
 #endif
 
 import Streamly.Test.FileSystem.Event.Common
@@ -47,8 +77,21 @@ absPath = Path.toString . Event.getAbsPath
 rootPath :: Event -> FilePath
 rootPath = Path.toString . Event.getRoot
 
+relPath :: Event -> Maybe FilePath
+relPath = fmap Path.toString . Event.getRelPath
+
 isCreatedAt :: FilePath -> Event -> Bool
 isCreatedAt file ev = Event.isCreated ev && absPath ev == file
+
+-- | The roots of the create events of the file. On macOS and Windows a root
+-- is listed once, a later event for a path can repeat 'Event.isCreated' on
+-- macOS.
+createdRoots :: FilePath -> [Event] -> [FilePath]
+#if defined(CABAL_OS_LINUX)
+createdRoots file = map rootPath . filter (isCreatedAt file)
+#else
+createdRoots file = nub . map rootPath . filter (isCreatedAt file)
+#endif
 
 -- | The paths of the events that satisfy the predicate.
 pathsOf :: (Event -> Bool) -> [Event] -> [FilePath]
@@ -62,6 +105,18 @@ isChange ev =
     || Event.isMoved ev
     || Event.isModified ev
 
+-- | The events checked for a path that must not be reported. With @True@, on
+-- Linux, every event is checked, including the open, access and
+-- @isRootUnwatched@ events. Otherwise only the changes are checked: on Linux
+-- the @isRootUnwatched@ event of a directory removed from the watch can be
+-- read after the events of later changes.
+checkedEvents :: Bool -> [Event] -> [Event]
+#if defined(CABAL_OS_LINUX)
+checkedEvents everyEvent = if everyEvent then id else filter isChange
+#else
+checkedEvents _ = filter isChange
+#endif
+
 -- | @dir@ or a path under it.
 isUnder :: FilePath -> FilePath -> Bool
 isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
@@ -72,7 +127,7 @@ isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
 --
 -- On macOS a later event for a path can repeat 'Event.isCreated', there must
 -- be at least one for each path, and only the events of the given paths are
--- checked, the markers of 'waitStarted' and 'syncOn' can be reported again.
+-- checked, the markers of 'skipEarlier' and 'syncOn' can be reported again.
 shouldCreate :: [Event] -> [FilePath] -> Expectation
 shouldCreate evs paths =
 #if defined(CABAL_OS_LINUX)
@@ -87,12 +142,134 @@ shouldCreate evs paths =
 
     created = pathsOf Event.isCreated evs
 
+-- | The 'Event.isModified' events must include the given paths. On Linux
+-- they must be for the given paths only, one for each path, in order.
+shouldModify :: [Event] -> [FilePath] -> Expectation
+shouldModify evs paths =
+#if defined(CABAL_OS_LINUX)
+    modified `shouldBe` paths
+#else
+    filter (`notElem` modified) paths `shouldBe` []
+#endif
+
+    where
+
+    modified = pathsOf Event.isModified evs
+
+-- | Whether the event is the @isRootUnwatched@ event of Linux. macOS and
+-- Windows do not report a root or a directory that is no longer watched.
+isUnwatched :: Event -> Bool
+#if defined(CABAL_OS_LINUX)
+isUnwatched = Linux.isRootUnwatched
+#else
+isUnwatched = const False
+#endif
+
+-- | On Linux the @isRootUnwatched@ events must be for the given roots and
+-- paths, in order. Nothing is checked on macOS and Windows.
+shouldUnwatch :: [Event] -> [(FilePath, FilePath)] -> Expectation
+#if defined(CABAL_OS_LINUX)
+shouldUnwatch evs expected =
+    [(rootPath ev, absPath ev) | ev <- evs, isUnwatched ev]
+        `shouldBe` expected
+#else
+shouldUnwatch _ _ = return ()
+#endif
+
 createFile :: FilePath -> IO ()
 createFile file = writeFile file ""
+
+-- | The directory @out@ next to the root, outside the watched tree.
+outside :: FilePath -> FilePath
+outside root = takeDirectory root </> "out"
+
+onWindows :: Bool
+#if defined(CABAL_OS_WINDOWS)
+onWindows = True
+#else
+onWindows = False
+#endif
+
+onLinux :: Bool
+#if defined(CABAL_OS_LINUX)
+onLinux = True
+#else
+onLinux = False
+#endif
+
+-- | Run the test except on Windows.
+notOnWindows :: String -> IO () -> IO ()
+notOnWindows reason test =
+    if onWindows then pendingWith reason else test
 
 -------------------------------------------------------------------------------
 -- Running a watch
 -------------------------------------------------------------------------------
+
+-- The tests open the watch using 'Event.openWatch' and read it using
+-- 'Event.readEvent' in the test thread. On Linux the watch adds, removes and
+-- scans the directories of an event when the event is read. The changes that
+-- a test makes without reading the watch are all done before the watch
+-- handles the event of the first of them.
+
+-- | Read the events of the watch up to and including the first event that
+-- satisfies the predicate. Throw an exception if it does not occur within 10
+-- seconds or the watch is closed.
+readUntil :: (Event -> Bool) -> Event.Watch -> IO [Event]
+readUntil p w = do
+    r <- timeout 10000000 (go [])
+    maybe (error "readUntil: timed out") return r
+
+    where
+
+    go acc = do
+        r <- Event.readEvent w
+        case r of
+            Nothing -> error "readUntil: the watch is closed"
+            Just ev
+                | p ev -> return (reverse (ev : acc))
+                | otherwise -> go (ev : acc)
+
+-- | On Linux, read the events up to the @isRootUnwatched@ event of the path
+-- for the root. On macOS and Windows nothing is read.
+readUnwatched :: Event.Watch -> FilePath -> FilePath -> IO [Event]
+#if defined(CABAL_OS_LINUX)
+readUnwatched w root path =
+    readUntil
+        (\ev -> isUnwatched ev && rootPath ev == root && absPath ev == path)
+        w
+#else
+readUnwatched _ _ _ = return []
+#endif
+
+-- | On macOS a watch reports changes made shortly before it was opened.
+-- Create a file @ready@ in each root, read the events up to the last of
+-- them, and the events that follow within 100 ms of each other. On Linux and
+-- Windows nothing is read, the test gets every event of the watch.
+skipEarlier :: [FilePath] -> Event.Watch -> IO ()
+#if defined(CABAL_OS_DARWIN)
+skipEarlier roots w = do
+    forM_ (nub roots) $ \r -> createFile (r </> "ready")
+    wait (nub roots)
+
+    where
+
+    isReady ev = Event.isCreated ev && takeFileName (absPath ev) == "ready"
+
+    wait [] = drain
+    wait notSeen = do
+        evs <- readUntil isReady w
+        let seen = map rootPath (filter isReady evs)
+        wait (filter (`notElem` seen) notSeen)
+
+    drain = do
+        r <- timeout 100000 (Event.readEvent w)
+        case r of
+            Just (Just _) -> drain
+            _ -> return ()
+#else
+skipEarlier _ _ = return ()
+#endif
 
 -- | On Linux the watch reports all the events, as the Linux test suite does.
 allEvents :: Config -> Config
@@ -102,18 +279,681 @@ allEvents = Linux.setAllEvents True
 allEvents = id
 #endif
 
+-- | Open a watch on the roots, run the action and close the watch.
+withWatchCfg ::
+    (Config -> Config) -> [FilePath] -> (Event.Watch -> IO a) -> IO a
+withWatchCfg cfg roots action = do
+    paths <- mapM Path.fromString roots
+    bracket
+        (Event.openWatch cfg (NonEmpty.fromList paths))
+        Event.closeWatch
+        $ \w -> skipEarlier roots w >> action w
+
+-- | Like 'withWatchCfg', with 'allEvents'.
+withWatch ::
+    (Config -> Config) -> [FilePath] -> (Event.Watch -> IO a) -> IO a
+withWatch cfg = withWatchCfg (cfg . allEvents)
+
+-- | Watch the directory @root@ in a temporary directory.
+withRootCfg ::
+    (Config -> Config) -> (FilePath -> Event.Watch -> IO a) -> IO a
+withRootCfg cfg action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "root"
+        createDirectory root
+        withWatchCfg cfg [root] (action root)
+
+-- | Like 'withRootCfg', with 'allEvents'.
+withRoot ::
+    (Config -> Config) -> (FilePath -> Event.Watch -> IO a) -> IO a
+withRoot cfg = withRootCfg (cfg . allEvents)
+
 recursive :: Config -> Config
 recursive = Event.setRecursiveMode True
+
+-- | Watch the directories @root1@ and @root2@ in a temporary directory.
+withTwoRoots :: (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withTwoRoots action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root1 = fp </> "root1"
+            root2 = fp </> "root2"
+        createDirectory root1
+        createDirectory root2
+        withWatch id [root1, root2] (action root1 root2)
+
+-- | A recursive watch of the directory @root@ and of its subdirectory
+-- @root/sub@, both as roots.
+withNestedRoots :: (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withNestedRoots action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let root = fp </> "root"
+            sub = root </> "sub"
+        createDirectory root
+        createDirectory sub
+        withWatch recursive [root, sub] (action root sub)
+
+-- | Create the file @name@ in @root@ and read the events up to its create
+-- event. The events of the file system operations done before are read
+-- before it.
+syncOn :: FilePath -> String -> Event.Watch -> IO [Event]
+syncOn root name w = do
+    let file = root </> name
+    createFile file
+    readUntil (isCreatedAt file) w
+
+-------------------------------------------------------------------------------
+-- Watch roots
+-------------------------------------------------------------------------------
+
+-- On Linux the last of the 300 roots has an inotify watch descriptor greater
+-- than 255.
+manyRoots :: Spec
+manyRoots =
+    it "reports the events of the last of 300 roots"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let dirs = [fp </> ("dir" ++ show i) | i <- [1 .. 300 :: Int]]
+                file = fp </> "dir300" </> "file"
+            mapM_ createDirectory dirs
+            withWatch id dirs $ \w -> do
+                createFile file
+                evs <- readUntil (isCreatedAt file) w
+                evs `shouldCreate` [file]
+
+eventPaths :: Spec
+eventPaths =
+    it "getRelPath is the path relative to getRoot"
+        $ withRoot recursive $ \root w -> do
+            let sub = root </> "sub"
+                file = sub </> "file"
+            createDirectory sub
+            _ <- syncOn root "sync" w
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            let ev = last evs
+            rootPath ev `shouldBe` root
+            relPath ev `shouldBe` Just ("sub" </> "file")
+            absPath ev `shouldBe` root </> "sub" </> "file"
+
+-------------------------------------------------------------------------------
+-- Recursive mode
+-------------------------------------------------------------------------------
+
+recSubdirMovedDeleted :: Spec
+recSubdirMovedDeleted =
+    it "reports a subdirectory renamed and a subdirectory deleted"
+        $ withRoot recursive $ \root w -> do
+            let dir1 = root </> "dir1"
+                dir2 = root </> "dir2"
+                dir3 = root </> "dir3"
+            createDirectory dir1
+            createDirectory dir2
+            _ <- syncOn root "sync" w
+            renameDirectory dir1 dir3
+            removeDirectory dir2
+            evs <- syncOn root "sentinel" w
+            sort (pathsOf Event.isMoved evs) `shouldBe` [dir1, dir3]
+            pathsOf Event.isDeleted evs `shouldBe` [dir2]
+
+-- A subdirectory created while its parent is scanned on Linux is added by
+-- the scan and on its create event.
+recManyNewDirs :: Spec
+recManyNewDirs =
+    it "keeps watching while many directories are created"
+        $ withRoot recursive $ \root w -> do
+            let mkTree i = do
+                    let dir = root </> ("dir" ++ show i)
+                    createDirectory dir
+                    mapM_ (\j -> createDirectory (dir </> show j))
+                        [1 .. 50 :: Int]
+                sentinel = root </> "sentinel"
+                ops = mapM_ mkTree [1 .. 20 :: Int] >> createFile sentinel
+            done <- newChan
+            bracket (forkIO (ops `finally` writeChan done ())) killThread
+                $ \_ -> do
+                    _ <- readUntil (isCreatedAt sentinel) w
+                    readChan done
+            let file = root </> "dir20" </> "50" </> "file"
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            evs `shouldCreate` [file]
+
+-- On Linux the directory is replaced before its create event is read, the
+-- file must not be watched as a directory: the write is reported once. The
+-- close of "sync" can be reported after its create event, so only the events
+-- of @dir@ are checked.
+recDirReplacedByFile :: Spec
+recDirReplacedByFile =
+    it "reports a file that replaced a new directory"
+        $ withRoot recursive $ \root w -> do
+            let dir = root </> "dir"
+            createDirectory dir
+            removeDirectory dir
+            createFile dir
+            _ <- syncOn root "sync" w
+            appendFile dir "x"
+            evs <- syncOn root "sentinel" w
+            filter ((== dir) . absPath) evs `shouldModify` [dir]
+
+-- The create event of the first @dir@ is read after the second @dir@ is
+-- created. The second @dir@ stays watched when it is renamed later.
+recDirMovedOutRecreatedRenamed :: Spec
+recDirMovedOutRecreatedRenamed =
+    it "keeps a directory created at the path of a directory moved out"
+        $ withRoot recursive $ \root w -> do
+            let dir = root </> "dir"
+                dir1 = root </> "dir1"
+                file = dir </> "file"
+                file1 = dir1 </> "file1"
+            createDirectory dir
+            renameDirectory dir (outside root)
+            createDirectory dir
+            _ <- syncOn root "sync" w
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            evs `shouldCreate` [file]
+            renameDirectory dir dir1
+            evs1 <- syncOn root "sync1" w
+            createFile file1
+            createFile (outside root </> "stray")
+            evs2 <- syncOn root "sync2" w
+            evs2 `shouldCreate` [file1, root </> "sync2"]
+            (evs1 ++ evs2) `shouldUnwatch` []
+            filter (isUnder (outside root))
+                (map absPath (checkedEvents False (evs1 ++ evs2)))
+                `shouldBe` []
+
+-- A directory of the tree is moved out of the inner root and stays in the
+-- outer root. On Linux the inner root reports it as no longer watched.
+renameOutOfInnerRoot :: Spec
+renameOutOfInnerRoot =
+    it "a move out of the inner root is a rename within the outer root"
+        $ withNestedRoots $ \root sub w -> do
+            let dir = sub </> "dir"
+                dir1 = root </> "dir1"
+                file = dir1 </> "file"
+            createDirectory dir
+            _ <- syncOn root "sync" w
+            renameDirectory dir dir1
+            evs <- readUnwatched w sub dir
+            evs `shouldUnwatch` [(sub, dir)]
+            createFile file
+            evs1 <- readUntil (isCreatedAt file) w
+            createdRoots file evs1 `shouldBe` [root]
+
+-------------------------------------------------------------------------------
+-- Recursive mode changes to the tree
+-------------------------------------------------------------------------------
+
+-- | Changes to a recursive watch of @root@. The paths are absolute, the
+-- functions take @root@, the directory @out@ is outside the tree.
+data TreeChange = TreeChange
+    { changeTitle :: String
+    , posixOnly :: Bool
+    -- | On Linux 'stale' is checked against every event, see
+    -- 'checkedEvents'.
+    , linuxEveryEvent :: Bool
+    -- | Before the watch reports the events of 'setup'.
+    , setup :: FilePath -> IO ()
+    -- | Run without reading the events in between.
+    , changes :: FilePath -> IO ()
+    -- | Each of these paths reports 'Event.isCreated' for 'changes'.
+    , created :: FilePath -> [FilePath]
+    -- | After the events of 'changes' are read.
+    , laterOps :: FilePath -> IO ()
+    -- | Files created after 'laterOps', see 'shouldCreate'.
+    , laterFiles :: FilePath -> [FilePath]
+    -- | No change reported for 'laterOps' and 'laterFiles' is under these
+    -- paths.
+    , stale :: FilePath -> [FilePath]
+    }
+
+treeChange :: TreeChange
+treeChange =
+    TreeChange
+        { changeTitle = ""
+        , posixOnly = False
+        , linuxEveryEvent = False
+        , setup = const (return ())
+        , changes = const (return ())
+        , created = const []
+        , laterOps = const (return ())
+        , laterFiles = const []
+        , stale = const []
+        }
+
+-- | @root/dir1@ containing @sub@.
+withDir1 :: TreeChange
+withDir1 =
+    treeChange
+        { setup = \r -> do
+            createDirectory (r </> "dir1")
+            createDirectory (r </> "dir1" </> "sub")
+        }
+
+-- | @root/dir@ containing @file@.
+withDirFile :: TreeChange
+withDirFile =
+    treeChange
+        { setup = \r -> do
+            createDirectory (r </> "dir")
+            createFile (r </> "dir" </> "file")
+        }
+
+-- | A directory @src@ outside the tree containing @file@ and @sub@.
+withSrc :: FilePath -> IO ()
+withSrc r = do
+    let src = takeDirectory r </> "src"
+    createDirectory src
+    createFile (src </> "file")
+    createDirectory (src </> "sub")
+
+srcOf :: FilePath -> FilePath
+srcOf r = takeDirectory r </> "src"
+
+-- | Rename @root/dir1@ to @root/dir@ after the path @root/dir@ was used by a
+-- new directory. The watch of @dir1@ is kept under its new path.
+reusedPath :: String -> (FilePath -> IO ()) -> TreeChange
+reusedPath title action =
+    withDir1
+        { changeTitle = title
+        , changes = action
+        , laterFiles = \r ->
+            [r </> "dir" </> "later", r </> "dir" </> "sub" </> "later"]
+        , stale = \r -> [r </> "dir1", outside r]
+        }
+
+-- | Directories with symbolic links to them, @a/up@ to its parent,
+-- @a/b/top@ to the root, @x/z@ and @z/x@ to each other's directories, and
+-- files with symbolic links, @self@ to itself, @l1@ and @l2@ to each other.
+cycleDirs :: [FilePath]
+cycleDirs = ["a", "a" </> "b", "x", "z"]
+
+cycleLinks :: [FilePath]
+cycleLinks =
+    [ "a" </> "up", "a" </> "b" </> "top", "x" </> "z", "z" </> "x"
+    , "self", "l1", "l2"
+    ]
+
+symlinkCycleLinks :: FilePath -> FilePath -> IO ()
+symlinkCycleLinks base top = do
+    createDirectoryLink ".." (base </> "a" </> "up")
+    createDirectoryLink top (base </> "a" </> "b" </> "top")
+    createDirectoryLink (".." </> "z") (base </> "x" </> "z")
+    createDirectoryLink (".." </> "x") (base </> "z" </> "x")
+    createFileLink "self" (base </> "self")
+    createFileLink "l2" (base </> "l1")
+    createFileLink "l1" (base </> "l2")
+
+symlinkCycles :: FilePath -> FilePath -> IO ()
+symlinkCycles base top = do
+    mapM_ (createDirectory . (base </>)) cycleDirs
+    symlinkCycleLinks base top
+
+-- | A file in each directory of 'cycleDirs' under @root/dir@.
+cycleFiles :: FilePath -> [FilePath]
+cycleFiles r = map (\d -> r </> "dir" </> d </> "file") cycleDirs
+
+-- | The paths through the links of 'cycleLinks' under @root/dir@.
+cycleStale :: FilePath -> [FilePath]
+cycleStale r = map ((r </> "dir") </>) cycleLinks
+
+treeChanges :: [TreeChange]
+treeChanges =
+    [ withDir1
+        { changeTitle = "directory renamed"
+        , changes = \r -> renameDirectory (r </> "dir1") (r </> "dir2")
+        , laterFiles = \r ->
+            [r </> "dir2" </> "file", r </> "dir2" </> "sub" </> "file"]
+        , stale = \r -> [r </> "dir1"]
+        , linuxEveryEvent = True
+        }
+    , withDir1
+        { changeTitle = "directory renamed twice"
+        , changes = \r -> do
+            renameDirectory (r </> "dir1") (r </> "dir2")
+            renameDirectory (r </> "dir2") (r </> "dir3")
+        , laterFiles = \r -> [r </> "dir3" </> "sub" </> "later"]
+        , stale = \r -> [r </> "dir1", r </> "dir2"]
+        }
+    , withDir1
+        { changeTitle = "entries created after a rename"
+        , changes = \r -> do
+            let dir2 = r </> "dir2"
+            renameDirectory (r </> "dir1") dir2
+            createDirectory (dir2 </> "x")
+            createFile (dir2 </> "x" </> "f")
+            createFile (dir2 </> "g")
+        , created = \r ->
+            let dir2 = r </> "dir2"
+             in [dir2 </> "x", dir2 </> "x" </> "f", dir2 </> "g"]
+        , laterFiles = \r -> [r </> "dir2" </> "x" </> "later"]
+        , stale = \r -> [r </> "dir1"]
+        }
+    , withDir1
+        { changeTitle = "entries created before a rename"
+        , changes = \r -> do
+            createDirectory (r </> "dir1" </> "x")
+            createFile (r </> "dir1" </> "x" </> "f")
+            renameDirectory (r </> "dir1") (r </> "dir2")
+        , laterFiles = \r -> [r </> "dir2" </> "x" </> "later"]
+        , stale = \r -> [r </> "dir1"]
+        }
+    , treeChange
+        { changeTitle = "directory moved in"
+        , setup = withSrc
+        , changes = \r -> renameDirectory (srcOf r) (r </> "dir")
+        , laterFiles = \r -> [r </> "dir" </> "sub" </> "later"]
+        , stale = \r -> [srcOf r]
+        }
+    , treeChange
+        { changeTitle = "directory moved out"
+        , setup = \r -> do
+            createDirectory (r </> "dir")
+            createDirectory (r </> "dir" </> "sub")
+        , changes = \r -> renameDirectory (r </> "dir") (outside r)
+        , laterOps = \r -> do
+            createFile (outside r </> "file")
+            createFile (outside r </> "sub" </> "file")
+        , stale = \r -> [r </> "dir", outside r]
+        }
+    , treeChange
+        { changeTitle = "new directory renamed"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            createDirectory (r </> "dir" </> "sub")
+            createFile (r </> "dir" </> "sub" </> "file")
+            renameDirectory (r </> "dir") (r </> "dir1")
+        , laterFiles = \r -> [r </> "dir1" </> "sub" </> "later"]
+        , stale = \r -> [r </> "dir"]
+        }
+    , treeChange
+        { changeTitle = "new directory renamed twice"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            createFile (r </> "dir" </> "file")
+            renameDirectory (r </> "dir") (r </> "dir1")
+            renameDirectory (r </> "dir1") (r </> "dir2")
+        , laterFiles = \r -> [r </> "dir2" </> "later"]
+        , stale = \r -> [r </> "dir", r </> "dir1"]
+        }
+    , treeChange
+        { changeTitle = "new directory renamed, its old path reused"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            createFile (r </> "dir" </> "file")
+            renameDirectory (r </> "dir") (r </> "dir1")
+            createDirectory (r </> "dir")
+        , laterFiles = \r ->
+            [r </> "dir1" </> "later", r </> "dir" </> "later"]
+        }
+    , treeChange
+        { changeTitle = "new directory renamed twice, its old path reused"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            createFile (r </> "dir" </> "file")
+            renameDirectory (r </> "dir") (r </> "dir1")
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir1") (r </> "dir2")
+        , laterFiles = \r ->
+            [r </> "dir2" </> "later", r </> "dir" </> "later"]
+        , stale = \r -> [r </> "dir1"]
+        }
+    , treeChange
+        { changeTitle = "directory moved in and renamed"
+        , setup = withSrc
+        , changes = \r -> do
+            renameDirectory (srcOf r) (r </> "dir")
+            renameDirectory (r </> "dir") (r </> "dir1")
+        , laterFiles = \r -> [r </> "dir1" </> "sub" </> "later"]
+        , stale = \r -> [r </> "dir", srcOf r]
+        }
+    , withDirFile
+        { changeTitle = "directory renamed away and back"
+        , changes = \r -> do
+            renameDirectory (r </> "dir") (r </> "dir1")
+            renameDirectory (r </> "dir1") (r </> "dir")
+        , laterFiles = \r -> [r </> "dir" </> "later"]
+        , stale = \r -> [r </> "dir1"]
+        }
+    , withDirFile
+        { changeTitle = "directory moved in after a rename away and back"
+        , setup = \r -> setup withDirFile r >> withSrc r
+        , changes = \r -> do
+            renameDirectory (r </> "dir") (r </> "dir1")
+            renameDirectory (r </> "dir1") (r </> "dir")
+            renameDirectory (srcOf r) (r </> "dir1")
+        , laterFiles = \r ->
+            [r </> "dir" </> "later", r </> "dir1" </> "sub" </> "later"]
+        , stale = \r -> [srcOf r]
+        }
+    , treeChange
+        { changeTitle = "new directory deleted and created again"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            removeDirectory (r </> "dir")
+            createDirectory (r </> "dir")
+            createDirectory (r </> "dir" </> "sub")
+        , laterFiles = \r -> [r </> "dir" </> "sub" </> "file"]
+        }
+    , treeChange
+        { changeTitle = "new directory renamed and created again"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            createDirectory (r </> "dir" </> "sub")
+            renameDirectory (r </> "dir") (r </> "dir1")
+            createDirectory (r </> "dir")
+            createDirectory (r </> "dir" </> "sub")
+        , laterFiles = \r ->
+            [ r </> "dir" </> "sub" </> "file"
+            , r </> "dir1" </> "sub" </> "file"
+            ]
+        }
+    , treeChange
+        { changeTitle = "new directory moved out and created again"
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir") (outside r)
+            createDirectory (r </> "dir")
+        , laterFiles = \r -> [r </> "dir" </> "file"]
+        , laterOps = \r -> createFile (outside r </> "file")
+        , stale = \r -> [outside r]
+        }
+    , treeChange
+        { changeTitle = "directory moved to the path of a renamed new dir"
+        , setup = \r -> do
+            createDirectory (r </> "dir2")
+            createDirectory (r </> "dir2" </> "sub")
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir") (r </> "dir1")
+            renameDirectory (r </> "dir2") (r </> "dir")
+        , laterFiles = \r -> [r </> "dir" </> "sub" </> "file"]
+        , stale = \r -> [r </> "dir2"]
+        }
+    , withDir1
+        { changeTitle = "directory moved out and its path reused"
+        , changes = \r -> do
+            renameDirectory (r </> "dir1") (outside r)
+            createDirectory (r </> "dir1")
+        , laterOps = \r -> createFile (outside r </> "sub" </> "file")
+        , laterFiles = \r -> [r </> "dir1" </> "later"]
+        , stale = \r -> [outside r]
+        }
+    , treeChange
+        { changeTitle = "directory moved in at the path of a new dir moved out"
+        , setup = withSrc
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir") (outside r)
+            renameDirectory (srcOf r) (r </> "dir")
+        , laterFiles = \r -> [r </> "dir" </> "sub" </> "later"]
+        , stale = \r -> [outside r, srcOf r]
+        }
+    , reusedPath "watched directory moved to the path of a renamed new dir"
+        $ \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir") (r </> "dir-renamed")
+            renameDirectory (r </> "dir1") (r </> "dir")
+    , reusedPath "watched directory moved to the path of a deleted new dir"
+        $ \r -> do
+            createDirectory (r </> "dir")
+            removeDirectory (r </> "dir")
+            renameDirectory (r </> "dir1") (r </> "dir")
+    , reusedPath "watched directory moved to the path of a new dir moved out"
+        $ \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir") (outside r)
+            renameDirectory (r </> "dir1") (r </> "dir")
+    -- rename(2) replaces an empty directory, MoveFileEx on Windows does not.
+    , (reusedPath "watched directory moved over an empty new directory"
+        $ \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir1") (r </> "dir")
+      ) {posixOnly = True}
+    , reusedPath "watched directory renamed twice to a moved out new dir path"
+        $ \r -> do
+            createDirectory (r </> "dir")
+            renameDirectory (r </> "dir1") (r </> "dir1-renamed")
+            renameDirectory (r </> "dir") (outside r)
+            renameDirectory (r </> "dir1-renamed") (r </> "dir")
+    , treeChange
+        { changeTitle = "subdirectory of a directory moved in replaced"
+        , setup = \r -> do
+            withSrc r
+            createDirectory (srcOf r </> "sub" </> "c")
+        , changes = \r -> do
+            let dir = r </> "dir"
+            renameDirectory (srcOf r) dir
+            renameDirectory (dir </> "sub") (dir </> "sub2")
+            createDirectory (dir </> "sub")
+        , laterFiles = \r ->
+            let dir = r </> "dir"
+             in [ dir </> "sub" </> "new"
+                , dir </> "sub2" </> "new"
+                , dir </> "sub2" </> "c" </> "new"
+                ]
+        , stale = \r -> [r </> "dir" </> "sub" </> "c", srcOf r]
+        }
+    , treeChange
+        { changeTitle = "new directory replaced by a symlink to outside"
+        , setup = \r -> do
+            createDirectory (outside r)
+            createDirectory (outside r </> "sub")
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            removeDirectory (r </> "dir")
+            createDirectoryLink (outside r) (r </> "dir")
+        , laterOps = \r -> do
+            createFile (outside r </> "file")
+            createFile (outside r </> "sub" </> "file")
+        , stale = \r ->
+            [r </> "dir" </> "file", r </> "dir" </> "sub", outside r]
+        , linuxEveryEvent = True
+        }
+    , withDir1
+        { changeTitle = "parent of a new dir replaced by a symlink to outside"
+        , setup = \r -> do
+            setup withDir1 r
+            createDirectory (outside r)
+            createDirectory (outside r </> "new")
+        , changes = \r -> do
+            createDirectory (r </> "dir1" </> "new")
+            renameDirectory (r </> "dir1") (r </> "dir2")
+            createDirectoryLink (outside r) (r </> "dir1")
+        , laterOps = \r -> createFile (outside r </> "new" </> "stray")
+        , laterFiles = \r -> [r </> "dir2" </> "new" </> "later"]
+        , stale = \r -> [r </> "dir1", outside r]
+        }
+    , withDir1
+        { changeTitle = "parent of a new dir replaced by a symlink loop"
+        , posixOnly = True
+        , changes = \r -> do
+            createDirectory (r </> "dir1" </> "new")
+            renameDirectory (r </> "dir1") (r </> "dir2")
+            createFileLink (r </> "dir1") (r </> "dir1")
+        , laterFiles = \r ->
+            [ r </> "dir2" </> "new" </> "later"
+            , r </> "dir2" </> "sub" </> "later"
+            ]
+        , stale = \r -> [r </> "dir1"]
+        }
+    , treeChange
+        { changeTitle = "symlink cycles in a watched tree"
+        , posixOnly = True
+        , setup = \r -> do
+            createDirectory (r </> "dir")
+            mapM_ (createDirectory . ((r </> "dir") </>)) cycleDirs
+        , changes = \r -> symlinkCycleLinks (r </> "dir") r
+        , created = \r -> map ((r </> "dir") </>) cycleLinks
+        , laterFiles = cycleFiles
+        , stale = cycleStale
+        }
+    , treeChange
+        { changeTitle = "new directory with symlink cycles"
+        , posixOnly = True
+        , changes = \r -> do
+            createDirectory (r </> "dir")
+            symlinkCycles (r </> "dir") r
+        , laterFiles = cycleFiles
+        , stale = cycleStale
+        }
+    , treeChange
+        { changeTitle = "directory with symlink cycles moved in"
+        , posixOnly = True
+        , setup = \r -> do
+            createDirectory (outside r)
+            symlinkCycles (outside r) r
+        , changes = \r -> renameDirectory (outside r) (r </> "dir")
+        , laterFiles = cycleFiles
+        , stale = cycleStale
+        }
+    ]
+
+runTreeChange :: TreeChange -> Spec
+runTreeChange TreeChange{..} =
+    it changeTitle
+        $ (if posixOnly then notOnWindows "not portable to Windows" else id)
+        $ withRoot recursive $ \root w -> do
+            setup root
+            _ <- syncOn root "sync1" w
+            changes root
+            evs <- syncOn root "sync2" w
+            let createdPaths = pathsOf Event.isCreated evs
+            filter (`notElem` createdPaths) (created root) `shouldBe` []
+            laterOps root
+            let files = laterFiles root
+            mapM_ createFile files
+            evs1 <- syncOn root "sync3" w
+            evs1 `shouldCreate` (files ++ [root </> "sync3"])
+            let isStale p = any (`isUnder` p) (stale root)
+            filter isStale (map absPath (checkedEvents linuxEveryEvent evs1))
+                `shouldBe` []
+
+-- The tree is watched from the start, no event is reported through a link.
+-- On Linux every event from the open of the watch is checked, the scan at
+-- the start of the watch does not report the entries.
+recStartSymlinkCycles :: Spec
+recStartSymlinkCycles =
+    it "watches a tree with symlink cycles"
+        $ notOnWindows "not portable to Windows"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let root = fp </> "root"
+                files = cycleFiles root
+            createDirectory root
+            createDirectory (root </> "dir")
+            symlinkCycles (root </> "dir") root
+            withWatch recursive [root] $ \w -> do
+                mapM_ createFile files
+                evs <- readUntil (isCreatedAt (last files)) w
+                let viaLink p = any (`isUnder` p) (cycleStale root)
+                evs `shouldCreate` files
+                filter viaLink (map absPath (checkedEvents True evs))
+                    `shouldBe` []
 
 -------------------------------------------------------------------------------
 -- Handle API
 -------------------------------------------------------------------------------
 
-#if defined(CABAL_OS_WINDOWS)
-handleTests :: Spec
-handleTests =
-    it "handle API" $ pendingWith "the handle API is not implemented"
-#else
 -- | Open a watch on the directory @root@ in a temporary directory, run the
 -- action with the root and the watch, and close the watch.
 withRootHandle ::
@@ -146,25 +986,7 @@ readEventsUntil done w = do
                 Nothing -> return (reverse acc)
                 Just ev -> go (ev : acc)
 
--- | Read the events of the watch up to and including the first event that
--- satisfies the predicate. Throw an exception if it does not occur within 10
--- seconds or the watch is closed.
-readUntilH :: (Event -> Bool) -> Event.Watch -> IO [Event]
-readUntilH p w = do
-    r <- timeout 10000000 (go [])
-    maybe (error "readUntilH: timed out") return r
-
-    where
-
-    go acc = do
-        r <- Event.readEvent w
-        case r of
-            Nothing -> error "readUntilH: the watch is closed"
-            Just ev
-                | p ev -> return (reverse (ev : acc))
-                | otherwise -> go (ev : acc)
-
--- | Like 'readUntilH' but read the events using 'Event.eventStream'.
+-- | Like 'readUntil' but read the events using 'Event.eventStream'.
 readUntilS :: (Event -> Bool) -> Event.Watch -> IO [Event]
 readUntilS p w = do
     r <- timeout 10000000
@@ -205,10 +1027,6 @@ whileReading p w action = do
             evs <- takeMVar mv
             either (\(e :: SomeException) -> throwIO e) (return . (r,)) evs
 
--- | The roots of the create events of the file.
-createdRoots :: FilePath -> [Event] -> [FilePath]
-createdRoots file = nub . map rootPath . filter (isCreatedAt file)
-
 -- The watch reports a change made right after 'Event.openWatch' returns,
 -- without waiting for a marker event. Repeated to catch a watch that starts
 -- asynchronously.
@@ -224,7 +1042,7 @@ openActive =
                     $ \w -> do
                         let file = fp </> ("file" ++ show i)
                         createFile file
-                        evs <- readUntilH (isCreatedAt file) w
+                        evs <- readUntil (isCreatedAt file) w
                         createdRoots file evs `shouldBe` [fp]
 
 -- The reader thread is blocked reading the watch.
@@ -325,7 +1143,7 @@ removeStops =
                         marker = root </> ("marker" ++ show i)
                     createFile file
                     createFile marker
-                    evs <- readUntilH (isCreatedAt marker) w
+                    evs <- readUntil (isCreatedAt marker) w
                     return (file `notElem` pathsOf Event.isCreated evs)
                 go i
                     | i > (100 :: Int) =
@@ -338,12 +1156,91 @@ removeStops =
                         marker = root </> ("marker" ++ show i)
                     createFile file
                     createFile marker
-                    evs <- readUntilH (isCreatedAt marker) w
+                    evs <- readUntil (isCreatedAt marker) w
                     filter (isUnder root2) (pathsOf isChange evs)
                         `shouldBe` []
             go 1
 
--- The events of the root after it is added again are reported.
+-- | On macOS the events of a removed root can be reported for a short time
+-- after 'Event.removeRoot' returns. On macOS and Windows, run the action
+-- with 1, 2, ... until it returns 'True', at most 100 times. On Linux the
+-- action is not run, a removed root reports nothing after its
+-- @isRootUnwatched@ event.
+untilRemoved :: (Int -> IO Bool) -> IO ()
+#if defined(CABAL_OS_LINUX)
+untilRemoved _ = return ()
+#else
+untilRemoved action = go 1
+
+    where
+
+    go i
+        | i > (100 :: Int) =
+            expectationFailure "the removed root still reports"
+        | otherwise = do
+            stopped <- action i
+            unless stopped $ go (i + 1)
+#endif
+
+-- On Linux the second removeRoot runs before the isRootUnwatched event is
+-- read.
+removeTwice :: Spec
+removeTwice =
+    it "removeRoot twice does not raise an exception"
+        $ withTwoRoots $ \root1 root2 w -> do
+            let file = root2 </> "file"
+            p <- Path.fromString root1
+            Event.removeRoot w p
+            Event.removeRoot w p
+            evs <- readUnwatched w root1 root1
+            evs `shouldUnwatch` [(root1, root1)]
+            createFile file
+            evs1 <- readUntil (isCreatedAt file) w
+            createdRoots file evs1 `shouldBe` [root2]
+
+-- The reader thread is blocked reading the watch. On Linux the
+-- isRootUnwatched event of the removed root ends the read, on macOS and
+-- Windows the event of the file in the other root does.
+removeWhileReading :: Spec
+removeWhileReading =
+    it "removeRoot does not block while another thread reads the events"
+        $ withTwoRoots $ \root1 root2 w -> do
+            let file = root2 </> "file"
+                done ev = isUnwatched ev || isCreatedAt file ev
+            p <- Path.fromString root1
+            (r, evs) <- whileReading done w $ do
+                r <- timeout 2000000 $ Event.removeRoot w p
+                -- Unblock the reader if removeRoot did not
+                createFile file
+                return r
+            r `shouldBe` Just ()
+            evs `shouldUnwatch` [(root1, root1)]
+
+-- The directory @sub@ is watched through both the roots. After the inner
+-- root is removed, the outer root reports the changes in @sub@.
+overlapRemoveInner :: Spec
+overlapRemoveInner =
+    it "removing the inner root keeps the outer root watching"
+        $ withNestedRoots $ \root sub w -> do
+            let changeBoth i = do
+                    let file1 = sub </> ("file" ++ show i)
+                        file2 = root </> ("marker" ++ show i)
+                    createFile file1
+                    createFile file2
+                    evs <- readUntil (isCreatedAt file2) w
+                    return (file1, evs)
+            Event.removeRoot w =<< Path.fromString sub
+            evs <- readUnwatched w sub sub
+            evs `shouldUnwatch` [(sub, sub)]
+            untilRemoved $ \i -> do
+                (_, evs1) <- changeBoth i
+                return (sub `notElem` map rootPath evs1)
+            (file1, evs1) <- changeBoth (0 :: Int)
+            createdRoots file1 evs1 `shouldBe` [root]
+            filter (== sub) (map rootPath evs1) `shouldBe` []
+
+-- The events of the root after it is added again are reported. On Linux the
+-- root is added again before its isRootUnwatched event is read.
 removeAddAgain :: Spec
 removeAddAgain =
     it "a root removed and added again reports the events after the add"
@@ -353,7 +1250,8 @@ removeAddAgain =
             Event.removeRoot w p
             Event.addRoot w p
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
+            evs `shouldUnwatch` [(root, root)]
             createdRoots file evs `shouldBe` [root]
 
 closedWatchOps :: Spec
@@ -400,7 +1298,7 @@ readEventAfterClose =
         $ withRootHandle id $ \root w -> do
             let file = root </> "file"
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
             Event.closeWatch w
             _ <- readEventsUntil (const False) w
@@ -423,7 +1321,7 @@ readTimeout =
             forM_ [1 .. 20 :: Int] $ \_ -> readUntilTimeout w
             let file = root </> "file"
             createFile file
-            evs <- readUntilH (isCreatedAt file) w
+            evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
 
     where
@@ -483,13 +1381,340 @@ handleTests = do
     addRecursive
     keepEventsWhileAdding
     removeStops
+    removeTwice
+    removeWhileReading
     removeAddAgain
     closedWatchOps
     closeWhileReading
     readEventAfterClose
     readTimeout
     twoReaders
+
+-------------------------------------------------------------------------------
+-- Resources of a watch
+-------------------------------------------------------------------------------
+
+-- | The directory to be watched, and the count of the watch resources of
+-- the process before the watch is opened.
+data Probe = Probe FilePath Int
+
+-- | Take the probe before a watch is opened on the directory.
+newProbe :: FilePath -> IO Probe
+
+-- | Whether a watch opened after the probe is open.
+isWatchOpen :: Probe -> IO Bool
+
+-- | Whether the watches opened after the probe are closed.
+isWatchClosed :: Probe -> IO Bool
+
+#if defined(CABAL_OS_LINUX)
+-- | The number of inotify fds of the process, a watch has one. The test is
+-- marked pending if @\/proc@ is not available.
+inotifyFds :: IO Int
+inotifyFds = do
+    r <- try (listDirectory "/proc/self/fd")
+    case r of
+        Left (_ :: IOException) ->
+            pendingWith "/proc is not available" >> return 0
+        Right fds -> length . filter id <$> mapM isInotify fds
+
+    where
+
+    isInotify fd = do
+        r <- try (getSymbolicLinkTarget ("/proc/self/fd" </> fd))
+        return $ case r of
+            Left (_ :: IOException) -> False
+            Right target -> target == "anon_inode:inotify"
+
+newProbe dir = Probe dir <$> inotifyFds
+isWatchOpen (Probe _ n) = (== n + 1) <$> inotifyFds
+isWatchClosed (Probe _ n) = (== n) <$> inotifyFds
+#elif defined(CABAL_OS_DARWIN)
+-- | The number of open fds of the process, a watch has the two fds of its
+-- pipe.
+countFds :: IO Int
+countFds = length <$> listDirectory "/dev/fd"
+
+newProbe dir = Probe dir <$> countFds
+isWatchOpen (Probe _ n) = (> n) <$> countFds
+isWatchClosed (Probe _ n) = (<= n) <$> countFds
+#else
+-- | Whether the directory can be opened with no sharing, it cannot be if
+-- any other handle with data access to the directory is open. A watch keeps
+-- a handle of its root open.
+canOpenExclusive :: FilePath -> IO Bool
+canOpenExclusive dir = do
+    r <- try $ do
+        h <- Win32.createFile dir
+            Win32.fILE_LIST_DIRECTORY
+            Win32.fILE_SHARE_NONE
+            Nothing
+            Win32.oPEN_EXISTING
+            Win32.fILE_FLAG_BACKUP_SEMANTICS
+            Nothing
+        Win32.closeHandle h
+    return $ either (\(_ :: SomeException) -> False) (const True) r
+
+newProbe dir = return (Probe dir 0)
+-- An open with no sharing while the watch opens its root would make the
+-- watch fail with a sharing violation, wait for the watch instead.
+isWatchOpen _ = threadDelay 500000 >> return True
+isWatchClosed (Probe dir _) = canOpenExclusive dir
 #endif
+
+-- | Run the action until it returns 'True', at most 50 times, 100 ms apart.
+retryUntil :: IO Bool -> IO Bool
+retryUntil action = go (50 :: Int)
+
+    where
+
+    go 0 = return False
+    go n = do
+        ok <- action
+        if ok
+        then return True
+        else threadDelay 100000 >> go (n - 1)
+
+-- | The watch must be open within 5 seconds.
+waitOpen :: Probe -> IO ()
+waitOpen probe = retryUntil (isWatchOpen probe) >>= (`shouldBe` True)
+
+-- | The watches must be closed after garbage collection.
+gcClosed :: Probe -> IO ()
+gcClosed probe =
+    retryUntil (performGC >> isWatchClosed probe) >>= (`shouldBe` True)
+
+#if !defined(CABAL_OS_WINDOWS)
+-- | The number of fds open in a child process created with fork and exec.
+childFds :: FilePath -> IO Int
+childFds out = do
+    pid <- forkProcess $
+        executeFile "/bin/sh" False ["-c", "ls /dev/fd > " ++ out] Nothing
+    _ <- getProcessStatus True False pid
+    s <- readFile out
+    return $! length (lines s)
+
+-- The watch is open and reports events when the child is created. On Linux
+-- the inotify fd is close-on-exec, on macOS the two fds of the pipe are.
+childInherits :: Spec
+childInherits =
+    it "a child process does not inherit the fds of a watch"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let out = fp </> "fds"
+                root = fp </> "root"
+                file = root </> "file"
+            createDirectory root
+            n0 <- childFds out
+            when (n0 == 0) $ pendingWith "/dev/fd cannot be listed"
+            n1 <- withWatch id [root] $ \w -> do
+                createFile file
+                _ <- readUntil (isCreatedAt file) w
+                childFds out
+            n1 `shouldBe` n0
+#endif
+
+resourceTests :: Spec
+resourceTests =
+#if !defined(CABAL_OS_WINDOWS)
+    childInherits
+#else
+    return ()
+#endif
+
+-------------------------------------------------------------------------------
+-- Async exceptions
+-------------------------------------------------------------------------------
+
+-- | Run the action in a new thread, return the thread and an 'MVar' with its
+-- result. The thread starts masked, so that an exception thrown to it right
+-- after the fork is reported in the result.
+forkResult :: IO () -> IO (ThreadId, MVar (Either SomeException ()))
+forkResult action = do
+    result <- newEmptyMVar
+    tid <-
+        mask $ \restore ->
+            forkIO (try (restore action) >>= putMVar result)
+    return (tid, result)
+
+-- | The thread must end within 5 seconds, killed by 'killThread'. Any other
+-- exception fails the test, for example, reaching a limit on the watches.
+shouldBeKilled :: MVar (Either SomeException ()) -> Expectation
+shouldBeKilled result = do
+    r <- timeout 5000000 (takeMVar result)
+    case r of
+        Nothing -> expectationFailure "the thread did not end"
+        Just (Right ()) -> expectationFailure "the thread was not killed"
+        Just (Left e) ->
+            when (fromException e /= Just ThreadKilled) $ throwIO e
+
+-- | A recursive watch stream of the path.
+recStream :: FilePath -> IO (Stream.Stream IO Event)
+recStream root = do
+    p <- Path.fromString root
+    return $ Event.watchWith recursive (p NonEmpty.:| [])
+
+-- An exception raised in the stream closes the watch without a garbage
+-- collection.
+killWaitingReader :: Spec
+killWaitingReader =
+    it "killing a thread waiting for events closes the watch at once"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            probe <- newProbe fp
+            stream <- recStream fp
+            (tid, result) <- forkResult (Stream.fold Fold.drain stream)
+            waitOpen probe
+            -- Let the reader block in the wait for events
+            threadDelay 200000
+            killThread tid
+            shouldBeKilled result
+            isWatchClosed probe `shouldReturn` True
+
+-- On Linux the scan of the tree runs in the masked allocation of the
+-- bracket. The exception can be delivered when the allocation ends, outside
+-- the stream, the watch is then closed by the garbage collection.
+killStartingWatch :: Spec
+killStartingWatch =
+    it "killing a thread during the start of a watch closes the watch"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            mapM_
+                (\i -> createDirectory (fp </> show i))
+                [1 .. 2000 :: Int]
+            probe <- newProbe fp
+            stream <- recStream fp
+            let kill delay = do
+                    (tid, result) <-
+                        forkResult (Stream.fold Fold.drain stream)
+                    threadDelay delay
+                    killThread tid
+                    shouldBeKilled result
+                    gcClosed probe
+            mapM_ kill [0, 100, 1000, 5000, 20000, 50000]
+
+-- The delays cover the allocation, the first read and the wait. The garbage
+-- collections keep the number of unclosed watches below the limits of the
+-- system.
+killRepeatedly :: Spec
+killRepeatedly =
+    it "killing a thread at any point leaves no watch and no blocked thread"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            createDirectory (fp </> "sub")
+            probe <- newProbe fp
+            stream <- recStream fp
+            let kill i = do
+                    (tid, result) <-
+                        forkResult (Stream.fold Fold.drain stream)
+                    when (i `mod` 3 /= 0) $ threadDelay (i `mod` 400)
+                    killThread tid
+                    shouldBeKilled result
+                    when (i `mod` 50 == 0) performGC
+            mapM_ kill [1 .. 2000 :: Int]
+            gcClosed probe
+
+-- The consumer runs outside the stream, the stream does not see the
+-- exception. The watch is closed by the garbage collection.
+killConsumer :: Spec
+killConsumer =
+    it "killing a thread in the consumer closes the watch on GC"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            probe <- newProbe fp
+            stream <- recStream fp
+            consuming <- newEmptyMVar
+            let consume _ = do
+                    _ <- tryPutMVar consuming ()
+                    threadDelay 60000000
+            (tid, result) <-
+                forkResult (Stream.fold (Fold.drainMapM consume) stream)
+            waitOpen probe
+            createFile (fp </> "file")
+            timeout 5000000 (takeMVar consuming) `shouldReturn` Just ()
+            killThread tid
+            shouldBeKilled result
+            gcClosed probe
+
+-- 'Stream.take' stops without draining the stream, the bracket of the
+-- stream does not see the end. The watch is closed by the garbage
+-- collection.
+abandonStream :: Spec
+abandonStream =
+    it "a stream abandoned by the consumer closes the watch on GC"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            probe <- newProbe fp
+            stream <- recStream fp
+            (_, result) <-
+                forkResult (Stream.fold Fold.drain (Stream.take 1 stream))
+            waitOpen probe
+            createFile (fp </> "file")
+            r <- timeout 5000000 (takeMVar result)
+            fmap (either (const False) (const True)) r `shouldBe` Just True
+            gcClosed probe
+
+-- On Linux the read that times out reports dir and dir/file, reaches the
+-- end of the scan of dir, which closes dir, and waits for an event.
+readAfterTimeout :: String -> (Config -> Config) -> Spec
+readAfterTimeout desc cfg =
+    it ("reads again after reads that time out, " ++ desc)
+        $ withRootCfg (recursive . cfg) $ \root w -> do
+            let dir = root </> "dir"
+                file = root </> "file"
+                drain =
+                    timeout 500000
+                        $ Stream.fold Fold.drain (Event.eventStream w)
+            createDirectory dir
+            createFile (dir </> "file")
+            drain `shouldReturn` Nothing
+            drain `shouldReturn` Nothing
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [root]
+
+-- The reads time out after 1 to 200 us, some timeouts arrive after a read
+-- has taken an event from the watch and before the event is recorded. The
+-- last read collects the remaining events, up to the event of a file
+-- created after the reads.
+--
+-- XXX Events are lost on Linux and macOS, see dev/issues.md. The test is
+-- marked pending with the number of events lost, instead of failing.
+--
+-- On macOS, with 2000 files created before the first read, the watch
+-- reported about 1100 of them and then 'Event.isEventsLost'. The test
+-- creates 300 files on macOS and Windows.
+readTimeoutsNoLoss :: Spec
+readTimeoutsNoLoss =
+    it "does not lose an event when the reads time out repeatedly"
+        $ withRoot recursive $ \root w -> do
+            let n = if onLinux then 2000 else 300 :: Int
+                files = [root </> ("file" ++ show i) | i <- [1 .. n]]
+                end = root </> "end"
+            ref <- newIORef []
+            let collect ev = atomicModifyIORef' ref (\evs -> (ev : evs, ()))
+                drain t =
+                    timeout t
+                        $ Stream.fold (Fold.drainMapM collect)
+                        $ Event.eventStream w
+            mapM_ createFile files
+            mapM_ (\i -> drain (1 + i `mod` 200)) [1 .. 2000 :: Int]
+            createFile end
+            evs <- readUntilS (isCreatedAt end) w
+            earlier <- readIORef ref
+            let created = pathsOf Event.isCreated (earlier ++ evs)
+                missing = length (filter (`notElem` created) files)
+            when (any Event.isEventsLost (earlier ++ evs))
+                $ pendingWith "events were lost, reported by isEventsLost"
+            when (missing > 0)
+                $ pendingWith
+                $ show missing ++ " of " ++ show n
+                    ++ " events were lost, see dev/issues.md"
+
+asyncTests :: Spec
+asyncTests = do
+    readTimeoutsNoLoss
+    killWaitingReader
+    killStartingWatch
+    killRepeatedly
+    killConsumer
+    abandonStream
+    readAfterTimeout "all events" allEvents
+    readAfterTimeout "default events" id
 
 -------------------------------------------------------------------------------
 -- Main
@@ -499,7 +1724,24 @@ watchTests :: IO ()
 watchTests =
     hspec
         $ describe moduleName
-        $ describe "handle API" handleTests
+        $ do
+            describe "watch roots" $ do
+                manyRoots
+                eventPaths
+            describe "overlapping roots" $ do
+                overlapRemoveInner
+                renameOutOfInnerRoot
+            describe "recursive mode" $ do
+                recSubdirMovedDeleted
+                recManyNewDirs
+                recDirReplacedByFile
+                recDirMovedOutRecreatedRenamed
+                recStartSymlinkCycles
+            describe "recursive mode changes to the tree"
+                $ mapM_ runTreeChange treeChanges
+            describe "handle API" handleTests
+            describe "resources" resourceTests
+            describe "async exceptions" asyncTests
 
 main :: IO ()
 main = do
@@ -510,5 +1752,12 @@ main = do
     let runRec = runTests moduleName "recursive" Event.watchRecursive
     runRec DirType (commonTests ++ commonRecTests)
     runRec SymLinkOrigPath (commonTests ++ commonRecTests)
+
+#if !defined(CABAL_OS_WINDOWS)
+    -- A regular file cannot be a watch root on Windows.
+    let fileRootTests = [fileModify "" (const [])]
+    run FileType fileRootTests
+    runRec FileType fileRootTests
+#endif
 
     watchTests

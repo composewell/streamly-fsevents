@@ -52,6 +52,7 @@ limit costs nothing until that many watches are added.
 |-------|-------|---------------|
 | Paths in one watch | 4096 | An exception is raised |
 | Event streams of a process | 512, not documented by Apple | An exception is raised |
+| Unread events of one watch | Not documented by Apple, about 1100 in a test | Events are lost, `isEventsLost` is reported |
 
 * Paths in one watch: `MAX_WATCH_PATHS` in this library. It counts the watch
   roots, not the directories in the tree.
@@ -59,6 +60,10 @@ limit costs nothing until that many watches are added.
   short time while its roots are changed with the handle API. The limit of
   512 for a process is tested with this library. Third party reports also
   give a limit of 1024 for the system, which is not tested.
+* Unread events: in a test on macOS 26, 2000 files were created in a
+  watched directory before the program read any event. The watch reported
+  `isCreated` for 1057 to 1190 of them in three runs, and one `isEventsLost`
+  event.
 * `isKernelDropped` and `isUserDropped`, in the macOS module, give the reason
   for an `isEventsLost` event if events were dropped.
 
@@ -68,6 +73,13 @@ limit costs nothing until that many watches are added.
 |-------|-------|---------------|
 | Event buffer | 63 KB for each watch root | Events are lost, `isEventsLost` is reported |
 
-If the buffer overflows between two reads, all the events in the buffer are
-lost. Each watch root uses one directory handle, Windows has no specific
-limit on the number of these handles.
+The system holds the changes under each root in a buffer of 63 KB until the
+watch reads them. If the program does not read events fast enough and the
+buffer overflows, all the changes in it are lost. The watch then reports one
+`isEventsLost` event for that root and continues. The program scans the tree
+under the root to learn its current state; [robustness.md](robustness.md)
+describes the recovery.
+
+Each watch root uses one directory handle, Windows has no specific limit on
+the number of these handles. Each watch also uses one thread and one I/O
+completion port.

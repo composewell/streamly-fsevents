@@ -11,7 +11,7 @@ module Streamly.Test.FileSystem.Event.Darwin (main) where
 import Control.Concurrent
     ( forkFinally, forkIO, killThread, newEmptyMVar, putMVar, readMVar
     , takeMVar, threadDelay, tryPutMVar)
-import Control.Exception (IOException, evaluate, try)
+import Control.Exception (IOException, try)
 import Control.Monad (forM, forever, void)
 import Data.Either (lefts)
 import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
@@ -23,7 +23,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Mem (performMajorGC)
 import System.Posix.Process
-    (executeFile, exitImmediately, forkProcess, getProcessStatus)
+    (exitImmediately, forkProcess, getProcessStatus)
 import System.Posix.Resource
     ( Resource(ResourceOpenFiles), ResourceLimit(..), ResourceLimits(..)
     , getResourceLimit, setResourceLimit)
@@ -206,38 +206,6 @@ closeWithReader =
             _ <- getProcessStatus True False child
             k `shouldBe` fds
 
--- | The number of fds open in a child process created with fork and exec.
-childFds :: FilePath -> IO Int
-childFds out = do
-    pid <- forkProcess $
-        executeFile "/bin/sh" False ["-c", "ls /dev/fd > " ++ out] Nothing
-    _ <- getProcessStatus True False pid
-    s <- readFile out
-    evaluate (length (lines s))
-
--- | A child process must not inherit the fds of a watch.
-childInherits :: Spec
-childInherits =
-    it "a child process does not inherit the fds of a watch" $
-        withSystemTempDirectory "fsevent_dir" $ \dir -> do
-            let out = dir </> "fds"
-            root <- Path.fromString (dir </> "root")
-            createDirectory (dir </> "root")
-            n0 <- childFds out
-            started <- newEmptyMVar
-            let signal ev = tryPutMVar started () >> return ev
-            watcher <- forkIO $ Stream.drain $ Stream.mapM signal
-                $ Event.watch (NonEmpty.fromList [root])
-            -- Repeat the write, the watch may not be started for the first
-            writer <- forkIO $ forever $ do
-                writeFile (dir </> "root" </> "file") ""
-                threadDelay 100000
-            takeMVar started
-            killThread writer
-            n1 <- childFds out
-            killThread watcher
-            n1 `shouldBe` n0
-
 -- | With 'Event.setFileEvents' 'False' the path of an event is the
 -- directory in which an item changed. A non-recursive watch must not
 -- report the event for the subdirectory @nested@ when @nested/file@ is
@@ -342,9 +310,7 @@ main = do
     run FileType fileRootTests
 
     let symLinkRecTests =
-              dirCreateWithParent "subdir/dir"
-                (\dir -> [(dir, dirEvent Event.isCreated)])
-            : fileCreateWithParent "subdir/file"
+              fileCreateWithParent "subdir/file"
                 (\file ->
                     [ (file, fileEvent Event.isCreated)
                     , (file, fileEvent Event.isAttrsModified)
@@ -365,6 +331,5 @@ main = do
     hspec $ describe moduleName $ describe "robustness" $ do
         closeWithSigPipe
         closeWithReader
-        childInherits
         nestedDirEvents
         manyWatches

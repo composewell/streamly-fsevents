@@ -127,6 +127,10 @@ and in
 On Linux the watch of a root is attached to its inode, on macOS to its path.
 On Windows the watch keeps the root open.
 
+* Changes made before the watch is opened: Linux and Windows report only
+  the changes made after the watch is opened. macOS can also report changes
+  made shortly before the watch is opened, for example the creation of the
+  watch root.
 * A renamed root: on Linux and macOS it is no longer watched. On Linux the
   library reports `isRootUnwatched`, because the kernel does not report the
   new path. On Windows the watch opens the root with `FILE_SHARE_DELETE`,

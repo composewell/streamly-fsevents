@@ -464,7 +464,7 @@ runTest base total = do
     -- The watch is started when the create event of a sync file is read.
     -- The stream is read only after the tree has been added.
     s0 <- getMonotonicTime
-    w <- startWatch id False root_
+    w <- startWatch id TrackNothing root_
     s1 <- getMonotonicTime
     putStrLn $ "watch start time: " ++ show (s1 - s0) ++ " s"
     start <- report "watch started"
