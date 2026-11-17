@@ -82,7 +82,7 @@ jobs:
           # The ghcup and GHC binaries are built on FreeBSD 14 and need
           # its shared libraries (e.g. libutil.so.9) on FreeBSD 15.
           case "$(freebsd-version)" in
-            15.*) pkg install -y compat14x ;;
+            15.*) pkg install -y compat14x-amd64 ;;
           esac
         run: |
           sysctl vfs.inotify || true
