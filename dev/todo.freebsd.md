@@ -46,10 +46,11 @@ Check after the build:
 - **Linking.** The inotify functions are in `libsys` on FreeBSD 15 and in
   `libc` on 14.5. GHC links `libc`, which is expected to pull in `libsys`.
 - **Expected events.** The FreeBSD test-suite expects the events listed in
-  the Linux test-suite, except `isAttrsModified` on rmdir. The kernel
-  source shows `IN_OPEN`, `IN_ACCESS` and `IN_CLOSE_NOWRITE` when a
-  directory is read, reported by a watch on its parent through the name
-  cache; this has not been observed.
+  the Linux test-suite, except `isAttrsModified` on rmdir. The CI on 14.5
+  and 15.0 showed the `IN_ACCESS` events of the read of a directory by
+  `inotify_add_watch`, reported by the watch on its parent. The test "the
+  scan of a new directory is reported only by the parent watch" counts
+  only the open and close events of the directory on FreeBSD.
 - **Spurious `ENOENT`.** The retry of `inotify_add_watch` on `ENOENT` is
   from reading `vn_inotify_add_watch`. A test would need a directory whose
   entries are deleted while the watch is added.
