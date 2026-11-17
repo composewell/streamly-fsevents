@@ -518,8 +518,8 @@ data Root = Root
     , rootMem :: Ptr Word8
     }
 
--- | The roots of a watch. A root in 'rsActive' has a read in progress,
--- except the 'rsBusy' root.
+-- | The roots of a watch. A root in 'rsActive' has a read pending, except
+-- the 'rsProcessing' root.
 data Roots = Roots
     { rsClosed :: !Bool -- ^ 'closeWatch' was called
     , rsNextKey :: !CUIntPtr -- ^ The completion key of the next root
@@ -527,8 +527,8 @@ data Roots = Roots
       -- | The root whose completed read is being processed by the thread
       -- of the watch. The thread frees its memory if the root is removed
       -- meanwhile.
-    , rsBusy :: Maybe CUIntPtr
-      -- | The memory of the removed roots whose read is yet to complete,
+    , rsProcessing :: Maybe CUIntPtr
+      -- | The memory of the removed roots that have a read pending,
       -- by completion key. Their handles are closed.
     , rsRetired :: Map CUIntPtr (Ptr Word8)
     }
@@ -649,13 +649,14 @@ enqueue Watch{..} items =
 retireRoots :: (Root -> Bool) -> Roots -> IO Roots
 retireRoots p rs = do
     let (gone, kept) = Map.partition p (rsActive rs)
-        -- The busy root has no read in progress
-        reading = Map.filterWithKey (\k _ -> Just k /= rsBusy rs) gone
+        -- The root being processed has no read pending
+        pending =
+            Map.filterWithKey (\k _ -> Just k /= rsProcessing rs) gone
     mapM_ (closeQuietly . rootHandle) (Map.elems gone)
     return
         rs
             { rsActive = kept
-            , rsRetired = Map.union (Map.map rootMem reading) (rsRetired rs)
+            , rsRetired = Map.union (Map.map rootMem pending) (rsRetired rs)
             }
 
 -- | Close a 'Watch' handle. The event streams of the watch end, a thread
@@ -736,17 +737,20 @@ pumpEvents w@Watch{..} = loop
                     Nothing -> return (rs, Nothing)
                     Just root -> do
                         outcome <- classify (rootHandle root) res
-                        return (rs {rsBusy = Just key}, Just (root, outcome))
+                        return
+                            ( rs {rsProcessing = Just key}
+                            , Just (root, outcome)
+                            )
 
-    -- Start the next read of the busy root or release the root, with the
-    -- lock held. If the read cannot be started, returns the outcome and the
-    -- root remains busy.
+    -- Start the next read of the root being processed or release the root,
+    -- with the lock held. If the read cannot be started, returns the outcome
+    -- and the root remains the 'rsProcessing' root.
     releaseRoot key root outcome rs
         -- The root was removed, or the watch was closed, the handle is
         -- closed.
         | not (Map.member key (rsActive rs)) = do
             free (rootMem root)
-            return (rs {rsBusy = Nothing}, Nothing)
+            return (rs {rsProcessing = Nothing}, Nothing)
         | isTerminal outcome = do
             closeQuietly (rootHandle root)
             free (rootMem root)
@@ -756,11 +760,11 @@ pumpEvents w@Watch{..} = loop
                 $ atomically $ do
                     q <- readTVar watchQueue
                     writeTVar watchQueue q {qUnwatched = True}
-            return (rs {rsBusy = Nothing, rsActive = active}, Nothing)
+            return (rs {rsProcessing = Nothing, rsActive = active}, Nothing)
         | otherwise = do
             r <- startRead watchConfig root
             case r of
-                Nothing -> return (rs {rsBusy = Nothing}, Nothing)
+                Nothing -> return (rs {rsProcessing = Nothing}, Nothing)
                 Just err -> do
                     outcome1 <- classify (rootHandle root) (Left err)
                     return (rs, Just outcome1)
@@ -823,7 +827,7 @@ createWatch endsUnwatched cfg = do
                 -- 0 is the key of the packet posted by 'closeWatch'
                 , rsNextKey = 1
                 , rsActive = Map.empty
-                , rsBusy = Nothing
+                , rsProcessing = Nothing
                 , rsRetired = Map.empty
                 }
     queue <-
