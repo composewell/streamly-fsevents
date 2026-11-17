@@ -170,6 +170,7 @@ import System.Posix.Types (CSsize(..), Fd(..))
 
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
+import Streamly.Internal.FS.Event.RootPath (isDotPath, normalizeRoot)
 
 import qualified Control.Exception as Exception
     (interruptible, mask, mask_, uninterruptibleMask_)
@@ -2082,42 +2083,6 @@ getWorkingDir = go 4096
         if tooSmall
         then go (size * 2)
         else return (Path.unsafeFromArray (unsafeFreezeWithShrink arr))
-
--- | Whether the path is @.@.
-isDotPath :: Path -> Bool
-isDotPath p = Path.toArray p == Path.toArray (Path.fromString_ ".")
-
--- | Remove the redundant separators and the @.@ components of a root path,
--- @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. A path that is only @.@
--- components becomes @.@. A trailing separator is kept, a symbolic link
--- named with a trailing separator is resolved by the system calls. @..@
--- components are kept, removing them would change the path if a component
--- before them is a symbolic link.
---
--- The roots are compared by the bytes of their normalized paths, see
--- 'eqRoot' and 'compareRoot'. Two paths that differ only in redundant
--- separators and @.@ components have the same normalized path, as with
--- @Path.eqPath (Path.allowRelativeEquality True)@ on macOS and Windows.
---
--- TODO: use Path.normalise when streamly-core 0.4 is released, see
--- dev/upstream-issues.md.
-normalizeRoot :: Path -> Path
-normalizeRoot path =
-    case runIdentity (S.toList (Path.splitPath_ path)) of
-        [] -> path
-        comps -> addSep (foldl1 Path.join (dropLeadingDot comps))
-
-    where
-
-    dropLeadingDot (c : cs@(_ : _)) | isDotPath c = cs
-    dropLeadingDot cs = cs
-
-    addSep p
-        | Path.hasTrailingSeparator path
-            && not (isDotPath p)
-            && not (Path.hasTrailingSeparator p) =
-            Path.addTrailingSeparator p
-        | otherwise = p
 
 -- | The 'Root' of a path supplied by the user, the path is normalized by
 -- 'normalizeRoot'. A relative path is resolved against the current working
