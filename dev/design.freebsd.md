@@ -43,8 +43,9 @@ The portable module requires from each backend:
   `isMoved`, `isModified`, `isEventsLost` and `showEvent`.
 * The default configuration reports create, delete, move and modify
   events, and is not recursive.
-* Paths are streamly `Path` values. `getAbsPath` joins the root, as given
-  by the caller, with the relative path. For a root that is a symbolic
+* Paths are streamly `Path` values. `getAbsPath` joins the absolute path of
+  the root with the relative path. A relative root is resolved against the
+  working directory when the root is added. For a root that is a symbolic
   link, the path goes through the link.
 * Watching a path that does not exist raises an exception.
 * The watch is opened and closed with `bracketIO`: the resources are
