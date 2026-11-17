@@ -223,7 +223,7 @@ See `dev/design-issues/scan-roots.md`.
 
 See `dev/design-issues/dynamic-watches.md`.
 
-## Identify a watch root by file identity
+## Identify a watch root by its directory
 
 `addRoot` skips a path that is already a root, and `removeRoot` finds the
 root by its path. The paths are compared by their components, with case
@@ -241,7 +241,7 @@ With the case-significant comparison, the same directory added as
 `C:\Foo` and `c:\foo`, or via a symbolic link, becomes two roots, and its
 events are reported once for each root.
 
-### Proposal: compare file identity
+### Option 1: compare file identity
 
 Identify a root by the identity of the directory: the volume serial number
 and the file index from `GetFileInformationByHandle` on Windows, the device
@@ -256,6 +256,45 @@ the same directory as the path.
   it is created.
 * A directory deleted and created again at the same path has a new identity.
 * Network file systems may not give stable inode numbers or file indexes.
+
+### Option 2: compare the canonical path
+
+Identify a root by its canonical path: the absolute path with symbolic
+links and `..` components resolved. A directory cannot have hard links, so
+in most cases a directory has one canonical path. `addRoot` skips a
+directory whose canonical path is already a root, and `removeRoot`
+canonicalizes its argument and removes the root with the same canonical
+path.
+
+* macOS already computes the canonical path of each root,
+  `rootCanonical` in `src/Streamly/Internal/FS/Event/Darwin.hs`, with
+  `canonicalizePath` from the `directory` package. It canonicalizes the
+  existing part of the path, a root that does not exist yet has a
+  canonical path too. On Windows `GetFinalPathNameByHandleW` on the handle
+  that `addRoot` opens gives it, on Linux `readlink` of
+  `/proc/self/fd/<fd>` on the fd of the root. Getting the path from the
+  open handle or fd avoids a race with a rename between canonicalizing the
+  path and opening it.
+* A canonical path is a string, so the roots can still be ordered by their
+  bytes, as `compareRoot` on Linux requires.
+* A directory deleted and created again at the same path has the same
+  canonical path, unlike its file identity.
+* Case: `GetFinalPathNameByHandleW` returns the names as stored on disk,
+  so `C:\Foo` and `c:\foo` give the same canonical path on Windows.
+  `realpath` on Linux does not change the case of the names. Whether
+  `realpath` on macOS returns the stored case is not checked.
+* A directory can still have more than one canonical path: a Linux bind
+  mount, a directory hard link on HFS+ (Time Machine), or a Windows volume
+  mounted at two folders. Such a directory is two roots and its events are
+  reported once for each root, as today.
+* `removeRoot` changes from "the same path as used to add the root" to "the
+  same directory", as in option 1. Its argument is canonicalized by path,
+  `canonicalizePath` also works for a root that was deleted. If a symbolic
+  link in the path was changed after the root was added, the canonical
+  path differs and the root is not found; comparing the path as supplied
+  as well covers this case.
+* `getRoot` still reports the path as supplied, the canonical path is
+  only used for the comparison.
 
 Status: open.
 
