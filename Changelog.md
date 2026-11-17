@@ -14,6 +14,13 @@
 - Linux: a file deleted from or moved out of a watched directory is no
   longer watched. Earlier, a process that still had the file open
   generated events for it.
+- Linux: when a watch root is deleted, `isDeleted` is reported for the
+  root, the same as on macOS and Windows. Use `setRootDeleted False` to
+  disable it.
+- Linux: the stream ends when none of its roots is watched any more, for
+  example, when all the roots are deleted or renamed, the same as on
+  Windows when all the roots are deleted. Earlier the stream waited
+  forever.
 - Linux: when the kernel event queue overflows, the stream reports
   `isEventsLost` and ends. Earlier the stream continued, but events could be
   missing without any indication. To continue, open a new watch and scan the

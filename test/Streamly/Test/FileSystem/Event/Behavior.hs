@@ -267,7 +267,7 @@ behaviors =
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
-        , expected = onPlatform No Yes Yes
+        , expected = Yes
         }
     , base
         { title = "root deleted and created again is watched"

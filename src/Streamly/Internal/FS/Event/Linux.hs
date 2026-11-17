@@ -466,12 +466,14 @@ setOnlyDir = setFlag iN_ONLYDIR
 foreign import capi
     "sys/inotify.h value IN_DELETE_SELF" iN_DELETE_SELF :: Word32
 
--- | Report when the watched path itself gets deleted.
+-- | Report when the watched path itself gets deleted, as an event for which
+-- 'isRootDeleted' and 'isDeleted' are true.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
--- deletion of a subdirectory is reported as 'isDeleted'.
+-- deletion of a subdirectory is reported as 'isDeleted' for its path under
+-- its parent.
 --
--- /default: False/
+-- /default: True/
 setRootDeleted :: Bool -> Config -> Config
 setRootDeleted = setFlag iN_DELETE_SELF
 
@@ -489,10 +491,9 @@ setRootMoved :: Bool -> Config -> Config
 setRootMoved = setFlag iN_MOVE_SELF
 
 -- | Report when the watched root path itself gets deleted or renamed.
+-- Equivalent to setting 'setRootDeleted' and 'setRootMoved'.
 --
 -- In recursive mode, the events are reported for the watch roots only.
---
--- /default: False/
 setRootPathEvents :: Bool -> Config -> Config
 setRootPathEvents = setFlag (iN_DELETE_SELF .|. iN_MOVE_SELF)
 
@@ -646,6 +647,7 @@ setAllEvents s =
 --
 -- * setCreated True
 -- * setDeleted True
+-- * setRootDeleted True
 -- * setMovedFrom True
 -- * setMovedTo True
 -- * setModified True
@@ -658,6 +660,7 @@ defaultConfig =
       setExcludeUnlinked True
     $ setCreated True
     $ setDeleted True
+    $ setRootDeleted True
     $ setMovedFrom True
     $ setMovedTo True
     $ setModified True
@@ -1182,6 +1185,11 @@ data Undelivered = Undelivered
 --
 data Watch = Watch
     { watchConfig :: Config -- ^ The config used to open the watch
+      -- | End the event stream when no path is watched and no event is
+      -- left to report. 'True' for the watch of 'watchWith', whose roots
+      -- cannot be changed: when all of them are deleted or renamed the
+      -- watch cannot report another event.
+    , watchEndsUnwatched :: Bool
     , watchFd :: CInt -- ^ The inotify fd
       -- | Held during a system call on the fd, 'closeWatch' cannot close the
       -- fd, and the fd number cannot be reused, while the system call is in
@@ -1223,12 +1231,12 @@ foreign import capi
 #endif
 
 -- | Create a 'Watch' handle. 'addRoot' can be used to add paths being
--- monitored by this watch.
+-- monitored by this watch. See 'watchEndsUnwatched' for the 'Bool'.
 --
 -- /Pre-release/
 --
-createWatch :: Config -> IO Watch
-createWatch cfg = do
+createWatch :: Bool -> Config -> IO Watch
+createWatch endsUnwatched cfg = do
     -- The fd must not be inherited by child processes. An inherited fd
     -- keeps the inotify instance and its watches alive after 'closeWatch',
     -- and counts against the max_user_instances limit.
@@ -1247,6 +1255,7 @@ createWatch cfg = do
     return
         $ Watch
             { watchConfig = cfg
+            , watchEndsUnwatched = endsUnwatched
             , watchFd = fd
             , watchLock = lock
             , watchWdMap = emptyMapRef
@@ -1847,8 +1856,14 @@ updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
 updateWatch flags wtch wd pRep =
     (== ProbeSame) <$> probeWatch flags wtch wd pRep
 
+-- | The config of the watch of a subdirectory in recursive mode.
+--
+-- IN_DELETE_SELF is not requested. The deletion of a subdirectory is reported
+-- by the watch of its parent, its own IN_DELETE_SELF event would not be
+-- reported and would use a slot of the kernel event queue for each deleted
+-- directory. On FreeBSD 'watchFlags' requests it for every watch.
 subdirConfig :: Config -> Config
-subdirConfig = setOnlyDir True . setFollowSymLinks False
+subdirConfig = setOnlyDir True . setFollowSymLinks False . setRootDeleted False
 
 -- | Return the default value if the action fails because the subdirectory
 -- does not exist, is not a directory, or if the watch is closed.
@@ -2684,12 +2699,16 @@ closeWatch Watch {watchFd = fd, watchLock = lock} =
 -- /Pre-release/
 --
 openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch cfg paths =
+openWatch = openWatchWith False
+
+-- | Like 'openWatch', see 'watchEndsUnwatched' for the 'Bool'.
+openWatchWith :: Bool -> Config -> NonEmpty Path -> IO Watch
+openWatchWith endsUnwatched cfg paths =
     -- The handle is not returned to the caller if adding a path fails, the
     -- caller cannot close it. 'mask' ensures that an async exception cannot
     -- arrive between creating the watch and installing the handler.
     Exception.mask $ \restore -> do
-        w <- createWatch cfg
+        w <- createWatch endsUnwatched cfg
         restore (mapM_ (addRoot w) (NonEmpty.toList paths))
             `onException` closeWatch w
         return w
@@ -3499,7 +3518,8 @@ readBufSize = 32 * 1024
 -- | Read the events available on the fd of a watch, and take the events
 -- recorded by 'recordSynthEvents'. The array is empty if no event is
 -- available on the fd. If there are none of either, returns an action that
--- waits for an event. Returns 'Nothing' if the watch is closed.
+-- waits for an event. Returns 'Nothing' if the watch is closed, or if there
+-- are none of either, no path is watched and 'watchEndsUnwatched' is set.
 --
 -- The wait is registered, or counted, before the action is returned. The
 -- caller must mask async exceptions and must run the action. The action can
@@ -3516,7 +3536,15 @@ readEvents
             synth <- takeSynthEvents wtch
             if not (null arrs) || not (null synth)
             then return (st, Just $ Right (synth, arrs))
-            else fmap (Just . Left) <$> register st
+            else do
+                -- A watch descriptor stays in the map until its
+                -- IN_IGNORED event is handled, and a marker until its
+                -- paths are reported. With an empty map and an empty
+                -- queue no event can arrive.
+                m <- readIORef (watchWdMap wtch)
+                if watchEndsUnwatched wtch && Map.null (wmEntries m)
+                then return (st, Nothing)
+                else fmap (Just . Left) <$> register st
 
     where
 
@@ -3787,18 +3815,20 @@ eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 -- @
 --
 -- Each run of the stream opens a new watch and closes it when the stream
--- ends. The handle of the watch is not exposed, so the roots of the watch
--- are the given paths for as long as the stream runs. To add or remove
--- roots while reading the events, open the watch using 'openWatch', read it
--- using 'eventStream' and change the roots using 'addRoot' and
--- 'removeRoot'.
+-- ends. The stream ends after the 'isRootUnwatched' event of the last root
+-- when none of the roots is watched any more, for example, when all the
+-- roots are deleted or renamed. The handle of the watch is not exposed, so
+-- the roots of the watch are the given paths for as long as the stream runs.
+-- To add or remove roots while reading the events, open the watch using
+-- 'openWatch', read it using 'eventStream' and change the roots using
+-- 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before after eventStream
 
     where
 
     cfg = f defaultConfig
-    before = openWatch cfg paths
+    before = openWatchWith True cfg paths
     after = closeWatch
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
@@ -3942,7 +3972,10 @@ isRootUnwatched = getFlag iN_IGNORED
 -- object is moved to another filesystem, since mv(1) in effect copies the file
 -- to the other filesystem and then deletes it from the original filesystem.)
 -- In addition, an 'isRootUnwatched' event will subsequently be generated
--- for the watch descriptor.
+-- for the watch descriptor. 'isDeleted' is also true for this event.
+--
+-- A regular file that has other hard links is not deleted when the watched
+-- path is unlinked, this event is not reported for it.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- deletion of a subdirectory is reported as 'isDeleted'.
@@ -4050,9 +4083,13 @@ isCreated = getFlag iN_CREATE
 
 -- | File/directory deleted from watched directory.
 --
--- /Occurs only for an object inside the watched directory/
+-- This is also true when a watch root itself is deleted, if 'setRootDeleted'
+-- is enabled, which is the default. 'isRootDeleted' is true for such an
+-- event and 'getRelPath' returns 'Nothing'.
+--
+-- /Can occur for a watch root or an object inside it/
 isDeleted :: Event -> Bool
-isDeleted = getFlag iN_DELETE
+isDeleted = getFlag (iN_DELETE .|. iN_DELETE_SELF)
 
 -- | Generated for the original path when an object is moved from under a
 -- monitored directory.

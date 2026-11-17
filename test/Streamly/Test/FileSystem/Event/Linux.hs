@@ -536,16 +536,42 @@ defaultAttrsModified =
             evs <- readUntil Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
 
--- isRootDeleted is not enabled by default. The kernel watch generates
--- IN_DELETE_SELF on FreeBSD, the event is not reported.
+-- isRootDeleted is enabled by default, isDeleted is true for the same
+-- event, as it is for a deleted root on macOS and Windows.
 defaultRootDeleted :: Spec
-defaultRootDeleted =
-    it "reports isRootUnwatched for a deleted root"
+defaultRootDeleted = do
+    it "reports isDeleted and isRootUnwatched for a deleted root"
         $ withRoot Event.defaultConfig $ \root w -> do
             removeDirectory root
             evs <- readUntil Event.isRootUnwatched w
             unwatched evs `shouldBe` [(root, root)]
+            pathsOf Event.isRootDeleted evs `shouldBe` [root]
+            pathsOf Event.isDeleted evs `shouldBe` [root]
+    -- The kernel watch generates IN_DELETE_SELF on FreeBSD, the event is
+    -- not reported.
+    it "does not report isDeleted for a deleted root, setRootDeleted False"
+        $ withRoot (Event.setRootDeleted False Event.defaultConfig)
+        $ \root w -> do
+            removeDirectory root
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
             pathsOf Event.isRootDeleted evs `shouldBe` []
+            pathsOf Event.isDeleted evs `shouldBe` []
+    -- The deletion of a subdirectory is reported once, by its parent. The
+    -- isRootUnwatched event of the subdirectory is read before it.
+    it "reports isDeleted once for a deleted subdirectory"
+        $ withRoot (Event.setRecursiveMode True Event.defaultConfig)
+        $ \root w -> do
+            let dir = root </> "dir"
+                end = root </> "end"
+            createDirectory dir
+            _ <- readUntil (isCreatedAt dir) w
+            removeDirectory dir
+            createFile end
+            evs <- readUntil (isCreatedAt end) w
+            pathsOf Event.isDeleted evs `shouldBe` [dir]
+            pathsOf Event.isRootDeleted evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, dir)]
 
 -------------------------------------------------------------------------------
 -- Renamed roots tests

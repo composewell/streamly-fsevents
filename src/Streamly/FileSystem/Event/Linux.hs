@@ -34,16 +34,18 @@
 --
 -- /Watch root:/
 --
--- * If a watch root is deleted, its watch ends with an 'isRootUnwatched'
+-- * If a watch root is deleted, it reports an event for which 'isDeleted'
+-- and 'isRootDeleted' are true, and its watch ends with an 'isRootUnwatched'
 -- event.
 -- * If a watch root is renamed, its watch ends with an 'isRootUnwatched'
--- event. The kernel does not report the new path of the root.
+-- event. The kernel does not report the new path of the root. Use
+-- 'setRootMoved' to receive the 'isRootMoved' event.
 -- * An object created at the path of a removed root later, or renamed to it,
--- is not watched, including the root renamed back. Add the path to the watch
--- again to watch it.
+-- is not watched, including the root renamed back. Start a new watch to
+-- watch it.
+-- * The stream ends when none of the roots is watched any more.
 --
--- Use 'setRootPathEvents' to receive the 'isRootDeleted' and 'isRootMoved'
--- events. Objects inside a watched directory do not have these limitations. A
+-- Objects inside a watched directory do not have these limitations. A
 -- file deleted and created again in a watched directory reports 'isDeleted'
 -- and 'isCreated', and its later events are reported.
 --

@@ -40,6 +40,7 @@ import System.Directory
     , createFileLink
     , getCurrentDirectory
     , removeDirectory
+    , removePathForcibly
     , renameDirectory
     , setCurrentDirectory
     )
@@ -214,6 +215,14 @@ onInotify = False
 notOnWindows :: String -> IO () -> IO ()
 notOnWindows reason test =
     if onWindows then pendingWith reason else test
+
+-- | Run the test except on macOS.
+notOnDarwin :: String -> IO () -> IO ()
+#if defined(CABAL_OS_DARWIN)
+notOnDarwin reason _ = pendingWith reason
+#else
+notOnDarwin _ test = test
+#endif
 
 -------------------------------------------------------------------------------
 -- Running a watch
@@ -427,6 +436,50 @@ relativeRoot = do
             evs <- readUntil (isCreatedRel "file") w
             rootPath (last evs) `shouldBe` "root"
             absPath (last evs) `shouldBe` cwd </> "root" </> "file"
+
+-- The stream is read by another thread. The watch is open when it reports
+-- a file created in each root, the files are created until it does.
+--
+-- On Linux and Windows a deleted root is not watched again, even if it is
+-- created again, the stream ends when none of the roots is watched. On
+-- macOS the watch is on the path of a root, the stream does not end.
+deletedRootsEndStream :: Spec
+deletedRootsEndStream =
+    it "the stream ends when all its roots are deleted"
+        $ notOnDarwin "the watch of a deleted root continues"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let roots = [fp </> "root1", fp </> "root2"]
+            mapM_ createDirectory roots
+            paths <- mapM Path.fromString roots
+            ref <- newIORef []
+            result <- newEmptyMVar
+            let collect ev = atomicModifyIORef' ref (\evs -> (ev : evs, ()))
+                stream = Event.watch (NonEmpty.fromList paths)
+                reader =
+                    try (Stream.fold (Fold.drainMapM collect) stream)
+                        >>= putMVar result
+                isStarted = do
+                    evs <- readIORef ref
+                    let started = map rootPath (filter Event.isCreated evs)
+                    return (all (`elem` started) roots)
+                start i = do
+                    forM_ roots $ \r -> createFile (r </> ("start" ++ show i))
+                    threadDelay 10000
+                    ok <- isStarted
+                    unless ok $ start (i + 1 :: Int)
+            bracket (forkIO reader) killThread $ \_ -> do
+                r <- timeout 10000000 (start 0)
+                r `shouldBe` Just ()
+                mapM_ removePathForcibly roots
+                ended <- timeout 10000000 (takeMVar result)
+                case ended of
+                    Nothing -> expectationFailure "the stream did not end"
+                    Just (Left (e :: SomeException)) -> throwIO e
+                    Just (Right ()) -> return ()
+                evs <- readIORef ref
+                let isRootDeleted ev =
+                        Event.isDeleted ev && relPath ev == Nothing
+                sort (pathsOf isRootDeleted evs) `shouldBe` roots
 
 -------------------------------------------------------------------------------
 -- Recursive mode
@@ -1836,6 +1889,7 @@ watchTests =
                 manyRoots
                 eventPaths
                 relativeRoot
+                deletedRootsEndStream
             describe "overlapping roots" $ do
                 overlapRemoveInner
                 renameOutOfInnerRoot

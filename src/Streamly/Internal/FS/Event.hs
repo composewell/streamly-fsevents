@@ -157,6 +157,12 @@ watchWith = Event.watchWith
 --
 -- If a watch root is a symbolic link then the target of the link is watched.
 --
+-- When a watch root is deleted, an 'isDeleted' event is reported for the
+-- root. On Linux, FreeBSD and Windows a deleted root is not watched again,
+-- and the stream ends when none of the roots is watched any more. On macOS
+-- the watch continues, an object created at the path of the root later is
+-- watched.
+--
 -- Do not rename, or delete and create again, a watch root in a portable
 -- program, the result depends on the platform. See
 -- @docs\/platform-differences.md@ in this package, which also describes
@@ -324,17 +330,14 @@ getAbsPath = Event.getAbsPath
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
 
--- XXX To make the behavior consistent, can we block the event on watch root on
--- macOS?
---
 -- | Determine whether the event indicates deletion of an object within the
 -- monitored path.
 --
--- Whether this event occurs when the watch root itself is deleted depends on
--- the platform. See @docs\/platform-differences.md@ in this package.
---
--- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
--- Linux and FreeBSD.
+-- When a watch root itself is deleted, this event is reported for the root,
+-- 'getRelPath' returns 'Nothing' for it. It is not reported when the root is
+-- a symbolic link and the link is deleted. See
+-- @docs\/platform-differences.md@ in this package for the events of the
+-- entries in a deleted root, and for the watch after the root is deleted.
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
