@@ -13,21 +13,19 @@ to test it on Windows. Delete an entry when it is fixed.
   exported type.
 - Renames are not paired. There is no cookie; `isMovedFrom` and
   `isMovedTo` are separate events that are only adjacent.
-- If one root fails, the whole stream ends. There is no per-root event
+- If the system fails to report the changes of a root, the read raises the
+  exception and `watchWith` ends the stream. There is no per-root event
   like Linux's `isRootUnwatched`.
-- No explicit `openWatch`/`closeWatch` and no way to add or remove roots.
-  Cleanup relies on exceptions or GC.
 - The 63 KiB read buffer is not configurable.
-- `getAbsPath` returns a relative path when the root is relative.
 - The `isMovedFrom`/`isMovedTo` docs say "moved from under / into a
   monitored directory", but moves across the tree boundary are probably
   reported as removed/added.
 
 ## Event semantics
 
-- Lost events: if the consumer is slow, the 1500-event stream buffer
-  fills, the worker stops reading and the OS buffer overflows. After
-  `isEventsLost` the application has to rescan.
+- Lost events: if the consumer is slow, the event queue of the watch
+  fills at 1024 events, the thread of the watch stops reading and the OS
+  buffer overflows. After `isEventsLost` the application has to rescan.
 - The two halves of a rename may arrive in different reads.
 - One write can produce an added event plus several modified events; in
   recursive mode the parent directory reports modified events too.
@@ -47,19 +45,24 @@ to test it on Windows. Delete an entry when it is fixed.
 - Network shares: 63 KiB is under the 64 KiB limit, but redirectors that
   do not support the call fail with `ERROR_INVALID_FUNCTION` and end the
   stream.
-- Deleting the watch root or removing the volume produces no event for
-  the root; the stream most likely ends with an exception.
+- Deleting the watch root reports `isDeleted` for the root and ends the
+  watch of the root. Removing the volume is not tested, the stream most
+  likely ends with an exception.
 
 ## Unverified suspicions
 
-- Root deleted / volume removed: which error code, and whether a
-  delete-pending directory still reports events.
-- More roots than the `parConcatMap` thread limit: each root needs a
-  blocked worker, so extra roots may never be read.
+- Volume removed: which error code the read reports.
 - Handle closed externally: the read may return 0 bytes (reported as
   lost events) and the next call fails.
-- If `CancelSynchronousIo` lands just before the system call starts, the
-  read still waits for the next change.
+- `watchWith` ends the stream when it has read the `isDeleted` event of
+  each root. A root removed because its read failed is not counted, if
+  all the other roots are deleted the stream waits forever. Linux ends
+  the stream when no path is watched, the same check would cover this.
+- Not run on Windows: the changes of this branch to `Windows.hs` were
+  typechecked on Linux only, with stub `System.Win32` modules. They are
+  the absolute path of a relative root (`toAbsolute`), the item put back
+  in the queue by an interrupted read, and a path listed twice watched
+  once.
 - Do alternate data stream names (`file:stream`) show up in events?
 - Does `Path.fromString` accept `\\?\` or UNC roots?
 - No bounds check of `NextEntryOffset` against the bytes returned.
