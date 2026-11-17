@@ -2119,7 +2119,12 @@ makeRoot path0
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
--- event. Raise an exception if the watch is closed.
+-- event. Raise an exception if the watch is closed, if @root@ does not exist,
+-- or if the process does not have read permission on @root@.
+--
+-- A @root@ that is not a directory is watched as a file, the events of the
+-- file itself are reported. On Linux this includes a special file, for
+-- example, a FIFO or a device, the file is not opened.
 --
 -- /Pre-release/
 --

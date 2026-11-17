@@ -85,11 +85,14 @@ import Foreign.Storable (peek, peekByteOff, poke)
 import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr)
 import GHC.Conc
     (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
+import GHC.IO.Exception (IOErrorType(..), IOException(..))
 import System.IO.Error (catchIOError)
 import System.Win32.File
-    ( LPOVERLAPPED
+    ( BY_HANDLE_FILE_INFORMATION(..)
+    , LPOVERLAPPED
     , closeHandle
     , createFile
+    , fILE_ATTRIBUTE_DIRECTORY
     , fILE_FLAG_BACKUP_SEMANTICS
     , fILE_FLAG_OVERLAPPED
     , fILE_LIST_DIRECTORY
@@ -102,6 +105,7 @@ import System.Win32.File
     , fILE_SHARE_DELETE
     , fILE_SHARE_READ
     , fILE_SHARE_WRITE
+    , getFileInformationByHandle
     , oPEN_EXISTING
     )
 import System.Win32.Info (getFullPathName)
@@ -297,6 +301,22 @@ openDirHandle dir = do
         (fILE_FLAG_BACKUP_SEMANTICS .|. fILE_FLAG_OVERLAPPED)
         -- No template file
         Nothing
+
+-- | Raise an exception if the handle of @path@ is not a directory. A
+-- regular file can be opened by 'openDirHandle' but cannot be watched.
+checkIsDir :: Path -> HANDLE -> IO ()
+checkIsDir path h = do
+    info <- getFileInformationByHandle h
+    when (bhfiFileAttributes info .&. fILE_ATTRIBUTE_DIRECTORY == 0)
+        $ ioError
+            IOError
+                { ioe_handle = Nothing
+                , ioe_type = InappropriateType
+                , ioe_location = "addRoot"
+                , ioe_description = "not a directory"
+                , ioe_errno = Nothing
+                , ioe_filename = Just (Path.toString path)
+                }
 
 -- | Close a handle, ignore a failure.
 closeQuietly :: HANDLE -> IO ()
@@ -892,8 +912,8 @@ isRootPath path =
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
--- event. Raise an exception if the watch is closed, or if the directory
--- cannot be opened or watched.
+-- event. Raise an exception if the watch is closed, if @root@ does not exist
+-- or is not a directory, or if the directory cannot be opened or watched.
 --
 -- /Pre-release/
 --
@@ -913,6 +933,7 @@ addRoot Watch{..} root =
         absRoot <- toAbsolute root
         h <- openDirHandle root
         flip onException (closeQuietly h) $ do
+            checkIsDir root h
             port <- c_CreateIoCompletionPort h watchPort key 0
             when (port == nullPtr)
                 $ getLastError >>= failWith "CreateIoCompletionPort"

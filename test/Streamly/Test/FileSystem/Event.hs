@@ -69,6 +69,8 @@ import qualified Streamly.Internal.FS.Event.Linux as Inotify
 import Foreign.C.Types (CInt(..))
 import qualified Streamly.Internal.FS.Event.FreeBSD as Inotify
 #elif defined(CABAL_OS_WINDOWS)
+import GHC.IO.Exception (IOErrorType(InappropriateType))
+import System.IO.Error (ioeGetErrorType)
 import qualified System.Win32.File as Win32
 #endif
 
@@ -1421,6 +1423,25 @@ closedWatchOps =
             Event.removeRoot w p
             Event.closeWatch w
 
+#if defined(CABAL_OS_WINDOWS)
+-- The watch keeps reporting the events of its other roots after the failed
+-- add.
+fileRootRaises :: Spec
+fileRootRaises =
+    it "addRoot raises an exception if the root is a regular file"
+        $ withRootHandle id $ \root w -> do
+            let file = root </> "file"
+                file2 = root </> "file2"
+            createFile file
+            p <- Path.fromString file
+            r <- try (Event.addRoot w p)
+            either (Just . ioeGetErrorType) (const Nothing) r
+                `shouldBe` Just InappropriateType
+            createFile file2
+            evs <- readUntil (isCreatedAt file2) w
+            createdRoots file2 evs `shouldBe` [root]
+#endif
+
 -- The reader thread is blocked reading the watch. The stream ends when the
 -- watch is closed, without any file system event.
 closeWhileReading :: Spec
@@ -1540,6 +1561,9 @@ handleTests = do
     removeWhileReading
     removeAddAgain
     closedWatchOps
+#if defined(CABAL_OS_WINDOWS)
+    fileRootRaises
+#endif
     closeWhileReading
     readEventAfterClose
     readTimeout
@@ -1965,7 +1989,7 @@ main = do
     runRec SymLinkOrigPath (commonTests ++ commonRecTests)
 
 #if !defined(CABAL_OS_WINDOWS)
-    -- A regular file cannot be a watch root on Windows.
+    -- A regular file cannot be a watch root on Windows, see fileRootRaises.
     let fileRootTests = [fileModify "" (const [])]
     run FileType fileRootTests
     runRec FileType fileRootTests
