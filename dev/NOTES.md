@@ -1,7 +1,6 @@
 1. API design issues
 
 - No way to start from a past event ID. since is hard-coded to SinceNow, so a watch can't resume after a restart, and setFullHistory/isHistoryDone are dead API. Suggestions: a setSinceEventId setting and an accessor for the latest event ID. Resuming also needs the volume UUID, because event IDs are only valid for one volume.
-- Closing isn't prompt. Only the bracketed stream API is exported. After take or a fold that stops early, the watch stays open until GC: the FSEvents stream (one of only 512), the dispatch queue and two fds. A loop of short-lived watches can hit the limit before GC runs. A withWatch, or exporting openWatch/closeWatch as Linux does, would fix this.
 - One error for every failure. Pipe EMFILE, a path CoreFoundation can't convert, more than 4096 paths, and a start failure all give openWatch: failed to create watch., with no errno or reason.
 - setAllEvents only toggles two flags, despite its name.
 - getRoot returns the OS path for events outside every root, so it has two meanings.
@@ -18,7 +17,6 @@
 
 3. Suspected, not verified, left unchanged
 
-- writeEvent ignores short writes and EINTR. A partial write would permanently break the parser's record framing. It's probably unreachable, since libdispatch threads block most signals, but a write-until-done loop would be cheap insurance.
 - Close can still hang in one corner. If open("/dev/null") fails at close (fd limit reached), the dup2 step is skipped and close can still hang when the read end is shared.
 - A fork race can leak the fds. A fork in another thread between pipe() and fcntl() can still give a child the pipe; macOS has no pipe2. Close is safe in that case; only the fd leak into that child remains.
 - setRoot goes through String on every event. That costs time on each event and would mangle non-UTF-8 names on non-APFS volumes. Matching on bytes would avoid both.
