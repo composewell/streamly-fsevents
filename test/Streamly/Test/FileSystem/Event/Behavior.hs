@@ -521,8 +521,8 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- Linux reports the subdir as isAccessDenied and does not watch it. On
-    -- macOS and Windows the outcome is expected, not yet observed.
+    -- Linux reports the subdir as isAccessDenied and does not watch it. The
+    -- Windows outcome is expected, the test is skipped in the CI.
     , base
         { title = "unreadable subdir of a recursive root reports its changes"
         , config = Event.setRecursiveMode True
@@ -552,8 +552,8 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- The permission is checked when a watch is added, not afterwards. On
-    -- macOS and Windows the outcomes are expected, not yet observed.
+    -- The permission is checked when a watch is added, not afterwards. The
+    -- Windows outcomes are expected, the tests are skipped in the CI.
     , base
         { title = "root watched before its read permission is removed"
         , cleanup = allowRead . watchRoot
