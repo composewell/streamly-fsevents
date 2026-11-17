@@ -223,6 +223,41 @@ See `dev/design-issues/scan-roots.md`.
 
 See `dev/design-issues/dynamic-watches.md`.
 
+## Identify a watch root by file identity
+
+`addRoot` skips a path that is already a root, and `removeRoot` finds the
+root by its path. The paths are compared by their components, with case
+significant (`Path.eqPath` on macOS and Windows, byte equality on Linux).
+Case sensitivity is a property of the file system, or of a directory, not
+of the OS: NTFS is case-insensitive by default but a directory can be made
+case-sensitive (`fsutil file setCaseSensitiveInfo`), APFS and HFS+ can be
+formatted either way, and ext4 and f2fs support case-insensitive (casefold)
+directories. A path comparison cannot know which applies, so ignoring case
+would treat two different directories on a case-sensitive file system as
+one root.
+
+With the case-significant comparison, the same directory added as
+`C:\Foo` and `c:\foo`, or via a symbolic link, becomes two roots, and its
+events are reported once for each root.
+
+### Proposal: compare file identity
+
+Identify a root by the identity of the directory: the volume serial number
+and the file index from `GetFileInformationByHandle` on Windows, the device
+and inode from `stat` on Linux and macOS. `addRoot` skips a directory that
+is already a root under any path, and `removeRoot` removes the root that is
+the same directory as the path.
+
+* `removeRoot` changes from "the same path as used to add the root" to "the
+  same directory". The root to remove has to exist to get its identity, a
+  root that was deleted can only be removed by its path.
+* On macOS a root may not exist when it is added, it has no identity until
+  it is created.
+* A directory deleted and created again at the same path has a new identity.
+* Network file systems may not give stable inode numbers or file indexes.
+
+Status: open.
+
 ## Linux: restart a watch on request
 
 A directory that cannot be added, for example, at the `max_user_watches`
