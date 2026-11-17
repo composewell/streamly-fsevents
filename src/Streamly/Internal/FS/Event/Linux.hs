@@ -141,7 +141,7 @@ import Foreign.C.Error
     , throwErrnoIfMinus1_
     )
 #if defined(CABAL_OS_FREEBSD)
-import Foreign.C.Error (eEXIST)
+import Foreign.C.Error (eEXIST, eMLINK)
 #endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
@@ -1308,14 +1308,19 @@ foreign import ccall unsafe "dirent.h fdopendir"
 -- | Whether adding or listing a subdirectory failed because the path no longer
 -- refers to a directory. The path may have been deleted, or it may now be a
 -- file or a symbolic link. ELOOP is a symbolic link loop in place of the
--- directory or of its parent.
+-- directory or of its parent. On FreeBSD, open(2) with O_NOFOLLOW fails with
+-- EMLINK if the path is a symbolic link, Linux fails with ELOOP.
 isNotSubdirError :: IOError -> Bool
 isNotSubdirError e =
     isDoesNotExistError e || fmap Errno (ioe_errno e) `elem` errnos
 
     where
 
+#if defined(CABAL_OS_FREEBSD)
+    errnos = [Just eNOTDIR, Just eLOOP, Just eMLINK]
+#else
     errnos = [Just eNOTDIR, Just eLOOP]
+#endif
 
 -- | Whether adding or listing a directory failed because of missing
 -- permission. inotify_add_watch needs the read permission, listing the
