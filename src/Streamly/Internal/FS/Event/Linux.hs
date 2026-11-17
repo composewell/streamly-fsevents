@@ -175,7 +175,7 @@ import qualified Data.IntSet as IntSet
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as OrdMap
 import qualified Streamly.Data.Array as A
-    (createOf, fromList, read, toList)
+    (createOf, fromList, length, read, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.StreamK as StreamK
     (append, fromStream, toStream)
@@ -185,7 +185,7 @@ import qualified Streamly.Internal.Data.Array as A
     ( asCStringUnsafe, breakEndBy_, unsafePinnedAsPtr
     )
 import qualified Streamly.Internal.Data.MutArray as MArray
-    (byteLength, unsafeCreateWithPtr')
+    (unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.DirIO as Dir (ignoreMissing)
 import qualified Streamly.Internal.FileSystem.Posix.ReadDir as ReadDir
     (DirStream(..), closeDirStream, readDirStreamEither)
@@ -2697,11 +2697,11 @@ unwatchSubtree wtch pRep =
 -- does not state the position of IN_MOVE_SELF. The order was observed on Linux
 -- 6.12 only, the kernel source was not checked.
 --
--- If a kernel queues IN_MOVE_SELF first, every rename within the tree is
--- handled as a move out followed by a move in. The watches are removed and
--- added again, the events generated in between are lost, and the moved paths
--- report 'isRootUnwatched'. The set of watched paths remains correct. The test
--- recRenameNoUnwatched fails in that case.
+-- If a kernel queues IN_MOVE_SELF first, the IN_MOVE_SELF of a directory
+-- moved out of the tree is read before its IN_MOVED_FROM records the cookie.
+-- The directory is not removed, its events are reported with the old path.
+-- FreeBSD queues IN_MOVE_SELF first, 'orderMoves' puts the events of a rename
+-- in the Linux order before they are handled.
 
 -- NOTE: A directory renamed within the tree:
 --
@@ -3032,6 +3032,124 @@ readOneEvent = do
         pathLen :: Word32 <- peekByteOff ptr (len + 8)
         return (ewd, eflags, cookie, fromIntegral pathLen)
 
+-- | The kernel events of the arrays read from the fd of a watch.
+parseEvents :: [Array Word8] -> Stream IO RawEvent
+parseEvents =
+    S.concatMap (S.catRights . S.parseMany readOneEvent . A.read) . S.fromList
+
+#if defined(CABAL_OS_FREEBSD)
+-- NOTE: The events of a rename on FreeBSD:
+--
+-- For rename(2) of a directory D from the directory P1 to P2, FreeBSD queues
+-- IN_MOVE_SELF on the watch of D, then IN_MOVED_FROM on P1, and then
+-- IN_MOVED_TO on P2, see INOTIFY_MOVE in sys/sys/inotify.h and vn_inotify in
+-- sys/kern/vfs_inotify.c. Linux queues IN_MOVE_SELF last. The handling of a
+-- directory renamed within the tree or moved out of it needs the Linux order,
+-- see the NOTE above 'clearMoved'. 'orderMoves' moves IN_MOVE_SELF after
+-- IN_MOVED_TO, or after IN_MOVED_FROM if there is no IN_MOVED_TO.
+--
+-- On FreeBSD 14.5 and 15.1, IN_MOVE_SELF has the cookie of the rename. On
+-- FreeBSD 15.0, if D is watched by any inotify fd, IN_MOVE_SELF and
+-- IN_MOVED_FROM have cookie 0 and IN_MOVED_TO has the cookie of the rename.
+-- An IN_MOVED_FROM with cookie 0 followed by an IN_MOVED_TO is given the
+-- cookie of the IN_MOVED_TO, and so is an IN_MOVE_SELF with cookie 0 just
+-- before the two, see 'fixCookies'.
+--
+-- The three events are queued one after the other by the same system call,
+-- the events of other operations can be queued in between. Events with a
+-- non-zero cookie are matched by the cookie. An event with cookie 0 is
+-- matched only to the next event.
+--
+-- The events of a rename can be split across two reads of the fd. If the
+-- last event of a read is IN_MOVE_SELF or IN_MOVED_FROM, the fd is read again
+-- before the events are handled, see 'readEvents'. If the next event is
+-- queued after the second read, the IN_MOVE_SELF is handled before it, and a
+-- rename within the tree is handled as a move out followed by a move in: the
+-- watches of the directory are removed and added again, the moved paths
+-- report 'isRootUnwatched'.
+
+rawFlags :: RawEvent -> Word32
+rawFlags (RawEvent _ flags _ _) = flags
+
+rawCookie :: RawEvent -> Word32
+rawCookie (RawEvent _ _ cookie _) = cookie
+
+setRawCookie :: Word32 -> RawEvent -> RawEvent
+setRawCookie cookie (RawEvent wd flags _ name) = RawEvent wd flags cookie name
+
+rawHas :: Word32 -> RawEvent -> Bool
+rawHas flag ev = rawFlags ev .&. flag /= 0
+
+-- | Whether the two events are for the same kind of object, a directory or
+-- not.
+sameKind :: RawEvent -> RawEvent -> Bool
+sameKind e1 e2 = rawHas iN_ISDIR e1 == rawHas iN_ISDIR e2
+
+-- | Give the IN_MOVE_SELF and IN_MOVED_FROM events of a rename that have
+-- cookie 0 the cookie of the IN_MOVED_TO event that follows them, see the
+-- NOTE above.
+fixCookies :: [RawEvent] -> [RawEvent]
+fixCookies (s : es@(f : t : _))
+    | rawHas iN_MOVE_SELF s && rawCookie s == 0 && isPair f t && sameKind s f =
+        setRawCookie (rawCookie t) s : fixCookies es
+fixCookies (f : es@(t : _))
+    | isPair f t = setRawCookie (rawCookie t) f : fixCookies es
+fixCookies (e : es) = e : fixCookies es
+fixCookies [] = []
+
+-- | An IN_MOVED_FROM event with cookie 0 followed by its IN_MOVED_TO.
+isPair :: RawEvent -> RawEvent -> Bool
+isPair f t =
+       rawHas iN_MOVED_FROM f
+    && rawCookie f == 0
+    && rawHas iN_MOVED_TO t
+    && rawCookie t /= 0
+    && sameKind f t
+
+-- | Put the events of each rename in the Linux order, see the NOTE above.
+orderMoves :: [RawEvent] -> [RawEvent]
+orderMoves = go . map ((,) False) . fixCookies
+
+    where
+
+    -- True for an IN_MOVE_SELF that is already moved.
+    go [] = []
+    go ((moved, s) : es)
+        | not moved && rawHas iN_MOVE_SELF s
+        , Just es1 <- moveAfter s es = go es1
+        | otherwise = s : go es
+
+    -- The first event that satisfies the predicate, for cookie 0 only the
+    -- next event.
+    findNext cookie p xs
+        | cookie /= 0 =
+            case break (p . snd) xs of
+                (before, x : after) -> Just (before, x, after)
+                _ -> Nothing
+        | otherwise =
+            case xs of
+                x : after | p (snd x) -> Just ([], x, after)
+                _ -> Nothing
+
+    isMove flag cookie s e =
+        rawHas flag e && rawCookie e == cookie && sameKind s e
+
+    moveAfter s es = do
+        let cookie = rawCookie s
+            s1 = (True, s)
+        (b1, f, a1) <- findNext cookie (isMove iN_MOVED_FROM cookie s) es
+        return
+            $ case findNext cookie (isMove iN_MOVED_TO cookie s) a1 of
+                Just (b2, t, a2) -> b1 ++ f : b2 ++ t : s1 : a2
+                Nothing -> b1 ++ f : s1 : a1
+
+-- | Whether the last event may be followed by the rest of its rename, see the
+-- NOTE above 'orderMoves'.
+moveIncomplete :: [RawEvent] -> Bool
+moveIncomplete [] = False
+moveIncomplete evs = rawHas (iN_MOVE_SELF .|. iN_MOVED_FROM) (last evs)
+#endif
+
 -- | Run the action of a kernel event. Returns the given events of the kernel
 -- event followed by the stream returned by the action. If the action raises
 -- an 'IOException', the exception follows the events as an 'ItemFailed'.
@@ -3238,22 +3356,46 @@ foreign import ccall unsafe "unistd.h read"
 -- The wait is registered, or counted, before the action is returned. The
 -- caller must mask async exceptions and must run the action. The action can
 -- be interrupted by an async exception.
-readEvents :: Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], Array Word8)))
+readEvents ::
+    Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], [Array Word8])))
 readEvents
     wtch@Watch {watchFd = fd, watchLock = lock, watchSynthEvents = synthVar} =
     modifyMVar lock $ \st ->
         if fsWatchClosed st
         then return (st, Nothing)
         else do
-            arr <- MArray.unsafeCreateWithPtr' bufSize readFd
+            arrs <- readArrays
             synth <- takeSynthEvents wtch
-            if MArray.byteLength arr /= 0 || not (null synth)
-            then
-                return
-                    (st, Just $ Right (synth, unsafeFreezeWithShrink arr))
+            if not (null arrs) || not (null synth)
+            then return (st, Just $ Right (synth, arrs))
             else fmap (Just . Left) <$> register st
 
     where
+
+    readArray =
+        unsafeFreezeWithShrink <$> MArray.unsafeCreateWithPtr' bufSize readFd
+
+#if defined(CABAL_OS_FREEBSD)
+    -- Read again if the events of a rename may be split, see the NOTE above
+    -- 'orderMoves'.
+    readArrays = go (4 :: Int)
+
+        where
+
+        go n = do
+            arr <- readArray
+            if A.length arr == 0
+            then return []
+            else do
+                evs <- S.toList (parseEvents [arr])
+                if n > 1 && moveIncomplete evs
+                then (arr :) <$> go (n - 1)
+                else return [arr]
+#else
+    readArrays = do
+        arr <- readArray
+        return [arr | A.length arr /= 0]
+#endif
 
     -- As per the inotify man page, a buffer of size
     --
@@ -3358,7 +3500,7 @@ readEvent
     -- read. A read returns whole events, the events of a read are parsed on
     -- their own.
     readOne (Left wait) = S.fromPure (ItemWait wait)
-    readOne (Right (synth, arr)) =
+    readOne (Right (synth, arrs)) =
         S.append synthEvents kernelEvents
 
         where
@@ -3367,10 +3509,16 @@ readEvent
 
         -- 'handleEvent' returns a stream for each kernel event: the event
         -- for each of its paths, followed by the entries found by its scan.
-        kernelEvents =
-            S.concatMapM (handleEvent cfg wtch)
-                $ S.catRights
-                $ S.parseMany readOneEvent (A.read arr)
+        kernelEvents = S.concatMapM (handleEvent cfg wtch) rawEvents
+
+#if defined(CABAL_OS_FREEBSD)
+        -- See the NOTE above 'orderMoves'.
+        rawEvents =
+            S.concatEffect
+                (S.fromList . orderMoves <$> S.toList (parseEvents arrs))
+#else
+        rawEvents = parseEvents arrs
+#endif
 
     items = S.concatMap readOne fdReads
 

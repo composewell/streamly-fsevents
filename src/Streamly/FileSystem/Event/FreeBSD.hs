@@ -33,6 +33,11 @@
 -- read generates an 'isAccessed' event for the directory. A directory that
 -- is readable but not searchable cannot be watched, the watch fails with
 -- @EACCES@.
+-- * On FreeBSD 15.0, the kernel reports the 'isMovedFrom' event of a
+-- directory with cookie 0 if any inotify watch watches the directory itself,
+-- as a recursive watch does for each subdirectory. The library gives such an
+-- event the cookie of the 'isMovedTo' event that follows it. The
+-- 'isMovedFrom' event of a directory moved out of the tree keeps cookie 0.
 -- * devfs does not report events. File systems that do not use the kernel
 -- name cache, for example tmpfs mounted with @nonc@, may not report all the
 -- events.
