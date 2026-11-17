@@ -60,3 +60,24 @@ Listing a directory through its fd, with `fdopendir`, increased the live
 heap after the start of a watch on 28277 directories from 5.3 MB to
 5.9 MB, about 21 bytes per directory. The names are read by
 `readDirStreamEither` in both versions, the cause is not known.
+
+## Linux: root paths are compared byte by byte
+
+macOS and Windows compare root paths with `Path.eqPath` and
+`allowRelativeEquality`, which ignores redundant separators and `.`
+components: `x//y`, `x/./y` and `./x/y` are the same root as `x/y`.
+Linux compares the bytes of the paths (`eqPath` and `eqRoot` in
+`src/Streamly/Internal/FS/Event/Linux.hs`), so each of these paths is a
+separate root. Listing the same directory as `x/y` and `x//y` watches it
+twice and reports its events twice, and `removeRoot "x//y"` does not
+remove a root added as `x/y`.
+
+`eqPath` cannot be changed alone. `compareRoot` orders the roots by their
+bytes and is used by `comparePathKey`, the key of the path index, so the
+equality and the ordering must agree. Either normalize the root path
+once, when the root is added, and keep the byte comparisons, or change
+both `eqRoot` and `compareRoot`. Normalizing once keeps the comparison in
+`comparePathKey`, which is on the path of every directory event, as cheap
+as it is today. The normalized path has to be stored beside the path as
+supplied, because `getRoot` and the event paths report the root as
+supplied.
