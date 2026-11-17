@@ -53,9 +53,6 @@ import System.IO
     ( IOMode(AppendMode, ReadMode, WriteMode), hClose, hFlush, hPutStr
     , openFile
     )
-#if defined(FILESYSTEM_EVENT_FREEBSD)
-import System.IO (hPutStrLn, stderr)
-#endif
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (createLink, setFileMode)
 import System.Posix.Resource
@@ -1498,20 +1495,15 @@ recScanNewDirSilent =
             filter (/= dir) listed `shouldBe` []
 #if defined(FILESYSTEM_EVENT_FREEBSD)
             -- The add of the watch of dir reads dir and generates access
-            -- events. An open with O_PATH, used to walk to dir, generates an
-            -- open event. The count of these events is not known, the events
-            -- are printed. At least the open and the close of the listing.
-            -- TODO: assert the count once it is known.
-            let isOpenClose ev = isListing ev && not (Event.isAccessed ev)
-                openClose =
-                    filter (isUnder dir . getAbsPath)
-                        $ filter isOpenClose (evs ++ evs1)
-            hPutStrLn stderr
-                $ "listing events of dir: "
-                    ++ show (map Event.showEvent openClose)
-            length (filter Event.isOpened openClose) `shouldSatisfy` (>= 1)
-            length (filter Event.isNonWriteClosed openClose)
-                `shouldSatisfy` (>= 1)
+            -- events. dir reports four open events and one close event: the
+            -- open and the close of the listing, and three opens with
+            -- O_PATH, the close of an O_PATH fd generates no event. Seen on
+            -- FreeBSD 14.5 and 15.0.
+            let evs2 = evs ++ evs1
+                opened = filter (isUnder dir) (pathsOf Event.isOpened evs2)
+                closed =
+                    filter (isUnder dir) (pathsOf Event.isNonWriteClosed evs2)
+            (length opened, length closed) `shouldBe` (4, 1)
 #else
             -- open, one or two access events that the kernel may merge, close
             length listed `shouldSatisfy` (`elem` [3, 4])
