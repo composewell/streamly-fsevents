@@ -280,10 +280,15 @@ the cookie".
     empty before its `IN_MOVED_FROM` is queued, or if another event is
     queued between the two. The `IN_MOVE_SELF` is then
     handled before the cookie is recorded. After the events of a read
-    that found the queue empty, `unwatchMovedOut` removes the directories
-    that still have the cookie of an `IN_MOVED_FROM`; their `IN_MOVED_TO`
-    does not exist. A read found the queue empty if it left room in the
-    buffer for the largest event, 272 bytes.
+    that found the queue empty, the paths that still have the cookie of an
+    `IN_MOVED_FROM` have no `IN_MOVED_TO`. `unwatchMovedOut` probes each
+    of them with `probeWatch`: a path that refers to the directory of its
+    watch descriptor is kept and its cookie removed, the other paths are
+    removed as moved out. A kept path is a directory created at the path
+    after the move: in `mkdir d; mv d out; mkdir d` read after all three,
+    the create event watches the second `d`, and the `IN_MOVED_FROM` of
+    the first `d` gives it the cookie. A read found the queue empty if it
+    left room in the buffer for the largest event, 272 bytes.
 
     If the queue is found empty between `IN_MOVED_FROM` and `IN_MOVED_TO`,
     the directory is removed, and the `IN_MOVED_TO` adds it as moved in.
