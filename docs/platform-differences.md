@@ -186,9 +186,8 @@ On Windows the watch keeps the root open.
   is expected to stop reporting the events of a directory that the process
   can no longer reach, this is not yet observed.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
-* A FIFO as a root: on Linux the watch reports the events of the FIFO, it
-  does not open the FIFO. On macOS it is expected to be watched like a
-  regular file, this is not tested. Not allowed on Windows.
+* A FIFO as a root: on Linux and macOS the watch reports a write to the
+  FIFO, and does not open the FIFO. Not allowed on Windows.
 * A root listed twice: all platforms report a change in it once. Paths
   that differ only in redundant separators and `.` components, for
   example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
@@ -226,6 +225,8 @@ except for the following differences:
   its entries, the time taken is proportional to the number of entries. The
   read reports `isAccessed` for the directory to the watch on its parent. In
   a recursive watch, each subdirectory added generates such an event.
+* A FIFO as a root: the watch is added and does not open the FIFO, but a
+  write to the FIFO is not reported.
 * A directory that is readable but not searchable, mode `r--`, cannot be
   watched. As a root the watch raises an exception, in a recursive watch the
   directory is reported as `isAccessDenied`. Linux watches such a directory.
@@ -301,6 +302,7 @@ because the file is open.
 | A watch of a path that does not exist raises an exception | Yes | No | Yes |
 | A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 | A regular file can be a watch root | Yes | Yes | No |
+| A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
 
 ### Recursive watches
 
@@ -325,11 +327,11 @@ in a recursive watch.
 | A root with no read reports its events | No, the watch raises an exception | Yes | Not tested, expected No |
 | A root with none reports its events | No, the watch raises an exception | Expected No | Not tested, expected No |
 | A recursive watch with a subdirectory with no read is watched | Yes | Yes | Not tested |
-| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Expected Yes | Not tested, expected Yes |
+| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Not tested, expected Yes |
 | A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | Expected No | Not tested, expected Yes |
 | A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Not tested |
-| A root reports its events after its read permission is removed | Yes | Expected Yes | Not tested, expected Yes |
-| A subdirectory reports its events after its read permission is removed | Yes | Expected Yes | Not tested, expected Yes |
+| A root reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
+| A subdirectory reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
 | A root reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
 | A subdirectory reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
 | Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | Not tested, expected No |
@@ -357,9 +359,9 @@ expected outcomes are from the platform documentation.
 | A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
 | A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
 
-The row for the end of the
-stream is from the test suite `FileSystem.Event`. The row for the delivery
-of events in a non-recursive watch has no test, it is based on the platform
+The rows for the end of the stream and for a FIFO root are from the test
+suite `FileSystem.Event`. The row for the delivery of events in a
+non-recursive watch has no test, it is based on the platform
 documentation and the library code. The coalescing of the events of a directory
 and its subdirectory into `isEventsLost` on macOS is also based on the platform
 documentation.
