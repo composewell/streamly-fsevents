@@ -1,11 +1,16 @@
-1. API design issues
+# Darwin TODO
+
+Open problems in `src/Streamly/Internal/FS/Event/Darwin.hs` and
+`Darwin.c`. Delete an entry when it is fixed.
+
+## API design issues
 
 - No way to start from a past event ID. since is hard-coded to SinceNow, so a watch can't resume after a restart, and setFullHistory/isHistoryDone are dead API. Suggestions: a setSinceEventId setting and an accessor for the latest event ID. Resuming also needs the volume UUID, because event IDs are only valid for one volume.
 - One error for every failure. Pipe EMFILE, a path CoreFoundation can't convert, more than 4096 paths, and a start failure all give openWatch: failed to create watch., with no errno or reason.
 - setAllEvents only toggles two flags, despite its name.
 - getRoot returns the OS path for events outside every root, so it has two meanings.
 
-2. Things that might bite users
+## Things that might bite users
 
 - getAbsPath returns rel path in some cases
 - The 512-stream limit. Each watch uses one stream, two fds and a dispatch queue. It's better to use one watch with many roots (up to 4096).
@@ -15,10 +20,9 @@
 - Path matching works for the common cases I tried: /tmp → /private/tmp, a wrong-case root on case-insensitive APFS, a trailing slash, and a relative root. A symlink root is resolved once, at start. APFS rejects invalid UTF-8 names.
 - setIgnoreSelf hides events from every thread of the process, not just the watcher.
 
-3. Suspected, not verified, left unchanged
+## Suspected, not verified, left unchanged
 
 - Close can still hang in one corner. If open("/dev/null") fails at close (fd limit reached), the dup2 step is skipped and close can still hang when the read end is shared.
 - A fork race can leak the fds. A fork in another thread between pipe() and fcntl() can still give a child the pipe; macOS has no pipe2. Close is safe in that case; only the fd leak into that child remains.
 - setRoot goes through String on every event. That costs time on each event and would mangle non-UTF-8 names on non-APFS volumes. Matching on bytes would avoid both.
 - Not exercised: TCC/sandbox behaviour (~/Documents, removable volumes), mount/unmount events, dropped-event flags, and whether the 512 limit is the same on other macOS versions.
-
