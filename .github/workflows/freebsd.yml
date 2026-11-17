@@ -24,7 +24,6 @@ jobs:
       ${{ matrix.command }}
       ${{ matrix.ghc_version }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.ignore_error }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,12 +31,10 @@ jobs:
           - release: "15.0"
             command: cabal
             ghc_version: 9.14.1
-            ignore_error: true
 
           - release: "14.5"
             command: cabal
             ghc_version: 9.14.1
-            ignore_error: true
 
     steps:
     - uses: actions/checkout@v4
