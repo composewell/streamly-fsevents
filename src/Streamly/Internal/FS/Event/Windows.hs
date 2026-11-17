@@ -74,7 +74,6 @@ import Control.Exception
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (isAlpha, isAscii)
-import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
@@ -542,12 +541,20 @@ data Item =
 
 data Queue = Queue
     { qClosed :: !Bool -- ^ 'closeWatch' was called
+      -- | No root is watched and 'watchEndsUnwatched' is set. Set after the
+      -- items of the last root are added to 'qItems', cleared by 'addRoot'.
+    , qUnwatched :: !Bool
     , qItems :: Seq Item
     }
 
 -- | A handle for a watch.
 data Watch = Watch
     { watchConfig :: Config -- ^ The config used to open the watch
+      -- | End the event stream when no root is watched and no event is left
+      -- to report. 'True' for the watch of 'watchWith', whose roots cannot
+      -- be changed: when all of them are deleted, or their reads fail, the
+      -- watch cannot report another event.
+    , watchEndsUnwatched :: Bool
     , watchPort :: HANDLE -- ^ The I/O completion port
       -- | Held while the roots are changed and while the handle or the
       -- memory of a root is used. Not held across a blocking call.
@@ -744,6 +751,11 @@ pumpEvents w@Watch{..} = loop
             closeQuietly (rootHandle root)
             free (rootMem root)
             let active = Map.delete key (rsActive rs)
+            -- The items of the root were added to the queue by 'process'
+            when (watchEndsUnwatched && Map.null active)
+                $ atomically $ do
+                    q <- readTVar watchQueue
+                    writeTVar watchQueue q {qUnwatched = True}
             return (rs {rsBusy = Nothing, rsActive = active}, Nothing)
         | otherwise = do
             r <- startRead watchConfig root
@@ -798,9 +810,9 @@ checkThreadedRTS =
         $ "Streamly.FileSystem.Event.Windows: watching requires the "
             ++ "threaded RTS, link the program with -threaded"
 
--- | Create a watch with no root.
-createWatch :: Config -> IO Watch
-createWatch cfg = do
+-- | Create a watch with no root, see 'watchEndsUnwatched' for the 'Bool'.
+createWatch :: Bool -> Config -> IO Watch
+createWatch endsUnwatched cfg = do
     port <- c_CreateIoCompletionPort iNVALID_HANDLE_VALUE nullPtr 0 1
     when (port == nullPtr)
         $ getLastError >>= failWith "CreateIoCompletionPort"
@@ -814,10 +826,13 @@ createWatch cfg = do
                 , rsBusy = Nothing
                 , rsRetired = Map.empty
                 }
-    queue <- newTVarIO Queue {qClosed = False, qItems = Seq.empty}
+    queue <-
+        newTVarIO
+            Queue {qClosed = False, qUnwatched = False, qItems = Seq.empty}
     let w =
             Watch
                 { watchConfig = cfg
+                , watchEndsUnwatched = endsUnwatched
                 , watchPort = port
                 , watchRoots = roots
                 , watchQueue = queue
@@ -908,6 +923,11 @@ addRoot Watch{..} root =
                 Just err -> do
                     free mem
                     failWith "ReadDirectoryChangesW" err
+            -- A root added by 'openWatchWith' can be deleted before the next
+            -- root is added.
+            atomically $ do
+                q <- readTVar watchQueue
+                writeTVar watchQueue q {qUnwatched = False}
             return
                 rs
                     { rsNextKey = key + 1
@@ -939,6 +959,18 @@ removeRoot :: Watch -> Path -> IO ()
 removeRoot Watch{..} root =
     modifyMVar_ watchRoots (retireRoots (isRootPath root))
 
+-- | Open a watch on the paths with the given 'Config', see
+-- 'watchEndsUnwatched' for the 'Bool'.
+openWatchWith :: Bool -> Config -> NonEmpty Path -> IO Watch
+openWatchWith endsUnwatched cfg paths = do
+    checkThreadedRTS
+    -- The handle is not returned to the caller if adding a root fails, the
+    -- caller cannot close it.
+    Exception.mask_ $ do
+        w <- createWatch endsUnwatched cfg
+        mapM_ (addRoot w) (NonEmpty.toList paths) `onException` closeWatch w
+        return w
+
 -- | Start monitoring the directories @paths@ for file system events, with
 -- the supplied modifications applied to the 'defaultConfig'. Returns a
 -- 'Watch' handle which can then be used to read the event stream or to close
@@ -961,14 +993,7 @@ removeRoot Watch{..} root =
 -- /Pre-release/
 --
 openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
-openWatch f paths = do
-    checkThreadedRTS
-    -- The handle is not returned to the caller if adding a root fails, the
-    -- caller cannot close it.
-    Exception.mask_ $ do
-        w <- createWatch (f defaultConfig)
-        mapM_ (addRoot w) (NonEmpty.toList paths) `onException` closeWatch w
-        return w
+openWatch f = openWatchWith False (f defaultConfig)
 
 -------------------------------------------------------------------------------
 -- Reading events
@@ -1017,7 +1042,10 @@ readEvent Watch{..} =
                 item Seq.:< rest -> do
                     writeTVar watchQueue q {qItems = rest}
                     return (Just item)
-                Seq.EmptyL -> if qClosed q then return Nothing else retry
+                Seq.EmptyL ->
+                    if qClosed q || qUnwatched q
+                    then return Nothing
+                    else retry
         case r of
             Nothing -> return Nothing
             Just item -> do
@@ -1060,11 +1088,6 @@ readEvent Watch{..} =
 eventStream :: Watch -> Stream IO Event
 eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 
--- | Whether the event is the one reported when a watch root is deleted.
-isRootDeletedEvent :: Event -> Bool
-isRootDeletedEvent Event{..} =
-    totalBytes == 0 && eventFlags == fILE_ACTION_REMOVED
-
 -- | Start monitoring a list of directory paths for file system events with the
 -- supplied configuration modifier operation over the' defaultConfig'. The
 -- paths could be directories or symbolic links to directories.
@@ -1078,33 +1101,20 @@ isRootDeletedEvent Event{..} =
 --  [Path.fromString "dir"]
 -- @
 --
--- Each run of the stream opens a new watch and closes it when the stream
--- ends. The stream ends after the 'isDeleted' event of the last root when
--- all the roots are deleted. The handle of the watch is not exposed, so the
--- roots of the watch are the given paths for as long as the stream runs. To
--- add or remove roots while reading the events, open the watch using
--- 'openWatch', read it using 'eventStream' and change the roots using
--- 'addRoot' and 'removeRoot'.
+-- Each run of the stream opens a new watch and closes it when the stream ends.
+-- The stream ends after the 'isDeleted' event of the last root when all the
+-- roots are deleted. A renamed root stays watched and does not end the
+-- stream, its events are reported under the original root path and the
+-- rename itself is not reported. The roots of the watch are fixed as long
+-- as the stream runs. To add or remove roots while reading the events, open
+-- the watch using 'openWatch', read it using 'eventStream' and change the
+-- roots using 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
-watchWith f paths = S.bracketIO before closeWatch events
+watchWith f paths = S.bracketIO before closeWatch eventStream
 
     where
 
-    before = openWatch f paths
-
-    -- A path listed more than once is one root
-    rootCount = length (nub (map Path.toString (NonEmpty.toList paths)))
-
-    -- The state is the number of roots that are not deleted
-    step _ 0 = return Nothing
-    step w n = do
-        r <- readEvent w
-        return $ case r of
-            Nothing -> Nothing
-            Just ev | isRootDeletedEvent ev -> Just (ev, n - 1)
-            Just ev -> Just (ev, n)
-
-    events w = S.unfoldrM (step w) rootCount
+    before = openWatchWith True (f defaultConfig) paths
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
