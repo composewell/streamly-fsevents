@@ -58,10 +58,8 @@
 - Linux: in a recursive watch, the entries of a directory created in or
   moved into the tree are reported as `isCreated` events. See
   `setScanNewDirs` and `isScanEvent`.
-- Windows: a watch uses one thread for all its roots instead of one thread
-  for each root, and no longer depends on the `streamly` package.
-- Windows: a path that cannot be watched, for example a regular file,
-  raises an exception when the stream starts.
+- Windows: use one thread per watch instead of one thread per root, do not
+  depend on the `streamly` package.
 
 ### Bug Fixes
 
