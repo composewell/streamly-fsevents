@@ -785,8 +785,8 @@ scanFlags cfg@Config{..} =
 -- Path representation for events
 -------------------------------------------------------------------------------
 
--- | A watch root. 'rootPath' is the path supplied by the user, 'getRoot'
--- reports it and 'removeRoot' takes it. 'rootAbs' is the absolute path of
+-- | A watch root. 'rootPath' is the path supplied by the user, normalized by
+-- 'normalizeRoot', 'getRoot' reports it. 'rootAbs' is the absolute path of
 -- the root: a relative 'rootPath' joined to the working directory at the time
 -- the root was added. The system calls use 'rootAbs', a later change of the
 -- working directory does not change the directory they refer to. For a root
@@ -1162,7 +1162,7 @@ data Event = Event
    { eventWd :: CInt
    , eventFlags :: Word32
    , eventCookie :: Word32
-   , eventRoot :: Path -- ^ The watch root as supplied
+   , eventRoot :: Path -- ^ The watch root as supplied, normalized
    , eventAbsRoot :: Path -- ^ The absolute path of the watch root
    , eventRelPath :: Maybe Path
    , eventScanned :: Bool
@@ -2083,19 +2083,70 @@ getWorkingDir = go 4096
         then go (size * 2)
         else return (Path.unsafeFromArray (unsafeFreezeWithShrink arr))
 
--- | The 'Root' of a path supplied by the user. A relative path is resolved
--- against the current working directory, symbolic links are not resolved.
+-- | Whether the path is @.@.
+isDotPath :: Path -> Bool
+isDotPath p = Path.toArray p == Path.toArray (Path.fromString_ ".")
+
+-- | Remove the redundant separators and the @.@ components of a root path,
+-- @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. A path that is only @.@
+-- components becomes @.@. A trailing separator is kept, a symbolic link
+-- named with a trailing separator is resolved by the system calls. @..@
+-- components are kept, removing them would change the path if a component
+-- before them is a symbolic link.
+--
+-- The roots are compared by the bytes of their normalized paths, see
+-- 'eqRoot' and 'compareRoot'. Two paths that differ only in redundant
+-- separators and @.@ components have the same normalized path, as with
+-- @Path.eqPath (Path.allowRelativeEquality True)@ on macOS and Windows.
+--
+-- TODO: use Path.normalise when streamly-core 0.4 is released, see
+-- dev/upstream-issues.md.
+normalizeRoot :: Path -> Path
+normalizeRoot path =
+    case runIdentity (S.toList (Path.splitPath_ path)) of
+        [] -> path
+        comps -> addSep (foldl1 Path.join (dropLeadingDot comps))
+
+    where
+
+    dropLeadingDot (c : cs@(_ : _)) | isDotPath c = cs
+    dropLeadingDot cs = cs
+
+    addSep p
+        | Path.hasTrailingSeparator path
+            && not (isDotPath p)
+            && not (Path.hasTrailingSeparator p) =
+            Path.addTrailingSeparator p
+        | otherwise = p
+
+-- | The 'Root' of a path supplied by the user, the path is normalized by
+-- 'normalizeRoot'. A relative path is resolved against the current working
+-- directory, symbolic links are not resolved.
+--
+-- 'Path.isRooted' is true for @.@, the absolute path of @.@ is the working
+-- directory. A path starting with @.\/@ is not rooted after 'normalizeRoot'.
 makeRoot :: Path -> IO Root
-makeRoot path
+makeRoot path0
+    | isDotPath path = Root path <$> getWorkingDir
     | Path.isRooted path = return (Root path path)
     | otherwise = do
         cwd <- getWorkingDir
         return (Root path (Path.join cwd path))
 
+    where
+
+    path = normalizeRoot path0
+
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. A relative @root@ is
 -- relative to the working directory at the time of the call, a later change
 -- of the working directory does not affect the watch.
+--
+-- The path is normalized: redundant separators and @.@ components are
+-- removed, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. 'getRoot'
+-- reports the normalized path. A path that is already a root of the watch is
+-- not added again. Case is significant even in a case-insensitive directory,
+-- @\/tmp\/Foo@ and @\/tmp\/foo@ are two roots.
 --
 -- If the same directory is added via two different roots, for example, a
 -- recursive root and a root inside it, its events are reported once for each
@@ -2625,9 +2676,10 @@ unwatchPaths
             -- example, when the directory was deleted.
             when (errno /= eINVAL) $ throwErrno err
 
--- | Remove an absolute root path from a 'Watch', if a path was moved after
--- adding you need to provide the original path which was used to add the
--- Watch.
+-- | Remove a root path from a 'Watch'. The path must be the same as the one
+-- used to add the root, with the same case, ignoring redundant separators
+-- and @.@ components. If the root was moved after it was added, the
+-- original path must be supplied.
 --
 -- The events already queued for the root are reported, followed by an
 -- 'isRootUnwatched' event for each path watched under the root. A directory
@@ -2658,7 +2710,7 @@ removeRoot wtch root = do
     removed <-
         unwatchPaths
             wtch (show (Path.toString root)) allWds
-            (eqPath root . rootPath . getRepRoot)
+            (eqPath (normalizeRoot root) . rootPath . getRepRoot)
     recordSynthEvents wtch (map (uncurry SynthUnwatched) removed)
 
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
@@ -3868,7 +3920,7 @@ watch = watchWith id
 -------------------------------------------------------------------------------
 
 -- | Get the watch root corresponding to the 'Event', as it was supplied to
--- the watch API.
+-- the watch API, with redundant separators and @.@ components removed.
 --
 -- If a directory is watched via more than one root, for example, a recursive
 -- root and a root inside it, its events are reported once for each root.
