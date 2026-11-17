@@ -53,6 +53,9 @@ import System.IO
     ( IOMode(AppendMode, ReadMode, WriteMode), hClose, hFlush, hPutStr
     , openFile
     )
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+import System.IO (hPutStrLn, stderr)
+#endif
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (createLink, setFileMode)
 import System.Posix.Resource
@@ -1495,11 +1498,20 @@ recScanNewDirSilent =
             filter (/= dir) listed `shouldBe` []
 #if defined(FILESYSTEM_EVENT_FREEBSD)
             -- The add of the watch of dir reads dir and generates access
-            -- events, on FreeBSD main also an open and a close.
+            -- events. An open with O_PATH, used to walk to dir, generates an
+            -- open event. The count of these events is not known, the events
+            -- are printed. At least the open and the close of the listing.
+            -- TODO: assert the count once it is known.
             let isOpenClose ev = isListing ev && not (Event.isAccessed ev)
                 openClose =
-                    filter (isUnder dir) (pathsOf isOpenClose (evs ++ evs1))
-            length openClose `shouldSatisfy` (`elem` [2 .. 4])
+                    filter (isUnder dir . getAbsPath)
+                        $ filter isOpenClose (evs ++ evs1)
+            hPutStrLn stderr
+                $ "listing events of dir: "
+                    ++ show (map Event.showEvent openClose)
+            length (filter Event.isOpened openClose) `shouldSatisfy` (>= 1)
+            length (filter Event.isNonWriteClosed openClose)
+                `shouldSatisfy` (>= 1)
 #else
             -- open, one or two access events that the kernel may merge, close
             length listed `shouldSatisfy` (`elem` [3, 4])
