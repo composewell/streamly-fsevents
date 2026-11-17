@@ -167,7 +167,15 @@ On Windows the watch keeps the root open.
   the rest of the tree stays watched. On macOS the watch continues. On
   Windows it is expected to continue, this is not tested.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
-* A root listed twice: all platforms report a change in it once.
+* A root listed twice: all platforms report a change in it once. Paths
+  that differ only in redundant separators and `.` components, for
+  example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
+  macOS `getRoot` reports the path with these removed, on Windows it
+  reports the path as supplied.
+* A directory reached via two paths that differ otherwise, for example, a
+  symbolic link and its target, or paths that differ in case: all
+  platforms watch it as two roots and report a change in it once for each
+  root.
 * Nested roots, a root and a subdirectory of it, in a recursive watch: all
   platforms report a change in the subdirectory once for each root.
 * A root supplied as a relative path: on all platforms it is relative to
