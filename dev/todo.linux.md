@@ -90,3 +90,38 @@ arrives. `inotify_rm_watch` on a watch descriptor of the map queues an
 Proposed change: `eventStream` ends the stream if the watch is closed when
 a step starts, and `closeWatch` removes one watch descriptor of the map when
 it cannot queue a marker.
+
+## getCookie returns a cookie for every event
+
+`getCookie` returns a `Cookie` for every event, 0 for an event that is not a
+move. A `Maybe Cookie` would show that only `isMovedFrom` and `isMovedTo`
+have one. See the XXX comment on `getCookie`.
+
+## isRootUnwatched gives no reason
+
+`isRootUnwatched` is reported for a root removed by `removeRoot`, deleted,
+moved or unmounted. `isRootDeleted` and `isRootUnmounted` are separate
+events of the kernel, but a removal by `removeRoot` and a move cannot be
+told apart from the `isRootUnwatched` event.
+
+## The message of ENOSPC
+
+When `max_user_watches` is reached, `inotify_add_watch` fails with `ENOSPC`
+and the exception says "No space left on device". The message could name
+`max_user_watches`.
+
+## Paths longer than PATH_MAX
+
+A directory whose path is longer than `PATH_MAX` fails with `ENAMETOOLONG`,
+the watch of such a directory cannot be added by path. Not documented.
+
+## inotify_add_watch on a hung mount
+
+`inotify_add_watch` is an `unsafe` call on Linux. On a hung network or FUSE
+mount it blocks a capability while the lock of the watch is held. FreeBSD
+uses a `safe` call, because the call reads the directory.
+
+## File descriptors above 1024 in the non-threaded RTS
+
+The non-threaded RTS waits for an fd with `select`, which may fail for an
+fd of 1024 or above. Not tested.
