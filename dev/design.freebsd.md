@@ -273,10 +273,23 @@ the cookie".
     `IN_MOVED_FROM`, `readEvents` reads the fd again, up to 3 more times,
     before the events are handled.
 
-    If the `IN_MOVED_TO` is queued after the queue was found empty, the
-    reordered `IN_MOVE_SELF` removes the paths of the directory, and the
-    `IN_MOVED_TO` adds the directory as moved in. The three events are
-    queued in one system call, nanoseconds apart.
+    `orderMoves` does not match an `IN_MOVE_SELF` if the queue is found
+    empty before its `IN_MOVED_FROM` is queued, or, with cookie 0, if
+    another event is queued between the two. The `IN_MOVE_SELF` is then
+    handled before the cookie is recorded. After the events of a read
+    that found the queue empty, `unwatchMovedOut` removes the directories
+    that still have the cookie of an `IN_MOVED_FROM`; their `IN_MOVED_TO`
+    does not exist. A read found the queue empty if it left room in the
+    buffer for the largest event, 272 bytes.
+
+    If the queue is found empty between `IN_MOVED_FROM` and `IN_MOVED_TO`,
+    the directory is removed, and the `IN_MOVED_TO` adds it as moved in.
+    A rename within the tree then reports `isRootUnwatched` for the moved
+    paths and a scan of the new path, and the events generated in between
+    are lost. The three events are queued in one system call, nanoseconds
+    apart. The set of watched paths is correct in all these cases; the
+    detection of a directory moved out does not depend on the position of
+    `IN_MOVE_SELF`.
 
 11. **Cookie 0 on FreeBSD 15.0.** In releng/15.0 `vn_inotify` sets the
     cookie to 0 for the `IN_MOVE_SELF` and the `IN_MOVED_FROM` of a
