@@ -491,13 +491,14 @@ setRootDeleted = setFlag iN_DELETE_SELF
 foreign import capi
     "sys/inotify.h value IN_MOVE_SELF" iN_MOVE_SELF :: Word32
 
--- | Report when the watched root path itself gets renamed. A renamed root is
--- removed from the watch whether or not this is enabled, see 'isRootMoved'.
+-- | Report when the watched root path itself gets renamed, as an event for
+-- which 'isRootMoved' and 'isMoved' are true. A renamed root is removed from
+-- the watch whether or not this is enabled, see 'isRootMoved'.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
 --
--- /default: False/
+-- /default: True/
 setRootMoved :: Bool -> Config -> Config
 setRootMoved = setFlag iN_MOVE_SELF
 
@@ -659,6 +660,7 @@ setAllEvents s =
 -- * setCreated True
 -- * setDeleted True
 -- * setRootDeleted True
+-- * setRootMoved True
 -- * setMovedFrom True
 -- * setMovedTo True
 -- * setModified True
@@ -672,6 +674,7 @@ defaultConfig =
     $ setCreated True
     $ setDeleted True
     $ setRootDeleted True
+    $ setRootMoved True
     $ setMovedFrom True
     $ setMovedTo True
     $ setModified True
@@ -3999,6 +4002,8 @@ isRootDeleted :: Event -> Bool
 isRootDeleted = getFlag iN_DELETE_SELF
 
 -- | Watched file/directory was itself moved within the file system.
+-- 'isMoved' is also true for this event, 'isMovedFrom' and 'isMovedTo' are
+-- not.
 --
 -- The root is removed from the watch, and 'isRootUnwatched' is reported
 -- later. The root is removed whether or not this event is enabled by
@@ -4140,11 +4145,16 @@ isMovedTo = getFlag iN_MOVED_TO
 -- | Generated for a path that is moved from or moved to the monitored
 -- directory.
 --
--- >>> isMoved ev = isMovedFrom ev || isMovedTo ev
+-- This is also true when a watch root itself is renamed, if 'setRootMoved'
+-- is enabled, which is the default. 'isRootMoved' is true for such an event,
+-- 'getRelPath' returns 'Nothing', and the event reports the old path of the
+-- root.
 --
--- /Occurs only for an object inside the watched directory/
+-- >>> isMoved ev = isMovedFrom ev || isMovedTo ev || isRootMoved ev
+--
+-- /Can occur for a watch root or an object inside it/
 isMoved :: Event -> Bool
-isMoved ev = isMovedFrom ev || isMovedTo ev
+isMoved ev = isMovedFrom ev || isMovedTo ev || isRootMoved ev
 
 -- | Determine whether the event indicates modification of an object within the
 -- monitored path. This event is generated only for files and not directories.

@@ -347,8 +347,11 @@ isDeleted = Event.isDeleted
 -- one event, for the old path, and a move into the tree reports one event, for
 -- the new path. Moving hard links is no different than other types of objects.
 --
--- Whether this event occurs when the watch root itself is renamed depends on
--- the platform. See @docs\/platform-differences.md@ in this package.
+-- When a watch root itself is renamed, this event is reported for the root
+-- on Linux, FreeBSD and macOS, 'getRelPath' returns 'Nothing' for it. On
+-- Windows the rename of a watch root is not reported. See
+-- @docs\/platform-differences.md@ in this package for the watch after the
+-- root is renamed.
 --
 -- This event is reported for the moved directory, not for the entries in it.
 -- In a recursive watch, see 'setRecursiveMode' for the entries of a directory
