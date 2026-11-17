@@ -1,8 +1,9 @@
 # File System Event Notification (inotify/fsevents)
 
 A **portable, robust, and stream-based file system event notification
-API** for **Linux, macOS, and Windows**.  Provides a streaming interface
-as well as a traditional handle style interface.
+API** for **Linux, macOS, Windows, and FreeBSD** (14.5, 15.0 and later).
+Provides a streaming interface as well as a traditional handle style
+interface.
 
 The portable module in this package offers a consistent, cross-platform,
 common denominator API across all supported systems whereas
@@ -22,13 +23,16 @@ by `max_user_watches`, scans each directory added to the tree, and handles the
 races between a scan and the changes made to the tree during it. macOS and
 Windows therefore start a watch on a large tree faster and with less memory
 than Linux. The Linux items below describe this implementation; on macOS and
-Windows the operating system does this work.
+Windows the operating system does this work. FreeBSD uses the Linux
+implementation with the inotify API of FreeBSD.
 
 ### Functionality
 
 * Events are a streamly `Stream IO Event`, processed with streamly combinators.
-* `Streamly.FileSystem.Event` has the same API on Linux, macOS and Windows.
-* The `.Linux`, `.Darwin` and `.Windows` modules add OS-specific features.
+* `Streamly.FileSystem.Event` has the same API on Linux, macOS, Windows and
+  FreeBSD.
+* The `.Linux`, `.Darwin`, `.Windows` and `.FreeBSD` modules add OS-specific
+  features.
 * Streaming API: `watch` returns a stream; the watch is opened and closed for you.
 * Handle API (internal): `openWatch` opens a watch,
   `addRoot` and `removeRoot` add or remove paths, `readEvent` reads one

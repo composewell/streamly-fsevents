@@ -140,11 +140,17 @@ import Foreign.C.Error
     , eWOULDBLOCK, errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
     , throwErrnoIfMinus1_
     )
+#if defined(CABAL_OS_FREEBSD)
+import Foreign.C.Error (eEXIST, eMLINK)
+#endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
-import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.Storable (peek, peekByteOff, peekElemOff, sizeOf)
+import Foreign.Storable (peek, peekByteOff, sizeOf)
+#if !defined(CABAL_OS_FREEBSD)
+import Foreign.Marshal.Array (allocaArray)
+import Foreign.Storable (peekElemOff)
+#endif
 import GHC.Conc
     ( TVar, atomically, closeFdWith, newTVarIO, orElse, readTVar
     , retry, threadWaitReadSTM, writeTVar
@@ -169,7 +175,7 @@ import qualified Data.IntSet as IntSet
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as OrdMap
 import qualified Streamly.Data.Array as A
-    (createOf, fromList, read, toList)
+    (createOf, fromList, length, read, toList)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.StreamK as StreamK
     (append, fromStream, toStream)
@@ -179,7 +185,7 @@ import qualified Streamly.Internal.Data.Array as A
     ( asCStringUnsafe, breakEndBy_, unsafePinnedAsPtr
     )
 import qualified Streamly.Internal.Data.MutArray as MArray
-    (byteLength, unsafeCreateWithPtr')
+    (unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.DirIO as Dir (ignoreMissing)
 import qualified Streamly.Internal.FileSystem.Posix.ReadDir as ReadDir
     (DirStream(..), closeDirStream, readDirStreamEither)
@@ -394,6 +400,9 @@ iN_EXCL_UNLINK = 0
 --
 -- This setting has no effect if the kernel headers do not define
 -- @IN_EXCL_UNLINK@, that is, on Linux kernels older than 2.6.36.
+--
+-- macOS does not report the events of an unlinked file. FreeBSD does not
+-- report them either, setting this to 'False' has no effect on FreeBSD.
 --
 -- /default: True/
 setExcludeUnlinked :: Bool -> Config -> Config
@@ -661,8 +670,16 @@ defaultConfig =
 -- non-recursive mode. A root that reports IN_MOVE_SELF is removed from the
 -- watch if its path no longer refers to the watched object, see
 -- 'unwatchGoneRoots'.
+--
+-- FreeBSD 15.0 and 15.1 do not generate IN_IGNORED for a deleted object, and
+-- do not remove its watch, unless the watch has IN_DELETE_SELF. The deleted
+-- path would never report 'isRootUnwatched' and would stay in the map.
 rootEvents :: Word32
+#if defined(CABAL_OS_FREEBSD)
+rootEvents = iN_MOVE_SELF .|. iN_DELETE_SELF
+#else
 rootEvents = iN_MOVE_SELF
+#endif
 
 -- | The events that the kernel watch must generate in recursive mode, to add
 -- and remove the watches of the subdirectories.
@@ -1148,11 +1165,21 @@ newtype WD = WD CInt deriving Show
 foreign import ccall unsafe
     "sys/inotify.h inotify_init1" c_inotify_init1 :: CInt -> IO CInt
 
+#if defined(CABAL_OS_FREEBSD)
+-- The FreeBSD base sys/inotify.h defines IN_CLOEXEC and IN_NONBLOCK as
+-- O_CLOEXEC and O_NONBLOCK. The sys/inotify.h of the libinotify port, in
+-- /usr/local/include, shadows the base header and defines them with the
+-- Linux values, which the FreeBSD inotify_init1 rejects.
+foreign import capi "fcntl.h value O_CLOEXEC" iN_CLOEXEC :: CInt
+
+foreign import capi "fcntl.h value O_NONBLOCK" iN_NONBLOCK :: CInt
+#else
 foreign import capi
     "sys/inotify.h value IN_CLOEXEC" iN_CLOEXEC :: CInt
 
 foreign import capi
     "sys/inotify.h value IN_NONBLOCK" iN_NONBLOCK :: CInt
+#endif
 
 -- | Create a 'Watch' handle. 'addRoot' can be used to add paths being
 -- monitored by this watch.
@@ -1225,9 +1252,40 @@ takeSynthEvents Watch {watchSynthEvents = synthVar} =
         writeTVar synthVar []
         return (reverse ps)
 
+#if defined(CABAL_OS_FREEBSD)
+-- On FreeBSD, adding a watch on a directory reads all its entries, the call
+-- may take long on a large directory.
+foreign import ccall safe
+    "sys/inotify.h inotify_add_watch" c_inotify_add_watch
+        :: CInt -> CString -> CUInt -> IO CInt
+#else
 foreign import ccall unsafe
     "sys/inotify.h inotify_add_watch" c_inotify_add_watch
         :: CInt -> CString -> CUInt -> IO CInt
+#endif
+
+-- | Add a kernel watch for a path, returns -1 and sets errno on failure.
+--
+-- On FreeBSD, adding a watch on a directory looks up each entry of the
+-- directory, the call fails with ENOENT if an entry is deleted in between.
+-- The call is retried a few times on ENOENT, an object that does not exist
+-- fails all the retries.
+inotifyAddWatch :: CInt -> CString -> Word32 -> IO CInt
+#if defined(CABAL_OS_FREEBSD)
+inotifyAddWatch fd pathPtr flags = go (10 :: Int)
+
+    where
+
+    go n = do
+        wd <- c_inotify_add_watch fd pathPtr (CUInt flags)
+        if wd /= -1 || n == 0
+        then return wd
+        else do
+            errno <- getErrno
+            if errno == eNOENT then go (n - 1) else return wd
+#else
+inotifyAddWatch fd pathPtr flags = c_inotify_add_watch fd pathPtr (CUInt flags)
+#endif
 
 foreign import capi "fcntl.h openat" c_openat3
     :: CInt -> CString -> CInt -> IO CInt
@@ -1250,14 +1308,19 @@ foreign import ccall unsafe "dirent.h fdopendir"
 -- | Whether adding or listing a subdirectory failed because the path no longer
 -- refers to a directory. The path may have been deleted, or it may now be a
 -- file or a symbolic link. ELOOP is a symbolic link loop in place of the
--- directory or of its parent.
+-- directory or of its parent. On FreeBSD, open(2) with O_NOFOLLOW fails with
+-- EMLINK if the path is a symbolic link, Linux fails with ELOOP.
 isNotSubdirError :: IOError -> Bool
 isNotSubdirError e =
     isDoesNotExistError e || fmap Errno (ioe_errno e) `elem` errnos
 
     where
 
+#if defined(CABAL_OS_FREEBSD)
+    errnos = [Just eNOTDIR, Just eLOOP, Just eMLINK]
+#else
     errnos = [Just eNOTDIR, Just eLOOP]
+#endif
 
 -- | Whether adding or listing a directory failed because of missing
 -- permission. inotify_add_watch needs the read permission, listing the
@@ -1394,12 +1457,22 @@ addWatchByPath :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchByPath fd flags pRep =
     A.asCStringUnsafe (Path.toArray absPath) $ \pathPtr ->
         throwErrnoIfMinus1 ("add watch: " ++ Path.toString absPath)
-            $ c_inotify_add_watch fd pathPtr (CUInt flags)
+            $ inotifyAddWatch fd pathPtr flags
 
     where
 
     absPath = combinePathRep pRep
 
+#if defined(CABAL_OS_FREEBSD)
+-- | Call inotify_add_watch on a subdirectory opened by 'openDirAt'. FreeBSD
+-- has no @\/proc\/self\/fd@, the watch is added using the path, as on Linux
+-- when @\/proc@ is not available. See 'addWatchFor'.
+--
+-- TODO: inotify_add_watch_at with the fd of the directory would not resolve
+-- the path again.
+addWatchViaFd :: CInt -> Word32 -> PathRep -> CInt -> IO CInt
+addWatchViaFd fd flags pRep _ = addWatchByPath fd flags pRep
+#else
 foreign import ccall unsafe "unistd.h readlink"
     c_readlink :: CString -> CString -> CSize -> IO CSsize
 
@@ -1421,8 +1494,7 @@ addWatchViaFd fd flags pRep dirFd = do
     -- /proc/self/fd/N itself must be followed to reach the directory.
     wd <-
         withCString procPath $ \pathPtr ->
-            c_inotify_add_watch fd pathPtr
-                (CUInt (flags .&. complement iN_DONT_FOLLOW))
+            inotifyAddWatch fd pathPtr (flags .&. complement iN_DONT_FOLLOW)
     errno <- getErrno
     if wd /= -1
     then return wd
@@ -1456,6 +1528,8 @@ addWatchViaFd fd flags pRep dirFd = do
                 ("add watch: " ++ Path.toString (combinePathRep pRep))
                 errno Nothing Nothing
 
+#endif
+
 -- | Call inotify_add_watch on a path and return the watch descriptor. Raise an
 -- exception on failure.
 --
@@ -1468,10 +1542,10 @@ addWatchViaFd fd flags pRep dirFd = do
 -- a gap between the two.
 --
 -- A root is added using its path, a symbolic link can be used to reach a root.
--- If @\/proc@ is not mounted, or access to it is denied, a subdirectory is
--- also added using its path, the check of the components by 'openDirAt'
--- still applies. A subdirectory without read permission fails with EACCES
--- when @\/proc@ is available, it is not added by path.
+-- If @\/proc@ is not mounted, or access to it is denied, and on FreeBSD, a
+-- subdirectory is also added using its path, the check of the components by
+-- 'openDirAt' still applies. A subdirectory without read permission fails
+-- with EACCES when @\/proc@ is available, it is not added by path.
 addWatchFor :: CInt -> Word32 -> PathRep -> IO CInt
 addWatchFor fd flags pRep =
     case pRep of
@@ -2188,8 +2262,17 @@ addDirWithScan cfg wtch pRep
 concatStreams :: [Stream IO a] -> Stream IO a
 concatStreams = S.concatMap id . S.fromList
 
+#if defined(CABAL_OS_FREEBSD)
+-- | IN_MASK_CREATE of the FreeBSD base sys/inotify.h. It is not imported from
+-- the header: the libinotify port installs a sys/inotify.h in
+-- /usr/local/include that shadows the base header and does not define it.
+-- The event and watch flags have the same values in both headers.
+iN_MASK_CREATE :: Word32
+iN_MASK_CREATE = 0x10000000
+#else
 foreign import ccall unsafe "unistd.h pipe2"
     c_pipe2 :: Ptr CInt -> CInt -> IO CInt
+#endif
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
 
@@ -2243,13 +2326,41 @@ unmarkRemoved paths m0 = foldl' step m0 paths
 
 -- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
 -- removing it. The action is run with the watch descriptor after adding the
--- watch and before removing it. The string is used in the exception
--- messages.
+-- watch and before removing it. The watch descriptor is not shared with any
+-- user path. The string is used in the exception messages.
 --
--- Returns 'False' and does not run the action if @\/proc@ is not mounted or
--- access to it is denied. Requires a free fd for a pipe, throw an exception
--- if not.
+-- Returns 'False' and does not run the action if the watch cannot be added,
+-- see below. Throw an exception on any other failure.
 queueIgnored :: String -> CInt -> (CInt -> IO ()) -> IO Bool
+#if defined(CABAL_OS_FREEBSD)
+-- FreeBSD has no @\/proc\/self\/fd@ and cannot watch a pipe. The directory
+-- @\/@ is watched instead, or @\/dev@ if that fails. With IN_MASK_CREATE the
+-- add fails with EEXIST if the directory is already watched by the inotify
+-- fd, instead of returning the watch descriptor of the user path. Returns
+-- 'False' if the inotify fd already watches both, or access to both is
+-- denied.
+queueIgnored err fd action = add "/" ["/dev"]
+
+    where
+
+    flags = iN_ACCESS .|. iN_MASK_CREATE .|. iN_ONLYDIR .|. iN_DONT_FOLLOW
+
+    add dir dirs = do
+        wd <- withCString dir $ \p -> c_inotify_add_watch fd p (CUInt flags)
+        errno <- getErrno
+        case dirs of
+            _ | wd /= -1 -> do
+                action wd
+                throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
+                return True
+            next : rest -> add next rest
+            []  | errno == eEXIST || errno == eACCES || errno == eNOENT ->
+                    return False
+                | otherwise ->
+                    ioError (errnoToIOError err errno Nothing Nothing)
+#else
+-- Returns 'False' if @\/proc@ is not mounted or access to it is denied.
+-- Requires a free fd for a pipe, throw an exception if not.
 queueIgnored err fd action =
     allocaArray 2 $ \fds -> do
         -- For the marker event we need an inode that no user path can use,
@@ -2276,6 +2387,7 @@ queueIgnored err fd action =
             else if errno == eNOENT || errno == eACCES
             then return False
             else ioError (errnoToIOError err errno Nothing Nothing)
+#endif
 
 -- | Remove the given removed paths from the map. Returns the paths that were
 -- still in the map.
@@ -2305,8 +2417,8 @@ removeListed paths m0 =
 -- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
 -- we know that's the end point we were looking for.
 --
--- If @\/proc@ is not available the marker cannot be queued. The paths are
--- then removed from the map at once, and the paths
+-- If the marker cannot be queued, see 'queueIgnored', the paths are then
+-- removed from the map at once, and the paths
 -- still in the map are returned, to be reported 'isRootUnwatched' by the
 -- caller. The events already queued for the paths and not yet read are not
 -- reported. Returns an empty list if the marker is queued.
@@ -2334,14 +2446,15 @@ addRemovalMarker Watch {watchFd = fd, watchWdMap = wdMapRef} paths = do
 -- The events already queued for the paths are reported, followed by an
 -- 'isRootUnwatched' event for each path.
 --
--- If @\/proc@ is not mounted or access to it is denied, a path that shares
+-- If the marker cannot be queued, see 'queueIgnored', a path that shares
 -- the directory with another path is removed at once: the events queued for
 -- it and not yet read are not reported. Returns such paths, the caller
 -- reports their 'isRootUnwatched' events. See 'removeRoot'.
 --
--- Removing a path that shares the directory with another path requires a
--- free fd for a pipe, throw an exception if not. The paths of the shared
--- watch descriptors are not removed in that case, the call can be retried.
+-- On Linux, removing a path that shares the directory with another path
+-- requires a free fd for a pipe, throw an exception if not. The paths of the
+-- shared watch descriptors are not removed in that case, the call can be
+-- retried.
 --
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
@@ -2406,17 +2519,19 @@ unwatchPaths
 -- 'isRootUnwatched' event for each path watched under the root. A directory
 -- that is also watched via another root remains watched for that root.
 --
--- If @\/proc@ is not mounted or access to it is denied, the directories that
--- the root shares with another root are removed for the root at once: the
--- events queued for them and not yet read are not reported for the root, and
--- their 'isRootUnwatched' events are reported before the events of the next
--- read of the fd, the events already read are reported first. A thread
+-- On Linux, if @\/proc@ is not mounted or access to it is denied, and on
+-- FreeBSD, if the watch also watches both @\/@ and @\/dev@, the directories
+-- that the root shares with another root are removed for the root at once:
+-- the events queued for them and not yet read are not reported for the root,
+-- and their 'isRootUnwatched' events are reported before the events of the
+-- next read of the fd, the events already read are reported first. A thread
 -- waiting for events reports them at once in the threaded RTS, and when the
 -- next event arrives in the non-threaded RTS.
 --
--- Removing a root that shares a directory with another root requires a free
--- file descriptor, raise an exception if none is free. The shared directories
--- remain watched for the root in that case, the call can be retried.
+-- On Linux, removing a root that shares a directory with another root
+-- requires a free file descriptor, raise an exception if none is free. The
+-- shared directories remain watched for the root in that case, the call can
+-- be retried.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
@@ -2447,9 +2562,10 @@ closeInotifyFd fd = closeFdWith (\_ -> void (c_close fd)) (Fd fd)
 -- event.
 --
 -- With the non-threaded RTS, waking up the threads waiting for events
--- requires @\/proc@ to be mounted and a free file descriptor. If either is
--- not available, the waiting threads wake up when the next event arrives,
--- their streams end then.
+-- requires, on Linux, @\/proc@ to be mounted and a free file descriptor, and
+-- on FreeBSD, that the watch does not watch both @\/@ and @\/dev@. If not,
+-- the waiting threads wake up when the next event arrives, their streams end
+-- then.
 --
 -- /Pre-release/
 --
@@ -2581,11 +2697,10 @@ unwatchSubtree wtch pRep =
 -- does not state the position of IN_MOVE_SELF. The order was observed on Linux
 -- 6.12 only, the kernel source was not checked.
 --
--- If a kernel queues IN_MOVE_SELF first, every rename within the tree is
--- handled as a move out followed by a move in. The watches are removed and
--- added again, the events generated in between are lost, and the moved paths
--- report 'isRootUnwatched'. The set of watched paths remains correct. The test
--- recRenameNoUnwatched fails in that case.
+-- If a kernel queues IN_MOVE_SELF first, the IN_MOVE_SELF of a directory
+-- moved out of the tree is read before its IN_MOVED_FROM records the cookie.
+-- The directory is not removed, its events are reported with the old path.
+-- FreeBSD queues IN_MOVE_SELF first, see the NOTE above 'orderMoves'.
 
 -- NOTE: A directory renamed within the tree:
 --
@@ -2916,6 +3031,136 @@ readOneEvent = do
         pathLen :: Word32 <- peekByteOff ptr (len + 8)
         return (ewd, eflags, cookie, fromIntegral pathLen)
 
+-- | The kernel events of the arrays read from the fd of a watch.
+parseEvents :: [Array Word8] -> Stream IO RawEvent
+parseEvents =
+    S.concatMap (S.catRights . S.parseMany readOneEvent . A.read) . S.fromList
+
+#if defined(CABAL_OS_FREEBSD)
+-- NOTE: The events of a rename on FreeBSD:
+--
+-- For rename(2) of a directory D from the directory P1 to P2, FreeBSD queues
+-- IN_MOVE_SELF on the watch of D, then IN_MOVED_FROM on P1, and then
+-- IN_MOVED_TO on P2, see INOTIFY_MOVE in sys/sys/inotify.h and vn_inotify in
+-- sys/kern/vfs_inotify.c. Linux queues IN_MOVE_SELF last. The handling of a
+-- directory renamed within the tree or moved out of it needs the Linux order,
+-- see the NOTE above 'clearMoved'. 'orderMoves' moves IN_MOVE_SELF after
+-- IN_MOVED_TO, or after IN_MOVED_FROM if there is no IN_MOVED_TO.
+--
+-- IN_MOVE_SELF has cookie 0, as on Linux. On FreeBSD 15.0, if D is watched
+-- by any inotify fd, IN_MOVED_FROM also has cookie 0, IN_MOVED_TO has the
+-- cookie of the rename. An IN_MOVED_FROM with cookie 0 followed by an
+-- IN_MOVED_TO is given the cookie of the IN_MOVED_TO, see 'fixCookies'.
+--
+-- The three events are queued one after the other by the same system call,
+-- the events of other operations can be queued in between. An IN_MOVE_SELF
+-- is matched only to an IN_MOVED_FROM that is the next event. An
+-- IN_MOVED_TO is matched by the cookie of the IN_MOVED_FROM, or, for cookie
+-- 0, only if it is the next event.
+--
+-- The events of a rename can be split across two reads of the fd. If the
+-- last event of a read is IN_MOVE_SELF or IN_MOVED_FROM, the fd is read again
+-- before the events are handled, up to 3 more times, see 'readEvents'.
+--
+-- The IN_MOVE_SELF is not matched if the queue is found empty before its
+-- IN_MOVED_FROM is queued, or if another event is queued between the two.
+-- It is then handled before the IN_MOVED_FROM records the cookie, and does
+-- not remove a directory moved out of the tree. Therefore,
+-- after the events of a read that found the queue empty are handled, the
+-- paths that still have the cookie of an IN_MOVED_FROM have no IN_MOVED_TO.
+-- A path that no longer refers to the directory of its watch descriptor is
+-- removed as moved out, see 'unwatchMovedOut'.
+--
+-- If the queue is found empty between IN_MOVED_FROM and IN_MOVED_TO, the
+-- directory is removed, by its reordered IN_MOVE_SELF or by
+-- 'unwatchMovedOut', and the IN_MOVED_TO adds it as moved in. A rename within
+-- the tree is then handled as a move out followed by a move in: the watches
+-- are removed and added again, the moved paths report 'isRootUnwatched', and
+-- the events generated in between are lost. The set of watched paths is
+-- correct in all these cases.
+
+rawFlags :: RawEvent -> Word32
+rawFlags (RawEvent _ flags _ _) = flags
+
+rawCookie :: RawEvent -> Word32
+rawCookie (RawEvent _ _ cookie _) = cookie
+
+setRawCookie :: Word32 -> RawEvent -> RawEvent
+setRawCookie cookie (RawEvent wd flags _ name) = RawEvent wd flags cookie name
+
+rawHas :: Word32 -> RawEvent -> Bool
+rawHas flag ev = rawFlags ev .&. flag /= 0
+
+-- | Whether the two events are for the same kind of object, a directory or
+-- not.
+sameKind :: RawEvent -> RawEvent -> Bool
+sameKind e1 e2 = rawHas iN_ISDIR e1 == rawHas iN_ISDIR e2
+
+-- | Give an IN_MOVED_FROM event with cookie 0 the cookie of the IN_MOVED_TO
+-- event that follows it, see the NOTE above.
+fixCookies :: [RawEvent] -> [RawEvent]
+fixCookies (f : es@(t : _))
+    | isPair f t = setRawCookie (rawCookie t) f : fixCookies es
+fixCookies (e : es) = e : fixCookies es
+fixCookies [] = []
+
+-- | An IN_MOVED_FROM event with cookie 0 followed by its IN_MOVED_TO.
+isPair :: RawEvent -> RawEvent -> Bool
+isPair f t =
+       rawHas iN_MOVED_FROM f
+    && rawCookie f == 0
+    && rawHas iN_MOVED_TO t
+    && rawCookie t /= 0
+    && sameKind f t
+
+-- | Put the events of each rename in the Linux order, see the NOTE above.
+orderMoves :: [RawEvent] -> [RawEvent]
+orderMoves = go . map ((,) False) . fixCookies
+
+    where
+
+    -- True for an IN_MOVE_SELF that is already moved.
+    go [] = []
+    go ((moved, s) : es)
+        | not moved && rawHas iN_MOVE_SELF s
+        , Just es1 <- moveAfter s es = go es1
+        | otherwise = s : go es
+
+    -- The IN_MOVED_TO of the IN_MOVED_FROM f: the first event with its
+    -- cookie, for cookie 0 only the next event.
+    findTo f xs
+        | rawCookie f /= 0 =
+            case break (isTo . snd) xs of
+                (before, x : after) -> Just (before, x, after)
+                _ -> Nothing
+        | otherwise =
+            case xs of
+                x : after | isTo (snd x) -> Just ([], x, after)
+                _ -> Nothing
+
+        where
+
+        isTo e =
+            rawHas iN_MOVED_TO e && rawCookie e == rawCookie f && sameKind f e
+
+    moveAfter s es =
+        case es of
+            fx@(_, f) : a1
+                | rawHas iN_MOVED_FROM f && sameKind s f ->
+                    let s1 = (True, s)
+                    in Just
+                        $ case findTo f a1 of
+                            Just (b2, t, a2) -> fx : b2 ++ t : s1 : a2
+                            Nothing -> fx : s1 : a1
+            _ -> Nothing
+
+-- | Whether the last event may be followed by the rest of its rename, see the
+-- NOTE above 'orderMoves'.
+moveIncomplete :: [RawEvent] -> Bool
+moveIncomplete [] = False
+moveIncomplete evs = rawHas (iN_MOVE_SELF .|. iN_MOVED_FROM) (last evs)
+#endif
+
 -- | Run the action of a kernel event. Returns the given events of the kernel
 -- event followed by the stream returned by the action. If the action raises
 -- an 'IOException', the exception follows the events as an 'ItemFailed'.
@@ -2931,6 +3176,52 @@ withEffects evs action = do
     return
         $ S.fromList (map ItemEvent evs)
         `S.append` either (S.fromPure . ItemFailed) id r
+
+#if defined(CABAL_OS_FREEBSD)
+-- | Handle the paths that still have the cookie of an IN_MOVED_FROM event
+-- after all the events in the queue are handled, see the NOTE above
+-- 'orderMoves'. A path that refers to the directory of its watch descriptor
+-- is kept and its cookie is removed: the IN_MOVED_FROM was for another
+-- directory at the path, for example, in @mkdir d; mv d out; mkdir d@ read
+-- after all three, the create event watches the second @d@. The other paths
+-- are removed as moved out. Returns the paths removed without a marker as
+-- 'isRootUnwatched' events, see 'unwatchPaths'.
+unwatchMovedOut :: Watch -> IO (Stream IO StreamItem)
+unwatchMovedOut wtch@Watch {watchConfig = cfg, watchWdMap = wdMapRef} =
+    withEffects [] $ do
+        m <- readIORef wdMapRef
+        let moved =
+                [ (wd, wpRep wp)
+                | wd <- movedWds m
+                , wp <- wdUserPaths wd m
+                , isMovedPath wp
+                ]
+        removed <- concat <$> mapM unwatchGone moved
+        return
+            $ S.fromList
+                [ ItemEvent (synthEvent (SynthUnwatched wd pRep))
+                | (wd, pRep) <- removed
+                ]
+
+    where
+
+    isMovedPath wp = not (wpRemoved wp) && isJust (wpMoveCookie wp)
+
+    unwatchGone (wd, pRep) = do
+        r <- probeWatch (watchFlags (subdirConfig cfg)) wtch wd pRep
+        if r == ProbeSame
+        then do
+            let isPath wp = isMovedPath wp && eqPathRep (wpRep wp) pRep
+            atomicModifyIORef' wdMapRef (\m -> (clearMoved isPath m, ()))
+            return []
+        else unwatchSubtree wtch pRep
+
+-- | Whether a read of the given number of bytes found the queue empty. A
+-- read returns as many events as fit in the buffer, the largest event has a
+-- 16 byte header and a 256 byte name.
+isDrained :: Int -> Bool
+isDrained n = n + 16 + 256 <= readBufSize
+#endif
 
 -- | Handle a kernel event: change the watches and the map, and return the
 -- events to report.
@@ -3114,6 +3405,16 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
 foreign import ccall unsafe "unistd.h read"
     c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
 
+-- | The size of the buffer of a read of the inotify fd. As per the inotify man
+-- page, a buffer of size
+--
+--          sizeof(struct inotify_event) + NAME_MAX + 1
+--
+-- is sufficient to read at least one event. A smaller buffer fails with
+-- EINVAL.
+readBufSize :: Int
+readBufSize = 32 * 1024
+
 -- | Read the events available on the fd of a watch, and take the events
 -- recorded by 'recordSynthEvents'. The array is empty if no event is
 -- available on the fd. If there are none of either, returns an action that
@@ -3122,34 +3423,51 @@ foreign import ccall unsafe "unistd.h read"
 -- The wait is registered, or counted, before the action is returned. The
 -- caller must mask async exceptions and must run the action. The action can
 -- be interrupted by an async exception.
-readEvents :: Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], Array Word8)))
+readEvents ::
+    Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], [Array Word8])))
 readEvents
     wtch@Watch {watchFd = fd, watchLock = lock, watchSynthEvents = synthVar} =
     modifyMVar lock $ \st ->
         if fsWatchClosed st
         then return (st, Nothing)
         else do
-            arr <- MArray.unsafeCreateWithPtr' bufSize readFd
+            arrs <- readArrays
             synth <- takeSynthEvents wtch
-            if MArray.byteLength arr /= 0 || not (null synth)
-            then
-                return
-                    (st, Just $ Right (synth, unsafeFreezeWithShrink arr))
+            if not (null arrs) || not (null synth)
+            then return (st, Just $ Right (synth, arrs))
             else fmap (Just . Left) <$> register st
 
     where
 
-    -- As per the inotify man page, a buffer of size
-    --
-    --          sizeof(struct inotify_event) + NAME_MAX + 1
-    --
-    -- is sufficient to read at least one event. A smaller buffer fails with
-    -- EINVAL.
-    bufSize = 32 * 1024
+    readArray =
+        unsafeFreezeWithShrink
+            <$> MArray.unsafeCreateWithPtr' readBufSize readFd
+
+#if defined(CABAL_OS_FREEBSD)
+    -- Read again if the events of a rename may be split, see the NOTE above
+    -- 'orderMoves'.
+    readArrays = go (4 :: Int)
+
+        where
+
+        go n = do
+            arr <- readArray
+            if A.length arr == 0
+            then return []
+            else do
+                evs <- S.toList (parseEvents [arr])
+                if n > 1 && moveIncomplete evs
+                then (arr :) <$> go (n - 1)
+                else return [arr]
+#else
+    readArrays = do
+        arr <- readArray
+        return [arr | A.length arr /= 0]
+#endif
 
     -- Returns 0 if no event is available.
     readFd p = do
-        n <- c_read fd p (fromIntegral bufSize)
+        n <- c_read fd p (fromIntegral readBufSize)
         if n >= 0
         then return (fromIntegral n)
         else do
@@ -3242,7 +3560,7 @@ readEvent
     -- read. A read returns whole events, the events of a read are parsed on
     -- their own.
     readOne (Left wait) = S.fromPure (ItemWait wait)
-    readOne (Right (synth, arr)) =
+    readOne (Right (synth, arrs)) =
         S.append synthEvents kernelEvents
 
         where
@@ -3252,9 +3570,27 @@ readEvent
         -- 'handleEvent' returns a stream for each kernel event: the event
         -- for each of its paths, followed by the entries found by its scan.
         kernelEvents =
-            S.concatMapM (handleEvent cfg wtch)
-                $ S.catRights
-                $ S.parseMany readOneEvent (A.read arr)
+            S.concatMapM (handleEvent cfg wtch) rawEvents
+                `S.append` movedOut
+
+#if defined(CABAL_OS_FREEBSD)
+        -- See the NOTE above 'orderMoves'.
+        rawEvents =
+            S.concatEffect
+                (S.fromList . orderMoves <$> S.toList (parseEvents arrs))
+
+        -- The removal of the directories moved out of the tree, after the
+        -- events of a read that found the queue empty.
+        movedOut =
+            case arrs of
+                (_ : _) | isDrained (A.length (last arrs)) ->
+                    S.concatEffect (unwatchMovedOut wtch)
+                _ -> S.nil
+#else
+        rawEvents = parseEvents arrs
+
+        movedOut = S.nil
+#endif
 
     items = S.concatMap readOne fdReads
 
@@ -3549,6 +3885,9 @@ isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 -- (e.g., utimensat(2)), extended attributes (setxattr(2)), link count (since
 -- Linux 2.6.25; e.g., for the target of link(2) and for unlink(2)), and
 -- user/group ID (e.g., chown(2)).
+--
+-- On FreeBSD, a link count change is reported only by a watch on the object
+-- itself, not by a watch on its directory, and rmdir(2) does not report it.
 --
 -- /Can occur for watched path or a file inside it/
 isAttrsModified :: Event -> Bool

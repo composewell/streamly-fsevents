@@ -1,9 +1,9 @@
 # Platform Differences
 
-`Streamly.FileSystem.Event` has the same API on Linux, macOS and Windows. The
-library implements a recursive watch such that Linux reports new and moved
-directories in the same way as macOS and Windows do, with the exceptions listed
-below. The other differences come from the event models of the operating
+`Streamly.FileSystem.Event` has the same API on Linux, macOS, Windows and
+FreeBSD. The library implements a recursive watch such that Linux reports new
+and moved directories in the same way as macOS and Windows do, with the
+exceptions listed below. The other differences come from the event models of the operating
 systems. The tables at the end list each difference as recorded by the test
 suite `FileSystem.Event.Behavior`.
 
@@ -163,6 +163,44 @@ On Windows the watch keeps the root open.
 * Nested roots, a root and a subdirectory of it, in a recursive watch: Linux
   and Windows report a change in the subdirectory once for each root. macOS
   reports it once, for the innermost root that contains the path.
+
+## FreeBSD
+
+FreeBSD 14.5, 15.0 and later releases have an inotify API compatible with
+the Linux API. On FreeBSD the library uses the same implementation as on
+Linux, and everything stated for Linux in this document holds for FreeBSD,
+except for the following differences:
+
+* An open file after it is deleted: reads and writes through the open file
+  are never reported, `setExcludeUnlinked False` has no effect.
+* Link count changes: `unlink`, `link` and a rename over an existing file
+  report `isAttrsModified` only to a watch on the file itself, not to a
+  watch on its directory. Linux reports `isAttrsModified` for the entry to
+  the watch on the directory. `rmdir` does not report `isAttrsModified`.
+* Hard links: an access to a file through any of its hard links reports an
+  event in each watched directory that has a link to the file, even if the
+  access used a link in an unwatched directory. A watched directory with two
+  links to one file reports each event twice, once for each name.
+* Adding the watch of a directory reads the directory and looks up each of
+  its entries, the time taken is proportional to the number of entries. The
+  read reports `isAccessed` for the directory to the watch on its parent. In
+  a recursive watch, each subdirectory added generates such an event.
+* A directory that is readable but not searchable, mode `r--`, cannot be
+  watched. As a root the watch raises an exception, in a recursive watch the
+  directory is reported as `isAccessDenied`. Linux watches such a directory.
+* Rename cookies on FreeBSD 15.0: the kernel reports the `isMovedFrom` event
+  of a directory with cookie 0 if any inotify watch watches the directory
+  itself, as a recursive watch does for each subdirectory. The library gives
+  such an event the cookie of the `isMovedTo` event that follows it. The
+  `isMovedFrom` event of a directory moved out of the tree keeps cookie 0.
+  FreeBSD 14.5 and 15.1 report the cookie of the rename.
+* File systems: devfs does not report events. File systems that do not use
+  the kernel name cache, for example tmpfs mounted with `nonc`, may not
+  report all the events.
+* Limits: `vfs.inotify.max_user_instances`, 256 by default, limits the
+  inotify watches of a user, Linux allows 128. `vfs.inotify.max_user_watches`
+  limits the watched directories and files of a user, as `max_user_watches`
+  does on Linux.
 
 ## Platform specific features
 

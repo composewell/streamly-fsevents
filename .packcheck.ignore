@@ -1,4 +1,5 @@
 appveyor.yml
+.github/workflows/freebsd.yml
 .github/workflows/haskell.yml
 .github/workflows/markdown-doctest.yml
 .github/workflows/no-proc.yml

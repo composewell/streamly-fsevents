@@ -253,7 +253,7 @@ jobs:
             # WARNING! cannot use # comments inside pack_options.
             pack_options: >-
               HLINT_VERSION=3.6.1
-              HLINT_OPTIONS="lint"
+              HLINT_OPTIONS="lint --cpp-define=HAVE_DECL_IN_EXCL_UNLINK=1"
               HLINT_TARGETS="src"
 
           #- name: docspec

@@ -4,8 +4,8 @@ version:            0.1.1
 synopsis:           File system event notification streams
 description:
   A portable, robust, and stream-based file system event notification API for
-  Linux, macOS, and Windows. This library provides a streaming alternative to
-  the fsnotify package.
+  Linux, macOS, Windows, and FreeBSD. This library provides a streaming
+  alternative to the fsnotify package.
   .
   The portable module in this package offers a consistent,
   cross-platform, common denominator API across all supported systems
@@ -95,6 +95,9 @@ common compile-options
 
     if os(windows)
       cpp-options:    -DCABAL_OS_WINDOWS
+
+    if os(freebsd)
+      cpp-options:    -DCABAL_OS_FREEBSD
 
     if flag(internal-dev)
       cpp-options:    -DDEVBUILD
@@ -249,7 +252,13 @@ library
           exposed-modules: Streamly.FileSystem.Event.Linux
                            Streamly.Internal.FS.Event.Linux
 
-    if os(linux) || os(darwin) || os(windows)
+    -- FreeBSD uses the inotify implementation of the Linux module.
+    if os(freebsd)
+          exposed-modules: Streamly.FileSystem.Event.FreeBSD
+                           Streamly.Internal.FS.Event.FreeBSD
+          other-modules: Streamly.Internal.FS.Event.Linux
+
+    if os(linux) || os(darwin) || os(windows) || os(freebsd)
           exposed-modules: Streamly.FileSystem.Event
                            Streamly.Internal.FS.Event
 
@@ -281,7 +290,9 @@ test-suite FileSystem.Event
     build-depends: Win32 >= 2.6 && < 2.15
   else
     build-depends: unix >= 2.7 && < 2.9
-  if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
+  if (os(linux) || os(freebsd)) && impl(ghc < 9.4)
+    buildable: False
+  if !(os(linux) || os(darwin) || os(windows) || os(freebsd))
     buildable: False
 
 test-suite FileSystem.Event.Behavior
@@ -316,6 +327,18 @@ test-suite FileSystem.Event.Linux
   ghc-options: -main-is Streamly.Test.FileSystem.Event.Linux
   build-depends: unix >= 2.7 && < 2.9
   if impl(ghc < 9.4) || !os(linux)
+    buildable: False
+
+-- The FreeBSD test-suite reuses the Linux test-suite source.
+test-suite FileSystem.Event.FreeBSD
+  import: test-options
+  type: exitcode-stdio-1.0
+  main-is: Streamly/Test/FileSystem/Event/Linux.hs
+  other-modules: Streamly.Test.FileSystem.Event.Common
+  cpp-options: -DFILESYSTEM_EVENT_FREEBSD
+  ghc-options: -main-is Streamly.Test.FileSystem.Event.Linux
+  build-depends: unix >= 2.7 && < 2.9
+  if impl(ghc < 9.4) || !os(freebsd)
     buildable: False
 
 test-suite FileSystem.Event.LargeTree

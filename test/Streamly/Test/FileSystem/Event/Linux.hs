@@ -16,15 +16,30 @@ import Control.Exception
     (IOException, SomeException, bracket, finally, throwIO, try)
 import Control.Monad (filterM, unless, void, when)
 import Data.List (isPrefixOf, nub, sort)
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+import Control.Monad ((<=<))
+import Foreign.C.Error (throwErrnoIfMinus1_)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt(..), CSize(..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Storable (peek, poke, sizeOf)
+import Streamly.Internal.FS.Event.FreeBSD (Event)
+#else
 import Streamly.Internal.FS.Event.Linux (Event)
+#endif
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
 import System.Environment (lookupEnv)
+#endif
 import System.Directory
     ( createDirectory
     , createDirectoryLink
     , createFileLink
     , doesDirectoryExist
     , getPermissions
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
     , getSymbolicLinkTarget
+#endif
     , listDirectory
     , removeDirectory
     , removeFile
@@ -55,14 +70,22 @@ import qualified Data.List as List
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Internal.Data.Stream as Stream
 import qualified Streamly.Internal.FileSystem.Path as Path
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Event
+#else
 import qualified Streamly.Internal.FS.Event.Linux as Event
+#endif
 
 import Streamly.Test.FileSystem.Event.Common
 
 #define DEVBUILD
 
 moduleName :: String
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+moduleName = "FS.Event.FreeBSD"
+#else
 moduleName = "FS.Event.Linux"
+#endif
 
 dirTouchEvents :: String -> [([Char], Event -> Bool)]
 dirTouchEvents dir =
@@ -71,18 +94,26 @@ dirTouchEvents dir =
     , (dir, dirEvent Event.isNonWriteClosed)
     ]
 
+-- | The link count change of a deleted directory. FreeBSD does not report it.
+dirDelAttrsEvents :: String -> [([Char], Event -> Bool)]
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+dirDelAttrsEvents _ = []
+#else
+dirDelAttrsEvents dir = [(dir, dirEvent Event.isAttrsModified)]
+#endif
+
 dirDelEvents :: String -> [([Char], Event -> Bool)]
 dirDelEvents dir =
       (dir, dirEvent Event.isDeleted)
-    : (dir, dirEvent Event.isAttrsModified)
-    : dirTouchEvents dir
+    : dirDelAttrsEvents dir
+    ++ dirTouchEvents dir
 
 rootDirDelEvents :: String -> [([Char], Event -> Bool)]
 rootDirDelEvents root =
       (root, Event.isRootUnwatched)
     : (root, rootEvent Event.isRootDeleted)
-    : (root, dirEvent Event.isAttrsModified)
-    : dirTouchEvents root
+    : dirDelAttrsEvents root
+    ++ dirTouchEvents root
 
 dirMoveEvents :: [Char] -> [Char] -> [([Char], Event -> Bool)]
 dirMoveEvents src dst =
@@ -169,12 +200,34 @@ getRoot = Path.toString . Event.getRoot
 getAbsPath :: Event -> FilePath
 getAbsPath = Path.toString . Event.getAbsPath
 
--- | Whether @\/proc\/self\/fd@ can be listed. The library falls back to a
--- lax removal of a shared root without it, see 'Event.removeRoot'.
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+-- | Whether @\/proc\/self\/fd@ can be listed.
 procAvailable :: IO Bool
 procAvailable = do
     r <- try (listDirectory "/proc/self/fd")
     return $ either (\(_ :: IOException) -> False) (const True) r
+#endif
+
+-- | Whether the library can queue the marker event of a shared root. It
+-- falls back to a lax removal of a shared root without it, see
+-- 'Event.removeRoot'. On Linux the marker needs @\/proc\/self\/fd@, on
+-- FreeBSD it needs a watch on @\/@ or @\/dev@, which the tests do not
+-- prevent.
+markerAvailable :: IO Bool
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+markerAvailable = return True
+#else
+markerAvailable = procAvailable
+#endif
+
+-- | Whether the marker event needs a free file descriptor. On Linux it needs
+-- a pipe, on FreeBSD it needs none.
+markerNeedsFd :: Bool
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+markerNeedsFd = False
+#else
+markerNeedsFd = True
+#endif
 
 -- | The last event must be the isRootUnwatched event for root1.
 shouldEndUnwatched :: [Event] -> FilePath -> Expectation
@@ -261,21 +314,21 @@ overlapFanOut =
                 (\ev -> isCreatedAt file ev && getRoot ev == sub) w
             createdRoots file evs `shouldBe` [root, sub]
 
--- The create event of file is queued before the removal of sub. With
--- @\/proc@ the marker reports it for sub, without @\/proc@ sub is removed at
--- once and it is reported for root only.
+-- The create event of file is queued before the removal of sub. With the
+-- marker it is reported for sub, without the marker sub is removed at once
+-- and it is reported for root only.
 overlapRemoveQueued :: Spec
 overlapRemoveQueued =
     it "removing the inner root reports the events queued before it"
         $ withNestedRoots $ \root sub w -> do
-            hasProc <- procAvailable
+            hasMarker <- markerAvailable
             let file = sub </> "file"
             createFile file
             Event.removeRoot w =<< Path.fromString sub
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev
                     || (isCreatedAt file ev && getRoot ev == root)) w
-            if hasProc
+            if hasMarker
             then do
                 evs1 <- readUntil Event.isRootUnwatched w
                 createdRoots file (evs ++ evs1) `shouldBe` [root, sub]
@@ -291,11 +344,11 @@ overlapRemoveOuter :: Spec
 overlapRemoveOuter =
     it "removing the outer root keeps the inner root watching"
         $ withNestedRoots $ \root sub w -> do
-            hasProc <- procAvailable
+            hasMarker <- markerAvailable
             Event.removeRoot w =<< Path.fromString root
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
-            if hasProc
+            if hasMarker
             then unwatched evs `shouldBe` [(root, root), (root, sub)]
             -- The shared watch descriptor of sub is removed for root at once,
             -- before the IN_IGNORED event of the watch descriptor of root.
@@ -482,6 +535,17 @@ defaultAttrsModified =
             setPermissions file (setOwnerExecutable True perms)
             evs <- readUntil Event.isAttrsModified w
             pathsOf Event.isAttrsModified evs `shouldBe` [file]
+
+-- isRootDeleted is not enabled by default. The kernel watch generates
+-- IN_DELETE_SELF on FreeBSD, the event is not reported.
+defaultRootDeleted :: Spec
+defaultRootDeleted =
+    it "reports isRootUnwatched for a deleted root"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            removeDirectory root
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+            pathsOf Event.isRootDeleted evs `shouldBe` []
 
 -------------------------------------------------------------------------------
 -- Renamed roots tests
@@ -857,6 +921,18 @@ recRenameDuringScan =
 -- Resource tests
 -------------------------------------------------------------------------------
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+foreign import capi "fcntl.h fcntl" c_fcntl :: CInt -> CInt -> IO CInt
+
+foreign import capi "fcntl.h value F_GETFD" f_GETFD :: CInt
+
+-- | The open file descriptors of the process below 1024. FreeBSD has no
+-- @\/proc\/self\/fd@ to find the inotify file descriptors, the file
+-- descriptors opened by a watch are found by comparing the lists before and
+-- after opening it.
+inotifyFds :: IO [CInt]
+inotifyFds = filterM (\fd -> (/= -1) <$> c_fcntl fd f_GETFD) [0 .. 1023]
+#else
 -- | The inotify file descriptors of the process.
 inotifyFds :: IO [FilePath]
 inotifyFds = do
@@ -872,6 +948,7 @@ inotifyFds = do
         return $ case r of
             Left (_ :: IOException) -> False
             Right target -> target == "anon_inode:inotify"
+#endif
 
 -- The second root does not exist, adding it fails after the inotify fd is
 -- created and the first root is added.
@@ -913,16 +990,16 @@ whileReading p w action = do
 
 -- The reader thread is blocked reading the watch fd. The isRootUnwatched
 -- event of sub wakes it up without a file system event: the marker event
--- with @\/proc@, the synthetic event in the threaded RTS without it.
+-- if it can be queued, the synthetic event in the threaded RTS if not.
 removeSharedWhileReading :: Spec
 removeSharedWhileReading =
     it "removing a shared root wakes up a thread reading the events"
         $ withNestedRoots $ \root sub w -> do
-            hasProc <- procAvailable
+            hasMarker <- markerAvailable
             p <- Path.fromString sub
             (r, evs) <- whileReading Event.isRootUnwatched w $ do
                 r <- timeout 2000000 $ Event.removeRoot w p
-                unless (hasProc || rtsSupportsBoundThreads)
+                unless (hasMarker || rtsSupportsBoundThreads)
                     $ createFile (root </> "file")
                 return r
             r `shouldBe` Just ()
@@ -1112,6 +1189,32 @@ recDeepMovedIn =
                 evs1 <- readUntil (isCreatedAt new) w
                 createdRoots new evs1 `shouldBe` [root]
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+-- The marker of the shared watch descriptor of link needs a watch on / or
+-- /dev, the watch already watches both. link is removed at once, the events
+-- queued for it are not reported. The watch is not recursive, a recursive
+-- watch of / would add a watch for every directory.
+removeFailRetry :: Spec
+removeFailRetry =
+    it "removeRoot removes a shared root at once without the marker"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let root = fp </> "root"
+                link = fp </> "link"
+                file = root </> "file"
+            createDirectory root
+            createDirectoryLink root link
+            roots <- mapM Path.fromString [root, link]
+            bracket
+                (Event.openWatch watchCfg (NonEmpty.fromList roots))
+                Event.closeWatch
+                $ \w -> do
+                    mapM_ (Event.addRoot w <=< Path.fromString) ["/", "/dev"]
+                    Event.removeRoot w =<< Path.fromString link
+                    createFile file
+                    evs <- readUntil (isCreatedAt file) w
+                    unwatched evs `shouldBe` [(link, link)]
+                    createdRoots file evs `shouldBe` [root]
+#else
 -- The marker of the shared watch descriptor of sub needs a pipe, the pipe
 -- fails with EMFILE.
 removeFailRetry :: Spec
@@ -1128,6 +1231,7 @@ removeFailRetry =
                     Event.removeRoot w p
                     evs <- readUntil Event.isRootUnwatched w
                     unwatched evs `shouldBe` [(sub, sub)]
+#endif
 
 -- The directory cannot be added without a free fd. Its create event is
 -- reported, followed by the exception. The events of the files were read
@@ -1239,8 +1343,9 @@ recRenameMovedToDisabled =
     cfg = Event.setMovedTo False recCfg
 
 -- The reader thread is blocked reading the watch fd. With the non-threaded
--- RTS, closeWatch needs a pipe to wake up the reader, the pipe fails with
--- EMFILE, and the reader wakes up on the next event.
+-- RTS, closeWatch needs a pipe to wake up the reader on Linux, the pipe fails
+-- with EMFILE, and the reader wakes up on the next event. On FreeBSD
+-- closeWatch needs no fd to wake up the reader.
 closeFailFallback :: Spec
 closeFailFallback =
     it "closeWatch ends the stream without a free fd"
@@ -1259,10 +1364,11 @@ closeFailFallback =
                             pendingWith "the open file limit is too high"
                         Just c -> do
                             c `shouldBe` Just ()
-                            when (not rtsSupportsBoundThreads) $ do
-                                threadDelay 200000
-                                done <- tryTakeMVar mv
-                                fmap (const ()) done `shouldBe` Nothing
+                            when (markerNeedsFd && not rtsSupportsBoundThreads)
+                                $ do
+                                    threadDelay 200000
+                                    done <- tryTakeMVar mv
+                                    fmap (const ()) done `shouldBe` Nothing
                             createFile (root </> "file")
                             -- The stream ends without an exception
                             res <- timeout 2000000 (takeMVar mv)
@@ -1387,8 +1493,21 @@ recScanNewDirSilent =
             filter (isUnder dir) (map getAbsPath evs) `shouldContain` [sub]
             let listed = filter (isUnder dir) (pathsOf isListing (evs ++ evs1))
             filter (/= dir) listed `shouldBe` []
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+            -- The add of the watch of dir reads dir and generates access
+            -- events. dir reports four open events and one close event: the
+            -- open and the close of the listing, and three opens with
+            -- O_PATH, the close of an O_PATH fd generates no event. Seen on
+            -- FreeBSD 14.5 and 15.0.
+            let evs2 = evs ++ evs1
+                opened = filter (isUnder dir) (pathsOf Event.isOpened evs2)
+                closed =
+                    filter (isUnder dir) (pathsOf Event.isNonWriteClosed evs2)
+            (length opened, length closed) `shouldBe` (4, 1)
+#else
             -- open, one or two access events that the kernel may merge, close
             length listed `shouldSatisfy` (`elem` [3, 4])
+#endif
 
 -- The flags removed for the scan are restored after it.
 recTouchAfterNewDirScan :: Spec
@@ -2129,6 +2248,20 @@ recDeniedAfterWatched =
                 `shouldBe` [dir </> "file", root </> "sentinel"]
             accessDenied evs `shouldBe` []
 
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+foreign import ccall unsafe "sysctlbyname" c_sysctlbyname
+    :: CString -> Ptr () -> Ptr CSize -> Ptr () -> CSize -> IO CInt
+
+-- | The max_queued_events limit of inotify.
+maxQueuedEvents :: IO Int
+maxQueuedEvents =
+    withCString "vfs.inotify.max_queued_events" $ \name ->
+        alloca $ \valPtr -> alloca $ \lenPtr -> do
+            poke lenPtr (fromIntegral (sizeOf (0 :: CInt)))
+            throwErrnoIfMinus1_ "sysctlbyname"
+                $ c_sysctlbyname name (castPtr valPtr) lenPtr nullPtr 0
+            fromIntegral <$> (peek valPtr :: IO CInt)
+#else
 -- | The max_queued_events limit of inotify.
 maxQueuedEvents :: IO Int
 maxQueuedEvents = do
@@ -2138,12 +2271,13 @@ maxQueuedEvents = do
         Left (e :: IOException) -> do
             v <- lookupEnv "FSEVENTS_MAX_QUEUED_EVENTS"
             maybe (throwIO e) (return . read) v
+#endif
 
 -- | Run the action after overflowing the event queue of the watch, by
 -- creating more files in @dir@ than the queue can hold. Returns 'Nothing' if
 -- the queue limit is more than 100000 events.
 --
--- Without @\/proc@ the limit is taken from the environment variable
+-- On Linux without @\/proc@ the limit is taken from the environment variable
 -- @FSEVENTS_MAX_QUEUED_EVENTS@.
 withOverflow :: FilePath -> IO a -> IO (Maybe a)
 withOverflow dir action = do
@@ -2379,6 +2513,7 @@ watchTests =
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
+                defaultRootDeleted
                 lastRootEvent
             describe "symbolic link roots" recRootSymlinkNoFollow
 

@@ -12,6 +12,12 @@
 
 module Streamly.Test.FileSystem.Event (main) where
 
+-- Linux and FreeBSD use the same inotify backend, the tests expect the same
+-- events on both.
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+#define INOTIFY_BACKEND
+#endif
+
 import Control.Concurrent
     ( MVar, ThreadId, forkIO, killThread, newChan, newEmptyMVar, putMVar
     , readChan, takeMVar, threadDelay, tryPutMVar, writeChan
@@ -23,7 +29,7 @@ import Control.Exception
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (elemIndex, isPrefixOf, sort, sortOn)
-#if !defined(CABAL_OS_LINUX)
+#if !defined(INOTIFY_BACKEND)
 import Data.List (nub)
 #endif
 import Streamly.Internal.FS.Event (Config, Event)
@@ -57,7 +63,10 @@ import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Internal.FS.Event as Event
 import qualified Streamly.Internal.FileSystem.Path as Path
 #if defined(CABAL_OS_LINUX)
-import qualified Streamly.Internal.FS.Event.Linux as Linux
+import qualified Streamly.Internal.FS.Event.Linux as Inotify
+#elif defined(CABAL_OS_FREEBSD)
+import Foreign.C.Types (CInt(..))
+import qualified Streamly.Internal.FS.Event.FreeBSD as Inotify
 #elif defined(CABAL_OS_WINDOWS)
 import qualified System.Win32.File as Win32
 #endif
@@ -87,7 +96,7 @@ isCreatedAt file ev = Event.isCreated ev && absPath ev == file
 -- is listed once, a later event for a path can repeat 'Event.isCreated' on
 -- macOS.
 createdRoots :: FilePath -> [Event] -> [FilePath]
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
 createdRoots file = map rootPath . filter (isCreatedAt file)
 #else
 createdRoots file = nub . map rootPath . filter (isCreatedAt file)
@@ -111,7 +120,7 @@ isChange ev =
 -- the @isRootUnwatched@ event of a directory removed from the watch can be
 -- read after the events of later changes.
 checkedEvents :: Bool -> [Event] -> [Event]
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
 checkedEvents everyEvent = if everyEvent then id else filter isChange
 #else
 checkedEvents _ = filter isChange
@@ -130,7 +139,7 @@ isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
 -- checked, the markers of 'skipEarlier' and 'syncOn' can be reported again.
 shouldCreate :: [Event] -> [FilePath] -> Expectation
 shouldCreate evs paths =
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
     created `shouldBe` paths
 #elif defined(CABAL_OS_DARWIN)
     nub (sort (filter (`elem` paths) created)) `shouldBe` nub (sort paths)
@@ -146,7 +155,7 @@ shouldCreate evs paths =
 -- they must be for the given paths only, one for each path, in order.
 shouldModify :: [Event] -> [FilePath] -> Expectation
 shouldModify evs paths =
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
     modified `shouldBe` paths
 #else
     filter (`notElem` modified) paths `shouldBe` []
@@ -156,19 +165,20 @@ shouldModify evs paths =
 
     modified = pathsOf Event.isModified evs
 
--- | Whether the event is the @isRootUnwatched@ event of Linux. macOS and
+-- | Whether the event is the @isRootUnwatched@ event of Linux and FreeBSD.
+-- macOS and
 -- Windows do not report a root or a directory that is no longer watched.
 isUnwatched :: Event -> Bool
-#if defined(CABAL_OS_LINUX)
-isUnwatched = Linux.isRootUnwatched
+#if defined(INOTIFY_BACKEND)
+isUnwatched = Inotify.isRootUnwatched
 #else
 isUnwatched = const False
 #endif
 
--- | On Linux the @isRootUnwatched@ events must be for the given roots and
--- paths, in order. Nothing is checked on macOS and Windows.
+-- | On Linux and FreeBSD the @isRootUnwatched@ events must be for the given
+-- roots and paths, in order. Nothing is checked on macOS and Windows.
 shouldUnwatch :: [Event] -> [(FilePath, FilePath)] -> Expectation
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
 shouldUnwatch evs expected =
     [(rootPath ev, absPath ev) | ev <- evs, isUnwatched ev]
         `shouldBe` expected
@@ -190,11 +200,11 @@ onWindows = True
 onWindows = False
 #endif
 
-onLinux :: Bool
-#if defined(CABAL_OS_LINUX)
-onLinux = True
+onInotify :: Bool
+#if defined(INOTIFY_BACKEND)
+onInotify = True
 #else
-onLinux = False
+onInotify = False
 #endif
 
 -- | Run the test except on Windows.
@@ -233,7 +243,7 @@ readUntil p w = do
 -- | On Linux, read the events up to the @isRootUnwatched@ event of the path
 -- for the root. On macOS and Windows nothing is read.
 readUnwatched :: Event.Watch -> FilePath -> FilePath -> IO [Event]
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
 readUnwatched w root path =
     readUntil
         (\ev -> isUnwatched ev && rootPath ev == root && absPath ev == path)
@@ -273,8 +283,8 @@ skipEarlier _ _ = return ()
 
 -- | On Linux the watch reports all the events, as the Linux test suite does.
 allEvents :: Config -> Config
-#if defined(CABAL_OS_LINUX)
-allEvents = Linux.setAllEvents True
+#if defined(INOTIFY_BACKEND)
+allEvents = Inotify.setAllEvents True
 #else
 allEvents = id
 #endif
@@ -1167,7 +1177,7 @@ removeStops =
 -- action is not run, a removed root reports nothing after its
 -- @isRootUnwatched@ event.
 untilRemoved :: (Int -> IO Bool) -> IO ()
-#if defined(CABAL_OS_LINUX)
+#if defined(INOTIFY_BACKEND)
 untilRemoved _ = return ()
 #else
 untilRemoved action = go 1
@@ -1429,6 +1439,21 @@ inotifyFds = do
 newProbe dir = Probe dir <$> inotifyFds
 isWatchOpen (Probe _ n) = (== n + 1) <$> inotifyFds
 isWatchClosed (Probe _ n) = (== n) <$> inotifyFds
+#elif defined(CABAL_OS_FREEBSD)
+foreign import capi "fcntl.h fcntl" c_fcntl :: CInt -> CInt -> IO CInt
+
+foreign import capi "fcntl.h value F_GETFD" f_GETFD :: CInt
+
+-- | The number of open fds of the process below 1024, a watch has one.
+-- FreeBSD has no @\/proc\/self\/fd@, and @\/dev\/fd@ lists only the fds 0,
+-- 1 and 2 unless fdescfs is mounted.
+countFds :: IO Int
+countFds =
+    length . filter (/= -1) <$> mapM (`c_fcntl` f_GETFD) [0 .. 1023]
+
+newProbe dir = Probe dir <$> countFds
+isWatchOpen (Probe _ n) = (> n) <$> countFds
+isWatchClosed (Probe _ n) = (<= n) <$> countFds
 #elif defined(CABAL_OS_DARWIN)
 -- | The number of open fds of the process, a watch has the two fds of its
 -- pipe.
@@ -1682,7 +1707,7 @@ readTimeoutsNoLoss :: Spec
 readTimeoutsNoLoss =
     it "does not lose an event when the reads time out repeatedly"
         $ withRoot recursive $ \root w -> do
-            let n = if onLinux then 2000 else 300 :: Int
+            let n = if onInotify then 2000 else 300 :: Int
                 files = [root </> ("file" ++ show i) | i <- [1 .. n]]
                 end = root </> "end"
             ref <- newIORef []

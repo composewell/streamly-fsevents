@@ -74,6 +74,9 @@ import qualified Streamly.Internal.FS.Event.Linux as Event
 #elif defined(CABAL_OS_WINDOWS)
 import Streamly.Internal.FS.Event.Windows (Config, Event, Watch)
 import qualified Streamly.Internal.FS.Event.Windows as Event
+#elif defined(CABAL_OS_FREEBSD)
+import Streamly.Internal.FS.Event.FreeBSD (Config, Event, Watch)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Event
 #else
 #error "FS Events not supported on this platform"
 #endif
@@ -100,9 +103,9 @@ import qualified Streamly.Internal.FS.Event.Windows as Event
 -- watching only the watch root directory.
 --
 -- The entries already in a directory moved into the tree are reported as
--- 'isCreated' events on Linux and are not reported on macOS and Windows. A
--- portable program scans such a directory on its 'isMoved' event, and removes
--- the duplicates on Linux.
+-- 'isCreated' events on Linux and FreeBSD, and are not reported on macOS and
+-- Windows. A portable program scans such a directory on its 'isMoved' event,
+-- and removes the duplicates on Linux and FreeBSD.
 --
 -- See @docs\/platform-differences.md@ in this package for the differences in
 -- a recursive watch on each platform.
@@ -298,8 +301,8 @@ getAbsPath = Event.getAbsPath
 -- Creating a hard link does not generate this event on all platforms. See
 -- @docs\/platform-differences.md@ in this package.
 --
--- In a recursive watch on Linux, this event is also generated for the entries
--- of a directory moved into the tree, which may not be new. See
+-- In a recursive watch on Linux and FreeBSD, this event is also generated for
+-- the entries of a directory moved into the tree, which may not be new. See
 -- 'setRecursiveMode'.
 isCreated :: Event -> Bool
 isCreated = Event.isCreated
@@ -314,7 +317,7 @@ isCreated = Event.isCreated
 -- the platform. See @docs\/platform-differences.md@ in this package.
 --
 -- See also the 'Streamly.Internal.FS.Event.Linux.isRootDeleted' event on
--- Linux.
+-- Linux and FreeBSD.
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
@@ -352,8 +355,8 @@ isModified = Event.isModified
 -- know its current state. See @docs\/robustness.md@ in this package for the
 -- path reported on each platform and for the recovery.
 --
--- On Linux the watch is closed and the stream ends after this event, a new
--- watch has to be opened to continue.
+-- On Linux and FreeBSD the watch is closed and the stream ends after this
+-- event, a new watch has to be opened to continue.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 

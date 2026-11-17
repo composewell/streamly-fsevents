@@ -6,7 +6,8 @@
 -- Stability   : released
 -- Portability : GHC
 --
--- Portable file system event notification API for Linux, macOS, and Windows.
+-- Portable file system event notification API for Linux, macOS, Windows, and
+-- FreeBSD.
 --
 -- This module provides a common interface for file system event monitoring
 -- across major platforms. In most cases, behavior is consistent across
@@ -19,6 +20,7 @@
 -- For platform-specific APIs, see:
 --
 -- * "Streamly.FileSystem.Event.Darwin"
+-- * "Streamly.FileSystem.Event.FreeBSD"
 -- * "Streamly.FileSystem.Event.Linux"
 -- * "Streamly.FileSystem.Event.Windows"
 --
