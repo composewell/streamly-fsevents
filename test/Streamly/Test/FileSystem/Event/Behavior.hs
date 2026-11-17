@@ -724,7 +724,7 @@ behaviors =
                     | ev <- evs, isNamed "file" ev, Event.isCreated ev
                     ]
              in length (nub roots) == 2
-        , expected = onPlatform Yes No Yes
+        , expected = Yes
         }
 #if defined(CABAL_OS_DARWIN)
     , base

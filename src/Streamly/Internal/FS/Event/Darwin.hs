@@ -102,9 +102,9 @@ import Control.Monad (void, when)
 import Control.Monad.Cont (runCont, cont)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (dropWhileEnd, sortOn, stripPrefix)
+import Data.List (dropWhileEnd, nubBy, stripPrefix)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word8, Word32, Word64)
 import Foreign.C.Error (eAGAIN, eINTR, eWOULDBLOCK, getErrno, throwErrno)
 import Foreign.C.Types (CInt(..), CDouble(..), CSize(..), CUChar(..))
@@ -467,10 +467,17 @@ toRoot p = do
             , rootCanonical = dropTrailingSeparators canonical
             }
 
--- | Set the watch root of the event and the path relative to it. If the event
--- path is under more than one root, the longest root is used. If it is not
--- under any root, the root is not set.
-setRoot :: [Root] -> Event -> IO Event
+-- | Whether the two roots were supplied as the same path.
+isSameRoot :: Root -> Root -> Bool
+isSameRoot r1 r2 =
+    Path.toString (rootPath r1) == Path.toString (rootPath r2)
+
+-- | The event with its watch root and the path relative to the root set. If
+-- the event path is under more than one root, for example, a root and a
+-- root inside it, one event is returned for each of them, in the order of
+-- the roots, as on Linux and Windows. If it is not under any root, the event
+-- is returned without a root.
+setRoot :: [Root] -> Event -> IO [Event]
 setRoot roots ev = do
     let path = dropTrailingSeparators (Path.toString (eventPath ev))
         matches =
@@ -478,10 +485,7 @@ setRoot roots ev = do
             | root <- roots
             , Just rel <- [relativeTo (rootCanonical root) path]
             ]
-    -- The shortest relative path belongs to the longest root
-    case listToMaybe (sortOn (length . snd) matches) of
-        Nothing -> return ev
-        Just (root, rel) -> do
+        withRoot (root, rel) = do
             relPath <-
                 if null rel
                 then return Nothing
@@ -492,6 +496,7 @@ setRoot roots ev = do
                     , eventAbsRoot = Just (rootAbs root)
                     , eventRelPath = relPath
                     }
+    if null matches then return [ev] else mapM withRoot matches
 
     where
 
@@ -655,10 +660,11 @@ data ReadState = ReadState
       -- may be incomplete.
       rdBuffer :: Array Word8
     , rdEnded :: !Bool -- ^ The watch is closed
-      -- | An event processed by a read that was interrupted by an async
-      -- exception before it could return the event. The next read returns
-      -- it.
-    , rdUndelivered :: Maybe Event
+      -- | The events of a processed record that are not returned yet. A
+      -- record has one event for each root that its path is under. An
+      -- event is also kept here by a read that was interrupted by an async
+      -- exception before it could return the event.
+    , rdUndelivered :: [Event]
     }
 
 -- | A handle for a watch.
@@ -705,7 +711,7 @@ createWatch cfg@Config{..} =
                 ReadState
                     { rdBuffer = mempty
                     , rdEnded = False
-                    , rdUndelivered = Nothing
+                    , rdUndelivered = []
                     }
         return
             Watch
@@ -806,8 +812,12 @@ addRoot wtch@Watch{..} root = do
             $ ioError (userError "addRoot: the watch is closed.")
         let roots = rsRoots st ++ [r]
             gen = rsGen st + 1
-        setRoots "addRoot" wtch gen roots
-        return st {rsRoots = roots, rsGen = gen}
+        -- A path that is already a root is watched once
+        if any (isSameRoot r) (rsRoots st)
+        then return st
+        else do
+            setRoots "addRoot" wtch gen roots
+            return st {rsRoots = roots, rsGen = gen}
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
 -- one used to add the root.
@@ -915,7 +925,8 @@ openWatch f paths = do
     -- is created later it cannot be properly monitored. Also a user may
     -- inadvertently provide a path for which the user may not have permission
     -- and then later wonder why events are not being reported.
-    roots <- mapM toRoot (NonEmpty.toList paths)
+    -- A path listed more than once is watched once
+    roots <- nubBy isSameRoot <$> mapM toRoot (NonEmpty.toList paths)
     -- The handle is not returned to the caller if starting the stream
     -- fails, the caller cannot close it. 'mask' ensures that an async
     -- exception cannot arrive between creating the watch and installing the
@@ -1009,11 +1020,11 @@ readPipe Watch{watchFd = fd, watchFdLock = lock} =
         else return st1
 
 -- | Process a record: forget the generation of a retired stream, stop the
--- streams that are replaced, and find the root of an event. Returns
--- 'Nothing' for a retired stream, for an event not reported while the
--- streams are replaced, and for an event not reported in the non-recursive
--- mode.
-processRecord :: Watch -> Record -> IO (Maybe Event)
+-- streams that are replaced, and find the roots of an event. Returns the
+-- event for each of its roots, see 'setRoot'. Returns no event for a retired
+-- stream, for an event not reported while the streams are replaced, and for
+-- an event not reported in the non-recursive mode.
+processRecord :: Watch -> Record -> IO [Event]
 processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
     modifyMVar streams $ \ss -> go ss rec
 
@@ -1027,7 +1038,7 @@ processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
                 { ssReplace = Replace.onRetired gen (ssReplace ss)
                 , ssRoots = deleteGen gen (ssRoots ss)
                 }
-            , Nothing
+            , []
             )
     go ss (RecordEvent gen ev) = do
         let (report, stops, rs) =
@@ -1039,12 +1050,12 @@ processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
             then return ss {ssReplace = rs}
             else (\x -> x {ssReplace = rs}) <$> stopStreams stops ss
         if not report
-        then return (ss1, Nothing)
+        then return (ss1, [])
         else do
-            ev1 <- setRoot (fromMaybe [] (lookup gen (ssRoots ss1))) ev
-            if watchRec cfg || isNonRecursiveEvent fileEvents ev1
-            then return (ss1, Just ev1)
-            else return (ss1, Nothing)
+            evs <- setRoot (fromMaybe [] (lookup gen (ssRoots ss1))) ev
+            if watchRec cfg
+            then return (ss1, evs)
+            else return (ss1, filter (isNonRecursiveEvent fileEvents) evs)
 
 -- | The result of a step of 'readEvent'.
 data ReadStep =
@@ -1110,23 +1121,23 @@ readEvent wtch@Watch{watchReadState = stRef} =
         r <- try (Exception.interruptible (return ()))
         case r of
             Left (e :: SomeException) -> do
-                putMVar stRef st {rdUndelivered = Just ev}
+                putMVar stRef st {rdUndelivered = ev : rdUndelivered st}
                 throwIO e
-            Right () -> do
-                putMVar stRef st {rdUndelivered = Nothing}
-                return (Just ev)
+            Right () -> putMVar stRef st >> return (Just ev)
 
-    -- Parse and process one record of the buffer. Read the pipe only when
-    -- the buffer does not hold a complete record.
-    step st@ReadState{rdUndelivered = Just ev} =
-        return (StepEvent ev st {rdUndelivered = Nothing})
+    -- Return an event of the last processed record if any. Otherwise parse
+    -- and process one record of the buffer. Read the pipe only when the
+    -- buffer does not hold a complete record.
+    step st@ReadState{rdUndelivered = ev : evs} =
+        return (StepEvent ev st {rdUndelivered = evs})
     step st = do
         r <- parseRecord (rdBuffer st)
         case r of
             Just (rec, rest) -> do
-                mev <- processRecord wtch rec
-                let st1 = st {rdBuffer = rest}
-                return $ maybe (StepContinue st1) (`StepEvent` st1) mev
+                evs <- processRecord wtch rec
+                -- The next step returns the first event
+                return
+                    $ StepContinue st {rdBuffer = rest, rdUndelivered = evs}
             Nothing | rdEnded st -> return StepEnd
             Nothing -> do
                 res <- readPipe wtch
@@ -1229,8 +1240,8 @@ isEventIdWrapped :: Event -> Bool
 isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 
 -- | Get the watch root to which this event belongs, as it was supplied to the
--- watch API. When the watch roots are nested, the innermost root containing
--- the event path is returned.
+-- watch API. If a path is under more than one root, for example, a root and
+-- a root inside it, its events are reported once for each root.
 --
 -- If the event path is not under any watch root, the path reported by the OS
 -- is returned. For example, the 'isRootPathEvent' event for a non-existing
