@@ -12,7 +12,6 @@ Open problems in `src/Streamly/Internal/FS/Event/Darwin.hs` and
 
 ## Things that might bite users
 
-- getAbsPath returns rel path in some cases
 - The 512-stream limit. Each watch uses one stream, two fds and a dispatch queue. It's better to use one watch with many roots (up to 4096).
 - Slow consumers. The callback blocks once the 64 KB pipe is full, so pressure goes back into fseventsd. It will eventually drop events and send isEventsLost with UserDropped/KernelDropped, so users must rescan on that event.
 - Flags accumulate. A single event can carry Created, Modified and Removed together; users should stat the path.
@@ -22,6 +21,8 @@ Open problems in `src/Streamly/Internal/FS/Event/Darwin.hs` and
 
 ## Suspected, not verified, left unchanged
 
+- closeWatch is not safe against an async exception. It stops the streams, calls destroyWatch, which frees the watch, and then takes the lock of the read fd. If a reader holds that lock, closeWatch waits and can be interrupted. modifyMVar_ then restores the state with rsClosed False. A second closeWatch calls destroyWatch on the freed watch, and addRoot starts a stream on it. Proposed change: run the body of closeWatch under uninterruptibleMask_, the locks it takes are not held across a blocking call. Not reproduced, it needs an exception at the moment closeWatch waits for the lock.
+- Not run on macOS: the changes of this branch to Darwin.hs were typechecked on Linux only. They are the absolute path of a relative root, the event kept by an interrupted read, one event for each root of nested roots, and a path listed twice watched once.
 - Close can still hang in one corner. If open("/dev/null") fails at close (fd limit reached), the dup2 step is skipped and close can still hang when the read end is shared.
 - A fork race can leak the fds. A fork in another thread between pipe() and fcntl() can still give a child the pipe; macOS has no pipe2. Close is safe in that case; only the fd leak into that child remains.
 - setRoot goes through String on every event. That costs time on each event and would mangle non-UTF-8 names on non-APFS volumes. Matching on bytes would avoid both.
