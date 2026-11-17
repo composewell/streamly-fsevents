@@ -29,10 +29,7 @@ import Control.Exception
     )
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (elemIndex, isPrefixOf, sort, sortOn)
-#if !defined(INOTIFY_BACKEND)
-import Data.List (nub)
-#endif
+import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn)
 import Streamly.Internal.FS.Event (Config, Event)
 import System.Directory
     ( createDirectory
@@ -443,14 +440,16 @@ relativeRoot = do
 -- On Linux and Windows a deleted root is not watched again, even if it is
 -- created again, the stream ends when none of the roots is watched. On
 -- macOS the watch is on the path of a root, the stream does not end.
-deletedRootsEndStream :: Spec
-deletedRootsEndStream =
-    it "the stream ends when all its roots are deleted"
+--
+-- @names@ are the roots given to the watch, a name can be listed twice.
+deletedRootsEnd :: String -> [FilePath] -> Spec
+deletedRootsEnd title names =
+    it title
         $ notOnDarwin "the watch of a deleted root continues"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let roots = [fp </> "root1", fp </> "root2"]
+            let roots = map (fp </>) (nub names)
             mapM_ createDirectory roots
-            paths <- mapM Path.fromString roots
+            paths <- mapM (Path.fromString . (fp </>)) names
             ref <- newIORef []
             result <- newEmptyMVar
             let collect ev = atomicModifyIORef' ref (\evs -> (ev : evs, ()))
@@ -479,7 +478,15 @@ deletedRootsEndStream =
                 evs <- readIORef ref
                 let isRootDeleted ev =
                         Event.isDeleted ev && relPath ev == Nothing
-                sort (pathsOf isRootDeleted evs) `shouldBe` roots
+                sort (pathsOf isRootDeleted evs) `shouldBe` sort roots
+
+deletedRootsEndStream :: Spec
+deletedRootsEndStream = do
+    deletedRootsEnd
+        "the stream ends when all its roots are deleted" ["root1", "root2"]
+    deletedRootsEnd
+        "the stream ends when a root listed twice is deleted"
+        ["root1", "root1"]
 
 -------------------------------------------------------------------------------
 -- Recursive mode

@@ -470,7 +470,8 @@ toRoot p = do
 -- | Whether the two roots were supplied as the same path.
 isSameRoot :: Root -> Root -> Bool
 isSameRoot r1 r2 =
-    Path.toString (rootPath r1) == Path.toString (rootPath r2)
+    Path.eqPath
+        (Path.allowRelativeEquality True) (rootPath r1) (rootPath r2)
 
 -- | The event with its watch root and the path relative to the root set. If
 -- the event path is under more than one root, for example, a root and a

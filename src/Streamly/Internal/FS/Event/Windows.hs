@@ -74,6 +74,7 @@ import Control.Exception
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (isAlpha, isAscii)
+import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
@@ -851,14 +852,21 @@ toAbsolute path
 
     str = Path.toString path
 
+-- | Whether the root was added via a path equal to @path@.
+isRootPath :: Path -> Root -> Bool
+isRootPath path =
+    Path.eqPath (Path.allowRelativeEquality True) path . rootPath
+
 -- | @addRoot watch root@ adds the directory @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. The root is watched
 -- when the call returns: a change made after it is reported. A relative
 -- @root@ is relative to the current directory at the time of the call, a
 -- later change of the current directory does not affect the watch.
 --
--- A directory added more than once, via the same path or via different
--- roots, reports its events once for each root.
+-- A path that is already a root of the watch is not added again, its events
+-- are reported once. A directory added via different paths, for example, a
+-- recursive root and a root inside it, reports its events once for each
+-- root.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
@@ -872,6 +880,13 @@ addRoot Watch{..} root =
     modifyMVar_ watchRoots $ \rs -> do
         when (rsClosed rs)
             $ ioError (userError "addRoot: the watch is closed.")
+        if any (isRootPath root) (Map.elems (rsActive rs))
+        then return rs
+        else add rs
+
+    where
+
+    add rs = do
         let key = rsNextKey rs
         absRoot <- toAbsolute root
         h <- openDirHandle root
@@ -900,8 +915,7 @@ addRoot Watch{..} root =
                     }
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
--- one used to add the root. If the path was added more than once, all the
--- roots added using it are removed.
+-- one used to add the root.
 --
 -- The directory handle of the root is closed when the call returns. The
 -- events of the root already in the event queue of the watch are reported,
@@ -923,12 +937,7 @@ addRoot Watch{..} root =
 --
 removeRoot :: Watch -> Path -> IO ()
 removeRoot Watch{..} root =
-    modifyMVar_ watchRoots (retireRoots isRoot)
-
-    where
-
-    name = Path.toString root
-    isRoot = (== name) . Path.toString . rootPath
+    modifyMVar_ watchRoots (retireRoots (isRootPath root))
 
 -- | Start monitoring the directories @paths@ for file system events, with
 -- the supplied modifications applied to the 'defaultConfig'. Returns a
@@ -1083,6 +1092,9 @@ watchWith f paths = S.bracketIO before closeWatch events
 
     before = openWatch f paths
 
+    -- A path listed more than once is one root
+    rootCount = length (nub (map Path.toString (NonEmpty.toList paths)))
+
     -- The state is the number of roots that are not deleted
     step _ 0 = return Nothing
     step w n = do
@@ -1092,7 +1104,7 @@ watchWith f paths = S.bracketIO before closeWatch events
             Just ev | isRootDeletedEvent ev -> Just (ev, n - 1)
             Just ev -> Just (ev, n)
 
-    events w = S.unfoldrM (step w) (NonEmpty.length paths)
+    events w = S.unfoldrM (step w) rootCount
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
