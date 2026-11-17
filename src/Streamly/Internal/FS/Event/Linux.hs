@@ -1164,6 +1164,20 @@ data StreamItem =
       -- | The stream ends, the items after it are not reported.
     | ItemEnd
 
+-- | The part of the event stream of a watch that is not returned to the
+-- application yet, see 'readEvent'.
+data Undelivered = Undelivered
+    { -- | An event, or a failure, taken out of the stream by a read that
+      -- was interrupted by an async exception before it could return it.
+      -- The next read returns it.
+      udItem :: Maybe (Either IOException Event)
+      -- | The rest of the event stream: the events read from the fd but
+      -- not yet returned to the application, and the entries of a new
+      -- directory scan not yet returned, followed by the reads of the fd
+      -- still to be made. 'Nothing' until the first event is taken.
+    , udStream :: Maybe (Stream IO StreamItem)
+    }
+
 -- | A handle for a watch.
 --
 data Watch = Watch
@@ -1174,13 +1188,10 @@ data Watch = Watch
       -- progress. The system calls made with the lock held must not block.
     , watchLock :: MVar FdState
     , watchWdMap :: IORef WdMap
-      -- | The rest of the event stream of 'eventStream': the events
-      -- read from the fd but not yet returned to the application, and the
-      -- entries of a new directory scan not yet returned, followed by the
-      -- reads of the fd still to be made. 'Nothing' until the first event
-      -- is taken. A stream that stops reading leaves the rest here, the
-      -- next stream on the watch continues from it.
-    , watchUndelivered :: MVar (Maybe (Stream IO StreamItem))
+      -- | The rest of the event stream of 'eventStream'. A stream that
+      -- stops reading leaves the rest here, the next stream on the watch
+      -- continues from it. Empty while a read is in progress.
+    , watchUndelivered :: MVar Undelivered
       -- | The synthetic events, most recent first. A thread waiting for
       -- events in the threaded RTS is woken up when one is added.
     , watchSynthEvents :: TVar [SynthEvent]
@@ -1231,7 +1242,7 @@ createWatch cfg = do
         newMVar
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef emptyWdMap
-    undeliveredRef <- newMVar Nothing
+    undeliveredRef <- newMVar (Undelivered Nothing Nothing)
     synthVar <- newTVarIO []
     return
         $ Watch
@@ -3601,10 +3612,17 @@ readEvents
 -- and the 'isScanEvent' events of its entries. When the watch is closed,
 -- every reader gets 'Nothing'.
 --
--- A read that is interrupted by an async exception while it waits for an
--- event, for example, by a timeout, does not lose any event. The next read
--- returns the first event not yet read. The scan of a new directory
--- continues in the next read, see 'setScanNewDirs'.
+-- A read that is interrupted by an async exception, for example, by a
+-- timeout, does not take an event out of the watch. The next read returns
+-- the first event not yet read. The scan of a new directory continues in the
+-- next read, see 'setScanNewDirs'.
+--
+-- The read returns the event with the masking state of the caller. If async
+-- exceptions are not masked, an exception that arrives after the read has
+-- taken the event and before the caller records it loses the event. To avoid
+-- that, call 'readEvent' and the code that records the event with async
+-- exceptions masked. The read can still be interrupted: while it waits for an
+-- event, and before it takes an event that is available.
 --
 -- If the read raises an 'IOException', for example, when a directory
 -- cannot be added because the process has reached the
@@ -3618,8 +3636,9 @@ readEvent :: Watch -> IO (Maybe Event)
 readEvent
     wtch@Watch {watchConfig = cfg, watchUndelivered = undeliveredRef} =
     Exception.mask_ $ do
-        r <- takeMVar undeliveredRef
-        next (fromMaybe items r)
+        Undelivered {..} <- takeMVar undeliveredRef
+        let stream = fromMaybe items udStream
+        maybe (next stream) (`deliver` stream) udItem
 
     where
 
@@ -3664,7 +3683,7 @@ readEvent
 
     items = S.concatMap readOne fdReads
 
-    save = putMVar undeliveredRef . Just
+    save item rest = putMVar undeliveredRef (Undelivered item (Just rest))
 
     -- The rest of the stream is not a pure value, it refers to the open
     -- directories of a scan in progress, and running a part of it changes
@@ -3682,6 +3701,9 @@ readEvent
     -- * An 'IOException' is returned as an item, by 'handleEvent' and by the
     --   stream of a scan, and is raised after the rest of the stream is
     --   saved.
+    -- * An async exception that arrived during the step is raised before
+    --   the event of the step is returned, and the event is saved, see
+    --   'deliver'.
     --
     -- Any other exception leaves the stream in an unknown state. It is
     -- saved in place of the stream, every later read raises it again.
@@ -3698,21 +3720,33 @@ readEvent
                 --
                 -- The watch cannot be recovered after such an exception,
                 -- it has to be closed and opened again.
-                save (S.concatEffect (throwIO e))
+                save Nothing (S.concatEffect (throwIO e))
                 throwIO e
-            Right Nothing -> save S.nil >> return Nothing
-            -- An async exception that arrived during the step is raised
-            -- when 'mask_' ends, and the event is lost. See
-            -- dev/design-issues.md.
-            Right (Just (ItemEvent ev, rest)) ->
-                save rest >> return (Just ev)
-            -- Similarly, the async exception replaces the 'IOException'
-            -- when 'mask_' ends, and the failure is not reported.
-            Right (Just (ItemFailed e, rest)) -> save rest >> ioError e
-            Right (Just (ItemEnd, _)) -> save S.nil >> return Nothing
+            Right Nothing -> save Nothing S.nil >> return Nothing
+            Right (Just (ItemEvent ev, rest)) -> deliver (Right ev) rest
+            Right (Just (ItemFailed e, rest)) -> deliver (Left e) rest
+            Right (Just (ItemEnd, _)) -> save Nothing S.nil >> return Nothing
             Right (Just (ItemWait wait, rest)) -> do
-                wait `onException` save rest
+                wait `onException` save Nothing rest
                 next rest
+
+    -- An async exception that arrived during the step is pending. Raise it
+    -- now and save the item along with the rest of the stream, the next
+    -- read returns the item. Otherwise the exception would be raised when
+    -- 'mask_' ends, after the item is taken out, and the event, or the
+    -- 'IOException', would be lost. If the caller has masked async
+    -- exceptions, this is the only point other than the wait where the read
+    -- can be interrupted.
+    --
+    -- The item is not put back in the stream with a cons: the rest of the
+    -- stream would run through one more layer after each interrupted read.
+    deliver item rest = do
+        r <- try (Exception.interruptible (return ()))
+        case r of
+            Left (e :: SomeException) -> save (Just item) rest >> throwIO e
+            Right () -> do
+                save Nothing rest
+                either ioError (return . Just) item
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
 -- stream does not close the watch, use 'closeWatch' to close it. The stream

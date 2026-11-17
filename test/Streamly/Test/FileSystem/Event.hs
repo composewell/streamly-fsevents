@@ -24,7 +24,8 @@ import Control.Concurrent
     )
 import Control.Exception
     ( AsyncException(ThreadKilled), IOException, SomeException, bracket
-    , finally, fromException, mask, throwIO, try
+    , finally, fromException, mask, mask_, throwIO, try
+    , uninterruptibleMask_
     )
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -1735,13 +1736,12 @@ readAfterTimeout desc cfg =
             evs <- readUntil (isCreatedAt file) w
             createdRoots file evs `shouldBe` [root]
 
--- The reads time out after 1 to 200 us, some timeouts arrive after a read
--- has taken an event from the watch and before the event is recorded. The
--- last read collects the remaining events, up to the event of a file
--- created after the reads.
---
--- XXX Events are lost on Linux and macOS, see dev/issues.md. The test is
--- marked pending with the number of events lost, instead of failing.
+-- The reads time out after 1 to 200 us. The reader masks async exceptions
+-- around the read and the code that records the event. The exception of a
+-- timeout is then raised only by the read, while it waits for an event or
+-- before it takes one out of the watch, and no event is lost. The last read
+-- collects the remaining events, up to the event of a file created after
+-- the reads.
 --
 -- On macOS, with 2000 files created before the first read, the watch
 -- reported about 1100 of them and then 'Event.isEventsLost'. The test
@@ -1757,6 +1757,7 @@ readTimeoutsNoLoss =
             let collect ev = atomicModifyIORef' ref (\evs -> (ev : evs, ()))
                 drain t =
                     timeout t
+                        $ mask_
                         $ Stream.fold (Fold.drainMapM collect)
                         $ Event.eventStream w
             mapM_ createFile files
@@ -1764,17 +1765,55 @@ readTimeoutsNoLoss =
             createFile end
             evs <- readUntilS (isCreatedAt end) w
             earlier <- readIORef ref
-            let created = pathsOf Event.isCreated (earlier ++ evs)
-                missing = length (filter (`notElem` created) files)
-            when (any Event.isEventsLost (earlier ++ evs))
+            let allEvs = reverse earlier ++ evs
+            when (any Event.isEventsLost allEvs)
                 $ pendingWith "events were lost, reported by isEventsLost"
-            when (missing > 0)
-                $ pendingWith
-                $ show missing ++ " of " ++ show n
-                    ++ " events were lost, see dev/issues.md"
+            allEvs `shouldCreate` (files ++ [end])
+
+-- The reader has async exceptions masked, and an exception is thrown to it
+-- before it starts to read. The events of the files are in the watch by
+-- then, the reads do not wait. The first read must raise the exception
+-- without taking an event out of the watch.
+pendingException :: Spec
+pendingException =
+    it "a read raises a pending async exception before it takes an event"
+        $ withRootCfg id $ \root w -> do
+            let files = [root </> ("file" ++ show i) | i <- [1 .. 100 :: Int]]
+                end = root </> "end"
+            ref <- newIORef []
+            ready <- newEmptyMVar
+            start <- newEmptyMVar
+            result <- newEmptyMVar
+            let record ev = atomicModifyIORef' ref (\evs -> (ev : evs, ()))
+                loop = do
+                    r <- Event.readEvent w
+                    case r of
+                        Nothing -> return ()
+                        Just ev -> record ev >> loop
+                reader = do
+                    putMVar ready ()
+                    uninterruptibleMask_ (takeMVar start)
+                    loop
+            mapM_ createFile files
+            -- Let the events reach the watch
+            threadDelay 500000
+            tid <-
+                mask $ \_ -> forkIO (try reader >>= putMVar result)
+            takeMVar ready
+            _ <- forkIO (killThread tid)
+            -- Let the exception reach the reader
+            threadDelay 200000
+            putMVar start ()
+            shouldBeKilled result
+            taken <- readIORef ref
+            length taken `shouldBe` 0
+            createFile end
+            evs <- readUntil (isCreatedAt end) w
+            evs `shouldCreate` (files ++ [end])
 
 asyncTests :: Spec
 asyncTests = do
+    pendingException
     readTimeoutsNoLoss
     killWaitingReader
     killStartingWatch

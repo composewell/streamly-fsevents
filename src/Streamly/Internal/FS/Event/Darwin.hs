@@ -655,6 +655,10 @@ data ReadState = ReadState
       -- may be incomplete.
       rdBuffer :: Array Word8
     , rdEnded :: !Bool -- ^ The watch is closed
+      -- | An event processed by a read that was interrupted by an async
+      -- exception before it could return the event. The next read returns
+      -- it.
+    , rdUndelivered :: Maybe Event
     }
 
 -- | A handle for a watch.
@@ -698,7 +702,11 @@ createWatch cfg@Config{..} =
                     }
         readState <-
             newMVar
-                ReadState {rdBuffer = mempty, rdEnded = False}
+                ReadState
+                    { rdBuffer = mempty
+                    , rdEnded = False
+                    , rdUndelivered = Nothing
+                    }
         return
             Watch
                 { watchConfig = cfg
@@ -1059,9 +1067,16 @@ data ReadStep =
 -- Each reader gets its events in the order in which they occurred. When the
 -- watch is closed, every reader gets 'Nothing'.
 --
--- A read that is interrupted by an async exception while it waits for an
--- event, for example, by a timeout, does not lose any event. The next read
--- returns the first event not yet read.
+-- A read that is interrupted by an async exception, for example, by a
+-- timeout, does not take an event out of the watch. The next read returns
+-- the first event not yet read.
+--
+-- The read returns the event with the masking state of the caller. If async
+-- exceptions are not masked, an exception that arrives after the read has
+-- taken the event and before the caller records it loses the event. To avoid
+-- that, call 'readEvent' and the code that records the event with async
+-- exceptions masked. The read can still be interrupted: while it waits for an
+-- event, and before it takes an event that is available.
 --
 -- /Pre-release/
 --
@@ -1078,15 +1093,33 @@ readEvent wtch@Watch{watchReadState = stRef} =
         r <- try (Exception.uninterruptibleMask_ (step st))
         case r of
             Left (e :: SomeException) -> putMVar stRef st >> throwIO e
-            Right (StepEvent ev st1) -> putMVar stRef st1 >> return (Just ev)
+            Right (StepEvent ev st1) -> deliver ev st1
             Right (StepContinue st1) -> loop st1
             Right (StepWait wait) -> do
                 wait `onException` putMVar stRef st
                 loop st
             Right StepEnd -> putMVar stRef st >> return Nothing
 
+    -- An async exception that arrived during the step is pending. Raise it
+    -- now and keep the event in the state, the next read returns it.
+    -- Otherwise the exception would be raised when 'mask_' ends, after the
+    -- event is taken out of the state, and the event would be lost. If the
+    -- caller has masked async exceptions, this is the only point other than
+    -- the wait where the read can be interrupted.
+    deliver ev st = do
+        r <- try (Exception.interruptible (return ()))
+        case r of
+            Left (e :: SomeException) -> do
+                putMVar stRef st {rdUndelivered = Just ev}
+                throwIO e
+            Right () -> do
+                putMVar stRef st {rdUndelivered = Nothing}
+                return (Just ev)
+
     -- Parse and process one record of the buffer. Read the pipe only when
     -- the buffer does not hold a complete record.
+    step st@ReadState{rdUndelivered = Just ev} =
+        return (StepEvent ev st {rdUndelivered = Nothing})
     step st = do
         r <- parseRecord (rdBuffer st)
         case r of

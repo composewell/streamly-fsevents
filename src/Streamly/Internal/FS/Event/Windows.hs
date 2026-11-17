@@ -69,7 +69,8 @@ where
 import Control.Concurrent (forkIO, rtsSupportsBoundThreads)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
-import Control.Exception (IOException, onException, try)
+import Control.Exception
+    (IOException, SomeException, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (isAlpha, isAscii)
@@ -119,7 +120,7 @@ import System.Win32.Types
 import Streamly.Data.Stream (Stream)
 import Streamly.Internal.FileSystem.Path (Path)
 
-import qualified Control.Exception as Exception (mask_)
+import qualified Control.Exception as Exception (interruptible, mask_)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
@@ -977,9 +978,16 @@ openWatch cfg paths = do
 -- 'isMovedFrom' and 'isMovedTo' events of a rename. When the watch is
 -- closed, every reader gets 'Nothing'.
 --
--- A read that is interrupted by an async exception while it waits for an
--- event, for example, by a timeout, does not lose any event. The next read
--- returns the first event not yet read.
+-- A read that is interrupted by an async exception, for example, by a
+-- timeout, does not take an event out of the watch. The next read returns
+-- the first event not yet read.
+--
+-- The read returns the event with the masking state of the caller. If async
+-- exceptions are not masked, an exception that arrives after the read has
+-- taken the event and before the caller records it loses the event. To avoid
+-- that, call 'readEvent' and the code that records the event with async
+-- exceptions masked. The read can still be interrupted: while it waits for an
+-- event, and before it takes an event that is available.
 --
 -- When a root is deleted, an 'isDeleted' event is returned for the root
 -- and the root is removed from the watch.
@@ -992,8 +1000,6 @@ openWatch cfg paths = do
 --
 readEvent :: Watch -> IO (Maybe Event)
 readEvent Watch{..} =
-    -- An async exception cannot arrive after the item is removed from the
-    -- queue and before it is returned.
     Exception.mask_ $ do
         r <- atomically $ do
             q <- readTVar watchQueue
@@ -1004,8 +1010,24 @@ readEvent Watch{..} =
                 Seq.EmptyL -> if qClosed q then return Nothing else retry
         case r of
             Nothing -> return Nothing
-            Just (ItemEvent ev) -> return (Just ev)
-            Just (ItemFailed e) -> ioError e
+            Just item -> do
+                -- The transaction is interrupted only if it waits. An async
+                -- exception that arrived while it removed the item is
+                -- pending. Raise it now and put the item back, the next
+                -- read returns it. Otherwise the exception would be raised
+                -- when 'mask_' ends and the item would be lost.
+                i <- try (Exception.interruptible (return ()))
+                case i of
+                    Left (e :: SomeException) -> do
+                        atomically $ do
+                            q <- readTVar watchQueue
+                            writeTVar
+                                watchQueue q {qItems = item Seq.<| qItems q}
+                        throwIO e
+                    Right () ->
+                        case item of
+                            ItemEvent ev -> return (Just ev)
+                            ItemFailed e -> ioError e
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
 -- stream does not close the watch, use 'closeWatch' to close it. The stream

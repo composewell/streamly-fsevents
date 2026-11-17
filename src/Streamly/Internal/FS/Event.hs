@@ -205,6 +205,14 @@ closeWatch = Event.closeWatch
 -- Returns 'Nothing' when the watch is closed. Several threads can read the
 -- same watch, each event is returned to one of them.
 --
+-- A read that is interrupted by an async exception, for example, by a
+-- timeout, does not take an event out of the watch, the next read returns
+-- it. An async exception that arrives after the read returns the event and
+-- before the caller records it loses the event. To avoid that, call
+-- 'readEvent' and the code that records the event with async exceptions
+-- masked. The read can still be interrupted: while it waits for an event,
+-- and before it takes an event that is available.
+--
 readEvent :: Watch -> IO (Maybe Event)
 readEvent = Event.readEvent
 
