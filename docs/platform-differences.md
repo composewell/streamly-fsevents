@@ -293,7 +293,6 @@ because the file is open.
 | A root renamed back after the rename event is read is watched | No | Yes | Yes |
 | A watch of a path that does not exist raises an exception | Yes | No | Yes |
 | A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A watch of a path without read permission raises an exception | Yes | No | Not tested |
 | A regular file can be a watch root | Yes | Yes | No |
 
 ### Recursive watches
@@ -306,8 +305,31 @@ because the file is open.
 | A file modified in a new directory, before the consumer reads the directory's create event, reports `isModified` | No | Yes | Yes |
 | A file created and deleted in a new directory, before the consumer reads the directory's create event, is reported | No | Yes | Yes |
 | A write to a file in a directory renamed twice before the consumer reads the first rename, the first new path taken by another directory, reports `isModified` at the path of the file | No | Yes | No |
-| A recursive watch with a subdirectory without read permission is watched | Yes | Yes | Not tested |
-| A directory without read permission moved into a recursive watch does not end the watch | Yes | Yes | Not tested |
+
+### Permissions
+
+"No read" is a directory without read permission and with search
+permission, "none" is a directory without any permission. A subdirectory is
+in a recursive watch.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A watch of a root without read permission raises an exception | Yes | No | Not tested, expected Yes |
+| A root with no read reports its events | No, the watch raises an exception | Yes | Not tested, expected No |
+| A root with none reports its events | No, the watch raises an exception | Expected No | Not tested, expected No |
+| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Not tested |
+| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Expected Yes | Not tested, expected Yes |
+| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | Expected No | Not tested, expected Yes |
+| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Not tested |
+| A root reports its events after its read permission is removed | Yes | Expected Yes | Not tested, expected Yes |
+| A subdirectory reports its events after its read permission is removed | Yes | Expected Yes | Not tested, expected Yes |
+| A root reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
+| A subdirectory reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
+
+_Expected_ is the outcome asserted by the test suite that has not yet been
+recorded from the CI. On Windows the test suite cannot remove a permission
+of a directory for the test process, the tests are skipped there and the
+expected outcomes are from the platform documentation.
 
 ### Event reporting
 
@@ -327,8 +349,7 @@ because the file is open.
 | A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
 | A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
 
-On Windows the test suite does not remove the read permission of a path, so
-the three tests that need it are skipped there. The row for the end of the
+The row for the end of the
 stream is from the test suite `FileSystem.Event`. The row for the delivery
 of events in a non-recursive watch has no test, it is based on the platform
 documentation and the library code. The coalescing of the events of a directory
