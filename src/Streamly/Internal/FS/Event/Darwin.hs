@@ -118,7 +118,7 @@ import Streamly.Data.Stream (Stream)
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FS.Event.Darwin.Replace (Gen, Since(..))
 import Streamly.Internal.FileSystem.Path (Path)
-import System.Directory (canonicalizePath)
+import System.Directory (canonicalizePath, getCurrentDirectory)
 import System.IO.Error (catchIOError)
 import System.Posix.Types (CSsize(..), Fd(..))
 
@@ -424,6 +424,7 @@ data Event = Event
    , eventFlags :: Word32
    , eventPath :: Path -- absolute path reported by the OS
    , eventRoot :: Maybe Path -- watch root as supplied, if any matched
+   , eventAbsRoot :: Maybe Path -- absolute path of eventRoot
    , eventRelPath :: Maybe Path -- relative to eventRoot
    }
 
@@ -431,10 +432,20 @@ data Event = Event
 -- Watch roots
 -------------------------------------------------------------------------------
 
--- | A watch root as supplied by the user, and its canonical path without
--- trailing separators. The OS reports the event paths with symbolic links
--- resolved, we compare them against the canonical path.
-type Root = (Path, String)
+-- | A watch root.
+data Root = Root
+    { rootPath :: Path -- ^ As supplied by the user
+      -- | The absolute path of the root: a relative 'rootPath' joined to
+      -- the working directory at the time the root was added. Symbolic
+      -- links are not resolved. The FSEvents streams are created with this
+      -- path, a stream created after a change of the working directory
+      -- watches the same directory.
+    , rootAbs :: Path
+      -- | The canonical path without trailing separators. The OS reports
+      -- the event paths with symbolic links resolved, we compare them
+      -- against the canonical path.
+    , rootCanonical :: String
+    }
 
 dropTrailingSeparators :: String -> String
 dropTrailingSeparators = dropWhileEnd (== '/')
@@ -442,8 +453,19 @@ dropTrailingSeparators = dropWhileEnd (== '/')
 -- XXX Use OsPath or streamly's canonicalize
 toRoot :: Path -> IO Root
 toRoot p = do
-    canonical <- canonicalizePath (Path.toString p)
-    return (p, dropTrailingSeparators canonical)
+    absPath <-
+        if Path.isRooted p
+        then return p
+        else do
+            cwd <- getCurrentDirectory >>= Path.fromString
+            return (Path.join cwd p)
+    canonical <- canonicalizePath (Path.toString absPath)
+    return
+        Root
+            { rootPath = p
+            , rootAbs = absPath
+            , rootCanonical = dropTrailingSeparators canonical
+            }
 
 -- | Set the watch root of the event and the path relative to it. If the event
 -- path is under more than one root, the longest root is used. If it is not
@@ -453,8 +475,8 @@ setRoot roots ev = do
     let path = dropTrailingSeparators (Path.toString (eventPath ev))
         matches =
             [ (root, rel)
-            | (root, canonical) <- roots
-            , Just rel <- [relativeTo canonical path]
+            | root <- roots
+            , Just rel <- [relativeTo (rootCanonical root) path]
             ]
     -- The shortest relative path belongs to the longest root
     case listToMaybe (sortOn (length . snd) matches) of
@@ -464,7 +486,12 @@ setRoot roots ev = do
                 if null rel
                 then return Nothing
                 else Just <$> Path.fromString rel
-            return ev {eventRoot = Just root, eventRelPath = relPath}
+            return
+                ev
+                    { eventRoot = Just (rootPath root)
+                    , eventAbsRoot = Just (rootAbs root)
+                    , eventRelPath = relPath
+                    }
 
     where
 
@@ -562,6 +589,7 @@ parseRecord arr
                             , eventFlags = fromIntegral hdrEventFlags
                             , eventPath = Path.unsafeFromArray path
                             , eventRoot = Nothing
+                            , eventAbsRoot = Nothing
                             , eventRelPath = Nothing
                             }
             return (Just (rec, rest))
@@ -713,7 +741,7 @@ setRoots name Watch{..} gen roots =
                     SinceId eid ->
                         let full = kFSEventStreamCreateFlagFullHistory
                         in return (eid, flags .|. full)
-            h <- withPathNames (map fst roots) $ \arraysPtr ->
+            h <- withPathNames (map rootAbs roots) $ \arraysPtr ->
                     c_startStream
                         watchPtr arraysPtr (fromIntegral (length roots))
                         gen sinceId flags1
@@ -742,7 +770,9 @@ deleteGen :: Gen -> [(Gen, a)] -> [(Gen, a)]
 deleteGen gen = filter ((/= gen) . fst)
 
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
--- @watch@, with the 'Config' used to open the watch.
+-- @watch@, with the 'Config' used to open the watch. A relative @root@ is
+-- relative to the working directory at the time of the call, a later change
+-- of the working directory does not affect the watch.
 --
 -- The events of @root@ that occur before 'addRoot' returns may not be
 -- reported. The events of the other roots of the watch are not lost or
@@ -798,7 +828,8 @@ removeRoot :: Watch -> Path -> IO ()
 removeRoot wtch@Watch{..} root =
     modifyMVar_ watchRootLock $ \st -> do
         let name = Path.toString root
-            roots = filter ((/= name) . Path.toString . fst) (rsRoots st)
+            roots =
+                filter ((/= name) . Path.toString . rootPath) (rsRoots st)
             gen = rsGen st + 1
         if rsClosed st || length roots == length (rsRoots st)
         then return st
@@ -1185,22 +1216,23 @@ getRoot Event{..} = fromMaybe eventPath eventRoot
 getRelPath :: Event -> Maybe Path
 getRelPath Event{..} = eventRelPath
 
--- | Get the file system object path for which the event is generated, the
--- 'getRoot' path joined with the 'getRelPath' path.
+-- | Get the absolute file system object path for which the event is
+-- generated.
 --
--- The path is absolute when the watch root was supplied as an absolute path.
--- For a relative watch root it is relative, to the current directory at the
--- time the watch was started.
+-- If the watch root was supplied as a relative path, it is taken relative to
+-- the working directory at the time the root was added to the watch.
 --
 -- When the watch root is a symlink, the path returned is via the original
 -- symlink and not through the resolved path.
 --
--- If the event is for the watch root then this is the same as 'getRoot'.
+-- If the event is for the watch root, and the root was supplied as an
+-- absolute path, this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
-getAbsPath ev =
-    case getRelPath ev of
-        Just relPath -> Path.join (getRoot ev) relPath
-        Nothing -> getRoot ev
+getAbsPath Event{..} =
+    case eventAbsRoot of
+        -- The event path is not under any watch root
+        Nothing -> eventPath
+        Just root -> maybe root (Path.join root) eventRelPath
 
 -------------------------------------------------------------------------------
 -- Event types

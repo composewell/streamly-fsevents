@@ -72,6 +72,7 @@ import Control.Concurrent.MVar
 import Control.Exception (IOException, onException, try)
 import Control.Monad (unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
+import Data.Char (isAlpha, isAscii)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
@@ -102,6 +103,7 @@ import System.Win32.File
     , fILE_SHARE_WRITE
     , oPEN_EXISTING
     )
+import System.Win32.Info (getFullPathName)
 import System.Win32.Types
     ( BOOL
     , DWORD
@@ -258,7 +260,8 @@ getConfigRecMode Config{..} = watchRec
 data Event = Event
     { eventFlags :: DWORD
     , eventRelPath :: Path
-    , eventRootPath :: Path
+    , eventRootPath :: Path -- ^ The watch root as supplied
+    , eventAbsRootPath :: Path -- ^ The absolute path of the watch root
     , totalBytes :: DWORD
     }
 
@@ -395,21 +398,24 @@ peekFNI buf = do
     let fnam = Path.unsafeFromArray (Array.unsafeCast fnam0)
     return $ FILE_NOTIFY_INFORMATION neof acti fnam
 
+-- | The events of the records of a read. The paths are the root as supplied
+-- and its absolute path.
 readChangeEvents ::
-    Ptr FILE_NOTIFY_INFORMATION -> Path -> DWORD -> IO [Event]
-readChangeEvents pfni root bytesRet = do
+    Ptr FILE_NOTIFY_INFORMATION -> Path -> Path -> DWORD -> IO [Event]
+readChangeEvents pfni root absRoot bytesRet = do
     fni <- peekFNI pfni
     let entry = Event
             { eventFlags = fniAction fni
             , eventRelPath = fniFileName fni
             , eventRootPath = root
+            , eventAbsRootPath = absRoot
             , totalBytes = bytesRet
             }
         nioff = fromEnum $ fniNextEntryOffset fni
     entries <-
         if nioff == 0
         then return []
-        else readChangeEvents (pfni `plusPtr` nioff) root bytesRet
+        else readChangeEvents (pfni `plusPtr` nioff) root absRoot bytesRet
     return $ entry : entries
 
 -- XXX Try to get these from windows header files
@@ -433,24 +439,26 @@ fILE_ACTION_RENAMED_NEW_NAME  =  5
 -- | The event reported when the watch root has been deleted. 'totalBytes' 0
 -- and 'eventFlags' 'fILE_ACTION_REMOVED' identify it. 'eventRelPath' is a
 -- placeholder, 'getRelPath' returns 'Nothing'.
-rootDeletedEvent :: Path -> Event
-rootDeletedEvent root =
+rootDeletedEvent :: Path -> Path -> Event
+rootDeletedEvent root absRoot =
     Event
         { eventFlags = fILE_ACTION_REMOVED
         , eventRelPath = root
         , eventRootPath = root
+        , eventAbsRootPath = absRoot
         , totalBytes = 0
         }
 
 -- | The event reported when the changes were lost. 'totalBytes' 0 and
 -- 'eventFlags' 0 identify it. 'eventRelPath' is a placeholder, 'getRelPath'
 -- returns 'Nothing'.
-eventsLostEvent :: Path -> Event
-eventsLostEvent root =
+eventsLostEvent :: Path -> Path -> Event
+eventsLostEvent root absRoot =
     Event
         { eventFlags = 0
         , eventRelPath = root
         , eventRootPath = root
+        , eventAbsRootPath = absRoot
         , totalBytes = 0
         }
 
@@ -500,6 +508,8 @@ maxQueued = 1024
 -- | A root of a watch.
 data Root = Root
     { rootPath :: Path -- ^ As supplied by the user
+      -- | The absolute path of the root, see 'toAbsolute'
+    , rootAbsPath :: Path
     , rootHandle :: HANDLE
       -- | 'overlappedSize' bytes for the OVERLAPPED structure followed by
       -- 'changeBufferSize' bytes for the changes. The system writes to it
@@ -603,9 +613,12 @@ outcomeItems Root{..} outcome =
     case outcome of
         Changes n ->
             let buf = castPtr (rootMem `plusPtr` overlappedSize)
-             in map ItemEvent <$> readChangeEvents buf rootPath n
-        ChangesLost -> return [ItemEvent (eventsLostEvent rootPath)]
-        RootDeleted -> return [ItemEvent (rootDeletedEvent rootPath)]
+             in map ItemEvent
+                    <$> readChangeEvents buf rootPath rootAbsPath n
+        ChangesLost ->
+            return [ItemEvent (eventsLostEvent rootPath rootAbsPath)]
+        RootDeleted ->
+            return [ItemEvent (rootDeletedEvent rootPath rootAbsPath)]
         ReadFailed e -> return [ItemFailed e]
 
 -- | Add the items to the event queue of the watch. Wait while the queue
@@ -810,9 +823,38 @@ createWatch cfg = do
     void $ forkIO (pumpEvents w)
     return w
 
+-- | Whether the path starts with a drive followed by a separator, or with
+-- two separators. Such a path does not depend on the current directory or
+-- the current drive. For example, @C:\\dir@ and @\\\\server\\share@ are
+-- fully qualified, @dir@, @\\dir@ and @C:dir@ are not.
+isFullyQualified :: String -> Bool
+isFullyQualified str =
+    case str of
+        a : b : _ | isSep a && isSep b -> True
+        d : ':' : c : _ -> isAscii d && isAlpha d && isSep c
+        _ -> False
+
+    where
+
+    isSep c = c == '\\' || c == '/'
+
+-- | The absolute path of a root. A path that is not fully qualified is
+-- resolved against the current directory, symbolic links are not resolved.
+toAbsolute :: Path -> IO Path
+toAbsolute path
+    | isFullyQualified str = return path
+    -- The path is returned by the system, do not validate it, see 'peekFNI'.
+    | otherwise = Path.unsafeFromString <$> getFullPathName str
+
+    where
+
+    str = Path.toString path
+
 -- | @addRoot watch root@ adds the directory @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. The root is watched
--- when the call returns: a change made after it is reported.
+-- when the call returns: a change made after it is reported. A relative
+-- @root@ is relative to the current directory at the time of the call, a
+-- later change of the current directory does not affect the watch.
 --
 -- A directory added more than once, via the same path or via different
 -- roots, reports its events once for each root.
@@ -830,13 +872,20 @@ addRoot Watch{..} root =
         when (rsClosed rs)
             $ ioError (userError "addRoot: the watch is closed.")
         let key = rsNextKey rs
+        absRoot <- toAbsolute root
         h <- openDirHandle root
         flip onException (closeQuietly h) $ do
             port <- c_CreateIoCompletionPort h watchPort key 0
             when (port == nullPtr)
                 $ getLastError >>= failWith "CreateIoCompletionPort"
             mem <- mallocBytes (overlappedSize + changeBufferSize)
-            let r = Root {rootPath = root, rootHandle = h, rootMem = mem}
+            let r =
+                    Root
+                        { rootPath = root
+                        , rootAbsPath = absRoot
+                        , rootHandle = h
+                        , rootMem = mem
+                        }
             res <- startRead watchConfig r
             case res of
                 Nothing -> return ()
@@ -1055,16 +1104,22 @@ getRoot Event{..} = eventRootPath
 
 -- | Get the absolute file system object path for which the event is generated.
 --
+-- If the watch root was supplied as a relative path, it is taken relative to
+-- the current directory at the time the root was added to the watch.
+--
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
+--
+-- If the event is for the watch root, and the root was supplied as an
+-- absolute path, this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
-getAbsPath ev =
+getAbsPath ev@Event{..} =
     case getRelPath ev of
         -- The path is relative to the root as reported by the system.
         -- Path.join raises an exception if the path starts with a letter
         -- and a colon, e.g. a stream "a:s" of a file named "a".
-        Just relPath -> Path.unsafeJoin (getRoot ev) relPath
-        Nothing -> getRoot ev
+        Just relPath -> Path.unsafeJoin eventAbsRootPath relPath
+        Nothing -> eventAbsRootPath
 
 -- XXX need to document the exact semantics of these.
 --

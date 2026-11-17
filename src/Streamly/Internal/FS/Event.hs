@@ -224,6 +224,9 @@ eventStream = Event.eventStream
 -- the call returns may not be reported. Raise an exception if the watch is
 -- closed.
 --
+-- A relative path is relative to the working directory at the time of the
+-- call, a later change of the working directory does not affect the watch.
+--
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call. On macOS this does not hold on a volume that does not keep a
 -- history of file system events, e.g. a read-only or a network volume: the
@@ -284,10 +287,16 @@ getRelPath = Event.getRelPath
 -- | Get the absolute path of the file system object for which the event is
 -- generated.
 --
+-- If the watch root was supplied as a relative path, it is taken relative to
+-- the working directory at the time the watch was started. The 'getRoot' path
+-- joined with the 'getRelPath' path gives the path relative to that
+-- directory.
+--
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
 --
--- If the event is for the watch root then this is the same as 'getRoot'.
+-- If the event is for the watch root then this is the absolute path of the
+-- watch root.
 --
 -- For an 'isEventsLost' event, this gives the path whose tree has to be
 -- scanned again.

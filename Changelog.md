@@ -18,6 +18,10 @@
   `isEventsLost` and ends. Earlier the stream continued, but events could be
   missing without any indication. To continue, open a new watch and scan the
   tree again.
+- `getAbsPath` returns an absolute path when a watch root is supplied as a
+  relative path. Earlier it returned the relative path. The root is taken
+  relative to the working directory at the time the watch is started. Use
+  `getRoot` and `getRelPath` to get the relative path.
 - Users of the `Streamly.Internal.FS.Event.*` modules should move to the new
   public platform specific modules. In these, the Linux `setUnwatchMoved` is
   renamed to `setExcludeUnlinked`, and the Windows `getRelPath` returns
@@ -52,6 +56,8 @@
   subdirectory without read permission is skipped and reported by
   `isAccessDenied`, instead of ending the watch with an exception. Watching
   a large tree no longer overflows the event queue at the start.
+- Linux: a recursive watch on a relative path keeps watching the new
+  directories after the working directory of the process changes.
 - macOS: raise an exception when a watch fails to start.
 - macOS: closing a watch no longer hangs or crashes the process.
 - Windows: a watched directory can be deleted or renamed while it is

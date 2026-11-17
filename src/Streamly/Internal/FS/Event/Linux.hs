@@ -124,7 +124,9 @@ import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
 import Data.IntSet (IntSet)
 import Data.IORef
-    (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+    ( IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef
+    , writeIORef
+    )
 import Data.List (find, isPrefixOf)
 #if !(MIN_VERSION_base(4,20,0))
 import Data.List (foldl')
@@ -137,8 +139,8 @@ import Data.Semigroup (Semigroup(..))
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
     ( Errno(..), eACCES, eAGAIN, eINTR, eINVAL, eLOOP, eNOENT, eNOTDIR, ePERM
-    , eWOULDBLOCK, errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
-    , throwErrnoIfMinus1_
+    , eRANGE, eWOULDBLOCK, errnoToIOError, getErrno, throwErrno
+    , throwErrnoIfMinus1, throwErrnoIfMinus1_
     )
 #if defined(CABAL_OS_FREEBSD)
 import Foreign.C.Error (eEXIST, eMLINK)
@@ -766,15 +768,27 @@ scanFlags cfg@Config{..} =
 -- Path representation for events
 -------------------------------------------------------------------------------
 
+-- | A watch root. 'rootPath' is the path supplied by the user, 'getRoot'
+-- reports it and 'removeRoot' takes it. 'rootAbs' is the absolute path of
+-- the root: a relative 'rootPath' joined to the working directory at the time
+-- the root was added. The system calls use 'rootAbs', a later change of the
+-- working directory does not change the directory they refer to. For a root
+-- supplied as an absolute path both are the same 'Path'.
+data Root = Root
+    { rootPath :: !Path
+    , rootAbs :: !Path
+    }
+
 type PathRep =
-    ( Path       -- Absolute path of the watch root
+    ( Root       -- The watch root
     , Maybe Path -- Path of subdir relative to watch root
     )
 
+-- | The absolute path of a 'PathRep', for the system calls.
 {-# INLINE combinePathRep #-}
 combinePathRep :: PathRep -> Path
-combinePathRep (root, Nothing) = root
-combinePathRep (root, Just sub) = Path.join root sub
+combinePathRep (root, Nothing) = rootAbs root
+combinePathRep (root, Just sub) = Path.join (rootAbs root) sub
 
 {-# INLINE addSub #-}
 addSub :: PathRep -> Path -> PathRep
@@ -782,7 +796,7 @@ addSub (root, Nothing) sub = (root, Just sub)
 addSub (root, Just sub0) sub1 = (root, Just (Path.join sub0 sub1))
 
 {-# INLINE getRepRoot #-}
-getRepRoot :: PathRep -> Path
+getRepRoot :: PathRep -> Root
 getRepRoot = fst
 
 {-# INLINE getRepSub #-}
@@ -794,15 +808,30 @@ getRepSub = snd
 eqPath :: Path -> Path -> Bool
 eqPath p1 p2 = Path.toArray p1 == Path.toArray p2
 
+-- | Two roots are the same if both their paths are equal. The same relative
+-- path added from two different working directories gives two roots.
+eqRoot :: Root -> Root -> Bool
+eqRoot r1 r2 =
+    eqPath (rootPath r1) (rootPath r2) && eqPath (rootAbs r1) (rootAbs r2)
+
+compareRoot :: Root -> Root -> Ordering
+compareRoot r1 r2 =
+    compare (Path.toArray (rootPath r1)) (Path.toArray (rootPath r2))
+        <> compare (Path.toArray (rootAbs r1)) (Path.toArray (rootAbs r2))
+
+-- | Whether the two paths are under the same root.
+isSameRoot :: PathRep -> PathRep -> Bool
+isSameRoot p1 p2 = eqRoot (getRepRoot p1) (getRepRoot p2)
+
 eqPathRep :: PathRep -> PathRep -> Bool
 eqPathRep (r1, s1) (r2, s2) =
-    eqPath r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
+    eqRoot r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
 
 -- | @isInSubtree dir pRep@ is 'True' if @pRep@ is the subdirectory @dir@ of a
 -- root or a path under it, via the same root.
 isInSubtree :: PathRep -> PathRep -> Bool
 isInSubtree (r1, Just s1) (r2, Just s2) =
-    eqPath r1 r2 && (b2 == b1 || (b1 ++ [sep]) `isPrefixOf` b2)
+    eqRoot r1 r2 && (b2 == b1 || (b1 ++ [sep]) `isPrefixOf` b2)
 
     where
 
@@ -908,7 +937,7 @@ newtype PathKey = PathKey PathRep
 #endif
 comparePathKey :: PathKey -> PathKey -> Ordering
 comparePathKey (PathKey (r1, s1)) (PathKey (r2, s2)) =
-    compareSub s1 s2 <> compare (Path.toArray r1) (Path.toArray r2)
+    compareSub s1 s2 <> compareRoot r1 r2
 
 instance Eq PathKey where
     a == b = comparePathKey a b == EQ
@@ -1116,7 +1145,8 @@ data Event = Event
    { eventWd :: CInt
    , eventFlags :: Word32
    , eventCookie :: Word32
-   , eventRoot :: Path
+   , eventRoot :: Path -- ^ The watch root as supplied
+   , eventAbsRoot :: Path -- ^ The absolute path of the watch root
    , eventRelPath :: Maybe Path
    , eventScanned :: Bool
    }
@@ -1396,10 +1426,12 @@ openDirAt mode flags parent pRep =
             A.asCStringUnsafe (Path.toArray name) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 pfd ptr subFlags
         (_, (root, Just sub))
-            | mode == o_PATH -> openSubdir root sub
-            | otherwise -> bracket (openSubdir root sub) c_close (openDot pRep)
+            | mode == o_PATH -> openSubdir (rootAbs root) sub
+            | otherwise ->
+                bracket
+                    (openSubdir (rootAbs root) sub) c_close (openDot pRep)
         (_, (root, Nothing)) ->
-            A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+            A.asCStringUnsafe (Path.toArray (rootAbs root)) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 aT_FDCWD ptr rootFlags
 
     where
@@ -1980,9 +2012,49 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
             $ addToWatchAt
                 (subdirConfig cfg) watch0 (level + 1) subParent sub
 
+foreign import ccall unsafe "unistd.h getcwd"
+    c_getcwd :: Ptr Word8 -> CSize -> IO (Ptr Word8)
+
+foreign import ccall unsafe "string.h strlen"
+    c_strlen :: Ptr Word8 -> IO CSize
+
+-- | The current working directory of the process.
+getWorkingDir :: IO Path
+getWorkingDir = go 4096
+
+    where
+
+    -- getcwd fails with ERANGE if the buffer is too small for the path.
+    go size = do
+        failed <- newIORef False
+        arr <-
+            MArray.unsafeCreateWithPtr' size $ \p -> do
+                r <- c_getcwd p (fromIntegral size)
+                if r /= nullPtr
+                then fromIntegral <$> c_strlen p
+                else do
+                    errno <- getErrno
+                    when (errno /= eRANGE) $ throwErrno "getcwd"
+                    writeIORef failed True
+                    return 0
+        tooSmall <- readIORef failed
+        if tooSmall
+        then go (size * 2)
+        else return (Path.unsafeFromArray (unsafeFreezeWithShrink arr))
+
+-- | The 'Root' of a path supplied by the user. A relative path is resolved
+-- against the current working directory, symbolic links are not resolved.
+makeRoot :: Path -> IO Root
+makeRoot path
+    | Path.isRooted path = return (Root path path)
+    | otherwise = do
+        cwd <- getWorkingDir
+        return (Root path (Path.join cwd path))
+
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
--- @watch@, with the 'Config' used to open the watch. @root@ must be an
--- absolute path.
+-- @watch@, with the 'Config' used to open the watch. A relative @root@ is
+-- relative to the working directory at the time of the call, a later change
+-- of the working directory does not affect the watch.
 --
 -- If the same directory is added via two different roots, for example, a
 -- recursive root and a root inside it, its events are reported once for each
@@ -1995,7 +2067,8 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
 -- /Pre-release/
 --
 addRoot :: Watch -> Path -> IO ()
-addRoot wtch@Watch {watchConfig = cfg} root = do
+addRoot wtch@Watch {watchConfig = cfg} path = do
+    root <- makeRoot path
     denied <- addToWatchAt cfg wtch 0 Nothing (root, Nothing)
     recordSynthEvents wtch (map SynthDenied denied)
 
@@ -2544,7 +2617,7 @@ removeRoot wtch root = do
     removed <-
         unwatchPaths
             wtch (show (Path.toString root)) allWds
-            (eqPath root . getRepRoot)
+            (eqPath root . rootPath . getRepRoot)
     recordSynthEvents wtch (map (uncurry SynthUnwatched) removed)
 
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
@@ -2665,14 +2738,10 @@ unwatchGoneRoots cfg wtch roots = do
     results <- mapM (\root -> (,) (snd root) <$> isRootAt cfg wtch root) roots
     let kept = [root | (root, True) <- results]
         gone = [root | (root, False) <- results]
-        isGone p = any (isUnder p) gone && not (any (isUnder p) kept)
+        isGone p = any (isSameRoot p) gone && not (any (isSameRoot p) kept)
     if null gone
     then return []
     else unwatchPaths wtch "unwatchGoneRoots" allWds isGone
-
-    where
-
-    isUnder p root = eqPath (getRepRoot p) (getRepRoot root)
 
 -- | Remove a directory and the tree under it from the watch. Returns the
 -- paths removed without a marker, see 'unwatchPaths'.
@@ -2961,8 +3030,7 @@ movedInDir ::
     -> IO ([WdUnwatched], Stream IO ScanItem)
 movedInDir cfg wtch@Watch {watchWdMap = wdMapRef} cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
-    let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
-        sameRootFrom to = find (isSameRoot to . snd) froms
+    let sameRootFrom to = find (isSameRoot to . snd) froms
         movedOut = filter (\f -> not (any (isSameRoot (snd f)) paths)) froms
         movedIn = filter (isNothing . sameRootFrom) paths
         acrossRoots = zip movedIn movedOut
@@ -2985,7 +3053,8 @@ mkSynth wd flags (root, sub) =
         { eventWd = wd
         , eventFlags = flags
         , eventCookie = 0
-        , eventRoot = root
+        , eventRoot = rootPath root
+        , eventAbsRoot = rootAbs root
         , eventRelPath = sub
         , eventScanned = False
         }
@@ -3249,7 +3318,8 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                 { eventWd = wd
                 , eventFlags = eflags
                 , eventCookie = cookie
-                , eventRoot = root
+                , eventRoot = rootPath root
+                , eventAbsRoot = rootAbs root
                 , eventRelPath = rel
                 , eventScanned = False
                 }
@@ -3716,7 +3786,8 @@ watch = watchWith id
 -- Examine event stream
 -------------------------------------------------------------------------------
 
--- | Get the watch root corresponding to the 'Event'.
+-- | Get the watch root corresponding to the 'Event', as it was supplied to
+-- the watch API.
 --
 -- If a directory is watched via more than one root, for example, a recursive
 -- root and a root inside it, its events are reported once for each root.
@@ -3744,15 +3815,19 @@ getRelPath Event{..} = eventRelPath
 
 -- | Get the absolute file system object path for which the event is generated.
 --
+-- If the watch root was supplied as a relative path, it is taken relative to
+-- the working directory at the time the root was added to the watch.
+--
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
 --
--- If the event is for the watch root this is the same as 'getRoot'.
+-- If the event is for the watch root, and the root was supplied as an
+-- absolute path, this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
-getAbsPath ev =
-    case getRelPath ev of
-        Just relPath -> Path.join (getRoot ev) relPath
-        Nothing -> getRoot ev
+getAbsPath Event{..} =
+    case eventRelPath of
+        Just relPath -> Path.join eventAbsRoot relPath
+        Nothing -> eventAbsRoot
 
 -- XXX should we use a Maybe?
 -- | Cookie is set when a rename occurs. The cookie value can be used to

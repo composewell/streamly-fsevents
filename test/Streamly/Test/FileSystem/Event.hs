@@ -37,8 +37,10 @@ import System.Directory
     ( createDirectory
     , createDirectoryLink
     , createFileLink
+    , getCurrentDirectory
     , removeDirectory
     , renameDirectory
+    , setCurrentDirectory
     )
 import System.FilePath ((</>), pathSeparator, takeDirectory)
 #if defined(CABAL_OS_DARWIN)
@@ -383,6 +385,47 @@ eventPaths =
             rootPath ev `shouldBe` root
             relPath ev `shouldBe` Just ("sub" </> "file")
             absPath ev `shouldBe` root </> "sub" </> "file"
+
+-- | Watch the relative path @root@ recursively. The watch is opened with a
+-- temporary directory as the working directory, the action gets the
+-- absolute path of that directory as the system reports it. The working
+-- directory is restored when the action ends.
+withRelativeRoot :: (FilePath -> Event.Watch -> IO a) -> IO a
+withRelativeRoot action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        createDirectory (fp </> "root")
+        r <- Path.fromString "root"
+        orig <- getCurrentDirectory
+        flip finally (setCurrentDirectory orig) $ do
+            setCurrentDirectory fp
+            cwd <- getCurrentDirectory
+            bracket
+                (Event.openWatch (recursive . allEvents) (r NonEmpty.:| []))
+                Event.closeWatch
+                (action cwd)
+
+isCreatedRel :: FilePath -> Event -> Bool
+isCreatedRel rel ev = Event.isCreated ev && relPath ev == Just rel
+
+-- On Linux the watch of a new directory is added when its create event is
+-- read, the file is created after that.
+relativeRoot :: Spec
+relativeRoot = do
+    it "a relative root is watched after the working directory changes"
+        $ withRelativeRoot $ \cwd w -> do
+            let dir = cwd </> "root" </> "dir"
+            setCurrentDirectory (takeDirectory cwd)
+            createDirectory dir
+            _ <- readUntil (isCreatedRel "dir") w
+            createFile (dir </> "file")
+            evs <- readUntil (isCreatedRel ("dir" </> "file")) w
+            rootPath (last evs) `shouldBe` "root"
+    it "getAbsPath is absolute for a relative root"
+        $ withRelativeRoot $ \cwd w -> do
+            createFile (cwd </> "root" </> "file")
+            evs <- readUntil (isCreatedRel "file") w
+            rootPath (last evs) `shouldBe` "root"
+            absPath (last evs) `shouldBe` cwd </> "root" </> "file"
 
 -------------------------------------------------------------------------------
 -- Recursive mode
@@ -1753,6 +1796,7 @@ watchTests =
             describe "watch roots" $ do
                 manyRoots
                 eventPaths
+                relativeRoot
             describe "overlapping roots" $ do
                 overlapRemoveInner
                 renameOutOfInnerRoot
