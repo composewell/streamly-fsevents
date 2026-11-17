@@ -198,7 +198,7 @@ watchRecursive = Event.watchRecursive
 -- must be linked with the threaded RTS.
 --
 openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
-openWatch f = Event.openWatch (f Event.defaultConfig)
+openWatch = Event.openWatch
 
 -- | Close a watch. The streams reading the watch end, a thread waiting in
 -- 'readEvent' returns 'Nothing'. Closing a closed watch does nothing. Can be

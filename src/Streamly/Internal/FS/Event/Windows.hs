@@ -930,10 +930,11 @@ removeRoot Watch{..} root =
     name = Path.toString root
     isRoot = (== name) . Path.toString . rootPath
 
--- | Given a 'Config' and @paths@ start monitoring the directories for file
--- system events. Returns a 'Watch' handle which can then be used to read
--- the event stream or to close the watch. The watch is active when the call
--- returns: a change made after it is reported.
+-- | Start monitoring the directories @paths@ for file system events, with
+-- the supplied modifications applied to the 'defaultConfig'. Returns a
+-- 'Watch' handle which can then be used to read the event stream or to close
+-- the watch. The watch is active when the call returns: a change made after
+-- it is reported.
 --
 -- The 'Config' is kept in the 'Watch', 'addRoot' uses it.
 --
@@ -950,13 +951,13 @@ removeRoot Watch{..} root =
 --
 -- /Pre-release/
 --
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch cfg paths = do
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
+openWatch f paths = do
     checkThreadedRTS
     -- The handle is not returned to the caller if adding a root fails, the
     -- caller cannot close it.
     Exception.mask_ $ do
-        w <- createWatch cfg
+        w <- createWatch (f defaultConfig)
         mapM_ (addRoot w) (NonEmpty.toList paths) `onException` closeWatch w
         return w
 
@@ -1080,7 +1081,7 @@ watchWith f paths = S.bracketIO before closeWatch events
 
     where
 
-    before = openWatch (f defaultConfig) paths
+    before = openWatch f paths
 
     -- The state is the number of roots that are not deleted
     step _ 0 = return Nothing

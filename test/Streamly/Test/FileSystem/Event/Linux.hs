@@ -166,7 +166,7 @@ withTwoRoots action =
         createDirectory root2
         roots <- mapM Path.fromString [root1, root2]
         bracket
-            (Event.openWatch watchCfg (NonEmpty.fromList roots))
+            (Event.openWatch (const watchCfg) (NonEmpty.fromList roots))
             Event.closeWatch
             (action root1 root2)
 
@@ -284,7 +284,7 @@ withNestedRoots action =
         createDirectory sub
         roots <- mapM Path.fromString [root, sub]
         bracket
-            (Event.openWatch recCfg (NonEmpty.fromList roots))
+            (Event.openWatch (const recCfg) (NonEmpty.fromList roots))
             Event.closeWatch
             (action root sub)
 
@@ -412,7 +412,7 @@ duplicateRoot =
             createDirectory root
             r <- Path.fromString root
             bracket
-                (Event.openWatch watchCfg (r NonEmpty.:| [r]))
+                (Event.openWatch (const watchCfg) (r NonEmpty.:| [r]))
                 Event.closeWatch
                 $ \w -> do
                     createFile file
@@ -434,7 +434,7 @@ withRoot cfg action =
         createDirectory root
         r <- Path.fromString root
         bracket
-            (Event.openWatch cfg (r NonEmpty.:| []))
+            (Event.openWatch (const cfg) (r NonEmpty.:| []))
             Event.closeWatch
             (action root)
 
@@ -476,7 +476,7 @@ recRootSymlinkNoFollow =
             createDirectoryLink target link
             roots <- mapM Path.fromString [link, other]
             bracket
-                (Event.openWatch cfg (NonEmpty.fromList roots))
+                (Event.openWatch (const cfg) (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
                     createFile (sub </> "file")
@@ -640,7 +640,7 @@ rootHardLinkRenamed =
             createLink f g
             roots <- mapM Path.fromString [f, g]
             bracket
-                (Event.openWatch watchCfg (NonEmpty.fromList roots))
+                (Event.openWatch (const watchCfg) (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
                     evs <- renameRootUntil f f w
@@ -922,7 +922,7 @@ recRenameDuringScan =
             subPath <- Path.fromString sub
             done <- newEmptyMVar
             bracket
-                (Event.openWatch watchCfg (subPath NonEmpty.:| []))
+                (Event.openWatch (const watchCfg) (subPath NonEmpty.:| []))
                 Event.closeWatch
                 $ \w1 -> do
                     _ <- forkIO
@@ -986,7 +986,10 @@ openWatchNoLeak =
             createDirectory root
             roots <- mapM Path.fromString [root, fp </> "missing"]
             fds <- inotifyFds
-            r <- try (Event.openWatch watchCfg (NonEmpty.fromList roots))
+            r <-
+                try
+                    $ Event.openWatch
+                        (const watchCfg) (NonEmpty.fromList roots)
             case r of
                 Left (_ :: IOException) -> return ()
                 Right w -> do
@@ -1183,7 +1186,7 @@ withDeepRoot action =
         r <- Path.fromString root
         withFdLimit deepFdLimit
             $ bracket
-                (Event.openWatch recCfg (r NonEmpty.:| []))
+                (Event.openWatch (const recCfg) (r NonEmpty.:| []))
                 Event.closeWatch
                 (\w -> action root w (root </> last dirs </> "new"))
 
@@ -1231,7 +1234,7 @@ removeFailRetry =
             createDirectoryLink root link
             roots <- mapM Path.fromString [root, link]
             bracket
-                (Event.openWatch watchCfg (NonEmpty.fromList roots))
+                (Event.openWatch (const watchCfg) (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
                     mapM_ (Event.addRoot w <=< Path.fromString) ["/", "/dev"]
@@ -2215,7 +2218,7 @@ recDeniedAtStart =
                 r <- Path.fromString root
                 withMode mode dir []
                     $ bracket
-                        (Event.openWatch recCfg (r NonEmpty.:| []))
+                        (Event.openWatch (const recCfg) (r NonEmpty.:| []))
                         Event.closeWatch
                     $ \w -> do
                         createFile sentinel
@@ -2325,7 +2328,7 @@ recStartScanSilent =
             createDirectory (root </> "sub")
             p <- Path.fromString root
             bracket
-                (Event.openWatch recCfg (p NonEmpty.:| []))
+                (Event.openWatch (const recCfg) (p NonEmpty.:| []))
                 Event.closeWatch
                 $ \w -> do
                     createFile sentinel
@@ -2343,7 +2346,7 @@ recTouchAfterScan =
             createDirectory sub
             p <- Path.fromString root
             bracket
-                (Event.openWatch recCfg (p NonEmpty.:| []))
+                (Event.openWatch (const recCfg) (p NonEmpty.:| []))
                 Event.closeWatch
                 $ \w -> do
                     _ <- listDirectory sub
@@ -2365,7 +2368,7 @@ overflowEnds mode cfg =
             createDirectory root2
             roots <- mapM Path.fromString [root1, root2]
             bracket
-                (Event.openWatch cfg (NonEmpty.fromList roots))
+                (Event.openWatch (const cfg) (NonEmpty.fromList roots))
                 Event.closeWatch
                 $ \w -> do
                     r <- withOverflow root1 (createFile file)

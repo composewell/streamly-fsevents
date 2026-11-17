@@ -2687,21 +2687,8 @@ closeWatch Watch {watchFd = fd, watchLock = lock} =
                 `catchIOError` \_ -> return ()
             return st {fsWatchClosed = True}
 
--- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
--- monitoring the paths for file system events. Returns a 'Watch' handle which
--- can then be used to read the event stream or to close the watch.
---
--- The 'Config' is kept in the 'Watch', 'readEvent', 'eventStream' and
--- 'addRoot' use it.
---
--- If adding a path fails, the watch is closed and the exception is rethrown.
---
--- /Pre-release/
---
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch = openWatchWith False
-
--- | Like 'openWatch', see 'watchEndsUnwatched' for the 'Bool'.
+-- | Open a watch on the paths with the given 'Config', see
+-- 'watchEndsUnwatched' for the 'Bool'.
 openWatchWith :: Bool -> Config -> NonEmpty Path -> IO Watch
 openWatchWith endsUnwatched cfg paths =
     -- The handle is not returned to the caller if adding a path fails, the
@@ -2712,6 +2699,21 @@ openWatchWith endsUnwatched cfg paths =
         restore (mapM_ (addRoot w) (NonEmpty.toList paths))
             `onException` closeWatch w
         return w
+
+-- | Start monitoring the @paths@ ("/" separated byte arrays) for file system
+-- events, with the supplied modifications applied to the 'defaultConfig'.
+-- Returns a 'Watch' handle which can then be used to read the event stream
+-- or to close the watch.
+--
+-- The 'Config' is kept in the 'Watch', 'readEvent', 'eventStream' and
+-- 'addRoot' use it.
+--
+-- If adding a path fails, the watch is closed and the exception is rethrown.
+--
+-- /Pre-release/
+--
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
+openWatch f = openWatchWith False (f defaultConfig)
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle

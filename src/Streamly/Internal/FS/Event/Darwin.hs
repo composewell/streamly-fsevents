@@ -893,9 +893,9 @@ closeWatch Watch{..} =
 -- events to a POSIX pipe. 'readEvent' reads the events from the read end of
 -- the pipe.
 
--- | Given a 'Config' and @paths@ start monitoring the paths for file system
--- events. Returns a 'Watch' handle which can then be used to read the event
--- stream or to close the watch.
+-- | Start monitoring the @paths@ for file system events, with the supplied
+-- modifications applied to the 'defaultConfig'. Returns a 'Watch' handle
+-- which can then be used to read the event stream or to close the watch.
 --
 -- The 'Config' is kept in the 'Watch', 'readEvent', 'eventStream' and
 -- 'addRoot' use it.
@@ -907,8 +907,8 @@ closeWatch Watch{..} =
 --
 -- /Pre-release/
 --
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch cfg paths = do
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
+openWatch f paths = do
     -- XXX write a test case when path does not exist
     -- XXX write a test case when there are no permissions
     -- XXX check whether the path exists. If the path does not exist and
@@ -921,7 +921,7 @@ openWatch cfg paths = do
     -- exception cannot arrive between creating the watch and installing the
     -- handler.
     Exception.mask $ \restore -> do
-        w <- createWatch cfg
+        w <- createWatch (f defaultConfig)
         let start st = do
                 setRoots "openWatch" w 1 roots
                 return st {rsRoots = roots, rsGen = 1}
@@ -1192,7 +1192,7 @@ watchWith f paths = S.bracketIO before closeWatch eventStream
 
     where
 
-    before = openWatch (f defaultConfig) paths
+    before = openWatch f paths
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --
