@@ -201,8 +201,9 @@ openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
 openWatch = Event.openWatch
 
 -- | Close a watch. The streams reading the watch end, a thread waiting in
--- 'readEvent' returns 'Nothing'. Closing a closed watch does nothing. Can be
--- called from any thread.
+-- 'readEvent' returns 'Nothing'. The events that the watch has already read
+-- from the system can still be returned before that. Closing a closed watch
+-- does nothing. Can be called from any thread.
 --
 closeWatch :: Watch -> IO ()
 closeWatch = Event.closeWatch
