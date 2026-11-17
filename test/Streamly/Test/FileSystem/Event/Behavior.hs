@@ -692,8 +692,7 @@ behaviors =
         , check = const (createdNamed "copy")
         , expected = onPlatform Yes Yes Yes
         }
-    -- On macOS the library assigns an event to the innermost root that
-    -- contains its path. On Windows each root has its own watch.
+    -- A path listed twice is one root.
     --
     -- On macOS a second FSEvents event for the file can also carry the
     -- created flag, it has a different event id. A copy of one event for
@@ -710,7 +709,7 @@ behaviors =
 #else
              in length (filter created evs) == 2
 #endif
-        , expected = onPlatform No No Yes
+        , expected = No
         }
     , base
         { title = "nested roots report a file in the inner root for both"
