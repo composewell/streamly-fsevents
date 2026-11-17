@@ -54,6 +54,11 @@ import System.Directory (getSymbolicLinkTarget, listDirectory)
 import System.Directory (listDirectory)
 #endif
 #if !defined(CABAL_OS_WINDOWS)
+import Data.Bits ((.|.))
+import Data.List.NonEmpty (NonEmpty((:|)))
+import System.IO (IOMode(..), hClose, hPutStr, openFile, withFile)
+import System.Posix.Files
+    (createNamedPipe, ownerReadMode, ownerWriteMode)
 import System.Posix.Process (executeFile, forkProcess, getProcessStatus)
 #endif
 import Test.Hspec
@@ -1442,6 +1447,33 @@ fileRootRaises =
             createdRoots file2 evs `shouldBe` [root]
 #endif
 
+#if !defined(CABAL_OS_WINDOWS)
+-- Opening a FIFO for reading without O_NONBLOCK blocks until it has a
+-- writer, the timeout fails the test if openWatch opens the FIFO that way.
+-- System.IO opens the FIFO with O_NONBLOCK, the reader is opened first, an
+-- open for writing without a reader fails with ENXIO.
+fifoRoot :: Spec
+fifoRoot =
+    it "a FIFO as a root is watched without opening it"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let fifo = fp </> "fifo"
+            createNamedPipe fifo (ownerReadMode .|. ownerWriteMode)
+            p <- Path.fromString fifo
+            let open =
+                    timeout 10000000 (Event.openWatch allEvents (p :| []))
+                        >>= maybe (error "openWatch: timed out") return
+            bracket open Event.closeWatch $ \w ->
+                bracket (openFile fifo ReadMode) hClose $ \_ -> do
+                    withFile fifo WriteMode (`hPutStr` "x")
+                    evs <- readUntil (isModifiedAt fifo) w
+                    map absPath (filter (isModifiedAt fifo) evs)
+                        `shouldBe` [fifo]
+
+    where
+
+    isModifiedAt file ev = Event.isModified ev && absPath ev == file
+#endif
+
 -- The reader thread is blocked reading the watch. The stream ends when the
 -- watch is closed, without any file system event.
 closeWhileReading :: Spec
@@ -1962,6 +1994,9 @@ watchTests =
                 eventPaths
                 relativeRoot
                 normalizedRoots
+#if !defined(CABAL_OS_WINDOWS)
+                fifoRoot
+#endif
                 deletedRootsEndStream
             describe "overlapping roots" $ do
                 overlapRemoveInner
