@@ -555,7 +555,8 @@ behaviors =
     -- The permission is checked when a watch is added, not afterwards. The
     -- Windows outcomes are expected, the tests are skipped in the CI.
     , base
-        { title = "root watched before its read permission is removed"
+        { title =
+            "root reports its events after its read permission is removed"
         , cleanup = allowRead . watchRoot
         , skip = permissionNotRemovable denyRead allowRead
         , ops = \p -> do
@@ -566,7 +567,8 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , base
-        { title = "subdir watched before its read permission is removed"
+        { title =
+            "subdir reports its events after its read permission is removed"
         , config = Event.setRecursiveMode True
         , setup = createDirectory . deniedDir
         , cleanup = allowRead . deniedDir
@@ -609,7 +611,7 @@ behaviors =
         , expected = onPlatform No No Yes
         }
     , base
-        { title = "root watched before it becomes unreachable"
+        { title = "root reports its events after it becomes unreachable"
         , setup = \p -> createFile (watchRoot p </> "file")
         , cleanup = allowAll . watchRoot
         , skip = permissionNotRemovable denyAll allowAll
@@ -622,7 +624,7 @@ behaviors =
         , expected = onPlatform Yes No Yes
         }
     , base
-        { title = "subdir watched before it becomes unreachable"
+        { title = "subdir reports its events after it becomes unreachable"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -643,7 +645,8 @@ behaviors =
     -- change in it, as macOS does. The privilege is disabled before the
     -- watch starts. Expected, not yet observed.
     , base
-        { title = "subdir made unreachable without traverse bypass"
+        { title =
+            "no traverse bypass: subdir reports its events once unreachable"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
