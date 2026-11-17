@@ -1493,8 +1493,17 @@ recScanNewDirSilent =
             filter (isUnder dir) (map getAbsPath evs) `shouldContain` [sub]
             let listed = filter (isUnder dir) (pathsOf isListing (evs ++ evs1))
             filter (/= dir) listed `shouldBe` []
+#if defined(FILESYSTEM_EVENT_FREEBSD)
+            -- The add of the watch of dir reads dir and generates access
+            -- events, on FreeBSD main also an open and a close.
+            let isOpenClose ev = isListing ev && not (Event.isAccessed ev)
+                openClose =
+                    filter (isUnder dir) (pathsOf isOpenClose (evs ++ evs1))
+            length openClose `shouldSatisfy` (`elem` [2 .. 4])
+#else
             -- open, one or two access events that the kernel may merge, close
             length listed `shouldSatisfy` (`elem` [3, 4])
+#endif
 
 -- The flags removed for the scan are restored after it.
 recTouchAfterNewDirScan :: Spec
