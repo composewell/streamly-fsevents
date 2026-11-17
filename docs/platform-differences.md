@@ -160,12 +160,24 @@ On Windows the watch keeps the root open.
 * A root that does not exist: on Linux and Windows the watch raises an
   exception. On macOS the path is watched when it is created.
 * A root without read permission: on Linux the watch raises an exception, on
-  Windows it is expected to, this is not tested. On macOS the events in the
-  root are reported.
-* A subdirectory without read or search permission in a recursive watch: on
-  Linux the subdirectory is not watched and is reported as `isAccessDenied`,
-  the rest of the tree stays watched. On macOS the watch continues. On
-  Windows it is expected to continue, this is not tested.
+  Windows it is expected to, this is not tested. On macOS the watch does not
+  raise an exception. FSEvents reports the events of a directory only to a
+  process that can reach it through the file system permissions, a process
+  running as root receives all events. A root with search permission and
+  without read permission reports its events. A root without any
+  permission is expected to report no events, this is not yet observed.
+* A subdirectory without permission in a recursive watch: on Linux a
+  subdirectory without read or search permission is not watched and is
+  reported as `isAccessDenied`, the rest of the tree stays watched. On macOS
+  the watch continues, and the events of the subdirectory are reported if
+  the process can reach it, as for a root. On Windows the events of the
+  subdirectory are expected to be reported, this is not tested.
+* A permission removed during the watch: Linux checks the permission when
+  the watch of a directory is added, and keeps reporting its events after
+  the permission is removed. Windows is expected to do the same, the
+  permission is checked when the handle of the root is opened. macOS is
+  expected to stop reporting the events of a directory that the process can
+  no longer reach, this is not yet observed.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
 * A FIFO as a root: on Linux the watch reports the events of the FIFO, it
   does not open the FIFO. On macOS it is expected to be watched like a
