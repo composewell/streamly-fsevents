@@ -265,6 +265,25 @@ allowAll path =
 hardLink source link = void $ readProcess "ln" [source, link] ""
 #endif
 
+-- | Why a permission removed from a directory may not apply to the test
+-- process. On Windows the ACL of the directory and the privileges of the
+-- process, an empty string on other platforms.
+permissionDiagnostics :: FilePath -> IO String
+#if defined(CABAL_OS_WINDOWS)
+permissionDiagnostics dir = do
+    acl <- run "icacls" [dir]
+    privs <- run "whoami" ["/priv"]
+    return $ "\nicacls " ++ dir ++ ":\n" ++ acl ++ "\nwhoami /priv:\n" ++ privs
+
+    where
+
+    run cmd args = do
+        r <- try (readProcess cmd args "")
+        return $ either (\(e :: IOException) -> show e) id r
+#else
+permissionDiagnostics _ = return ""
+#endif
+
 -- | @copyFile source copy@. On macOS the copy is a clone of the source.
 --
 -- The copy is created at its path. 'System.Directory.copyFile' is not used,
@@ -973,9 +992,11 @@ behaviors =
 
     stillReadable dir = do
         r <- try (listDirectory dir)
-        return $ case r of
-            Left (_ :: IOException) -> Nothing
-            Right _ -> Just "the permission was not removed"
+        case r of
+            Left (_ :: IOException) -> return Nothing
+            Right _ ->
+                Just . ("the permission was not removed" ++)
+                    <$> permissionDiagnostics dir
 
     -- The permission is removed by 'ops', after the watch starts. The probe
     -- directory is not watched.
