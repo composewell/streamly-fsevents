@@ -79,6 +79,11 @@ jobs:
           pkg install -y bash
           pkg install -y git
           pkg install -y gmp
+          # The ghcup and GHC binaries are built on FreeBSD 14 and need
+          # its shared libraries (e.g. libutil.so.9) on FreeBSD 15.
+          case "$(freebsd-version)" in
+            15.*) pkg install -y compat14x ;;
+          esac
         run: |
           sysctl vfs.inotify || true
           # Diagnostics: a port may install a sys/inotify.h in
