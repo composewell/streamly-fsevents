@@ -54,15 +54,11 @@ to test it on Windows. Delete an entry when it is fixed.
 - Volume removed: which error code the read reports.
 - Handle closed externally: the read may return 0 bytes (reported as
   lost events) and the next call fails.
-- `watchWith` ends the stream when it has read the `isDeleted` event of
-  each root. A root removed because its read failed is not counted, if
-  all the other roots are deleted the stream waits forever. Linux ends
-  the stream when no path is watched, the same check would cover this.
 - Not run on Windows: the changes of this branch to `Windows.hs` were
   typechecked on Linux only, with stub `System.Win32` modules. They are
   the absolute path of a relative root (`toAbsolute`), the item put back
-  in the queue by an interrupted read, and a path listed twice watched
-  once.
+  in the queue by an interrupted read, a path listed twice watched once,
+  and the end of the `watchWith` stream when no root is watched.
 - Do alternate data stream names (`file:stream`) show up in events?
 - Does `Path.fromString` accept `\\?\` or UNC roots?
 - No bounds check of `NextEntryOffset` against the bytes returned.
