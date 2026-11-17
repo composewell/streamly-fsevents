@@ -123,12 +123,16 @@ directory".
 Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
 `sys/kern/vfs_inotify.c`):
 
-| Branch | inotify | `IN_IGNORED` without `IN_DELETE_SELF` |
-|-|-|-|
-| releng/14.4 and earlier, 13.x | no | |
-| releng/14.5, stable/14 | yes | fixed |
-| releng/15.0, releng/15.1 | yes | missing |
-| stable/15, main | yes | fixed |
+| Branch | inotify | `IN_IGNORED` without `IN_DELETE_SELF` | Cookie of `IN_MOVED_FROM` |
+|-|-|-|-|
+| releng/14.4 and earlier, 13.x | no | | |
+| releng/14.5, stable/14 | yes | fixed | fixed |
+| releng/15.0 | yes | missing | missing |
+| releng/15.1 | yes | missing | fixed |
+| stable/15, main | yes | fixed | fixed |
+
+The cookie bug was fixed in main by da8ab13249, "inotify: Avoid resetting
+the cookie".
 
 ### The same as on Linux
 
@@ -249,6 +253,51 @@ Checked in the FreeBSD source repository (`sys/sys/inotify.h` and
    Exceeding the second fails with `ENOSPC`, as on Linux. Each watch keeps
    a reference to its vnode.
 
+10. **The order of the events of a rename.** For `rename(2)` of a
+    directory D from P1 to P2, `INOTIFY_MOVE` in `sys/sys/inotify.h` calls
+    `vn_inotify` twice. The first call queues `IN_MOVE_SELF` on the watch
+    of D, then `IN_MOVED_FROM` on P1. The second call queues `IN_MOVED_TO`
+    on P2. Linux queues `IN_MOVED_FROM`, `IN_MOVED_TO`, then
+    `IN_MOVE_SELF`. The Linux module detects a directory moved out of the
+    tree by an `IN_MOVE_SELF` read for a path that has the cookie of its
+    `IN_MOVED_FROM`. In the FreeBSD order the cookie is not recorded yet
+    when `IN_MOVE_SELF` is read. The directory moved out stayed watched,
+    and its events were reported with the old path.
+
+    `orderMoves` reorders the events of each read before they are handled:
+    an `IN_MOVE_SELF` is moved after the `IN_MOVED_TO` of its rename, or
+    after the `IN_MOVED_FROM` if there is no `IN_MOVED_TO`. Events with a
+    non-zero cookie are matched by the cookie, `IN_MOVE_SELF` has the
+    cookie of the rename. An event with cookie 0 is matched only to the
+    next event. If the last event of a read is `IN_MOVE_SELF` or
+    `IN_MOVED_FROM`, `readEvents` reads the fd again, up to 3 more times,
+    before the events are handled.
+
+    If the `IN_MOVED_TO` is queued after the queue was found empty, the
+    reordered `IN_MOVE_SELF` removes the paths of the directory, and the
+    `IN_MOVED_TO` adds the directory as moved in. The three events are
+    queued in one system call, nanoseconds apart.
+
+11. **Cookie 0 on FreeBSD 15.0.** In releng/15.0 `vn_inotify` sets the
+    cookie to 0 for the `IN_MOVE_SELF` and the `IN_MOVED_FROM` of a
+    renamed object that has a watch in any inotify fd. `IN_MOVED_TO` has
+    the cookie of the rename. In recursive mode every subdirectory is
+    watched, the `IN_MOVED_FROM` and `IN_MOVED_TO` of a rename within the
+    tree did not pair. `fixCookies` gives an `IN_MOVED_FROM` with cookie 0
+    followed by an `IN_MOVED_TO` of the same kind, a directory or not, the
+    cookie of the `IN_MOVED_TO`, and does the same for an `IN_MOVE_SELF`
+    with cookie 0 just before them. The fixed cookie is also the cookie
+    reported to the user. The `IN_MOVED_FROM` of a directory moved out of
+    the tree keeps cookie 0. Documented.
+
+12. **`EMLINK` for a symbolic link.** `open(2)` with `O_NOFOLLOW` fails
+    with `EMLINK` on a symbolic link, Linux fails with `ELOOP`. A root
+    opened with `IN_DONT_FOLLOW`, and a subdirectory replaced by a
+    symbolic link during its scan, raised an exception instead of being
+    treated as not a directory. `isNotSubdirError` includes `EMLINK` on
+    FreeBSD. `inotify_add_watch` with `IN_DONT_FOLLOW` watches the link
+    itself and does not fail.
+
 ## Event mapping
 
 The `Event` type and all the predicates are those of the Linux module;
@@ -272,7 +321,7 @@ is unmounted or the vnode is revoked.
 ## Code organisation
 
 * `src/Streamly/Internal/FS/Event/Linux.hs`: `CABAL_OS_FREEBSD` blocks
-  for differences 1, 2, 6 and 8.
+  for differences 1, 2, 6, 8, 10, 11 and 12.
 * `src/Streamly/Internal/FS/Event/FreeBSD.hs`: new, re-exports the Linux
   module, FreeBSD documentation.
 * `src/Streamly/FileSystem/Event/FreeBSD.hs`: new, the released API, the
