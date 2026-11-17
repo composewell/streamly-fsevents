@@ -41,7 +41,7 @@ import System.Directory
     , renameDirectory
     , setCurrentDirectory
     )
-import System.FilePath ((</>), pathSeparator, takeDirectory)
+import System.FilePath ((</>), normalise, pathSeparator, takeDirectory)
 #if defined(CABAL_OS_DARWIN)
 import System.FilePath (takeFileName)
 #endif
@@ -434,6 +434,41 @@ relativeRoot = do
             rootPath (last evs) `shouldBe` "root"
             absPath (last evs) `shouldBe` cwd </> "root" </> "file"
 
+-- | @normalizedRoot supplied expected@ watches the directory @root@ in a
+-- temporary directory @fp@, via the path @supplied fp@, and checks that
+-- 'Event.getRoot' reports @expected fp@. The working directory is @fp@.
+normalizedRoot ::
+    String -> (FilePath -> FilePath) -> (FilePath -> FilePath) -> Spec
+normalizedRoot title supplied expected =
+    it title
+        $ notOnWindows "getRoot reports the path as supplied"
+        $ withSystemTempDirectory "fsevent_dir" $ \tmp -> do
+            orig <- getCurrentDirectory
+            flip finally (setCurrentDirectory orig) $ do
+                setCurrentDirectory tmp
+                fp <- getCurrentDirectory
+                createDirectory (fp </> "root")
+                path <- Path.fromString (supplied fp)
+                bracket
+                    (Event.openWatch allEvents (path NonEmpty.:| []))
+                    Event.closeWatch
+                    $ \w -> do
+                        skipEarlier [expected fp] w
+                        createFile (fp </> "root" </> "file")
+                        evs <- readUntil (isCreatedRel "file") w
+                        rootPath (last evs) `shouldBe` expected fp
+
+normalizedRoots :: Spec
+normalizedRoots = do
+    normalizedRoot
+        "getRoot reports an absolute root without redundant components"
+        (\fp -> fp ++ "//./root/.")
+        (</> "root")
+    normalizedRoot
+        "getRoot reports a relative root without a leading ./"
+        (const "./root")
+        (const "root")
+
 -- The stream is read by another thread. The watch is open when it reports
 -- a file created in each root, the files are created until it does.
 --
@@ -441,13 +476,16 @@ relativeRoot = do
 -- created again, the stream ends when none of the roots is watched. On
 -- macOS the watch is on the path of a root, the stream does not end.
 --
--- @names@ are the roots given to the watch, a name can be listed twice.
+-- @names@ are the roots given to the watch, a name can be listed twice, or
+-- via two paths that differ only in redundant separators and @.@
+-- components. The first of such paths must be normalized, Windows reports
+-- the root as the first path supplied.
 deletedRootsEnd :: String -> [FilePath] -> Spec
 deletedRootsEnd title names =
     it title
         $ notOnDarwin "the watch of a deleted root continues"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let roots = map (fp </>) (nub names)
+            let roots = nub (map (normalise . (fp </>)) names)
             mapM_ createDirectory roots
             paths <- mapM (Path.fromString . (fp </>)) names
             ref <- newIORef []
@@ -487,6 +525,9 @@ deletedRootsEndStream = do
     deletedRootsEnd
         "the stream ends when a root listed twice is deleted"
         ["root1", "root1"]
+    deletedRootsEnd
+        "the stream ends when a root listed via two equal paths is deleted"
+        ["root1", "." </> "root1"]
 
 -------------------------------------------------------------------------------
 -- Recursive mode
@@ -1896,6 +1937,7 @@ watchTests =
                 manyRoots
                 eventPaths
                 relativeRoot
+                normalizedRoots
                 deletedRootsEndStream
             describe "overlapping roots" $ do
                 overlapRemoveInner
