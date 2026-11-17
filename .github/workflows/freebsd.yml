@@ -73,7 +73,10 @@ jobs:
           CABAL_REINIT_CONFIG CABAL_CHECK_RELAX CABAL_PROJECT CABAL_BUILD_OPTIONS
           DISABLE_BENCH DISABLE_DOCS DISABLE_SDIST_BUILD DISABLE_DIST_CHECKS
           PACKCHECK PACKCHECK_GITHUB_URL PACKCHECK_GITHUB_COMMIT
+        # IGNORE_OSVERSION: the ports repository may have packages built for
+        # a later minor release than the VM, pkg refuses to update then.
         prepare: |
+          export IGNORE_OSVERSION=yes
           pkg update
           pkg install -y gmake
           pkg install -y bash
@@ -81,6 +84,11 @@ jobs:
           pkg install -y gmp
         run: |
           sysctl vfs.inotify || true
+          # Diagnostics: a port may install a sys/inotify.h in
+          # /usr/local/include that shadows the base system header.
+          pkg info | grep -i inotify || true
+          ls -l /usr/local/include/sys/inotify.h || true
+          grep -n MASK_CREATE /usr/include/sys/inotify.h || true
           if test ! -e "$PACKCHECK"
           then
             if test -z "$PACKCHECK_GITHUB_COMMIT"
