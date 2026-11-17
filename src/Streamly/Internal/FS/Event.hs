@@ -242,6 +242,10 @@ eventStream = Event.eventStream
 -- A relative path is relative to the working directory at the time of the
 -- call, a later change of the working directory does not affect the watch.
 --
+-- A path that is already a root of the watch is not added again. Case is
+-- significant in the comparison of the paths, even on a case-insensitive
+-- file system.
+--
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call. On macOS this does not hold on a volume that does not keep a
 -- history of file system events, e.g. a read-only or a network volume: the
@@ -252,8 +256,9 @@ addRoot :: Watch -> Path -> IO ()
 addRoot = Event.addRoot
 
 -- | Remove a root from a watch, the path must be the same as the one used to
--- add it. The events of the root queued before the call are reported. Does
--- nothing if the watch is closed or the path is not a root.
+-- add it, with the same case. The events of the root queued before the call
+-- are reported. Does nothing if the watch is closed or the path is not a
+-- root.
 --
 -- On Linux the end of the events of the root is reported by @isRootUnwatched@
 -- events. On macOS and Windows there is no such event. On macOS the events of

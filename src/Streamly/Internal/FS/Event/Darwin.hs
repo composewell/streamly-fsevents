@@ -789,6 +789,11 @@ deleteGen gen = filter ((/= gen) . fst)
 -- relative to the working directory at the time of the call, a later change
 -- of the working directory does not affect the watch.
 --
+-- A path that is already a root of the watch is not added again. Two paths
+-- are the same if their components are equal, ignoring redundant separators
+-- and @.@ components. Case is significant even on a case-insensitive file
+-- system, @\/tmp\/Foo@ and @\/tmp\/foo@ are two roots.
+--
 -- The events of @root@ that occur before 'addRoot' returns may not be
 -- reported. The events of the other roots of the watch are not lost or
 -- duplicated by the call, except on a volume that does not keep a history
@@ -821,7 +826,7 @@ addRoot wtch@Watch{..} root = do
             return st {rsRoots = roots, rsGen = gen}
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
--- one used to add the root.
+-- one used to add the root, with the same case.
 --
 -- The events of the root that are queued before the call are reported. The
 -- events of the root may still be reported for a short time after the call
