@@ -1452,6 +1452,9 @@ fileRootRaises =
 -- writer, the timeout fails the test if openWatch opens the FIFO that way.
 -- System.IO opens the FIFO with O_NONBLOCK, the reader is opened first, an
 -- open for writing without a reader fails with ENXIO.
+--
+-- FreeBSD 14.5 and 15.0 add the watch but do not report a write to the
+-- FIFO, the test checks that no isModified event arrives in 3 seconds.
 fifoRoot :: Spec
 fifoRoot =
     it "a FIFO as a root is watched without opening it"
@@ -1465,9 +1468,14 @@ fifoRoot =
             bracket open Event.closeWatch $ \w ->
                 bracket (openFile fifo ReadMode) hClose $ \_ -> do
                     withFile fifo WriteMode (`hPutStr` "x")
+#if defined(CABAL_OS_FREEBSD)
+                    r <- timeout 3000000 (readUntil (isModifiedAt fifo) w)
+                    fmap (const ()) r `shouldBe` Nothing
+#else
                     evs <- readUntil (isModifiedAt fifo) w
                     map absPath (filter (isModifiedAt fifo) evs)
                         `shouldBe` [fifo]
+#endif
 
     where
 
