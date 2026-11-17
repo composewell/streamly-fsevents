@@ -50,7 +50,13 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Process (readProcess)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
+import Data.Word (Word32)
+import Foreign.C.String (CWString, withCWString)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Storable (peek, poke, pokeByteOff)
 import System.Win32.HardLink (createHardLink)
+import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
 import qualified System.Win32.File as Win32
 #endif
 import Streamly.Internal.FS.Event (Config, Event)
@@ -197,6 +203,48 @@ denyAll path =
 allowAll = allowRead
 
 hardLink = createHardLink
+
+foreign import ccall unsafe "windows.h GetCurrentProcess"
+    c_GetCurrentProcess :: IO HANDLE
+
+foreign import ccall unsafe "windows.h OpenProcessToken"
+    c_OpenProcessToken :: HANDLE -> DWORD -> Ptr HANDLE -> IO BOOL
+
+foreign import ccall unsafe "windows.h LookupPrivilegeValueW"
+    c_LookupPrivilegeValueW :: CWString -> CWString -> Ptr () -> IO BOOL
+
+foreign import ccall unsafe "windows.h AdjustTokenPrivileges"
+    c_AdjustTokenPrivileges ::
+        HANDLE -> BOOL -> Ptr () -> DWORD -> Ptr () -> Ptr DWORD -> IO BOOL
+
+-- | Enable or disable the "Bypass traverse checking" privilege,
+-- SeChangeNotifyPrivilege, of the process. A process has it enabled by
+-- default.
+--
+-- TOKEN_PRIVILEGES with one privilege: the count at offset 0, the LUID at
+-- offset 4 and the attributes at offset 12, 16 bytes.
+setBypassTraverse :: Bool -> IO ()
+setBypassTraverse enable =
+    alloca $ \tokPtr -> do
+        process <- c_GetCurrentProcess
+        -- TOKEN_ADJUST_PRIVILEGES .|. TOKEN_QUERY
+        ok <- c_OpenProcessToken process 0x28 tokPtr
+        unless ok $ getLastError >>= failWith "OpenProcessToken"
+        tok <- peek tokPtr
+        flip finally (Win32.closeHandle tok) $ allocaBytes 16 $ \tp -> do
+            found <-
+                withCWString "SeChangeNotifyPrivilege" $ \name ->
+                    c_LookupPrivilegeValueW nullPtr name (tp `plusPtr` 4)
+            unless found $ getLastError >>= failWith "LookupPrivilegeValueW"
+            poke (castPtr tp) (1 :: Word32)
+            -- SE_PRIVILEGE_ENABLED
+            pokeByteOff tp 12 (if enable then 2 else 0 :: Word32)
+            adjusted <- c_AdjustTokenPrivileges tok False tp 0 nullPtr nullPtr
+            -- The call succeeds with ERROR_NOT_ALL_ASSIGNED if the process
+            -- does not have the privilege.
+            err <- getLastError
+            unless (adjusted && err == 0)
+                $ failWith "AdjustTokenPrivileges" err
 #else
 denyRead path =
     setPermissions path
@@ -589,6 +637,30 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
         }
+#if defined(CABAL_OS_WINDOWS)
+    -- Without the "Bypass traverse checking" privilege NTFS is expected to
+    -- check the traverse access of the watcher to a subdirectory for each
+    -- change in it, as macOS does. The privilege is disabled before the
+    -- watch starts. Expected, not yet observed.
+    , base
+        { title = "subdir made unreachable without traverse bypass"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            setBypassTraverse False
+        , cleanup = \p ->
+            allowAll (deniedDir p) `finally` setBypassTraverse True
+        , skip = permissionNotRemovable denyAll allowAll
+        , ops = \p -> do
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = No
+        }
+#endif
     , base
         { title = "regular file as a root is watched"
         , setup = \p -> do
