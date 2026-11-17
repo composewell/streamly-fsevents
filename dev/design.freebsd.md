@@ -220,7 +220,9 @@ the cookie".
    on a directory reads all its entries and looks up each one, to fill
    the name cache. The cost is proportional to the number of entries. The
    read generates `IN_ACCESS` for the directory, reported by a watch on its
-   parent. Two failures follow:
+   parent. An open with `O_PATH`, which the scan uses to walk to a
+   directory, generates `IN_OPEN` (`vn_open_vnode`); Linux generates no
+   event for it. Two failures follow:
 
    * An entry deleted between the read and the lookup fails the add with
      `ENOENT`, although the directory exists. The backend retries the add
@@ -266,16 +268,17 @@ the cookie".
 
     `orderMoves` reorders the events of each read before they are handled:
     an `IN_MOVE_SELF` is moved after the `IN_MOVED_TO` of its rename, or
-    after the `IN_MOVED_FROM` if there is no `IN_MOVED_TO`. Events with a
-    non-zero cookie are matched by the cookie, `IN_MOVE_SELF` has the
-    cookie of the rename. An event with cookie 0 is matched only to the
-    next event. If the last event of a read is `IN_MOVE_SELF` or
+    after the `IN_MOVED_FROM` if there is no `IN_MOVED_TO`. `IN_MOVE_SELF`
+    has cookie 0 on all releases, it is matched only to an `IN_MOVED_FROM`
+    that is the next event. An `IN_MOVED_TO` is matched by the cookie of
+    the `IN_MOVED_FROM`, or, for cookie 0, only if it is the next event.
+    If the last event of a read is `IN_MOVE_SELF` or
     `IN_MOVED_FROM`, `readEvents` reads the fd again, up to 3 more times,
     before the events are handled.
 
     `orderMoves` does not match an `IN_MOVE_SELF` if the queue is found
-    empty before its `IN_MOVED_FROM` is queued, or, with cookie 0, if
-    another event is queued between the two. The `IN_MOVE_SELF` is then
+    empty before its `IN_MOVED_FROM` is queued, or if another event is
+    queued between the two. The `IN_MOVE_SELF` is then
     handled before the cookie is recorded. After the events of a read
     that found the queue empty, `unwatchMovedOut` removes the directories
     that still have the cookie of an `IN_MOVED_FROM`; their `IN_MOVED_TO`
@@ -292,14 +295,14 @@ the cookie".
     `IN_MOVE_SELF`.
 
 11. **Cookie 0 on FreeBSD 15.0.** In releng/15.0 `vn_inotify` sets the
-    cookie to 0 for the `IN_MOVE_SELF` and the `IN_MOVED_FROM` of a
-    renamed object that has a watch in any inotify fd. `IN_MOVED_TO` has
+    cookie to 0 for the `IN_MOVED_FROM` of a renamed object that has a
+    watch in any inotify fd. `IN_MOVE_SELF` has cookie 0 on all releases,
+    as on Linux. `IN_MOVED_TO` has
     the cookie of the rename. In recursive mode every subdirectory is
     watched, the `IN_MOVED_FROM` and `IN_MOVED_TO` of a rename within the
     tree did not pair. `fixCookies` gives an `IN_MOVED_FROM` with cookie 0
     followed by an `IN_MOVED_TO` of the same kind, a directory or not, the
-    cookie of the `IN_MOVED_TO`, and does the same for an `IN_MOVE_SELF`
-    with cookie 0 just before them. The fixed cookie is also the cookie
+    cookie of the `IN_MOVED_TO`. The fixed cookie is also the cookie
     reported to the user. The `IN_MOVED_FROM` of a directory moved out of
     the tree keeps cookie 0. Documented.
 
