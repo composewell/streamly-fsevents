@@ -879,7 +879,10 @@ isRootPath path =
 -- later change of the current directory does not affect the watch.
 --
 -- A path that is already a root of the watch is not added again, its events
--- are reported once. A directory added via different paths, for example, a
+-- are reported once. Two paths are the same if their components are equal,
+-- ignoring redundant separators and @.@ components. Case is significant even
+-- on a case-insensitive file system, @C:\\Foo@ and @c:\\foo@ are two roots.
+-- A directory added via different paths, for example, a
 -- recursive root and a root inside it, reports its events once for each
 -- root.
 --
@@ -935,7 +938,7 @@ addRoot Watch{..} root =
                     }
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
--- one used to add the root.
+-- one used to add the root, with the same case.
 --
 -- The directory handle of the root is closed when the call returns. The
 -- events of the root already in the event queue of the watch are reported,
