@@ -101,7 +101,7 @@ module Streamly.FileSystem.Event.Linux
       Config
     , setRecursiveMode
     , setScanNewDirs
-    , setFollowSymLinks
+    , setFollowRootSymLinks
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir

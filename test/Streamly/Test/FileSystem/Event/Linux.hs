@@ -471,7 +471,7 @@ recRootSymlinkNoFollow =
                 link = fp </> "link"
                 other = fp </> "other"
                 end = other </> "end"
-                cfg = Event.setFollowSymLinks False recCfg
+                cfg = Event.setFollowRootSymLinks False recCfg
             mapM_ createDirectory [target, sub, other]
             createDirectoryLink target link
             roots <- mapM Path.fromString [link, other]

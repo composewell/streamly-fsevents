@@ -19,6 +19,7 @@ module Streamly.Internal.FS.Event.Linux
     -- ** Watch Behavior
     , setRecursiveMode
     , setScanNewDirs
+    , setFollowRootSymLinks
     , setFollowSymLinks
     , setExcludeUnlinked
     , setUnwatchMoved
@@ -228,7 +229,7 @@ setFlag mask status cfg@Config{..} =
 -- immediate children of the directory.
 --
 -- A symbolic link inside the tree is not followed, whatever the value of
--- 'setFollowSymLinks'.
+-- 'setFollowRootSymLinks'.
 --
 -- /Created in the tree/: A directory created in the tree is added to the watch
 -- when its create event is processed, which is some time after the directory
@@ -370,19 +371,29 @@ setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 foreign import capi
     "sys/inotify.h value IN_DONT_FOLLOW" iN_DONT_FOLLOW :: Word32
 
--- | If the pathname to be watched is a symbolic link then watch the target of
--- the symbolic link instead of the symbolic link itself. Applies to the watch
+-- | If a watch root is a symbolic link then watch the target of the
+-- symbolic link instead of the symbolic link itself. Applies to the watch
 -- roots only, and only to the last component of the root path: symbolic
 -- links in the parent components are always resolved. When this is 'False',
 -- in recursive mode the directory tree of the target of a symlink is not
 -- watched.
 --
+-- A symbolic link inside a watched directory tree is never followed.
+--
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
 --
 -- /default: True/
+setFollowRootSymLinks :: Bool -> Config -> Config
+setFollowRootSymLinks s = setFlag iN_DONT_FOLLOW (not s)
+
+-- | Same as 'setFollowRootSymLinks'.
+--
+-- /Pre-release/
+--
+{-# DEPRECATED setFollowSymLinks "Use setFollowRootSymLinks" #-}
 setFollowSymLinks :: Bool -> Config -> Config
-setFollowSymLinks s = setFlag iN_DONT_FOLLOW (not s)
+setFollowSymLinks = setFollowRootSymLinks
 
 #if HAVE_DECL_IN_EXCL_UNLINK
 foreign import capi
@@ -638,7 +649,7 @@ setAllEvents s =
 -- | The default configuration settings are:
 --
 -- * 'setScanNewDirs' 'True'
--- * 'setFollowSymLinks' 'True'
+-- * 'setFollowRootSymLinks' 'True'
 -- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
@@ -1863,7 +1874,8 @@ updateWatch flags wtch wd pRep =
 -- reported and would use a slot of the kernel event queue for each deleted
 -- directory. On FreeBSD 'watchFlags' requests it for every watch.
 subdirConfig :: Config -> Config
-subdirConfig = setOnlyDir True . setFollowSymLinks False . setRootDeleted False
+subdirConfig =
+    setOnlyDir True . setFollowRootSymLinks False . setRootDeleted False
 
 -- | Return the default value if the action fails because the subdirectory
 -- does not exist, is not a directory, or if the watch is closed.
@@ -2109,7 +2121,7 @@ addRoot wtch@Watch {watchConfig = cfg} path = do
 -- skipped because of a permission error, see 'addToWatchAt'.
 --
 -- The subdirectory is added with 'setOnlyDir' and without
--- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
+-- 'setFollowRootSymLinks', the add fails with ENOTDIR if the path is a file
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO [PathRep]
 addSubdirToWatch cfg wtch pRep =
@@ -3812,7 +3824,7 @@ eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 --
 -- @
 -- watchWith
---      ('setFollowSymLinks' True . 'setExcludeUnlinked' False)
+--      ('setFollowRootSymLinks' True . 'setExcludeUnlinked' False)
 --      [Path.fromString "dir"]
 -- @
 --

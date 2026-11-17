@@ -31,7 +31,8 @@
   `getRoot` and `getRelPath` to get the relative path.
 - Users of the `Streamly.Internal.FS.Event.*` modules should move to the new
   public platform specific modules. In these, the Linux `setUnwatchMoved` is
-  renamed to `setExcludeUnlinked`, and the Windows `getRelPath` returns
+  renamed to `setExcludeUnlinked`, the Linux `setFollowSymLinks` is renamed
+  to `setFollowRootSymLinks`, and the Windows `getRelPath` returns
   `Maybe Path`.
 
 ### Enhancements

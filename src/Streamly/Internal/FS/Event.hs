@@ -128,7 +128,7 @@ setRecursiveMode = Event.setRecursiveMode
 -- the code is not meant to be portable:
 --
 -- @
--- watchWith (setRecursiveMode True . Linux.setFollowSymLinks False) paths
+-- watchWith (setRecursiveMode True . Linux.setFollowRootSymLinks False) paths
 -- @
 --
 -- Each run of the stream opens a new watch and closes it when the stream ends.
@@ -146,7 +146,7 @@ watchWith = Event.watchWith
 -- root is watched on macOS but not on Linux.
 --
 -- Also, to make the behavior of Linux same as macOS we need to set
--- setFollowSymLinks on Linux.
+-- setFollowRootSymLinks on Linux.
 
 -- XXX Verify all the cases mentioned below using test cases.
 -- XXX Make it fail if the watch root is a file. It works on macOS and Linux

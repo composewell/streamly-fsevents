@@ -61,7 +61,7 @@ module Streamly.FileSystem.Event.FreeBSD
       Config
     , setRecursiveMode
     , setScanNewDirs
-    , setFollowSymLinks
+    , setFollowRootSymLinks
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir

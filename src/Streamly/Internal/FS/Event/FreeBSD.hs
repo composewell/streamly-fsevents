@@ -34,6 +34,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     -- ** Watch Behavior
     , setRecursiveMode
     , setScanNewDirs
+    , setFollowRootSymLinks
     , setFollowSymLinks
     , setExcludeUnlinked
     , setUnwatchMoved

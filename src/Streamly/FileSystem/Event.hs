@@ -32,7 +32,7 @@
 -- import qualified Streamly.FileSystem.Event as Event
 -- import qualified Streamly.FileSystem.Event.Linux as Linux
 --
--- Event.watchWith (Linux.setFollowSymLinks False) paths
+-- Event.watchWith (Linux.setFollowRootSymLinks False) paths
 --     & Stream.filter Linux.isDir
 -- @
 --
