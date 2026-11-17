@@ -58,8 +58,10 @@ import Control.Concurrent
     , putMVar, readChan, takeMVar, threadDelay, tryReadMVar, tryTakeMVar
     , writeChan
     )
-import Control.Exception
-    (IOException, SomeException, bracket, evaluate, try)
+import Control.Exception (IOException, SomeException, bracket, try)
+#if defined(CABAL_OS_LINUX)
+import Control.Exception (evaluate)
+#endif
 import Control.Monad (forM_, unless, when)
 import Data.Function ((&))
 import Data.IORef
