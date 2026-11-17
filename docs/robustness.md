@@ -260,11 +260,15 @@ All platforms:
   nothing.
 * Handle API: a stream returned by `eventStream` does not close the
   watch when it ends. After a read is interrupted by a timeout, the next
-  read continues with the remaining events. On Linux and macOS an event
-  is lost if the timeout arrives after the read has taken the event from
-  the watch and before the program has received it. In a test on macOS,
-  2000 reads interrupted after 1 to 200 microseconds lost 3 to 18 of the
-  events of 300 files. This is not measured on Windows.
+  read continues with the remaining events. A read that is interrupted
+  does not take an event out of the watch. An event is lost only if the
+  timeout arrives after the read has returned the event and before the
+  program has recorded it. A program that masks async exceptions around
+  `readEvent`, or around the fold of `eventStream`, and the code that
+  records the event does not lose any event: the read can still be
+  interrupted, while it waits for an event and before it takes one. In a
+  test on Linux, 2000 such reads interrupted after 1 to 200 microseconds
+  lost none of the events of 2000 files.
 
 Linux:
 
