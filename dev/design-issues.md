@@ -98,8 +98,8 @@ Status: open.
 The portable `isMoved` does not say which end of a rename an event is for, or
 whether the path left the tree, came into it or was renamed within it. A
 consumer cannot tell whether to add or to remove the path. On Linux a renamed
-watch root reports `isRootMoved`, not `isMoved`, and only if `setRootMoved` is
-enabled, which is not the default.
+watch root reports `isMoved` and `isRootMoved`, and neither `isMovedFrom` nor
+`isMovedTo`.
 
 A rename tells the consumer that the new path is the same object as the old
 one, for example, an indexer can move its entry for `a` to `b` without reading
@@ -246,41 +246,6 @@ stream ends" in `dev/design.linux.md`. The recovery from `ENOSPC` is the
 same: raise `max_user_watches`, close the watch, open a new one and scan the
 tree.
 
-## Linux: an event is lost if an async exception arrives during a step
-
-`eventStream` runs each step of the stream under `mask_`, and the
-`uncons` of the saved stream under `uninterruptibleMask_`. An async
-exception that arrives during the step, for example, the exception of a
-`timeout`, is delayed until `mask_` ends. If the step produced an event, the
-rest of the stream without the event is already saved in the `Watch`, the
-exception discards the event being returned, and the next stream on the
-watch starts after it. An `IOException` returned by the step as an item is
-lost the same way, the async exception replaces it.
-
-The guarantee that no event is lost holds only if the exception arrives
-while the step waits for an event. A reader that is idle spends most of its
-time in the wait; a reader under a high event rate can be interrupted in the
-step.
-
-### Proposal
-
-Use the seed of the `unfoldrM` to tell whether the consumer took the last
-event:
-
-* Save the event at the head of the rest of the stream, marked as not yet
-  delivered.
-* The next step of the same stream gets the seed `Delivered` and drops the
-  marked event.
-* A new stream on the watch starts with the seed `Fresh` and delivers the
-  marked event again.
-
-The guarantee changes from at most once to at least once: if the consumer
-received the event and was interrupted before the next step, the next stream
-delivers the event again. A duplicate event is usually harmless to a
-consumer that reacts to changes, a lost event is not.
-
-Status: open.
-
 ## Linux: follow symbolic links inside a recursive tree
 
 A symbolic link inside a recursive tree is never followed. Following a link
@@ -304,9 +269,8 @@ to a directory needs:
 
 Proposed options:
 
-* `setFollowSymLinks` applies only to roots; rename it to
-  `setFollowRootSymLinks`.
-* A new option to follow links inside the tree.
+* A new option to follow links inside the tree, `setFollowSymLinks`.
+  `setFollowRootSymLinks` applies only to roots.
 * A new option to allow a followed link to lead outside the tree. When it is
   off, a link whose target is outside the root is not followed.
 
@@ -345,10 +309,10 @@ Status: open.
 
 ## A renamed watch root
 
-On Linux a renamed root is removed from the watch and reports
-`isRootUnwatched`; the kernel does not report the new path. On macOS the
-watch is attached to the path, the renamed root is no longer watched, and an
-object created at the path later is watched. On Windows the watch keeps a
+On Linux a renamed root is removed from the watch and reports `isMoved`
+and `isRootUnwatched`; the kernel does not report the new path. On macOS the
+watch is attached to the path, the renamed root reports `isMoved` and is no
+longer watched, and an object created at the path later is watched. On Windows the watch keeps a
 handle to the root open with `FILE_SHARE_DELETE`. After `mv d d.bak` the
 watch continues, and the events report paths under `d`, for example, `d\x`
 for the file `d.bak\x`. A consumer that opens, copies or deletes `d\x` acts
