@@ -2700,8 +2700,7 @@ unwatchSubtree wtch pRep =
 -- If a kernel queues IN_MOVE_SELF first, the IN_MOVE_SELF of a directory
 -- moved out of the tree is read before its IN_MOVED_FROM records the cookie.
 -- The directory is not removed, its events are reported with the old path.
--- FreeBSD queues IN_MOVE_SELF first, 'orderMoves' puts the events of a rename
--- in the Linux order before they are handled.
+-- FreeBSD queues IN_MOVE_SELF first, see the NOTE above 'orderMoves'.
 
 -- NOTE: A directory renamed within the tree:
 --
@@ -3062,11 +3061,23 @@ parseEvents =
 --
 -- The events of a rename can be split across two reads of the fd. If the
 -- last event of a read is IN_MOVE_SELF or IN_MOVED_FROM, the fd is read again
--- before the events are handled, see 'readEvents'. If the next event is
--- queued after the second read, the IN_MOVE_SELF is handled before it, and a
--- rename within the tree is handled as a move out followed by a move in: the
--- watches of the directory are removed and added again, the moved paths
--- report 'isRootUnwatched'.
+-- before the events are handled, up to 3 more times, see 'readEvents'.
+--
+-- The IN_MOVE_SELF is not matched if the queue is found empty before its
+-- IN_MOVED_FROM is queued, or, with cookie 0, if another event is queued
+-- between the two. It is then handled before the IN_MOVED_FROM records the
+-- cookie, and does not remove a directory moved out of the tree. Therefore,
+-- after the events of a read that found the queue empty are handled, the
+-- directories that still have the cookie of an IN_MOVED_FROM have no
+-- IN_MOVED_TO, they are removed as moved out, see 'unwatchMovedOut'.
+--
+-- If the queue is found empty between IN_MOVED_FROM and IN_MOVED_TO, the
+-- directory is removed, by its reordered IN_MOVE_SELF or by
+-- 'unwatchMovedOut', and the IN_MOVED_TO adds it as moved in. A rename within
+-- the tree is then handled as a move out followed by a move in: the watches
+-- are removed and added again, the moved paths report 'isRootUnwatched', and
+-- the events generated in between are lost. The set of watched paths is
+-- correct in all these cases.
 
 rawFlags :: RawEvent -> Word32
 rawFlags (RawEvent _ flags _ _) = flags
@@ -3165,6 +3176,35 @@ withEffects evs action = do
     return
         $ S.fromList (map ItemEvent evs)
         `S.append` either (S.fromPure . ItemFailed) id r
+
+#if defined(CABAL_OS_FREEBSD)
+-- | Remove the directories that still have the cookie of an IN_MOVED_FROM
+-- event after all the events in the queue are handled, see the NOTE above
+-- 'orderMoves'. Returns the paths removed without a marker as
+-- 'isRootUnwatched' events, see 'unwatchPaths'.
+unwatchMovedOut :: Watch -> IO (Stream IO StreamItem)
+unwatchMovedOut wtch = withEffects [] $ do
+    m <- readIORef (watchWdMap wtch)
+    let moved =
+            [ wpRep wp
+            | wd <- movedWds m
+            , wp <- wdUserPaths wd m
+            , not (wpRemoved wp)
+            , isJust (wpMoveCookie wp)
+            ]
+    removed <- concat <$> mapM (unwatchSubtree wtch) moved
+    return
+        $ S.fromList
+            [ ItemEvent (synthEvent (SynthUnwatched wd pRep))
+            | (wd, pRep) <- removed
+            ]
+
+-- | Whether a read of the given number of bytes found the queue empty. A
+-- read returns as many events as fit in the buffer, the largest event has a
+-- 16 byte header and a 256 byte name.
+isDrained :: Int -> Bool
+isDrained n = n + 16 + 256 <= readBufSize
+#endif
 
 -- | Handle a kernel event: change the watches and the map, and return the
 -- events to report.
@@ -3348,6 +3388,16 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
 foreign import ccall unsafe "unistd.h read"
     c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
 
+-- | The size of the buffer of a read of the inotify fd. As per the inotify man
+-- page, a buffer of size
+--
+--          sizeof(struct inotify_event) + NAME_MAX + 1
+--
+-- is sufficient to read at least one event. A smaller buffer fails with
+-- EINVAL.
+readBufSize :: Int
+readBufSize = 32 * 1024
+
 -- | Read the events available on the fd of a watch, and take the events
 -- recorded by 'recordSynthEvents'. The array is empty if no event is
 -- available on the fd. If there are none of either, returns an action that
@@ -3373,7 +3423,7 @@ readEvents
     where
 
     readArray =
-        unsafeFreezeWithShrink <$> MArray.unsafeCreateWithPtr' bufSize readFd
+        unsafeFreezeWithShrink <$> MArray.unsafeCreateWithPtr' readBufSize readFd
 
 #if defined(CABAL_OS_FREEBSD)
     -- Read again if the events of a rename may be split, see the NOTE above
@@ -3397,17 +3447,9 @@ readEvents
         return [arr | A.length arr /= 0]
 #endif
 
-    -- As per the inotify man page, a buffer of size
-    --
-    --          sizeof(struct inotify_event) + NAME_MAX + 1
-    --
-    -- is sufficient to read at least one event. A smaller buffer fails with
-    -- EINVAL.
-    bufSize = 32 * 1024
-
     -- Returns 0 if no event is available.
     readFd p = do
-        n <- c_read fd p (fromIntegral bufSize)
+        n <- c_read fd p (fromIntegral readBufSize)
         if n >= 0
         then return (fromIntegral n)
         else do
@@ -3509,15 +3551,27 @@ readEvent
 
         -- 'handleEvent' returns a stream for each kernel event: the event
         -- for each of its paths, followed by the entries found by its scan.
-        kernelEvents = S.concatMapM (handleEvent cfg wtch) rawEvents
+        kernelEvents =
+            S.concatMapM (handleEvent cfg wtch) rawEvents
+                `S.append` movedOut
 
 #if defined(CABAL_OS_FREEBSD)
         -- See the NOTE above 'orderMoves'.
         rawEvents =
             S.concatEffect
                 (S.fromList . orderMoves <$> S.toList (parseEvents arrs))
+
+        -- The removal of the directories moved out of the tree, after the
+        -- events of a read that found the queue empty.
+        movedOut =
+            case arrs of
+                (_ : _) | isDrained (A.length (last arrs)) ->
+                    S.concatEffect (unwatchMovedOut wtch)
+                _ -> S.nil
 #else
         rawEvents = parseEvents arrs
+
+        movedOut = S.nil
 #endif
 
     items = S.concatMap readOne fdReads
