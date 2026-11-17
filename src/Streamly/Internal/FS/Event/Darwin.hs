@@ -1191,6 +1191,12 @@ eventStream wtch = S.unfoldrM step ()
 --      [Path.fromString "path"]
 -- @
 --
+-- The stream does not end when a root is deleted or renamed, or when a root
+-- does not exist. The watch is on the path of the root, an object created
+-- at that path later is watched. On Linux and Windows a root that does not
+-- exist raises an exception, and the stream ends when none of the roots is
+-- watched any more.
+--
 -- Each run of the stream opens a new watch and closes it when the stream
 -- ends. The handle of the watch is not exposed, so the roots of the watch
 -- are the given paths for as long as the stream runs. To add or remove
