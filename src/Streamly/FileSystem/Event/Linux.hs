@@ -53,10 +53,11 @@
 -- non-existing path.
 --
 -- /Overlapping Paths:/ A path listed more than once is watched once, its
--- events are reported once. The paths are compared byte by byte, case is
--- significant even in a case-insensitive directory. If two different paths
--- reach the same file or directory, for example, a recursive root and a root
--- inside it, its events are reported once for each path.
+-- events are reported once. Paths that differ only in redundant separators
+-- and @.@ components, for example, @x\/\/y@ and @x\/y@, are the same path.
+-- Case is significant even in a case-insensitive directory. If two different
+-- paths reach the same file or directory, for example, a recursive root and
+-- a root inside it, its events are reported once for each path.
 --
 -- /Coalescing:/ Identical successive events may be coalesced into a single
 -- event.
