@@ -16,7 +16,8 @@
 -- asserted, it is recorded from the CI logs.
 --
 -- The expected outcomes were observed on Linux 6.12 and Ubuntu 24.04,
--- macOS 26 (arm64), Windows Server 2025 and Windows Server 2012 R2.
+-- macOS 26 (arm64) and Windows Server 2025. The suite is skipped on Windows
+-- older than Windows 10 and Windows Server 2016.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where
 
@@ -50,11 +51,13 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Process (readProcess)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
+import Data.Char (isDigit)
 import Data.Word (Word32)
 import Foreign.C.String (CWString, withCWString)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke, pokeByteOff)
+import System.Exit (exitSuccess)
 import System.Win32.HardLink (createHardLink)
 import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
 import qualified System.Win32.File as Win32
@@ -754,7 +757,9 @@ behaviors =
         , expected = onPlatform No Yes Yes
         }
     -- On Linux a subdirectory is opened through the root, which needs SEARCH
-    -- on the root. The file "file" in the root is used by the skip check.
+    -- on the root. Windows checks the traverse access of the subdirectory
+    -- that changed, not of the root. The file "file" in the root is used by
+    -- the skip check.
     , base
         { title = "A subdirectory of a root with only READ reports its events"
         , config = Event.setRecursiveMode True
@@ -770,7 +775,7 @@ behaviors =
         , skip = stillSearchable . watchRoot
         , ops = writeHeldFiles
         , check = const (modifiedNamed "subfile")
-        , expected = onPlatform No No No
+        , expected = onPlatform No No Yes
         }
 #if defined(CABAL_OS_WINDOWS)
     -- Without the "Bypass traverse checking" privilege NTFS checks the
@@ -1347,9 +1352,25 @@ expectedNote b outcome
     | outcome == expected b = ""
     | otherwise = " (expected " ++ show (expected b) ++ ")"
 
+#if defined(CABAL_OS_WINDOWS)
+-- | The major version of Windows, from the output of @ver@, for example,
+-- @Microsoft Windows [Version 10.0.26100.1]@. 10 if it cannot be parsed.
+windowsMajorVersion :: IO Int
+windowsMajorVersion = do
+    out <- readProcess "cmd" ["/c", "ver"] ""
+    return $ case reads (dropWhile (not . isDigit) out) of
+        [(n, _)] -> n
+        _ -> 10
+#endif
+
 main :: IO ()
 main = do
 #if defined(CABAL_OS_WINDOWS)
+    major <- windowsMajorVersion
+    when (major < 10) $ do
+        putStrLn $ "Skipped on Windows version " ++ show major
+            ++ ", the suite needs Windows 10 or Windows Server 2016"
+        exitSuccess
     disableBackupPrivileges
 #endif
     resultsRef <- newIORef []
