@@ -217,14 +217,14 @@ foreign import ccall unsafe "windows.h AdjustTokenPrivileges"
     c_AdjustTokenPrivileges ::
         HANDLE -> BOOL -> Ptr () -> DWORD -> Ptr () -> Ptr DWORD -> IO BOOL
 
--- | Enable or disable the "Bypass traverse checking" privilege,
--- SeChangeNotifyPrivilege, of the process. A process has it enabled by
--- default.
+-- | Enable or disable a privilege of the process, for example
+-- @SeChangeNotifyPrivilege@ ("Bypass traverse checking"). Disabling a
+-- privilege that the process does not have succeeds.
 --
 -- TOKEN_PRIVILEGES with one privilege: the count at offset 0, the LUID at
 -- offset 4 and the attributes at offset 12, 16 bytes.
-setBypassTraverse :: Bool -> IO ()
-setBypassTraverse enable =
+setPrivilege :: String -> Bool -> IO ()
+setPrivilege privilege enable =
     alloca $ \tokPtr -> do
         process <- c_GetCurrentProcess
         -- TOKEN_ADJUST_PRIVILEGES .|. TOKEN_QUERY
@@ -233,18 +233,33 @@ setBypassTraverse enable =
         tok <- peek tokPtr
         flip finally (Win32.closeHandle tok) $ allocaBytes 16 $ \tp -> do
             found <-
-                withCWString "SeChangeNotifyPrivilege" $ \name ->
+                withCWString privilege $ \name ->
                     c_LookupPrivilegeValueW nullPtr name (tp `plusPtr` 4)
             unless found $ getLastError >>= failWith "LookupPrivilegeValueW"
             poke (castPtr tp) (1 :: Word32)
             -- SE_PRIVILEGE_ENABLED
             pokeByteOff tp 12 (if enable then 2 else 0 :: Word32)
             adjusted <- c_AdjustTokenPrivileges tok False tp 0 nullPtr nullPtr
-            -- The call succeeds with ERROR_NOT_ALL_ASSIGNED if the process
-            -- does not have the privilege.
+            -- The call succeeds with ERROR_NOT_ALL_ASSIGNED (1300) if the
+            -- process does not have the privilege.
             err <- getLastError
-            unless (adjusted && err == 0)
-                $ failWith "AdjustTokenPrivileges" err
+            unless (adjusted && (err == 0 || not enable && err == 1300))
+                $ failWith ("AdjustTokenPrivileges " ++ privilege) err
+
+-- | Enable or disable the "Bypass traverse checking" privilege,
+-- SeChangeNotifyPrivilege, of the process. A process has it enabled by
+-- default.
+setBypassTraverse :: Bool -> IO ()
+setBypassTraverse = setPrivilege "SeChangeNotifyPrivilege"
+
+-- | Disable the backup and restore privileges of the process. An
+-- administrator, such as the CI runner, has them enabled. A directory is
+-- always opened with FILE_FLAG_BACKUP_SEMANTICS, with these privileges the
+-- open is granted regardless of the ACL of the directory.
+disableBackupPrivileges :: IO ()
+disableBackupPrivileges = do
+    setPrivilege "SeBackupPrivilege" False
+    setPrivilege "SeRestorePrivilege" False
 #else
 denyRead path =
     setPermissions path
@@ -263,25 +278,6 @@ allowAll path =
         $ setOwnerSearchable True emptyPermissions
 
 hardLink source link = void $ readProcess "ln" [source, link] ""
-#endif
-
--- | Why a permission removed from a directory may not apply to the test
--- process. On Windows the ACL of the directory and the privileges of the
--- process, an empty string on other platforms.
-permissionDiagnostics :: FilePath -> IO String
-#if defined(CABAL_OS_WINDOWS)
-permissionDiagnostics dir = do
-    acl <- run "icacls" [dir]
-    privs <- run "whoami" ["/priv"]
-    return $ "\nicacls " ++ dir ++ ":\n" ++ acl ++ "\nwhoami /priv:\n" ++ privs
-
-    where
-
-    run cmd args = do
-        r <- try (readProcess cmd args "")
-        return $ either (\(e :: IOException) -> show e) id r
-#else
-permissionDiagnostics _ = return ""
 #endif
 
 -- | @copyFile source copy@. On macOS the copy is a clone of the source.
@@ -541,7 +537,7 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- Linux reports the subdir as isAccessDenied and does not watch it. The
-    -- Windows outcome is expected, the test is skipped in the CI.
+    -- Windows outcome is expected, not yet observed.
     , base
         { title = "unreadable subdir of a recursive root reports its changes"
         , config = Event.setRecursiveMode True
@@ -572,7 +568,7 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- The permission is checked when a watch is added, not afterwards. The
-    -- Windows outcomes are expected, the tests are skipped in the CI.
+    -- Windows outcomes are expected, not yet observed.
     , base
         { title =
             "root reports its events after its read permission is removed"
@@ -992,11 +988,9 @@ behaviors =
 
     stillReadable dir = do
         r <- try (listDirectory dir)
-        case r of
-            Left (_ :: IOException) -> return Nothing
-            Right _ ->
-                Just . ("the permission was not removed" ++)
-                    <$> permissionDiagnostics dir
+        return $ case r of
+            Left (_ :: IOException) -> Nothing
+            Right _ -> Just "the permission was not removed"
 
     -- The permission is removed by 'ops', after the watch starts. The probe
     -- directory is not watched.
@@ -1203,6 +1197,9 @@ expectedNote b outcome
 
 main :: IO ()
 main = do
+#if defined(CABAL_OS_WINDOWS)
+    disableBackupPrivileges
+#endif
     resultsRef <- newIORef []
     let spec seconds b runner = it (title b) $ do
             outcome <- outcomeWithin seconds runner
