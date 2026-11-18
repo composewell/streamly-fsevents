@@ -596,9 +596,10 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- A directory that cannot be reached: FSEvents does not report its events
-    -- to a process that is not root. The file is written through a handle
-    -- opened before the permissions are removed. On macOS and Windows the
-    -- outcomes are expected, not yet observed.
+    -- to a process that is not root, except the events of a root that
+    -- becomes unreachable after the start of the watch. The file is written
+    -- through a handle opened before the permissions are removed. The
+    -- Windows outcomes are expected, not yet observed.
     , base
         { title = "unreachable root reports its changes"
         , setup = \p -> do
@@ -636,7 +637,7 @@ behaviors =
             settle
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes No Yes
+        , expected = onPlatform Yes Yes Yes
         }
     , base
         { title = "subdir reports its events after it becomes unreachable"
@@ -653,6 +654,40 @@ behaviors =
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
+        }
+    -- The permissions are restored after the start of the watch. The macOS
+    -- outcomes are expected, not yet observed.
+    , base
+        { title = "root reports its events after it becomes reachable"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denyAll (watchRoot p)
+        , cleanup = allowAll . watchRoot
+        , skip = stillReadable . watchRoot
+        , ops = \p -> do
+            allowAll (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    , base
+        { title = "subdir reports its events after it becomes reachable"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            createFile (deniedDir p </> "file")
+            holdFile p (deniedDir p </> "file")
+            denyAll (deniedDir p)
+        , cleanup = allowAll . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> do
+            allowAll (deniedDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform No Yes Yes
         }
 #if defined(CABAL_OS_WINDOWS)
     -- Without the "Bypass traverse checking" privilege NTFS is expected to
