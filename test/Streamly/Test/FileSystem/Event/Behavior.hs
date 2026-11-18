@@ -152,6 +152,11 @@ createdNamed name = any (\ev -> isNamed name ev && Event.isCreated ev)
 modifiedNamed :: String -> [Event] -> Bool
 modifiedNamed name = any (\ev -> isNamed name ev && Event.isModified ev)
 
+-- | Whether each of the names is reported as deleted.
+deletedNamed :: [String] -> [Event] -> Bool
+deletedNamed names evs =
+    all (\name -> any (\ev -> isNamed name ev && Event.isDeleted ev) evs) names
+
 -- | Whether a path whose name starts with "file" has two 'Event.isCreated'
 -- events.
 fileCreatedTwice :: [Event] -> Bool
@@ -1007,20 +1012,28 @@ behaviors =
         , expected = onPlatform No Yes No
         }
     , base
-        { title = "deleted root reports isDeleted for a file in it"
-        , setup = withFile
+        { title =
+            "A deleted watch root reports `isDeleted` for each file in it"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createFile (watchRoot p </> "file2")
+            settle
         , ops = removePathForcibly . watchRoot
-        , check = \_ ->
-            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , check = const (deletedNamed ["file", "file2"])
         , expected = onPlatform Yes No Yes
         }
     , base
-        { title = "deleted dir in the tree reports isDeleted for a file in it"
+        { title =
+            "Deleting a directory in a recursive watch reports `isDeleted` "
+                ++ "for each file in it"
         , config = Event.setRecursiveMode True
-        , setup = withDirFile
+        , setup = \p -> do
+            createDirectory (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir/file")
+            createFile (watchRoot p </> "dir/file2")
+            settle
         , ops = \p -> removePathForcibly (watchRoot p </> "dir")
-        , check = \_ ->
-            any (\ev -> isNamed "file" ev && Event.isDeleted ev)
+        , check = const (deletedNamed ["file", "file2"])
         , expected = onPlatform Yes Yes Yes
         }
     -- On macOS the copy is a clone, on APFS it reports 'Darwin.isCloned'.
