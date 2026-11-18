@@ -627,10 +627,11 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- A directory that cannot be reached: FSEvents does not report its events
-    -- to a process that is not root, except the events of a root that
-    -- becomes unreachable after the start of the watch. The file is written
-    -- through a handle opened before the permissions are removed, and closed
-    -- after the write. The Windows outcomes are expected, not yet observed.
+    -- to a process that is not root. On macOS a root that becomes
+    -- unreachable after the start of the watch reports its events in some
+    -- runs. The file is written through a handle opened before the
+    -- permissions are removed, and closed after the write. The Windows
+    -- outcomes are expected, not yet observed.
     , base
         { title = "unreachable root reports its changes"
         , setup = \p -> do
@@ -668,7 +669,8 @@ behaviors =
             settle
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes Yes Yes
+        , expected = onPlatform Yes No Yes
+        , racy = onDarwin
         }
     , base
         { title = "subdir reports its events after it becomes unreachable"
@@ -686,8 +688,9 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
         }
-    -- The permissions are restored after the start of the watch. The macOS
-    -- outcomes are expected, not yet observed.
+    -- The permissions are restored after the start of the watch. macOS does
+    -- not report the events of a root or subdir unreachable at the start of
+    -- the watch after it becomes reachable.
     , base
         { title = "root reports its events after it becomes reachable"
         , setup = \p -> do
@@ -701,7 +704,7 @@ behaviors =
             settle
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform WatchException Yes WatchException
+        , expected = onPlatform WatchException No WatchException
         }
     , base
         { title = "subdir reports its events after it becomes reachable"
@@ -718,7 +721,7 @@ behaviors =
             settle
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform No Yes Yes
+        , expected = onPlatform No No Yes
         }
 #if defined(CABAL_OS_WINDOWS)
     -- Without the "Bypass traverse checking" privilege NTFS is expected to
