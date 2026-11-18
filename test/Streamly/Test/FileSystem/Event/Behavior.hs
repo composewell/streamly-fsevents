@@ -352,6 +352,15 @@ setAttrs = Windows.setAttrsModified
 metadataChanged = Event.isModified
 #endif
 
+-- | The predicate for the end of the watch of a root, on the platforms that
+-- have it.
+rootUnwatchedFlag :: Maybe (Event -> Bool)
+#if defined(CABAL_OS_LINUX)
+rootUnwatchedFlag = Just Linux.isRootUnwatched
+#else
+rootUnwatchedFlag = Nothing
+#endif
+
 base :: Behavior
 base =
     Behavior
@@ -399,11 +408,15 @@ behaviors =
         , racy = onDarwin
         }
     , base
-        { title = "deleted root reports isDeleted for the root"
+        { title = "A deleted watch root reports `isDeleted` for the root"
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
         , expected = Yes
+        }
+    , (deletedRootReports rootUnwatchedFlag)
+        { title =
+            "A deleted watch root reports `isRootUnwatched` for the root"
         }
     , base
         { title = "root deleted and created again is watched"
@@ -1167,6 +1180,22 @@ behaviors =
         return r
 
     deniedDir p = watchRoot p </> "denied"
+
+    -- A deleted root reports the predicate for the root. Skipped on a
+    -- platform without the predicate.
+    deletedRootReports flag =
+        base
+            { skip = const $ return $ case flag of
+                Just _ -> Nothing
+                Nothing -> Just "the platform has no such predicate"
+            , ops = removePathForcibly . watchRoot
+            , check = \p evs ->
+                case flag of
+                    Just f ->
+                        any (\ev -> absPath ev == watchRoot p && f ev) evs
+                    Nothing -> False
+            , expected = Yes
+            }
 
     ignoreError action =
         void (try action :: IO (Either IOException ()))
