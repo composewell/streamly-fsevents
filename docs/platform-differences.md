@@ -74,17 +74,22 @@ Tested behavior common to all platforms:
 * A deleted watch root reports `isDeleted` for the root.
 * A root listed twice with the same path reports a change in it once.
 
+macOS watches the path of a root, Linux and Windows watch the object at the
+path:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| The stream ends when all the watch roots are deleted | Yes | No | Yes |
+| A watch root deleted and created again is watched | No | Yes | No |
+| A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
+
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
-| The stream ends when all the watch roots are deleted | Yes | No | Yes |
-| A watch root deleted and created again is watched | No | Yes | No |
 | A renamed watch root is watched | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
 | A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
 | A root renamed back after the rename event is read is watched | No | Yes | Yes |
-| A watch of a path that does not exist raises an exception | Yes | No | Yes |
-| A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 | A regular file can be a watch root | Yes | Yes | No |
 | A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
 
