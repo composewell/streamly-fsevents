@@ -192,6 +192,14 @@ allowRead :: FilePath -> IO ()
 denyAll :: FilePath -> IO ()
 -- | Undo 'denyAll'.
 allowAll :: FilePath -> IO ()
+-- | Remove the permission to reach the entries of a directory, keep the
+-- permission to list it. Undone by 'allowAll'. On Windows the traverse access
+-- is checked only without the "Bypass traverse checking" privilege, see
+-- 'bypassTraverse'.
+denySearch :: FilePath -> IO ()
+-- | On Windows, enable or disable the "Bypass traverse checking" privilege of
+-- the process. Does nothing on POSIX.
+bypassTraverse :: Bool -> IO ()
 -- | @hardLink source link@
 hardLink :: FilePath -> FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
@@ -210,6 +218,9 @@ denyAll path =
     void $ readProcess "icacls" [path, "/deny", "*S-1-1-0:(OI)(CI)(F)"] ""
 
 allowAll = allowRead
+
+denySearch path =
+    void $ readProcess "icacls" [path, "/deny", "*S-1-1-0:(X)"] ""
 
 hardLink = createHardLink
 
@@ -261,6 +272,8 @@ setPrivilege privilege enable =
 setBypassTraverse :: Bool -> IO ()
 setBypassTraverse = setPrivilege "SeChangeNotifyPrivilege"
 
+bypassTraverse = setBypassTraverse
+
 -- | Disable the backup and restore privileges of the process. An
 -- administrator, such as the CI runner, has them enabled. A directory is
 -- always opened with FILE_FLAG_BACKUP_SEMANTICS, with these privileges the
@@ -285,6 +298,12 @@ allowAll path =
         $ setOwnerReadable True
         $ setOwnerWritable True
         $ setOwnerSearchable True emptyPermissions
+
+denySearch path =
+    setPermissions path
+        $ setOwnerReadable True $ setOwnerWritable True emptyPermissions
+
+bypassTraverse _ = return ()
 
 hardLink source link = void $ readProcess "ln" [source, link] ""
 #endif
@@ -524,84 +543,6 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform WatchException Yes WatchException
         }
-    , base
-        { title = "root without read permission is watched"
-        , setup = denyRead . watchRoot
-        , cleanup = allowRead . watchRoot
-        , skip = rootStillReadable
-        , ops = \p -> createFile (watchRoot p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform WatchException Yes WatchException
-        }
-    , base
-        { title = "recursive root with an unreadable subdir is watched"
-        , config = Event.setRecursiveMode True
-        , setup = \p -> do
-            createDirectory (deniedDir p)
-            denyRead (deniedDir p)
-        , cleanup = allowRead . deniedDir
-        , skip = stillReadable . deniedDir
-        , ops = \p -> createFile (watchRoot p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
-        }
-    -- Linux reports the subdir as isAccessDenied and does not watch it.
-    , base
-        { title = "unreadable subdir of a recursive root reports its changes"
-        , config = Event.setRecursiveMode True
-        , setup = \p -> do
-            createDirectory (deniedDir p)
-            denyRead (deniedDir p)
-        , cleanup = allowRead . deniedDir
-        , skip = stillReadable . deniedDir
-        , ops = \p -> createFile (deniedDir p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Yes
-        }
-    , base
-        { title = "unreadable dir moved into a recursive root is skipped"
-        , config = Event.setRecursiveMode True
-        , setup = \p -> do
-            createDirectory (renamedRoot p)
-            denyRead (renamedRoot p)
-        , cleanup = \p -> do
-            ignoreError (allowRead (renamedRoot p))
-            ignoreError (allowRead (deniedDir p))
-        , skip = stillReadable . renamedRoot
-        , ops = \p -> do
-            renameDirectory (renamedRoot p) (deniedDir p)
-            settle
-            createFile (watchRoot p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
-        }
-    -- The permission is checked when a watch is added, not afterwards.
-    , base
-        { title =
-            "root reports its events after its read permission is removed"
-        , cleanup = allowRead . watchRoot
-        , skip = permissionNotRemovable denyRead allowRead
-        , ops = \p -> do
-            denyRead (watchRoot p)
-            settle
-            createFile (watchRoot p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
-        }
-    , base
-        { title =
-            "subdir reports its events after its read permission is removed"
-        , config = Event.setRecursiveMode True
-        , setup = createDirectory . deniedDir
-        , cleanup = allowRead . deniedDir
-        , skip = permissionNotRemovable denyRead allowRead
-        , ops = \p -> do
-            denyRead (deniedDir p)
-            settle
-            createFile (deniedDir p </> "file")
-        , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
-        }
     -- A write to a file, without any permission change. The tests of
     -- unreachable directories write to a file opened before the permissions
     -- are removed, and close it after the write. On macOS the write to a file
@@ -629,7 +570,7 @@ behaviors =
     -- to a process that is not root. The file is written through a handle
     -- opened before the permissions are removed, and closed after the write.
     , base
-        { title = "unreachable root reports its changes"
+        { title = "A root without READ and SEARCH reports its events"
         , setup = \p -> do
             createFile (watchRoot p </> "file")
             holdFile p (watchRoot p </> "file")
@@ -641,7 +582,91 @@ behaviors =
         , expected = onPlatform WatchException No WatchException
         }
     , base
-        { title = "unreachable subdir of a recursive root reports its changes"
+        { title = "A root with only SEARCH reports its events"
+        , setup = denyRead . watchRoot
+        , cleanup = allowRead . watchRoot
+        , skip = rootStillReadable
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    -- On Windows the tests that deny SEARCH disable the "Bypass traverse
+    -- checking" privilege, with it the traverse access is not checked.
+    , base
+        { title = "A root with only READ reports its events"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denySearch (watchRoot p)
+            bypassTraverse False
+        , cleanup = \p ->
+            allowAll (watchRoot p) `finally` bypassTraverse True
+        , skip = stillSearchable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes No Yes
+        }
+    -- The required permission is READ on Linux and Windows, SEARCH on macOS.
+    , base
+        { title =
+            "A root stops reporting events after the required permission is "
+                ++ "removed"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , cleanup = allowAll . watchRoot
+        , skip = requiredNotRemovable
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            denyRequired (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = \_ -> not . modifiedNamed "file"
+        , expected = onPlatform No Yes No
+        }
+    , base
+        { title =
+            "A root starts reporting events after the required permission is "
+                ++ "enabled"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            holdFile p (watchRoot p </> "file")
+            denyRequired (watchRoot p)
+        , cleanup = allowAll . watchRoot
+        , skip = requiredStillGranted . watchRoot
+        , ops = \p -> do
+            allowAll (watchRoot p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform WatchException Yes WatchException
+        }
+    , base
+        { title =
+            "A recursive watch with a subdirectory without READ is watched"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            denyRead (deniedDir p)
+        , cleanup = allowRead . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    -- Linux reports the subdir as isAccessDenied and does not watch it.
+    , base
+        { title = "A subdirectory without READ, with SEARCH reports its events"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (deniedDir p)
+            denyRead (deniedDir p)
+        , cleanup = allowRead . deniedDir
+        , skip = stillReadable . deniedDir
+        , ops = \p -> createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform No Yes Yes
+        }
+    , base
+        { title = "A subdirectory without READ and SEARCH reports its events"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -655,20 +680,41 @@ behaviors =
         , expected = onPlatform No No Yes
         }
     , base
-        { title = "root reports its events after it becomes unreachable"
-        , setup = \p -> createFile (watchRoot p </> "file")
-        , cleanup = allowAll . watchRoot
-        , skip = permissionNotRemovable denyAll allowAll
+        { title =
+            "A directory without READ moved into a recursive watch does not "
+                ++ "end the watch"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createDirectory (renamedRoot p)
+            denyRead (renamedRoot p)
+        , cleanup = \p -> do
+            ignoreError (allowRead (renamedRoot p))
+            ignoreError (allowRead (deniedDir p))
+        , skip = stillReadable . renamedRoot
         , ops = \p -> do
-            holdFile p (watchRoot p </> "file")
-            denyAll (watchRoot p)
+            renameDirectory (renamedRoot p) (deniedDir p)
             settle
-            writeHeldFiles p
-        , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes No Yes
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
         }
     , base
-        { title = "subdir reports its events after it becomes unreachable"
+        { title = "A subdirectory reports its events after its READ is removed"
+        , config = Event.setRecursiveMode True
+        , setup = createDirectory . deniedDir
+        , cleanup = allowRead . deniedDir
+        , skip = permissionNotRemovable denyRead allowRead
+        , ops = \p -> do
+            denyRead (deniedDir p)
+            settle
+            createFile (deniedDir p </> "file")
+        , check = const (createdNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title =
+            "A subdirectory reports its events after its READ and SEARCH "
+                ++ "are removed"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -683,24 +729,10 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
         }
-    -- The permissions are restored after the start of the watch.
     , base
-        { title = "root reports its events after it becomes reachable"
-        , setup = \p -> do
-            createFile (watchRoot p </> "file")
-            holdFile p (watchRoot p </> "file")
-            denyAll (watchRoot p)
-        , cleanup = allowAll . watchRoot
-        , skip = stillReadable . watchRoot
-        , ops = \p -> do
-            allowAll (watchRoot p)
-            settle
-            writeHeldFiles p
-        , check = const (modifiedNamed "file")
-        , expected = onPlatform WatchException Yes WatchException
-        }
-    , base
-        { title = "subdir reports its events after it becomes reachable"
+        { title =
+            "A subdirectory without READ and SEARCH reports its events "
+                ++ "after they are restored"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -716,6 +748,25 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform No Yes Yes
         }
+    -- On Linux a subdirectory is opened through the root, which needs SEARCH
+    -- on the root. The file "file" in the root is used by the skip check.
+    , base
+        { title = "A subdirectory of a root with only READ reports its events"
+        , config = Event.setRecursiveMode True
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createDirectory (watchRoot p </> "dir")
+            createFile (watchRoot p </> "dir" </> "subfile")
+            holdFile p (watchRoot p </> "dir" </> "subfile")
+            denySearch (watchRoot p)
+            bypassTraverse False
+        , cleanup = \p ->
+            allowAll (watchRoot p) `finally` bypassTraverse True
+        , skip = stillSearchable . watchRoot
+        , ops = writeHeldFiles
+        , check = const (modifiedNamed "subfile")
+        , expected = onPlatform No No No
+        }
 #if defined(CABAL_OS_WINDOWS)
     -- Without the "Bypass traverse checking" privilege NTFS checks the
     -- traverse access of the watcher to a subdirectory for each change in
@@ -723,7 +774,9 @@ behaviors =
     -- watch starts.
     , base
         { title =
-            "no traverse bypass: subdir reports its events once unreachable"
+            "Without the \"Bypass traverse checking\" privilege, a "
+                ++ "subdirectory reports its events after its READ and "
+                ++ "SEARCH are removed"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (deniedDir p)
@@ -1068,6 +1121,30 @@ behaviors =
         r <- stillReadable probe
         allow probe
         removeDirectory probe
+        return r
+
+    -- Whether the entry "file" of the directory can be reached.
+    stillSearchable dir = do
+        r <- try (getPermissions (dir </> "file"))
+        return $ case r of
+            Left (_ :: IOException) -> Nothing
+            Right _ -> Just "the permission was not removed"
+
+    -- The permission required to watch a directory.
+    denyRequired = if onDarwin then denySearch else denyRead
+
+    requiredStillGranted dir =
+        if onDarwin then stillSearchable dir else stillReadable dir
+
+    -- As 'permissionNotRemovable', for 'denyRequired'.
+    requiredNotRemovable p = do
+        let probe = renamedRoot p
+        createDirectory probe
+        createFile (probe </> "file")
+        denyRequired probe
+        r <- requiredStillGranted probe
+        allowAll probe
+        removePathForcibly probe
         return r
 
     deniedDir p = watchRoot p </> "denied"
