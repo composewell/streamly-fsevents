@@ -17,7 +17,6 @@ import Control.Exception
 import Control.Monad (filterM, unless, void, when)
 import Data.List (isPrefixOf, nub, sort)
 #if defined(FILESYSTEM_EVENT_FREEBSD)
-import Control.Monad ((<=<))
 import Foreign.C.Error (throwErrnoIfMinus1_)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..))
@@ -43,6 +42,7 @@ import System.Directory
     , listDirectory
     , removeDirectory
     , removeFile
+    , removePathForcibly
     , renameDirectory
     , renamePath
     , setOwnerExecutable
@@ -208,25 +208,24 @@ procAvailable = do
     return $ either (\(_ :: IOException) -> False) (const True) r
 #endif
 
--- | Whether the library can queue the marker event of a shared root. It
--- falls back to a lax removal of a shared root without it, see
--- 'Event.removeRoot'. On Linux the marker needs @\/proc\/self\/fd@, on
--- FreeBSD it needs a watch on @\/@ or @\/dev@, which the tests do not
--- prevent.
-markerAvailable :: IO Bool
+-- | Whether the library can wake up a thread waiting for events, by queueing
+-- an event on the fd. 'Event.removeRoot' and 'Event.closeWatch' need it in
+-- the non-threaded RTS. On Linux it needs @\/proc\/self\/fd@, on FreeBSD a
+-- watch on @\/@ or @\/dev@, which the tests do not prevent.
+wakeUpAvailable :: IO Bool
 #if defined(FILESYSTEM_EVENT_FREEBSD)
-markerAvailable = return True
+wakeUpAvailable = return True
 #else
-markerAvailable = procAvailable
+wakeUpAvailable = procAvailable
 #endif
 
--- | Whether the marker event needs a free file descriptor. On Linux it needs
+-- | Whether the wake up event needs a free file descriptor. On Linux it needs
 -- a pipe, on FreeBSD it needs none.
-markerNeedsFd :: Bool
+wakeUpNeedsFd :: Bool
 #if defined(FILESYSTEM_EVENT_FREEBSD)
-markerNeedsFd = False
+wakeUpNeedsFd = False
 #else
-markerNeedsFd = True
+wakeUpNeedsFd = True
 #endif
 
 -- | The last event must be the isRootUnwatched event for root1.
@@ -239,19 +238,22 @@ shouldEndUnwatched evs root1 = do
 
     lastMaybe = foldl (\_ x -> Just x) Nothing
 
--- The events queued before removeRoot, including isRootUnwatched, have
--- the watch descriptor of the removed root.
+-- The create event of the file is in the kernel queue when the root is
+-- removed.
 removeQueuedEvents :: Spec
 removeQueuedEvents =
-    it "removeRoot reports the queued events and isRootUnwatched"
-        $ withTwoRoots $ \root1 _ w -> do
+    it "removeRoot drops the queued events and reports isRootUnwatched"
+        $ withTwoRoots $ \root1 root2 w -> do
             let file = root1 </> "file"
+                end = root2 </> "end"
             openFile file WriteMode >>= hClose
             Event.removeRoot w =<< Path.fromString root1
             evs <- readUntilUnwatched w
-            any (\ev -> Event.isCreated ev && getAbsPath ev == file) evs
-                `shouldBe` True
             shouldEndUnwatched evs root1
+            openFile end WriteMode >>= hClose
+            evs1 <- readUntil (\ev -> getAbsPath ev == end) w
+            let ofRoot1 = filter ((== root1) . getRoot) (evs ++ evs1)
+            map Event.isRootUnwatched ofRoot1 `shouldBe` [True]
 
 -- The kernel removes the watch of a deleted root.
 removeDeleted :: Spec
@@ -314,29 +316,23 @@ overlapFanOut =
                 (\ev -> isCreatedAt file ev && getRoot ev == sub) w
             createdRoots file evs `shouldBe` [root, sub]
 
--- The create event of file is queued before the removal of sub. With the
--- marker it is reported for sub, without the marker sub is removed at once
--- and it is reported for root only.
+-- The create event of file is in the kernel queue when sub is removed. It is
+-- reported for root only.
 overlapRemoveQueued :: Spec
 overlapRemoveQueued =
-    it "removing the inner root reports the events queued before it"
+    it "removing the inner root drops its queued events"
         $ withNestedRoots $ \root sub w -> do
-            hasMarker <- markerAvailable
             let file = sub </> "file"
             createFile file
             Event.removeRoot w =<< Path.fromString sub
-            evs <- readUntil
-                (\ev -> Event.isRootUnwatched ev
-                    || (isCreatedAt file ev && getRoot ev == root)) w
-            if hasMarker
-            then do
-                evs1 <- readUntil Event.isRootUnwatched w
-                createdRoots file (evs ++ evs1) `shouldBe` [root, sub]
-                unwatched (evs ++ evs1) `shouldBe` [(sub, sub)]
-            else do
-                unwatched evs `shouldBe` [(sub, sub)]
-                evs1 <- readUntil (isCreatedAt file) w
-                createdRoots file evs1 `shouldBe` [root]
+            evs <-
+                readUntil (\ev -> isCreatedAt file ev && getRoot ev == root) w
+            evs1 <-
+                if null (unwatched evs)
+                then readUntil Event.isRootUnwatched w
+                else return []
+            createdRoots file (evs ++ evs1) `shouldBe` [root]
+            unwatched (evs ++ evs1) `shouldBe` [(sub, sub)]
 
 -- The watch descriptor of root is removed from the kernel, the watch
 -- descriptor of sub is still used by sub.
@@ -344,19 +340,10 @@ overlapRemoveOuter :: Spec
 overlapRemoveOuter =
     it "removing the outer root keeps the inner root watching"
         $ withNestedRoots $ \root sub w -> do
-            hasMarker <- markerAvailable
             Event.removeRoot w =<< Path.fromString root
             evs <- readUntil
                 (\ev -> Event.isRootUnwatched ev && getAbsPath ev == sub) w
-            if hasMarker
-            then unwatched evs `shouldBe` [(root, root), (root, sub)]
-            -- The shared watch descriptor of sub is removed for root at once,
-            -- before the IN_IGNORED event of the watch descriptor of root.
-            else do
-                evs2 <- readUntil
-                    (\ev -> Event.isRootUnwatched ev && getAbsPath ev == root)
-                    w
-                unwatched (evs ++ evs2) `shouldBe` [(root, sub), (root, root)]
+            unwatched evs `shouldBe` [(root, root), (root, sub)]
             let file = sub </> "file"
             createFile file
             evs1 <- readUntil (isCreatedAt file) w
@@ -377,8 +364,8 @@ overlapRemoveBoth =
             unwatched evs `shouldBe` [(sub, sub), (root, root), (root, sub)]
 
 -- The inner root sub is moved out of the outer root. The outer root paths
--- are removed first, by a marker event, while the inner root still uses the
--- watch descriptors of sub and sub/dir. The inner root is renamed, it is
+-- are removed first, while the inner root still uses the watch descriptors
+-- of sub and sub/dir. The inner root is renamed, it is
 -- removed next, which removes the watch descriptors.
 overlapMoveOutInner :: Spec
 overlapMoveOutInner =
@@ -503,6 +490,88 @@ defaultExcludeUnlinked =
             evs <- readUntil (isCreatedAt sentinel) w
             pathsOf Event.isModified evs `shouldBe` []
 
+-- | A recursive watch with the default events, without the open, access and
+-- close events of 'watchCfg'.
+recDefaultCfg :: Event.Config
+recDefaultCfg = Event.setRecursiveMode True Event.defaultConfig
+
+-- | Read the events of the watch up to the 'Event.isRootUnwatched' event of
+-- @path@, and then the events that follow within 500 ms of each other.
+readPastUnwatched :: FilePath -> Event.Watch -> IO [Event]
+readPastUnwatched path w = do
+    evs <- readUntil isUnwatched w
+    (evs ++) <$> more
+
+    where
+
+    isUnwatched ev = Event.isRootUnwatched ev && getAbsPath ev == path
+
+    more = do
+        r <- timeout 500000 (Event.readEvent w)
+        case r of
+            Just (Just ev) -> (ev :) <$> more
+            _ -> return []
+
+-- | The events after the 'Event.isDeleted' event of the root @root@ itself.
+afterRootDeleted :: FilePath -> [Event] -> [Event]
+afterRootDeleted root = drop 1 . dropWhile (not . isRootDelete)
+
+    where
+
+    isRootDelete ev =
+        Event.isDeleted ev && null (Event.getRelPath ev) && getRoot ev == root
+
+-- The tree is deleted before the events are read. The kernel queues the
+-- deletion of the entries before the deletion of the root.
+rootDeletedLast :: Spec
+rootDeletedLast =
+    it "only isRootUnwatched follows the isDeleted event of a root"
+        $ withRoot recDefaultCfg $ \root w -> do
+            let sub = root </> "sub"
+                sentinel = root </> "sentinel"
+            createDirectory sub
+            createFile (sub </> "file")
+            createFile sentinel
+            _ <- readUntil (isCreatedAt sentinel) w
+            removePathForcibly root
+            evs <- afterRootDeleted root <$> readPastUnwatched root w
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` []
+            unwatched evs `shouldSatisfy` elem (root, root)
+
+-- The watch stays on the renamed directory until the library processes the
+-- rename. A change in the renamed directory before that would report the old
+-- path, it is dropped.
+rootRenamedEvents :: Spec
+rootRenamedEvents =
+    it "a change after the rename of a root is not reported"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            let moved = root ++ "-moved"
+            renameDirectory root moved
+            createFile (moved </> "file")
+            evs <- readUntilUnwatched w
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` [root]
+            pathsOf Event.isMoved evs `shouldBe` [root]
+            unwatched evs `shouldBe` [(root, root)]
+
+-- A subdirectory moved out of the tree stays watched until the library
+-- processes its move. A change in it before that would report the old path,
+-- it is dropped.
+movedOutAfterRootDeleted :: Spec
+movedOutAfterRootDeleted =
+    it "no change in a moved out subdirectory follows the root's isDeleted"
+        $ withRoot recDefaultCfg $ \root w -> do
+            let sub = root </> "sub"
+                out = takeDirectory root </> "out"
+                sentinel = root </> "sentinel"
+            createDirectory sub
+            createFile sentinel
+            _ <- readUntil (isCreatedAt sentinel) w
+            renameDirectory sub out
+            removePathForcibly root
+            createFile (out </> "file")
+            evs <- afterRootDeleted root <$> readPastUnwatched sub w
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` []
+
 -- No activity follows the operation on the root. 'readUntil' raises an
 -- exception on a timeout if the event is held back until a later event.
 lastRootEvent :: Spec
@@ -622,17 +691,88 @@ recRootRenamed =
             evs <- renameRootUntil root sub w
             unwatched evs `shouldBe` [(root, root), (root, sub)]
 
--- Both renames are done before the events are read.
+-- | The events other than the 'Event.isRootMoved' and 'Event.isRootUnwatched'
+-- events of a renamed root.
+otherThanRename :: [Event] -> [FilePath]
+otherThanRename =
+    pathsOf (\ev -> not (Event.isRootMoved ev || Event.isRootUnwatched ev))
+
+recRootRenamedDropsEvents :: Spec
+recRootRenamedDropsEvents =
+    it "a renamed recursive root reports no events after isMoved"
+        $ withRoot recCfg $ \root w -> do
+            let sub = root </> "sub"
+                moved = root ++ "-moved"
+            createDirectory sub
+            createFile (root </> "sentinel")
+            _ <- readUntil (isCreatedAt (root </> "sentinel")) w
+            let files = [root </> "file", sub </> "file"]
+                isSubUnwatched ev =
+                    Event.isRootUnwatched ev && getAbsPath ev == sub
+            renamePath root moved
+            createFile (moved </> "file")
+            createFile (moved </> "sub" </> "file")
+            evs <- readUntil isSubUnwatched w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            pathsOf (\ev -> getAbsPath ev `elem` files) evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root), (root, sub)]
+
+-- Both renames are done before the events are read. A directory has one
+-- name, its IN_MOVE_SELF event removes the root.
 rootRenamedBack :: Spec
 rootRenamedBack =
-    it "a root renamed back before the event is read stays watched"
-        $ withRoot watchCfg $ \root w -> do
-            let file = root </> "file"
+    it "a root renamed back before the event is read is unwatched"
+        $ withRoot Event.defaultConfig $ \root w -> do
             renameDirectory root (root ++ "-moved")
             renameDirectory (root ++ "-moved") root
-            createFile file
-            evs <- readUntil (isCreatedAt file) w
-            unwatched evs `shouldBe` []
+            createFile (root </> "file")
+            evs <- readUntil Event.isRootUnwatched w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            otherThanRename evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root)]
+
+-- The rename of a parent of a root generates no event for the root. The root
+-- stays watched, its events report the old path.
+rootParentRenamed :: Spec
+rootParentRenamed =
+    it "a root whose parent is renamed stays watched under the old path"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let parent = fp </> "parent"
+                root = parent </> "root"
+                moved = fp </> "moved"
+            createDirectory parent
+            createDirectory root
+            r <- Path.fromString root
+            bracket
+                (Event.openWatch id (r NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    renameDirectory parent moved
+                    createFile (moved </> "root" </> "file")
+                    evs <- readUntil Event.isCreated w
+                    unwatched evs `shouldBe` []
+                    pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
+
+-- The rename of any hard link of a file reports IN_MOVE_SELF, the root is
+-- kept if its path refers to the file when the event is read.
+fileRootRenamedBack :: Spec
+fileRootRenamedBack =
+    it "a file root renamed back before the event is read stays watched"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let f = fp </> "f"
+            createFile f
+            root <- Path.fromString f
+            bracket
+                (Event.openWatch (const watchCfg) (root NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    renamePath f (f ++ "-moved")
+                    renamePath (f ++ "-moved") f
+                    appendFile f "x"
+                    evs <- readUntil Event.isModified w
+                    unwatched evs `shouldBe` []
+                    pathsOf Event.isMoved evs `shouldBe` []
+                    pathsOf Event.isModified evs `shouldBe` [f]
 
 -- The rename of one hard link reports IN_MOVE_SELF for both roots.
 rootHardLinkRenamed :: Spec
@@ -652,8 +792,43 @@ rootHardLinkRenamed =
                     unwatched evs `shouldBe` [(f, f)]
                     appendFile g "x"
                     evs1 <- readUntil Event.isModified w
+                    pathsOf Event.isMoved (evs ++ evs1) `shouldBe` [f]
                     map getRoot (filter Event.isModified evs1)
                         `shouldBe` [g]
+
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+-- | Run the test with the directory @src@ and its bind mount @mnt@, both
+-- watched as roots. test/bind-mount.sh creates them in the directory
+-- @FSEVENTS_BIND_MOUNT@.
+withBindMount :: (FilePath -> FilePath -> Event.Watch -> IO ()) -> IO ()
+withBindMount action = do
+    v <- lookupEnv "FSEVENTS_BIND_MOUNT"
+    case v of
+        Nothing -> pendingWith "run test/bind-mount.sh"
+        Just dir -> do
+            let src = dir </> "src"
+                mnt = dir </> "mnt"
+            roots <- mapM Path.fromString [src, mnt]
+            bracket
+                (Event.openWatch id (NonEmpty.fromList roots))
+                Event.closeWatch
+                (action src mnt)
+
+-- The root of a mount cannot be renamed, the IN_MOVE_SELF of the directory
+-- is for its other path.
+bindMountRootRenamed :: Spec
+bindMountRootRenamed =
+    it "renaming the source of a bind mount root unwatches the source only"
+        $ withBindMount $ \src mnt w -> do
+            renameDirectory src (src ++ "-moved")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(src, src)]
+            createFile (mnt </> "file")
+            evs1 <- readUntil Event.isCreated w
+            pathsOf Event.isMoved (evs ++ evs1) `shouldBe` [src]
+            pathsOf Event.isCreated evs1 `shouldBe` [mnt </> "file"]
+            renameDirectory (src ++ "-moved") src
+#endif
 
 -------------------------------------------------------------------------------
 -- Recursive mode tests
@@ -739,6 +914,26 @@ recMoveOutSpec :: Spec
 recMoveOutSpec =
     it "removes a directory moved out of the tree"
         $ () <$ recMoveOut recCfg
+
+-- The files are created in the moved out tree before the events are read.
+recMoveOutDropsEvents :: Spec
+recMoveOutDropsEvents =
+    it "reports no events of a moved out tree after the move"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                out = takeDirectory root </> "out"
+            createDirectory dir
+            createDirectory sub
+            waitWatched w dir
+            renameDirectory dir out
+            createFile (out </> "file")
+            createFile (out </> "sub" </> "file")
+            evs <- readUntil (isUnwatchedAt sub) w
+            let files = [dir </> "file", sub </> "file"]
+            pathsOf (\ev -> getAbsPath ev `elem` files) evs `shouldBe` []
+            pathsOf Event.isMovedFrom evs `shouldBe` [dir]
+            unwatched evs `shouldBe` [(root, dir), (root, sub)]
 
 -- The kernel watch generates IN_MOVED_FROM to remove the moved directory,
 -- the event is not reported.
@@ -1023,17 +1218,17 @@ whileReading p w action = do
             either (\(e :: SomeException) -> throwIO e) (return . (r,)) evs
 
 -- The reader thread is blocked reading the watch fd. The isRootUnwatched
--- event of sub wakes it up without a file system event: the marker event
--- if it can be queued, the synthetic event in the threaded RTS if not.
+-- event of sub wakes it up without a file system event, in the non-threaded
+-- RTS by an event queued on the fd if it can be queued.
 removeSharedWhileReading :: Spec
 removeSharedWhileReading =
     it "removing a shared root wakes up a thread reading the events"
         $ withNestedRoots $ \root sub w -> do
-            hasMarker <- markerAvailable
+            hasWakeUp <- wakeUpAvailable
             p <- Path.fromString sub
             (r, evs) <- whileReading Event.isRootUnwatched w $ do
                 r <- timeout 2000000 $ Event.removeRoot w p
-                unless (hasMarker || rtsSupportsBoundThreads)
+                unless (hasWakeUp || rtsSupportsBoundThreads)
                     $ createFile (root </> "file")
                 return r
             r `shouldBe` Just ()
@@ -1058,11 +1253,11 @@ readEventsUntil done w = do
                 Just ev -> go (ev : acc)
 
 -- Each thread adds its root, creates a file in it and removes the root, a
--- number of times. The events queued before a removal are reported before
--- its isRootUnwatched event.
+-- number of times. A create event still in the kernel queue at the removal
+-- is dropped, the others are reported once.
 addRemoveThreads :: Spec
 addRemoveThreads =
-    it "roots added and removed by several threads report all their events"
+    it "roots added and removed by several threads report each removal"
         $ withRoot watchCfg $ \root w -> do
             let base = takeDirectory root
                 dirs = [base </> ("dir" ++ show i) | i <- [1 .. threads]]
@@ -1103,9 +1298,13 @@ addRemoveThreads =
 
     checkDir evs fileOf dir = do
         let ofDir = filter ((== dir) . getRoot) evs
-        sort (pathsOf Event.isCreated ofDir)
-            `shouldBe` sort (map (fileOf dir) [1 .. cycles])
+            created = pathsOf Event.isCreated ofDir
+        created `shouldSatisfy` all (`elem` map (fileOf dir) [1 .. cycles])
+        length (nub created) `shouldBe` length created
         unwatched ofDir `shouldBe` replicate cycles (dir, dir)
+        fmap Event.isRootUnwatched (lastOf ofDir) `shouldBe` Just True
+
+    lastOf = foldl (\_ x -> Just x) Nothing
 
 -------------------------------------------------------------------------------
 -- Failure tests
@@ -1222,50 +1421,6 @@ recDeepMovedIn =
                 createFile new
                 evs1 <- readUntil (isCreatedAt new) w
                 createdRoots new evs1 `shouldBe` [root]
-
-#if defined(FILESYSTEM_EVENT_FREEBSD)
--- The marker of the shared watch descriptor of link needs a watch on / or
--- /dev, the watch already watches both. link is removed at once, the events
--- queued for it are not reported. The watch is not recursive, a recursive
--- watch of / would add a watch for every directory.
-removeFailRetry :: Spec
-removeFailRetry =
-    it "removeRoot removes a shared root at once without the marker"
-        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
-            let root = fp </> "root"
-                link = fp </> "link"
-                file = root </> "file"
-            createDirectory root
-            createDirectoryLink root link
-            roots <- mapM Path.fromString [root, link]
-            bracket
-                (Event.openWatch (const watchCfg) (NonEmpty.fromList roots))
-                Event.closeWatch
-                $ \w -> do
-                    mapM_ (Event.addRoot w <=< Path.fromString) ["/", "/dev"]
-                    Event.removeRoot w =<< Path.fromString link
-                    createFile file
-                    evs <- readUntil (isCreatedAt file) w
-                    unwatched evs `shouldBe` [(link, link)]
-                    createdRoots file evs `shouldBe` [root]
-#else
--- The marker of the shared watch descriptor of sub needs a pipe, the pipe
--- fails with EMFILE.
-removeFailRetry :: Spec
-removeFailRetry =
-    it "removeRoot can be retried after it fails"
-        $ withNestedRoots $ \_ sub w -> do
-            p <- Path.fromString sub
-            r <- withFdsExhausted (try (Event.removeRoot w p))
-            case r of
-                Nothing -> pendingWith "the open file limit is too high"
-                Just (Right ()) ->
-                    expectationFailure "removeRoot did not fail"
-                Just (Left (_ :: IOException)) -> do
-                    Event.removeRoot w p
-                    evs <- readUntil Event.isRootUnwatched w
-                    unwatched evs `shouldBe` [(sub, sub)]
-#endif
 
 -- The directory cannot be added without a free fd. Its create event is
 -- reported, followed by the exception. The events of the files were read
@@ -1398,7 +1553,7 @@ closeFailFallback =
                             pendingWith "the open file limit is too high"
                         Just c -> do
                             c `shouldBe` Just ()
-                            when (markerNeedsFd && not rtsSupportsBoundThreads)
+                            when (wakeUpNeedsFd && not rtsSupportsBoundThreads)
                                 $ do
                                     threadDelay 200000
                                     done <- tryTakeMVar mv
@@ -1888,13 +2043,12 @@ recReusedPathMovedWithin =
             renameDirectory dir1 dir
         map (takeFileName . snd) (unwatched evs) `shouldBe` ["dir", "sub"]
 
--- IN_MOVE_SELF of dir1 removes its watch when it is read, the kernel queues
--- IN_IGNORED after the IN_CREATE event of the new dir1. isRootUnwatched refers
--- to the directory that was at the path, the new dir1 is watched. This test
--- records the current behavior, see "Reused paths" in dev/design.linux.md.
+-- IN_MOVE_SELF of dir1 removes its watch when it is read, before the
+-- IN_CREATE event of the new dir1 is read. isRootUnwatched refers to the
+-- directory that was at the path, the new dir1 is watched.
 recUnwatchedAfterRecreated :: Spec
 recUnwatchedAfterRecreated =
-    it "reports isRootUnwatched of a moved out directory after a path reuse"
+    it "reports isRootUnwatched of a moved out directory before a path reuse"
         $ withRenameDirs $ \root w dir1 _ -> do
             let later = dir1 </> "later"
                 isAtDir ev =
@@ -1905,7 +2059,7 @@ recUnwatchedAfterRecreated =
                 createDirectory dir1
             evs1 <- recEventsOf root w (createFile later)
             map Event.isRootUnwatched (filter isAtDir (evs ++ evs1))
-                `shouldBe` [False, True]
+                `shouldBe` [True, False]
             pathsOf Event.isCreated evs1
                 `shouldBe` [later, root </> "sentinel"]
 
@@ -2467,11 +2621,19 @@ watchTests =
                 rootRenamed
                 rootRenamedUnrequested
                 recRootRenamed
+                recRootRenamedDropsEvents
                 rootRenamedBack
+                rootParentRenamed
+                fileRootRenamedBack
                 rootHardLinkRenamed
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+            describe "bind mount" $ do
+                bindMountRootRenamed
+#endif
             describe "recursive mode" $ do
                 recSubdirSelfEvents
                 recMoveOutSpec
+                recMoveOutDropsEvents
                 recMoveOutUnrequested
             describe "recursive mode rename races" $ do
                 recRenameCreateBeforeRead
@@ -2490,7 +2652,6 @@ watchTests =
                 removeSharedWhileReading
                 addRemoveThreads
             describe "failures" $ do
-                removeFailRetry
                 closeFailFallback
                 readAfterFailure
                 readAfterScanFailure
@@ -2544,6 +2705,10 @@ watchTests =
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan
+            describe "end of the events of a root" $ do
+                rootDeletedLast
+                rootRenamedEvents
+                movedOutAfterRootDeleted
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified

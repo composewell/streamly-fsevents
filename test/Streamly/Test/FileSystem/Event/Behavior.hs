@@ -352,6 +352,15 @@ setAttrs = Windows.setAttrsModified
 metadataChanged = Event.isModified
 #endif
 
+-- | The predicate for the end of the watch of a root, on the platforms that
+-- have it.
+rootUnwatchedFlag :: Maybe (Event -> Bool)
+#if defined(CABAL_OS_LINUX)
+rootUnwatchedFlag = Just Linux.isRootUnwatched
+#else
+rootUnwatchedFlag = Nothing
+#endif
+
 base :: Behavior
 base =
     Behavior
@@ -399,11 +408,15 @@ behaviors =
         , racy = onDarwin
         }
     , base
-        { title = "deleted root reports isDeleted for the root"
+        { title = "A deleted watch root reports `isDeleted` for the root"
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
         , expected = Yes
+        }
+    , (deletedRootReports rootUnwatchedFlag)
+        { title =
+            "A deleted watch root reports `isRootUnwatched` for the root"
         }
     , base
         { title = "root deleted and created again is watched"
@@ -431,8 +444,7 @@ behaviors =
              in any (\ev -> isRoot ev && Event.isMoved ev)
         , expected = onPlatform Yes Yes No
         }
-    -- On Linux the root is removed only if its path no longer refers to the
-    -- watched directory when the rename event is read.
+    -- On Linux the rename event of a directory root removes the root.
     , base
         { title = "root renamed back before the event is read is watched"
         , paused = True
@@ -441,7 +453,7 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p)
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
+        , expected = onPlatform No Yes Yes
         }
     , base
         { title = "root renamed back after the event is read is watched"
@@ -1167,6 +1179,22 @@ behaviors =
         return r
 
     deniedDir p = watchRoot p </> "denied"
+
+    -- A deleted root reports the predicate for the root. Skipped on a
+    -- platform without the predicate.
+    deletedRootReports flag =
+        base
+            { skip = const $ return $ case flag of
+                Just _ -> Nothing
+                Nothing -> Just "the platform has no such predicate"
+            , ops = removePathForcibly . watchRoot
+            , check = \p evs ->
+                case flag of
+                    Just f ->
+                        any (\ev -> absPath ev == watchRoot p && f ev) evs
+                    Nothing -> False
+            , expected = Yes
+            }
 
     ignoreError action =
         void (try action :: IO (Either IOException ()))

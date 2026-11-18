@@ -34,15 +34,22 @@
 --
 -- /Watch root:/
 --
--- * If a watch root is deleted, it reports an event for which 'isDeleted'
--- and 'isRootDeleted' are true, and its watch ends with an 'isRootUnwatched'
--- event.
--- * If a watch root is renamed, it reports an event for which 'isMoved' and
--- 'isRootMoved' are true, and its watch ends with an 'isRootUnwatched'
--- event. The kernel does not report the new path of the root.
+-- * If a watch root is deleted, it reports an 'isDeleted' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event.
+-- * If a watch root is renamed, it reports an 'isMoved' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event. The kernel does not report the new path of the
+-- root. The events between the two would report the old path, they are not
+-- reported.
 -- * An object created at the path of a removed root later, or renamed to it,
 -- is not watched, including the root renamed back. Start a new watch to
--- watch it.
+-- watch it. A root that is a file and is renamed back before its 'isMoved'
+-- event is read stays watched: the rename of any hard link of a file reports
+-- 'isMoved', the root is removed only if its path no longer refers to the
+-- file.
+-- * The rename of a parent directory of a root is not reported. The root
+-- stays watched and its events report the old path, which no longer exists.
 -- * The stream ends when none of the roots is watched any more.
 --
 -- Objects inside a watched directory do not have these limitations. A
@@ -147,8 +154,6 @@ module Streamly.FileSystem.Event.Linux
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
-    , isRootDeleted
-    , isRootMoved
     , isRootUnmounted
 
     -- ** Item Level Metadata change
