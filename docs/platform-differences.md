@@ -82,13 +82,21 @@ path:
 | A watch root deleted and created again is watched | No | Yes | No |
 | A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 
+On Windows the watch stays on the renamed root, and the events report paths
+under the old root path. On Linux the watch is also on the object, but the
+library ends it, so that the events do not report the old path, which no
+longer exists or refers to another object:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A renamed watch root is watched | No | No | Yes |
+| A root renamed back after the rename event is read is watched | No | Yes | Yes |
+
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
-| A renamed watch root is watched | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
 | A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
-| A root renamed back after the rename event is read is watched | No | Yes | Yes |
 | A regular file can be a watch root | Yes | Yes | No |
 | A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
 
