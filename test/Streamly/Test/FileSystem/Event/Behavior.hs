@@ -170,10 +170,18 @@ holdFile p path = do
     h <- openFile path AppendMode
     modifyIORef' (heldFiles p) (h :)
 
--- | Append to the files opened by 'holdFile'.
-writeHeldFiles :: Paths -> IO ()
-writeHeldFiles p =
+-- | Append to the files opened by 'holdFile' and keep them open.
+writeHeldFilesOpen :: Paths -> IO ()
+writeHeldFilesOpen p =
     readIORef (heldFiles p) >>= mapM_ (\h -> hPutStr h "x" >> hFlush h)
+
+-- | Append to the files opened by 'holdFile' and close them. On Windows a
+-- write through a handle that stays open may not be reported, see the
+-- "write through a handle kept open" behavior.
+writeHeldFiles :: Paths -> IO ()
+writeHeldFiles p = do
+    writeHeldFilesOpen p
+    readIORef (heldFiles p) >>= mapM_ hClose
 
 -- | Remove the permission to list a directory, keep the permission to create
 -- a file in it.
@@ -595,11 +603,32 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- The writes of the tests of unreachable directories are made through a
+    -- handle opened before the permissions are removed. On Windows the
+    -- outcomes are expected, not yet observed.
+    , base
+        { title = "write through a handle kept open is reported"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            writeHeldFilesOpen p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes Yes No
+        }
+    , base
+        { title = "write through a handle closed after it is reported"
+        , setup = \p -> createFile (watchRoot p </> "file")
+        , ops = \p -> do
+            holdFile p (watchRoot p </> "file")
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
     -- A directory that cannot be reached: FSEvents does not report its events
     -- to a process that is not root, except the events of a root that
     -- becomes unreachable after the start of the watch. The file is written
-    -- through a handle opened before the permissions are removed. The
-    -- Windows outcomes are expected, not yet observed.
+    -- through a handle opened before the permissions are removed, and closed
+    -- after the write. The Windows outcomes are expected, not yet observed.
     , base
         { title = "unreachable root reports its changes"
         , setup = \p -> do
