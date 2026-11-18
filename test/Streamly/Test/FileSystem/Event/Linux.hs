@@ -43,6 +43,7 @@ import System.Directory
     , listDirectory
     , removeDirectory
     , removeFile
+    , removePathForcibly
     , renameDirectory
     , renamePath
     , setOwnerExecutable
@@ -502,6 +503,88 @@ defaultExcludeUnlinked =
             createFile sentinel
             evs <- readUntil (isCreatedAt sentinel) w
             pathsOf Event.isModified evs `shouldBe` []
+
+-- | A recursive watch with the default events, without the open, access and
+-- close events of 'watchCfg'.
+recDefaultCfg :: Event.Config
+recDefaultCfg = Event.setRecursiveMode True Event.defaultConfig
+
+-- | Read the events of the watch up to the 'Event.isRootUnwatched' event of
+-- @path@, and then the events that follow within 500 ms of each other.
+readPastUnwatched :: FilePath -> Event.Watch -> IO [Event]
+readPastUnwatched path w = do
+    evs <- readUntil isUnwatched w
+    (evs ++) <$> more
+
+    where
+
+    isUnwatched ev = Event.isRootUnwatched ev && getAbsPath ev == path
+
+    more = do
+        r <- timeout 500000 (Event.readEvent w)
+        case r of
+            Just (Just ev) -> (ev :) <$> more
+            _ -> return []
+
+-- | The events after the 'Event.isDeleted' event of the root @root@ itself.
+afterRootDeleted :: FilePath -> [Event] -> [Event]
+afterRootDeleted root = drop 1 . dropWhile (not . isRootDelete)
+
+    where
+
+    isRootDelete ev =
+        Event.isDeleted ev && null (Event.getRelPath ev) && getRoot ev == root
+
+-- The tree is deleted before the events are read. The kernel queues the
+-- deletion of the entries before the deletion of the root.
+rootDeletedLast :: Spec
+rootDeletedLast =
+    it "only isRootUnwatched follows the isDeleted event of a root"
+        $ withRoot recDefaultCfg $ \root w -> do
+            let sub = root </> "sub"
+                sentinel = root </> "sentinel"
+            createDirectory sub
+            createFile (sub </> "file")
+            createFile sentinel
+            _ <- readUntil (isCreatedAt sentinel) w
+            removePathForcibly root
+            evs <- afterRootDeleted root <$> readPastUnwatched root w
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` []
+            unwatched evs `shouldSatisfy` elem (root, root)
+
+-- The watch stays on the renamed directory until the library processes the
+-- rename. A change in the renamed directory before that is reported under
+-- the old path, after the isMoved event of the root.
+rootRenamedEvents :: Spec
+rootRenamedEvents =
+    it "a change after the rename of a root is reported under the old path"
+        $ withRoot Event.defaultConfig $ \root w -> do
+            let moved = root ++ "-moved"
+            renameDirectory root moved
+            createFile (moved </> "file")
+            evs <- readUntilUnwatched w
+            pathsOf (\ev -> Event.isMoved ev || Event.isCreated ev) evs
+                `shouldBe` [root, root </> "file"]
+            unwatched evs `shouldBe` [(root, root)]
+
+-- A subdirectory moved out of the tree stays watched until the library
+-- processes its move. A change in it is reported under its old path, and can
+-- follow the isDeleted event of the root.
+movedOutAfterRootDeleted :: Spec
+movedOutAfterRootDeleted =
+    it "a change in a moved out subdirectory can follow the root's isDeleted"
+        $ withRoot recDefaultCfg $ \root w -> do
+            let sub = root </> "sub"
+                out = takeDirectory root </> "out"
+                sentinel = root </> "sentinel"
+            createDirectory sub
+            createFile sentinel
+            _ <- readUntil (isCreatedAt sentinel) w
+            renameDirectory sub out
+            removePathForcibly root
+            createFile (out </> "file")
+            evs <- afterRootDeleted root <$> readPastUnwatched sub w
+            pathsOf Event.isCreated evs `shouldBe` [sub </> "file"]
 
 -- No activity follows the operation on the root. 'readUntil' raises an
 -- exception on a timeout if the event is held back until a later event.
@@ -2544,6 +2627,10 @@ watchTests =
             describe "recursive mode scan of a tree" $ do
                 recStartScanSilent
                 recTouchAfterScan
+            describe "end of the events of a root" $ do
+                rootDeletedLast
+                rootRenamedEvents
+                movedOutAfterRootDeleted
             describe "defaultConfig" $ do
                 defaultExcludeUnlinked
                 defaultAttrsModified
