@@ -84,6 +84,11 @@ on Linux.
   the entries in the root, in recursive and non-recursive watches. On
   Windows `ReadDirectoryChangesW` does not report the deletion of the watch
   root, the library reports `isDeleted` for the root.
+* A write through an open handle on Windows: `ReadDirectoryChangesW`
+  detects a change of the size or of the last write time of a file when it
+  is written to the disk. With caching, a write through a handle that stays
+  open may not be reported until the cache is flushed or the handle is
+  closed. Linux and macOS report the write when it is made.
 * A non-recursive watch on macOS: FSEvents can only watch a tree. The library
   starts a recursive watch and drops the events more than one level below a
   watch root, the process still receives the events of the whole tree.
@@ -159,40 +164,6 @@ On Windows the watch keeps the root open.
   read, and is unwatched otherwise.
 * A root that does not exist: on Linux and Windows the watch raises an
   exception. On macOS the path is watched when it is created.
-* A root without read permission: on Linux the watch raises an exception, on
-  Windows it is expected to, this is not tested. On Windows a process with
-  the backup and restore privileges enabled, `SeBackupPrivilege` and
-  `SeRestorePrivilege`, opens a directory regardless of its permissions; an
-  administrator has these privileges. On macOS the watch does not raise an
-  exception. FSEvents reports the events of a directory only to a process
-  that can reach it through the file system permissions, a process running
-  as root receives all events. A root with search permission and without
-  read permission reports its events. A root without any permission does
-  not report its events.
-* A subdirectory without permission in a recursive watch: on Linux a
-  subdirectory without read or search permission is not watched and is
-  reported as `isAccessDenied`, the rest of the tree stays watched. On macOS
-  the watch continues, and the events of the subdirectory are reported if
-  the process can reach it. On Windows the events of the
-  subdirectory are expected to be reported, this is not tested. A process
-  has the "Bypass traverse checking" privilege, `SeChangeNotifyPrivilege`,
-  by default. Without it, NTFS is expected to check the traverse permission
-  of the watcher to the subdirectory for each change in it, and not to
-  report the change if the check fails. macOS also checks the access to a
-  directory for each change.
-* A permission removed during the watch: Linux checks the permission when
-  the watch of a directory is added, and keeps reporting its events after
-  the permission is removed. Windows is expected to do the same, the
-  permission is checked when the handle of the root is opened. Without the
-  "Bypass traverse checking" privilege, the traverse permission of a
-  subdirectory on Windows is expected to be checked for each change. macOS
-  stops reporting the events of a subdirectory that the process can no
-  longer reach. A root that the process can no longer reach keeps reporting
-  its events on macOS.
-* A permission restored during the watch: on Linux a subdirectory that was
-  not watched because of its permission stays unwatched. macOS is expected
-  to start reporting the events of a root or a subdirectory that the process
-  can reach again, this is not yet observed.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
 * A FIFO as a root: on Linux and macOS the watch reports a write to the
   FIFO, and does not open the FIFO. Not allowed on Windows.
@@ -211,6 +182,62 @@ On Windows the watch keeps the root open.
   the working directory at the time the watch is started, a later change
   of the working directory does not affect the watch. `getRoot` returns
   the relative path, `getAbsPath` returns an absolute path.
+
+## Permissions
+
+A directory has a read permission, needed to list its entries, and a search
+(execute) permission, needed to reach the paths under it. The Windows
+rights that correspond to them are "List folder" (`FILE_LIST_DIRECTORY`)
+and "Traverse folder" (`FILE_TRAVERSE`).
+
+Linux:
+
+* The permissions are checked when the watch of a directory is added.
+  `inotify_add_watch` needs the read permission of the directory. A watch
+  root without read permission raises an exception.
+* In a recursive watch, a subdirectory is added only if it has the read and
+  the search permissions. A subdirectory without either permission is not
+  watched and is reported as `isAccessDenied`, the rest of the tree stays
+  watched.
+* A permission removed after the watch of a directory is added does not
+  affect the watch, the events of the directory are still reported. A
+  permission restored later is not detected, a subdirectory reported as
+  `isAccessDenied` stays unwatched until it is moved.
+
+macOS:
+
+* The watch does not check the permissions when it starts, a watch root
+  without any permission does not raise an exception.
+* FSEvents reports the events of a directory only to a process that can
+  reach the directory through the file system permissions. A process
+  running as root receives all events. A root or a subdirectory with the
+  search permission and without the read permission reports its events. A
+  root or a subdirectory without any permission does not report its events.
+* A permission removed during the watch: a subdirectory without read
+  permission still reports its events, a subdirectory without any
+  permission stops reporting its events. A root without any permission
+  reports its events in some runs and not in others.
+* A permission restored during the watch: a root or a subdirectory without
+  any permission at the start of the watch does not report its events
+  after its permissions are restored.
+
+Windows:
+
+* The library opens the watch root with `CreateFile`, for the
+  `FILE_LIST_DIRECTORY` access. The permission is checked once, when the
+  root is opened. A watch root without the list permission raises an
+  exception. A permission removed later does not affect the open handle,
+  the events of the root are still reported.
+* `ReadDirectoryChangesW` reports the changes of the whole tree through the
+  handle of the root, the permissions of the subdirectories are not checked
+  if the process has the "Bypass traverse checking" privilege,
+  `SeChangeNotifyPrivilege`. Windows grants this privilege to all users by
+  default. Without it, NTFS is expected to check the traverse permission of
+  the watcher to the subdirectory for each change in it, and not to report
+  the change if the check fails.
+* A process with the backup and restore privileges enabled,
+  `SeBackupPrivilege` and `SeRestorePrivilege`, opens a directory
+  regardless of its permissions. An administrator has these privileges.
 
 ## FreeBSD
 
@@ -331,26 +358,27 @@ in a recursive watch.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A watch of a root without read permission raises an exception | Yes | No | Not tested, expected Yes |
-| A root with no read reports its events | No, the watch raises an exception | Yes | Not tested, expected No |
-| A root with none reports its events | No, the watch raises an exception | No | Not tested, expected No |
-| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Not tested |
-| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Not tested, expected Yes |
-| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Not tested, expected Yes |
-| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Not tested |
-| A root reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
-| A subdirectory reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
-| A root reports its events after all its permissions are removed | Yes | Yes | Not tested, expected Yes |
-| A subdirectory reports its events after all its permissions are removed | Yes | No | Not tested, expected Yes |
-| A root with none reports its events after its permissions are restored | No, the watch raises an exception | Expected Yes | Not tested, expected No, the watch raises an exception |
-| A subdirectory with none reports its events after its permissions are restored | No | Expected Yes | Not tested, expected Yes |
-| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | Not tested, expected No |
+| A watch of a root without read permission raises an exception | Yes | No | Yes |
+| A root with no read reports its events | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A root with none reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
+| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
+| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
+| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Expected Yes |
+| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Expected Yes |
+| A root reports its events after its read permission is removed | Yes | Yes | Yes |
+| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
+| A root reports its events after all its permissions are removed | Yes | In some runs | Expected Yes |
+| A subdirectory reports its events after all its permissions are removed | Yes | No | Expected Yes |
+| A root with none reports its events after its permissions are restored | No, the watch raises an exception | No | No, the watch raises an exception |
+| A subdirectory with none reports its events after its permissions are restored | No | No | Expected Yes |
+| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | Expected No |
 
 _Expected_ is the outcome asserted by the test suite that has not yet been
-recorded from the CI. The Windows outcomes are expected from the platform
-documentation. The CI runner on Windows is an administrator, and the test
-suite disables its backup and restore privileges so that a permission
-removed from a directory applies to the test process.
+recorded from the CI. The CI runner on Windows is an administrator, and the
+test suite disables its backup and restore privileges so that a permission
+removed from a directory applies to the test process. The tests of a
+directory without any permission write to a file through a handle opened
+before the permissions are removed, and close the handle after the write.
 
 ### Event reporting
 
@@ -358,6 +386,8 @@ removed from a directory applies to the test process.
 |----------|-------|-------|---------|
 | A move reports the source and the destination as separate predicates | Yes | No | Yes |
 | `isModified` is reported for a directory | No | No | Sometimes, in a recursive watch |
+| A write through a handle kept open is reported | Yes | Yes | Expected No |
+| A write through a handle closed after the write is reported | Yes | Yes | Expected Yes |
 | Writes to an open file after it is deleted are reported | Only if `setExcludeUnlinked` is `False` | Yes | Exception |
 | Metadata changes are reported by default | Yes | Yes | No |
 | Metadata change reporting can be disabled | Yes | No | Yes |
