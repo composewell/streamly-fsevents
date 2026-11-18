@@ -58,6 +58,7 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke, pokeByteOff)
 import System.Exit (exitSuccess)
+import System.Process (readCreateProcess, shell)
 import System.Win32.HardLink (createHardLink)
 import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
 import qualified System.Win32.File as Win32
@@ -1354,13 +1355,19 @@ expectedNote b outcome
 
 #if defined(CABAL_OS_WINDOWS)
 -- | The major version of Windows, from the output of @ver@, for example,
--- @Microsoft Windows [Version 10.0.26100.1]@. 10 if it cannot be parsed.
+-- @Microsoft Windows [Version 10.0.26100.1]@. 10 if @ver@ fails or its
+-- output cannot be parsed.
 windowsMajorVersion :: IO Int
 windowsMajorVersion = do
-    out <- readProcess "cmd" ["/c", "ver"] ""
-    return $ case reads (dropWhile (not . isDigit) out) of
-        [(n, _)] -> n
-        _ -> 10
+    -- With readProcess "cmd" ["/c", "ver"] cmd receives the quoted
+    -- argument "ver" and fails, 'shell' passes the command unquoted.
+    r <- try (readCreateProcess (shell "ver") "")
+    return $ case r of
+        Left (_ :: IOException) -> 10
+        Right out ->
+            case reads (dropWhile (not . isDigit) out) of
+                [(n, _)] -> n
+                _ -> 10
 #endif
 
 main :: IO ()
