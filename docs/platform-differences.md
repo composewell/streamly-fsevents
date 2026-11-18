@@ -72,6 +72,14 @@ Tested behavior common to all platforms:
 
 * A deleted watch root reports `isDeleted` for the root.
 * A root listed twice with the same path reports a change in it once.
+* A root renamed back before the rename event is read is watched.
+
+Non directory watch roots:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A renamed watch root reports `isMoved` | Yes | Yes | No |
 
 macOS watches the path of a root, Linux and Windows watch the object at the
 path:
@@ -96,9 +104,6 @@ longer exists or refers to another object:
 |----------|-------|-------|---------|
 | A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
-| A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
-| A regular file can be a watch root | Yes | Yes | No |
-| A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
 
 On macOS the event for a deleted root comes from fseventsd itself, the
 library receives no event for the files in the root, in a recursive or a
