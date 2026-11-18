@@ -478,8 +478,8 @@ setOnlyDir = setFlag iN_ONLYDIR
 foreign import capi
     "sys/inotify.h value IN_DELETE_SELF" iN_DELETE_SELF :: Word32
 
--- | Report when the watched path itself gets deleted, as an event for which
--- 'isRootDeleted' and 'isDeleted' are true.
+-- | Report when the watched path itself gets deleted, as an 'isDeleted'
+-- event for which 'getRelPath' returns 'Nothing'.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- deletion of a subdirectory is reported as 'isDeleted' for its path under
@@ -492,9 +492,10 @@ setRootDeleted = setFlag iN_DELETE_SELF
 foreign import capi
     "sys/inotify.h value IN_MOVE_SELF" iN_MOVE_SELF :: Word32
 
--- | Report when the watched root path itself gets renamed, as an event for
--- which 'isRootMoved' and 'isMoved' are true. A renamed root is removed from
--- the watch whether or not this is enabled, see 'isRootMoved'.
+-- | Report when the watched root path itself gets renamed, as an 'isMoved'
+-- event for which 'getRelPath' returns 'Nothing'. A renamed root is removed
+-- from the watch whether or not this is enabled, and 'isRootUnwatched' is
+-- reported later.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
@@ -4013,6 +4014,12 @@ isRootUnwatched = getFlag iN_IGNORED
 -- In addition, an 'isRootUnwatched' event will subsequently be generated
 -- for the watch descriptor. 'isDeleted' is also true for this event.
 --
+-- 'isRootDeleted' is the same as 'isDeleted' for an event for which
+-- 'getRelPath' returns 'Nothing': the deletion of an entry of a directory
+-- always has the path of the entry. The portable API reports the deletion of
+-- a root this way on all platforms. Not exported by the public Linux and
+-- FreeBSD modules.
+--
 -- A regular file that has other hard links is not deleted when the watched
 -- path is unlinked, this event is not reported for it.
 --
@@ -4033,6 +4040,10 @@ isRootDeleted = getFlag iN_DELETE_SELF
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- move of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
+--
+-- 'isRootMoved' is the same as 'isMoved' for an event for which 'getRelPath'
+-- returns 'Nothing': the move of an entry of a directory always has the path
+-- of the entry. Not exported by the public Linux and FreeBSD modules.
 --
 -- /Occurs only for a watched path/
 isRootMoved :: Event -> Bool
@@ -4125,8 +4136,8 @@ isCreated = getFlag iN_CREATE
 -- | File/directory deleted from watched directory.
 --
 -- This is also true when a watch root itself is deleted, if 'setRootDeleted'
--- is enabled, which is the default. 'isRootDeleted' is true for such an
--- event and 'getRelPath' returns 'Nothing'.
+-- is enabled, which is the default. 'getRelPath' returns 'Nothing' for such
+-- an event.
 --
 -- /Can occur for a watch root or an object inside it/
 isDeleted :: Event -> Bool
@@ -4168,9 +4179,8 @@ isMovedTo = getFlag iN_MOVED_TO
 -- directory.
 --
 -- This is also true when a watch root itself is renamed, if 'setRootMoved'
--- is enabled, which is the default. 'isRootMoved' is true for such an event,
--- 'getRelPath' returns 'Nothing', and the event reports the old path of the
--- root.
+-- is enabled, which is the default. 'getRelPath' returns 'Nothing' for such
+-- an event, and the event reports the old path of the root.
 --
 -- >>> isMoved ev = isMovedFrom ev || isMovedTo ev || isRootMoved ev
 --

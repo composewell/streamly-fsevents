@@ -34,12 +34,12 @@
 --
 -- /Watch root:/
 --
--- * If a watch root is deleted, it reports an event for which 'isDeleted'
--- and 'isRootDeleted' are true, and its watch ends with an 'isRootUnwatched'
--- event.
--- * If a watch root is renamed, it reports an event for which 'isMoved' and
--- 'isRootMoved' are true, and its watch ends with an 'isRootUnwatched'
--- event. The kernel does not report the new path of the root.
+-- * If a watch root is deleted, it reports an 'isDeleted' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event.
+-- * If a watch root is renamed, it reports an 'isMoved' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event. The kernel does not report the new path of the root.
 -- * An object created at the path of a removed root later, or renamed to it,
 -- is not watched, including the root renamed back. Start a new watch to
 -- watch it.
@@ -147,8 +147,6 @@ module Streamly.FileSystem.Event.Linux
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
-    , isRootDeleted
-    , isRootMoved
     , isRootUnmounted
 
     -- ** Item Level Metadata change
