@@ -1364,16 +1364,19 @@ windowsMajorVersion = do
     r <- try (readCreateProcess (shell "ver") "")
     return $ case r of
         Left (_ :: IOException) -> 10
+        -- Not 'reads' on the rest of the output, it reads "6.3" as one
+        -- number and fails for an Int.
         Right out ->
-            case reads (dropWhile (not . isDigit) out) of
-                [(n, _)] -> n
-                _ -> 10
+            case takeWhile isDigit (dropWhile (not . isDigit) out) of
+                [] -> 10
+                digits -> read digits
 #endif
 
 main :: IO ()
 main = do
 #if defined(CABAL_OS_WINDOWS)
     major <- windowsMajorVersion
+    putStrLn $ "Windows major version: " ++ show major
     when (major < 10) $ do
         putStrLn $ "Skipped on Windows version " ++ show major
             ++ ", the suite needs Windows 10 or Windows Server 2016"
