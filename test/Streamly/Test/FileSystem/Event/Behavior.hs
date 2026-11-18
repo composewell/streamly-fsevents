@@ -175,9 +175,8 @@ writeHeldFilesOpen :: Paths -> IO ()
 writeHeldFilesOpen p =
     readIORef (heldFiles p) >>= mapM_ (\h -> hPutStr h "x" >> hFlush h)
 
--- | Append to the files opened by 'holdFile' and close them. On Windows a
--- write through a handle that stays open may not be reported, see the
--- "write through a handle kept open" behavior.
+-- | Append to the files opened by 'holdFile' and close them. On macOS and
+-- Windows a write to a file that stays open may not be reported.
 writeHeldFiles :: Paths -> IO ()
 writeHeldFiles p = do
     writeHeldFilesOpen p
@@ -546,8 +545,7 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- Linux reports the subdir as isAccessDenied and does not watch it. The
-    -- Windows outcome is expected, not yet observed.
+    -- Linux reports the subdir as isAccessDenied and does not watch it.
     , base
         { title = "unreadable subdir of a recursive root reports its changes"
         , config = Event.setRecursiveMode True
@@ -577,8 +575,7 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- The permission is checked when a watch is added, not afterwards. The
-    -- Windows outcomes are expected, not yet observed.
+    -- The permission is checked when a watch is added, not afterwards.
     , base
         { title =
             "root reports its events after its read permission is removed"
@@ -605,20 +602,22 @@ behaviors =
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- The writes of the tests of unreachable directories are made through a
-    -- handle opened before the permissions are removed. On Windows the
-    -- outcomes are expected, not yet observed.
+    -- A write to a file, without any permission change. The tests of
+    -- unreachable directories write to a file opened before the permissions
+    -- are removed, and close it after the write. On macOS the write to a file
+    -- kept open was reported in one run and not in others.
     , base
-        { title = "write through a handle kept open is reported"
+        { title = "write is reported before the file is closed"
         , setup = \p -> createFile (watchRoot p </> "file")
         , ops = \p -> do
             holdFile p (watchRoot p </> "file")
             writeHeldFilesOpen p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes Yes No
+        , expected = onPlatform Yes No No
+        , racy = onDarwin
         }
     , base
-        { title = "write through a handle closed after it is reported"
+        { title = "write is reported after the file is closed"
         , setup = \p -> createFile (watchRoot p </> "file")
         , ops = \p -> do
             holdFile p (watchRoot p </> "file")
@@ -627,11 +626,8 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     -- A directory that cannot be reached: FSEvents does not report its events
-    -- to a process that is not root. On macOS a root that becomes
-    -- unreachable after the start of the watch reports its events in some
-    -- runs. The file is written through a handle opened before the
-    -- permissions are removed, and closed after the write. The Windows
-    -- outcomes are expected, not yet observed.
+    -- to a process that is not root. The file is written through a handle
+    -- opened before the permissions are removed, and closed after the write.
     , base
         { title = "unreachable root reports its changes"
         , setup = \p -> do
@@ -670,7 +666,6 @@ behaviors =
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
-        , racy = onDarwin
         }
     , base
         { title = "subdir reports its events after it becomes unreachable"
@@ -688,9 +683,7 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
         }
-    -- The permissions are restored after the start of the watch. macOS does
-    -- not report the events of a root or subdir unreachable at the start of
-    -- the watch after it becomes reachable.
+    -- The permissions are restored after the start of the watch.
     , base
         { title = "root reports its events after it becomes reachable"
         , setup = \p -> do
@@ -704,7 +697,7 @@ behaviors =
             settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform WatchException No WatchException
+        , expected = onPlatform WatchException Yes WatchException
         }
     , base
         { title = "subdir reports its events after it becomes reachable"
@@ -721,13 +714,13 @@ behaviors =
             settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform No No Yes
+        , expected = onPlatform No Yes Yes
         }
 #if defined(CABAL_OS_WINDOWS)
-    -- Without the "Bypass traverse checking" privilege NTFS is expected to
-    -- check the traverse access of the watcher to a subdirectory for each
-    -- change in it, as macOS does. The privilege is disabled before the
-    -- watch starts. Expected, not yet observed.
+    -- Without the "Bypass traverse checking" privilege NTFS checks the
+    -- traverse access of the watcher to a subdirectory for each change in
+    -- it, as macOS does. The privilege is disabled before the
+    -- watch starts.
     , base
         { title =
             "no traverse bypass: subdir reports its events once unreachable"
