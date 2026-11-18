@@ -24,6 +24,12 @@ it. The Windows rights that correspond to them are "List folder"
 following discussion we call these permissions as "READ" and "SEARCH"
 for all platforms.
 
+The CI runner on Windows is an administrator, and the test suite disables
+its backup and restore privileges so that a permission removed from a
+directory applies to the test process. The tests of a directory without
+any permission write to a file opened before the permissions are removed,
+and close the file after the write.
+
 ## Watch roots
 
 On Linux the watch of a root is attached to its inode, on macOS to its path.
@@ -173,25 +179,6 @@ Watch roots:
 | A root reports its events after its read permission is removed | Yes | Yes | Yes |
 | A root reports its events after all its permissions are removed | Yes | No | Yes |
 | A root with none reports its events after its permissions are restored | No, the watch raises an exception | Yes | No, the watch raises an exception |
-
-Subdirectories:
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
-| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
-| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Yes |
-| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Yes |
-| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
-| A subdirectory reports its events after all its permissions are removed | Yes | No | Yes |
-| A subdirectory with none reports its events after its permissions are restored | No | Yes | Yes |
-| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | No |
-
-The CI runner on Windows is an administrator, and the test suite disables
-its backup and restore privileges so that a permission removed from a
-directory applies to the test process. The tests of a directory without
-any permission write to a file opened before the permissions are removed,
-and close the file after the write.
 
 ## Event reporting
 
@@ -392,6 +379,19 @@ macOS:
   stops reporting its events. A subdirectory without any
   permission at the start of the watch starts reporting its events after its
   permissions are restored.
+
+Subdirectories:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
+| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
+| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Yes |
+| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Yes |
+| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
+| A subdirectory reports its events after all its permissions are removed | Yes | No | Yes |
+| A subdirectory with none reports its events after its permissions are restored | No | Yes | Yes |
+| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | No |
 
 ## FreeBSD vs Linux
 
