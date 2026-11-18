@@ -7,127 +7,22 @@ exceptions listed below. The other differences come from the event models of the
 systems. The tables at the end list each difference as recorded by the test
 suite `FileSystem.Event.Behavior`.
 
-## New and moved directories
+## Behavior tests
 
-On macOS and Windows the operating system implements the recursive watch. A
-new subdirectory is covered by the watch in the same operation that creates
-it, so no change in it is lost. This follows from the design of the APIs,
-neither platform documents it as a guarantee.
+Each entry is the result of the test suite `FileSystem.Event.Behavior` on that
+platform, except where noted below the table. The results were recorded on
+Ubuntu 24.04, macOS 26 (arm64), Windows Server 2025 and Windows Server
+2012 R2. _Exception_ means that the file system operation raises an exception
+because the file is open.
 
-On Linux inotify watches one directory, and this library implements the
-recursive watch in user space. It adds the watch of a new subdirectory after
-it reads the create event of the subdirectory, and then scans the
-subdirectory. The scan reports the entries already in it as `isCreated`
-events and sets `isScanEvent` to true; for example,
-`mkdir -p a/b; touch a/b/f` reports `a`, `a/b` and `a/b/f`. Creating the
-subdirectory and adding its watch are two separate steps, and the kernel
-does not report changes in the subdirectory in between. The remaining
-differences follow from this:
+## Directory permissions
 
-* On Linux a file created and then deleted in a newly created directory,
-  before the watch of the directory is added, is not reported at all. Writes
-  to a file created in this directory, before the watch is added, are not
-  reported as `isModified` events. After the directory watch is added, a
-  create event is reported for such a file, and all later events for it are
-  reported. macOS and Windows report these events.
-* Entries already in a directory moved into the tree: Linux reports each
-  entry, from the scan. macOS and Windows report only the directory, so a
-  portable program scans a directory moved in.
-* A directory renamed within the tree: on all platforms the directory stays
-  watched and no events under it are lost. macOS and Windows report the
-  directory only. Linux also reports a scan event for every entry under the
-  new path, after its `isMovedTo` event, because the move events do not show
-  whether the directory came from inside or outside the tree. A program can
-  therefore apply `isMovedFrom` as a removal of the subtree and `isMovedTo` as
-  an addition, without matching the two events.
-* Repeated creates: on Linux an entry created while its directory is being
-  scanned is reported by the scan and by the kernel. On macOS a later event
-  for a path can repeat `isCreated`. Windows does not repeat it. A consumer
-  applies a create event as an update of what it knows.
-* Cost: on Linux starting a watch takes time and memory proportional to the
-  number of directories in the tree, and each directory uses one inotify
-  watch, see [watch-limits.md](watch-limits.md). On macOS and Windows the
-  size of the tree does not matter.
-
-A directory moved out of the tree reports one event for the directory on all
-platforms, the entries under it are not reported. The consumer removes the
-directory and every path under it. `setScanNewDirs False` disables the scan
-on Linux.
-
-## Event reporting
-
-* Moves: Linux and Windows report the source as `isMovedFrom` and the
-  destination as `isMovedTo`. macOS reports `isMoved` for both, and the two
-  cannot be told apart.
-* `isModified` for a directory: Linux and macOS do not report it when an entry
-  is created in or deleted from the directory. Windows does not report it for
-  a file created in the directory. For a file deleted from a directory in a
-  recursive watch, Windows Server 2025 reports it and Windows Server 2012 R2
-  does not.
-* Metadata changes: Linux reports them as `isAttrsModified`, unless
-  `setAttrsModified` is `False`. macOS always reports them, as
-  `isAttrsModified`, `isSecurityModified`, `isFinderInfoModified` and
-  `isXAttrsModified`. Windows reports them as `isModified`, only if
-  `setAttrsModified` is `True`, the default is `False`.
-* An open file after it is deleted: on Linux, reads and writes through the
-  open file are reported only if `setExcludeUnlinked` is `False`, the default
-  is `True`. On macOS they are reported. On Windows the delete of an open file
-  raises an exception.
-* Hard links: creating a hard link reports `isCreated` on all platforms, and
-  on macOS also `isAttrsModified` on the directory. Deleting a hard link
-  reports `isDeleted` on all platforms.
-* A deleted directory: deleting a directory in a recursive watch, as with
-  `rm -rf dir`, reports `isDeleted` for each entry in it on all platforms.
-  Deleting a watch root reports `isDeleted` for the root on all platforms.
-  Linux and Windows also report `isDeleted` for each entry in the root. On
-  macOS FSEvents reports one event, for the root only, and does not report
-  the entries in the root, in recursive and non-recursive watches. On
-  Windows `ReadDirectoryChangesW` does not report the deletion of the watch
-  root, the library reports `isDeleted` for the root.
-* A write to a file that stays open: Linux reports the write when it is
-  made. macOS and Windows may not report it until the file is closed, they
-  report it after the file is closed. On Windows `ReadDirectoryChangesW`
-  detects a change of the size or of the last write time of a file when it
-  is written to the disk, with caching this can be when the cache is
-  flushed or the file is closed.
-* A non-recursive watch on macOS: FSEvents can only watch a tree. The library
-  starts a recursive watch and drops the events more than one level below a
-  watch root, the process still receives the events of the whole tree.
-
-## Event coalescing
-
-A program cannot count changes by counting events, on any platform.
-
-More than one predicate can be true for one event. A portable consumer
-must test every predicate it is interested in; a chain that stops at the
-first true predicate misses the other changes reported by the event.
-
-* Linux: inotify merges two identical events that are adjacent in the kernel
-  queue, if the older one has not been read. Two consecutive writes to `foo`
-  can report one `isModified`. In the sequence modify `foo`, modify `bar`,
-  modify `foo`, all three are reported. Events of different types are never
-  merged, so each event has one type, and the order of the events is the
-  order of the operations.
-* macOS: FSEvents can merge events of different types for a path into one
-  event. A file created and deleted can report one event for which both
-  `isCreated` and `isDeleted` are true, and the event does not give the order
-  of the two operations. A file created and renamed reports one event for
-  the old path for which both `isCreated` and `isMoved` are true. Events in
-  a directory and its subdirectory can be coalesced into one event for which
-  `isEventsLost` is true, without an overflow.
-* Windows: the documentation does not say whether identical changes are
-  merged. Each event has one type. One save of a file can report several
-  `isModified` events, because the write and the truncate are separate
-  changes.
-
-An event reports what changed, not the state of the path after the
-change. A consumer that needs the state, for example whether a path
-reported with both `isCreated` and `isDeleted` exists, calls `stat` on the
-path. The coalescing of FSEvents is described in the "Handling Events"
-section of Apple's
-[File System Events Programming Guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
-and in
-[this Stack Overflow question](https://stackoverflow.com/questions/18415285/osx-fseventstreameventflags-not-working-correctly).
+On POSIX a read permission is needed to list a directory's entries,
+and a search (execute) permission is needed to reach the paths under
+it. The Windows rights that correspond to them are "List folder"
+(`FILE_LIST_DIRECTORY`) and "Traverse folder" (`FILE_TRAVERSE`).  In the
+following discussion we call these permissions as "READ" and "SEARCH"
+for all platforms.
 
 ## Watch roots
 
@@ -184,40 +79,64 @@ On Windows the watch keeps the root open.
   of the working directory does not affect the watch. `getRoot` returns
   the relative path, `getAbsPath` returns an absolute path.
 
-## Permissions
+### Watch root behavior tests
 
-A directory has a read permission, needed to list its entries, and a search
-(execute) permission, needed to reach the paths under it. The Windows
-rights that correspond to them are "List folder" (`FILE_LIST_DIRECTORY`)
-and "Traverse folder" (`FILE_TRAVERSE`).
+Tested behavior common to all platforms:
+
+* A file deleted and written again in a watched directory reports
+  `isDeleted` and `isModified` for the file.
+* In a recursive watch, a subdirectory created in a new directory before the
+  consumer reads the create event of the directory is watched.
+* A file created in a directory moved into the tree, before the consumer
+  reads the move event, is reported.
+* A file in a directory moved out of the tree is not reported.
+* A rename of a file reports `isMoved` for both the source and the
+  destination.
+* Deleting a directory in a recursive watch reports `isDeleted` for a file
+  in it.
+* A copy of a file reports `isCreated` for the copy.
+* Creating a hard link reports `isCreated`, and deleting one reports
+  `isDeleted`.
+* A non-recursive watch does not report a file created in a subdirectory.
+* A deleted watch root reports `isDeleted` for the root.
+* A root listed twice reports a change in it once.
+* Nested roots in a recursive watch report a change in the inner root once
+  for each root.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A deleted watch root reports `isDeleted` for a file in it | Yes | No | Yes |
+| The stream ends when all the watch roots are deleted | Yes | No | Yes |
+| A watch root deleted and created again is watched | No | Yes | No |
+| A renamed watch root is watched | No | No | Yes |
+| A renamed watch root reports `isMoved` | Yes | Yes | No |
+| A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
+| A root renamed back after the rename event is read is watched | No | Yes | Yes |
+| A watch of a path that does not exist raises an exception | Yes | No | Yes |
+| A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A regular file can be a watch root | Yes | Yes | No |
+| A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
+
+### Watch root permissions
 
 Linux:
 
 * The permissions are checked when the watch of a directory is added.
   `inotify_add_watch` needs the read permission of the directory. A watch
-  root without read permission raises an exception.
-* In a recursive watch, a subdirectory is added only if it has the read and
-  the search permissions. A subdirectory without either permission is not
-  watched and is reported as `isAccessDenied`, the rest of the tree stays
-  watched.
-* A permission removed after the watch of a directory is added does not
-  affect the watch, the events of the directory are still reported. A
-  permission restored later is not detected, a subdirectory reported as
-  `isAccessDenied` stays unwatched until it is moved.
+  root without LIST permission raises an exception. Later change in
+  permissions?
 
 macOS:
 
 * The watch does not check the permissions when it starts, a watch root
   without any permission does not raise an exception.
-* FSEvents reports the events of a directory only to a process that can
-  reach the directory through the file system permissions. A process
-  running as root receives all events. A root or a subdirectory with the
-  search permission and without the read permission reports its events. A
-  root or a subdirectory without any permission does not report its events.
+* A root with the
+  search permission even without the read permission reports its events. A
+  root without any permission does not report its events.
 * The access is checked for each event, not when the watch starts. A root
-  or a subdirectory whose permissions are all removed during the watch
-  stops reporting its events. A root or a subdirectory without any
-  permission at the start of the watch reports its events after its
+  whose permissions are all removed during the watch
+  stops reporting its events. A root without any
+  permission at the start of the watch starts reporting its events after its
   permissions are restored.
 
 Windows:
@@ -238,7 +157,236 @@ Windows:
   `SeBackupPrivilege` and `SeRestorePrivilege`, opens a directory
   regardless of its permissions. An administrator has these privileges.
 
-## FreeBSD
+### Permissions
+
+"No read" is a directory without read permission and with search
+permission, "none" is a directory without any permission. A subdirectory is
+in a recursive watch.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A watch of a root without read permission raises an exception | Yes | No | Yes |
+| A root with no read reports its events | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A root with none reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
+| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
+| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
+| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Yes |
+| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Yes |
+| A root reports its events after its read permission is removed | Yes | Yes | Yes |
+| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
+| A root reports its events after all its permissions are removed | Yes | No | Yes |
+| A subdirectory reports its events after all its permissions are removed | Yes | No | Yes |
+| A root with none reports its events after its permissions are restored | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A subdirectory with none reports its events after its permissions are restored | No | Yes | Yes |
+| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | No |
+
+The CI runner on Windows is an administrator, and the test suite disables
+its backup and restore privileges so that a permission removed from a
+directory applies to the test process. The tests of a directory without
+any permission write to a file opened before the permissions are removed,
+and close the file after the write.
+
+## Event reporting
+
+* Moves: Linux and Windows report the source as `isMovedFrom` and the
+  destination as `isMovedTo`. macOS reports `isMoved` for both, and the two
+  cannot be told apart.
+* `isModified` for a directory: Linux and macOS do not report it when an entry
+  is created in or deleted from the directory. Windows does not report it for
+  a file created in the directory. For a file deleted from a directory in a
+  recursive watch, Windows Server 2025 reports it and Windows Server 2012 R2
+  does not.
+* Metadata changes: Linux reports them as `isAttrsModified`, unless
+  `setAttrsModified` is `False`. macOS always reports them, as
+  `isAttrsModified`, `isSecurityModified`, `isFinderInfoModified` and
+  `isXAttrsModified`. Windows reports them as `isModified`, only if
+  `setAttrsModified` is `True`, the default is `False`.
+* An open file after it is deleted: on Linux, reads and writes through the
+  open file are reported only if `setExcludeUnlinked` is `False`, the default
+  is `True`. On macOS they are reported. On Windows the delete of an open file
+  raises an exception.
+* Hard links: creating a hard link reports `isCreated` on all platforms, and
+  on macOS also `isAttrsModified` on the directory. Deleting a hard link
+  reports `isDeleted` on all platforms.
+* A deleted directory: deleting a directory in a recursive watch, as with
+  `rm -rf dir`, reports `isDeleted` for each entry in it on all platforms.
+  Deleting a watch root reports `isDeleted` for the root on all platforms.
+  Linux and Windows also report `isDeleted` for each entry in the root. On
+  macOS FSEvents reports one event, for the root only, and does not report
+  the entries in the root, in recursive and non-recursive watches. On
+  Windows `ReadDirectoryChangesW` does not report the deletion of the watch
+  root, the library reports `isDeleted` for the root.
+* A write to a file that stays open: Linux reports the write when it is
+  made. macOS and Windows may not report it until the file is closed, they
+  report it after the file is closed. On Windows `ReadDirectoryChangesW`
+  detects a change of the size or of the last write time of a file when it
+  is written to the disk, with caching this can be when the cache is
+  flushed or the file is closed.
+* A non-recursive watch on macOS: FSEvents can only watch a tree. The library
+  starts a recursive watch and drops the events more than one level below a
+  watch root, the process still receives the events of the whole tree.
+
+### Event reporting behavior tests
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A move reports the source and the destination as separate predicates | Yes | No | Yes |
+| `isModified` is reported for a directory | No | No | Sometimes, in a recursive watch |
+| A write to a file is reported before the file is closed | Yes | Usually not | No |
+| A write to a file is reported after the file is closed | Yes | Yes | Yes |
+| Writes to an open file after it is deleted are reported | Only if `setExcludeUnlinked` is `False` | Yes | Exception |
+| Metadata changes are reported by default | Yes | Yes | No |
+| Metadata change reporting can be disabled | Yes | No | Yes |
+| Creating a hard link reports a metadata change on the directory | No | Yes | No |
+| Two writes to a file before the consumer reads the first report one `isModified` | Yes | Usually | No |
+| Interleaved writes to two files report each `isModified` | Yes | Usually not | Yes |
+| One overwrite of a file reports several `isModified` | No | No | Yes |
+| One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
+| One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
+| A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
+| A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
+
+The rows for the end of the stream and for a FIFO root are from the test
+suite `FileSystem.Event`. The row for the delivery of events in a
+non-recursive watch has no test, it is based on the platform
+documentation and the library code. The coalescing of the events of a directory
+and its subdirectory into `isEventsLost` on macOS is also based on the platform
+documentation.
+
+On macOS two writes to a file are merged into one event only if FSEvents
+reports them in the same batch. The macOS entries of the two rows for writes
+are from several runs in the CI, the test suite does not assert them. The
+same holds for the macOS entry of the row for a file deleted after its
+create event is read: FSEvents can report the flags of earlier changes to a
+path with a later event of the path, and the delete reported `isCreated` in
+most CI runs but not in all of them.
+
+Lost events and the recovery are described in
+[robustness.md](robustness.md), the limits of each platform in
+[watch-limits.md](watch-limits.md).
+
+## Event coalescing
+
+A program cannot count changes by counting events, on any platform.
+
+More than one predicate can be true for one event. A portable consumer
+must test every predicate it is interested in; a chain that stops at the
+first true predicate misses the other changes reported by the event.
+
+* Linux: inotify merges two identical events that are adjacent in the kernel
+  queue, if the older one has not been read. Two consecutive writes to `foo`
+  can report one `isModified`. In the sequence modify `foo`, modify `bar`,
+  modify `foo`, all three are reported. Events of different types are never
+  merged, so each event has one type, and the order of the events is the
+  order of the operations.
+* macOS: FSEvents can merge events of different types for a path into one
+  event. A file created and deleted can report one event for which both
+  `isCreated` and `isDeleted` are true, and the event does not give the order
+  of the two operations. A file created and renamed reports one event for
+  the old path for which both `isCreated` and `isMoved` are true. Events in
+  a directory and its subdirectory can be coalesced into one event for which
+  `isEventsLost` is true, without an overflow.
+* Windows: the documentation does not say whether identical changes are
+  merged. Each event has one type. One save of a file can report several
+  `isModified` events, because the write and the truncate are separate
+  changes.
+
+An event reports what changed, not the state of the path after the
+change. A consumer that needs the state, for example whether a path
+reported with both `isCreated` and `isDeleted` exists, calls `stat` on the
+path. The coalescing of FSEvents is described in the "Handling Events"
+section of Apple's
+[File System Events Programming Guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
+and in
+[this Stack Overflow question](https://stackoverflow.com/questions/18415285/osx-fseventstreameventflags-not-working-correctly).
+
+## Recursive Watches
+
+### New and moved directories
+
+On macOS and Windows the operating system implements the recursive watch. A
+new subdirectory is covered by the watch in the same operation that creates
+it, so no change in it is lost. This follows from the design of the APIs,
+neither platform documents it as a guarantee.
+
+On Linux inotify watches one directory, and this library implements the
+recursive watch in user space. It adds the watch of a new subdirectory after
+it reads the create event of the subdirectory, and then scans the
+subdirectory. The scan reports the entries already in it as `isCreated`
+events and sets `isScanEvent` to true; for example,
+`mkdir -p a/b; touch a/b/f` reports `a`, `a/b` and `a/b/f`. Creating the
+subdirectory and adding its watch are two separate steps, and the kernel
+does not report changes in the subdirectory in between. The remaining
+differences follow from this:
+
+* On Linux a file created and then deleted in a newly created directory,
+  before the watch of the directory is added, is not reported at all. Writes
+  to a file created in this directory, before the watch is added, are not
+  reported as `isModified` events. After the directory watch is added, a
+  create event is reported for such a file, and all later events for it are
+  reported. macOS and Windows report these events.
+* Entries already in a directory moved into the tree: Linux reports each
+  entry, from the scan. macOS and Windows report only the directory, so a
+  portable program scans a directory moved in.
+* A directory renamed within the tree: on all platforms the directory stays
+  watched and no events under it are lost. macOS and Windows report the
+  directory only. Linux also reports a scan event for every entry under the
+  new path, after its `isMovedTo` event, because the move events do not show
+  whether the directory came from inside or outside the tree. A program can
+  therefore apply `isMovedFrom` as a removal of the subtree and `isMovedTo` as
+  an addition, without matching the two events.
+* Repeated creates: on Linux an entry created while its directory is being
+  scanned is reported by the scan and by the kernel. On macOS a later event
+  for a path can repeat `isCreated`. Windows does not repeat it. A consumer
+  applies a create event as an update of what it knows.
+* Cost: on Linux starting a watch takes time and memory proportional to the
+  number of directories in the tree, and each directory uses one inotify
+  watch, see [watch-limits.md](watch-limits.md). On macOS and Windows the
+  size of the tree does not matter.
+
+A directory moved out of the tree reports one event for the directory on all
+platforms, the entries under it are not reported. The consumer removes the
+directory and every path under it. `setScanNewDirs False` disables the scan
+on Linux.
+
+### Recursive watch behavior Tests
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A file created in a new directory can report `isCreated` twice | Yes | Yes | No |
+| A file already in a directory moved in is reported | Yes | No | No |
+| A file in a directory renamed within the tree is reported | Yes | No | No |
+| A file modified in a new directory, before the consumer reads the directory's create event, reports `isModified` | No | Yes | Yes |
+| A file created and deleted in a new directory, before the consumer reads the directory's create event, is reported | No | Yes | Yes |
+| A write to a file in a directory renamed twice before the consumer reads the first rename, the first new path taken by another directory, reports `isModified` at the path of the file | No | Yes | No |
+
+### Subdirectory permissions
+
+Linux:
+
+* In a recursive watch, a subdirectory is added only if it has the read and
+  the search permissions. A subdirectory without either permission is not
+  watched and is reported as `isAccessDenied`, the rest of the tree stays
+  watched.
+* A permission removed after the watch of a directory is added does not
+  affect the watch, the events of the directory are still reported. A
+  permission restored later is not detected, a subdirectory reported as
+  `isAccessDenied` stays unwatched until it is moved.
+
+macOS:
+
+* FSEvents reports the events of a directory only to a process that can
+  reach the directory through the file system permissions. A process
+  running as root receives all events. A subdirectory with the
+  search permission even without the read permission reports its events. A
+  subdirectory without any permission does not report its events.
+* The access is checked for each event, not when the watch starts. A
+  subdirectory whose permissions are all removed during the watch
+  stops reporting its events. A subdirectory without any
+  permission at the start of the watch starts reporting its events after its
+  permissions are restored.
+
+## FreeBSD vs Linux
 
 FreeBSD 14.5, 15.0 and later releases have an inotify API compatible with
 the Linux API. On FreeBSD the library uses the same implementation as on
@@ -278,9 +426,7 @@ except for the following differences:
   limits the watched directories and files of a user, as `max_user_watches`
   does on Linux.
 
-## Platform specific features
-
-### macOS
+## macOS specific features
 
 * Clones: on APFS a file can be copied by cloning it, as `cp -c` and the
   Finder's "Duplicate" command do. The source and the clone report
@@ -288,131 +434,3 @@ except for the following differences:
   `Streamly.FileSystem.Event.Darwin` only. Through the portable module, the
   event of the source matches no predicate, and the clone is reported as a
   created file, as a copy is on all platforms.
-
-## Behavior common to all platforms
-
-The test suite `FileSystem.Event.Behavior` also checks these behaviors, which
-are the same on Linux, macOS and Windows:
-
-* A file deleted and written again in a watched directory reports
-  `isDeleted` and `isModified` for the file.
-* In a recursive watch, a subdirectory created in a new directory before the
-  consumer reads the create event of the directory is watched.
-* A file created in a directory moved into the tree, before the consumer
-  reads the move event, is reported.
-* A file in a directory moved out of the tree is not reported.
-* A rename of a file reports `isMoved` for both the source and the
-  destination.
-* Deleting a directory in a recursive watch reports `isDeleted` for a file
-  in it.
-* A copy of a file reports `isCreated` for the copy.
-* Creating a hard link reports `isCreated`, and deleting one reports
-  `isDeleted`.
-* A non-recursive watch does not report a file created in a subdirectory.
-* A deleted watch root reports `isDeleted` for the root.
-* A root listed twice reports a change in it once.
-* Nested roots in a recursive watch report a change in the inner root once
-  for each root.
-
-## Behavior tables
-
-Each entry is the result of the test suite `FileSystem.Event.Behavior` on that
-platform, except where noted below the table. The results were recorded on
-Ubuntu 24.04, macOS 26 (arm64), Windows Server 2025 and Windows Server
-2012 R2. _Exception_ means that the file system operation raises an exception
-because the file is open.
-
-### Watch roots
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` for a file in it | Yes | No | Yes |
-| The stream ends when all the watch roots are deleted | Yes | No | Yes |
-| A watch root deleted and created again is watched | No | Yes | No |
-| A renamed watch root is watched | No | No | Yes |
-| A renamed watch root reports `isMoved` | Yes | Yes | No |
-| A root renamed back before the rename event is read is watched | Yes | Yes | Yes |
-| A root renamed back after the rename event is read is watched | No | Yes | Yes |
-| A watch of a path that does not exist raises an exception | Yes | No | Yes |
-| A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A regular file can be a watch root | Yes | Yes | No |
-| A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
-
-### Recursive watches
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A file created in a new directory can report `isCreated` twice | Yes | Yes | No |
-| A file already in a directory moved in is reported | Yes | No | No |
-| A file in a directory renamed within the tree is reported | Yes | No | No |
-| A file modified in a new directory, before the consumer reads the directory's create event, reports `isModified` | No | Yes | Yes |
-| A file created and deleted in a new directory, before the consumer reads the directory's create event, is reported | No | Yes | Yes |
-| A write to a file in a directory renamed twice before the consumer reads the first rename, the first new path taken by another directory, reports `isModified` at the path of the file | No | Yes | No |
-
-### Permissions
-
-"No read" is a directory without read permission and with search
-permission, "none" is a directory without any permission. A subdirectory is
-in a recursive watch.
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A watch of a root without read permission raises an exception | Yes | No | Yes |
-| A root with no read reports its events | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A root with none reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
-| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
-| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
-| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Yes |
-| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Yes |
-| A root reports its events after its read permission is removed | Yes | Yes | Yes |
-| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
-| A root reports its events after all its permissions are removed | Yes | No | Yes |
-| A subdirectory reports its events after all its permissions are removed | Yes | No | Yes |
-| A root with none reports its events after its permissions are restored | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A subdirectory with none reports its events after its permissions are restored | No | Yes | Yes |
-| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | No |
-
-The CI runner on Windows is an administrator, and the test suite disables
-its backup and restore privileges so that a permission removed from a
-directory applies to the test process. The tests of a directory without
-any permission write to a file opened before the permissions are removed,
-and close the file after the write.
-
-### Event reporting
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A move reports the source and the destination as separate predicates | Yes | No | Yes |
-| `isModified` is reported for a directory | No | No | Sometimes, in a recursive watch |
-| A write to a file is reported before the file is closed | Yes | Usually not | No |
-| A write to a file is reported after the file is closed | Yes | Yes | Yes |
-| Writes to an open file after it is deleted are reported | Only if `setExcludeUnlinked` is `False` | Yes | Exception |
-| Metadata changes are reported by default | Yes | Yes | No |
-| Metadata change reporting can be disabled | Yes | No | Yes |
-| Creating a hard link reports a metadata change on the directory | No | Yes | No |
-| Two writes to a file before the consumer reads the first report one `isModified` | Yes | Usually | No |
-| Interleaved writes to two files report each `isModified` | Yes | Usually not | Yes |
-| One overwrite of a file reports several `isModified` | No | No | Yes |
-| One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
-| One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
-| A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
-| A non-recursive watch delivers the events of the whole tree to the process | No | Yes, the library drops them | No |
-
-The rows for the end of the stream and for a FIFO root are from the test
-suite `FileSystem.Event`. The row for the delivery of events in a
-non-recursive watch has no test, it is based on the platform
-documentation and the library code. The coalescing of the events of a directory
-and its subdirectory into `isEventsLost` on macOS is also based on the platform
-documentation.
-
-On macOS two writes to a file are merged into one event only if FSEvents
-reports them in the same batch. The macOS entries of the two rows for writes
-are from several runs in the CI, the test suite does not assert them. The
-same holds for the macOS entry of the row for a file deleted after its
-create event is read: FSEvents can report the flags of earlier changes to a
-path with a later event of the path, and the delete reported `isCreated` in
-most CI runs but not in all of them.
-
-Lost events and the recovery are described in
-[robustness.md](robustness.md), the limits of each platform in
-[watch-limits.md](watch-limits.md).
