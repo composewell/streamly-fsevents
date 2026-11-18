@@ -34,22 +34,8 @@ and close the file after the write.
 On Linux the watch of a root is attached to its inode, on macOS to its path.
 On Windows the watch keeps the root open.
 
-* Changes made before the watch is opened: Linux and Windows report only
-  the changes made after the watch is opened. macOS can also report changes
-  made shortly before the watch is opened, for example the creation of the
-  watch root.
-* A renamed root: on Linux the library also reports `isRootUnwatched`,
-  because the kernel does not report the new path. On Windows the watch
-  continues and reports the events under the original root path.
 * A deleted root: a root that is a symbolic link does not report
-  `isDeleted` when the link is deleted. Linux reports `isDeleted` for each
-  entry in the root and then, in one event for the root, `isDeleted` and
-  `isRootDeleted`.
-* The end of the stream: the stream ends when none of the roots is watched
-  any more. On Linux this also happens when all the roots are renamed.
-* A new object at the path of a deleted or renamed root: on Linux the
-  consumer must add the path to the watch again after `isRootUnwatched`.
-* A FIFO as a root: on Linux and macOS the watch does not open the FIFO.
+  `isDeleted` when the link is deleted.
 * A root listed twice: paths
   that differ only in redundant separators and `.` components, for
   example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
@@ -70,46 +56,83 @@ On Windows the watch keeps the root open.
 
 Tested behavior common to all platforms:
 
-* A deleted watch root reports `isDeleted` for the root.
 * A root listed twice with the same path reports a change in it once.
-* A root renamed back before the rename event is read is watched.
+* A root renamed back quickly (before the rename event is read) is watched.
 
-Non directory watch roots:
+**Non directory watch roots** are allowed on Linux and macOS. A watch does
+not affect regular operations on the file being watched e.g. a test
+shows that the watch does not call "open" on a FIFO, therefore it does
+not count as a reader or writer.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
-| A renamed watch root reports `isMoved` | Yes | Yes | No |
+| A regular file can be watched | Yes | Yes | No |
+| A special file (e.g. FIFO) can be watched | Yes | Yes | No |
 
-macOS watches the path of a root, Linux and Windows watch the object at the
-path:
+**Watching non-existing paths:** macOS watches the path of a root, Linux
+and Windows watch the object at the path and not the path itself. The
+following tests are a direct consequence of that difference. macOS can
+watch a missing root, therefore, it also reports the creation of the
+root, which is an event that occurs even before the watch of that root
+started. This is in fact an event on the the parent directory of the
+missing path component.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A non-existing object path is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A watch root deleted and created again is watched | No | Yes | No |
+
+**End of watch stream**: On macOS a watch stream never ends even if you
+delete all the watched paths because they can be recreated and watched
+again. On Linux a deleted or renamed root is gone forever therefore
+the watch stream ends when all the roots are deleted or renamed. On
+Windows a renamed root remains watched therefore, the watch stream does
+not end, however, if all the roots are deleted then the watch stream
+ends.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | The stream ends when all the watch roots are deleted | Yes | No | Yes |
-| A watch root deleted and created again is watched | No | Yes | No |
-| A path created after the start of its watch is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 
-On Windows the watch stays on the renamed root, and the events report paths
-under the old root path. On Linux the watch is also on the object, but the
-library ends it, so that the events do not report the old path, which no
-longer exists or refers to another object:
+**Rename and delete**: On both Windows and Linux the watch is on the
+object and not on the path, so a rename carries the watch. On Windows
+the watch stays on the renamed root, and the events report paths under
+the old root path. Essentially a rename of a root is not detected on
+Windows. On Linux, a rename is detected and the library ends the watch
+with `isRootUnwatched`, so that the events do not report the old path,
+which no longer exists or refers to another object.
+
+**Draining the root events**: On Linux `isRootUnwatched` tells that the
+watch of a root has ended and no more events will come for it. Events can
+arrive after the `isMoved` event of a renamed root, under the old path,
+until `isRootUnwatched`. macOS and Windows have no such event, and with
+the current design they do not need it.
+
+On Windows the watch stays on the object after a rename, and the watch
+of a deleted root ends with its `isDeleted` event.
+
+On macOS the watch is on the path and does not end, after the
+`isDeleted` event of a root the events at the path are of the object
+created there next. FSEvents can merge the events of a path, so one
+event for the root path can report the changes of both the deleted and
+the new object, for example both `isDeleted` and `isCreated`, and it
+does not tell which change belongs to which object.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A renamed watch root is watched | No | No | Yes |
-| A root renamed back after the rename event is read is watched | No | Yes | Yes |
-
-| Behavior | Linux | macOS | Windows |
-|----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A renamed watch root remains watched | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
+| A root renamed back to original is watched | No | Yes | Yes |
+| A deleted watch root reports `isDeleted` for the root | Yes | Yes | Yes |
+| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A deleted watch root reports `isRootUnwatched` for the root | Yes | Not applicable | Not applicable |
 
-On macOS the event for a deleted root comes from fseventsd itself, the
-library receives no event for the files in the root, in a recursive or a
-non-recursive watch. fseventsd seems to coalesce the events under the
-deleted root into the event for the root. A directory deleted below the
-root reports each file in it.
+On macOS, for a deleted root it has been tested that fseventsd itself
+does not report delete events for the files in it, in a recursive or a
+non-recursive watch. fseventsd possibly coalesces the events under the
+deleted root into the event for the root. When the root itself is not
+deleted macOS does report the files deleted in it. So if a parent is
+deleted, applications should remove all paths under it automatically.
 
 ### Watch root permissions
 
@@ -389,6 +412,17 @@ Subdirectories:
 | A subdirectory without READ and SEARCH reports its events after they are restored | No | Yes | Yes |
 | A subdirectory of a root with only READ reports its events | No | No | Yes |
 | Without the "Bypass traverse checking" privilege, a subdirectory reports its events after its READ and SEARCH are removed | Not applicable | Not applicable | No |
+
+### Missing, out of order events
+
+TBD: move this section to robustness doc.
+
+* On macOS, when a root is deleted the deletion events of its children may be
+  missed.  In general, if a parent is deleted, applications should
+  remove all paths under it automatically.
+* Overflow can cause events to be missed.
+* On macOS events can be batched, so create and delete of the same file can be
+  one event and we do not know the order.
 
 ## FreeBSD vs Linux
 
