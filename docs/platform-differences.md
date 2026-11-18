@@ -108,6 +108,13 @@ Tested behavior common to all platforms:
 
 ### Watch root permissions
 
+Static permission checks: permissions are checked once
+before the start and remain effective throughout. Any changes to permissions
+are not seen until the object is unwatched and watched again.
+
+Dynamic permission checks: permissions are checked every time an event is
+delivered, changes are effective immediately.
+
 Linux:
 
 * The permissions are checked when the watch of a directory is added.
