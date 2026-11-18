@@ -196,11 +196,13 @@ allowAll :: FilePath -> IO ()
 -- | @hardLink source link@
 hardLink :: FilePath -> FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
+-- Deny the list access of the directory only, as on POSIX the traverse
+-- access is kept and the entries in the directory are not changed.
 denyRead path = void $ readProcess "icacls" [path, "/deny", everyone] ""
 
     where
 
-    everyone = "*S-1-1-0:(OI)(CI)(RX)"
+    everyone = "*S-1-1-0:(RD)"
 
 allowRead path =
     void $ readProcess "icacls" [path, "/remove:d", "*S-1-1-0"] ""
