@@ -11,8 +11,7 @@ suite `FileSystem.Event.Behavior`.
 
 Each entry is the result of the test suite `FileSystem.Event.Behavior` on that
 platform, except where noted below the table. The results were recorded on
-Ubuntu 24.04, macOS 26 (arm64), Windows Server 2025 and Windows Server
-2012 R2. _Exception_ means that the file system operation raises an exception
+Ubuntu 24.04, macOS 26 (arm64) and Windows Server 2025. _Exception_ means that the file system operation raises an exception
 because the file is open.
 
 ## Directory permissions
@@ -93,6 +92,12 @@ path:
 | A regular file can be a watch root | Yes | Yes | No |
 | A write to a FIFO watch root is reported | Yes | Yes | Not applicable |
 
+On macOS the event for a deleted root comes from fseventsd itself, the
+library receives no event for the files in the root, in a recursive or a
+non-recursive watch. fseventsd seems to coalesce the events under the
+deleted root into the event for the root. A directory deleted below the
+root reports each file in it.
+
 ### Watch root permissions
 
 Static permission checks: permissions are checked once
@@ -109,7 +114,7 @@ permission.
 |----------|-------|-------|---------|
 | A root without READ and SEARCH reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
 | A root with only SEARCH reports its events | Exception | Yes | Exception |
-| A root with only READ reports its events | Yes | Not recorded | Not recorded |
+| A root with only READ reports its events | Yes | No | Yes |
 
 On Windows the test of a root with only READ disables the "Bypass traverse
 checking" privilege. With the privilege, which a process has by default,
@@ -120,8 +125,8 @@ dynamically.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A root stops reporting events after the required permission is removed | No | Not recorded | No |
-| A root starts reporting events after the required permission is enabled | No, the watch raises an exception | Not recorded | No, the watch raises an exception |
+| A root stops reporting events after the required permission is removed | No | Yes | No |
+| A root starts reporting events after the required permission is enabled | No, the watch raises an exception | Yes | No, the watch raises an exception |
 
 ## Event reporting
 
@@ -131,8 +136,7 @@ dynamically.
 * `isModified` for a directory: Linux and macOS do not report it when an entry
   is created in or deleted from the directory. Windows does not report it for
   a file created in the directory. For a file deleted from a directory in a
-  recursive watch, Windows Server 2025 reports it and Windows Server 2012 R2
-  does not.
+  recursive watch, Windows reports it in some runs.
 * Metadata changes: Linux reports them as `isAttrsModified`, unless
   `setAttrsModified` is `False`. macOS always reports them, as
   `isAttrsModified`, `isSecurityModified`, `isFinderInfoModified` and
@@ -370,7 +374,7 @@ Subdirectories:
 | A subdirectory reports its events after its READ is removed | Yes | Yes | Yes |
 | A subdirectory reports its events after its READ and SEARCH are removed | Yes | No | Yes |
 | A subdirectory without READ and SEARCH reports its events after they are restored | No | Yes | Yes |
-| A subdirectory of a root with only READ reports its events | No | Not recorded | Not recorded |
+| A subdirectory of a root with only READ reports its events | No | No | Yes |
 | Without the "Bypass traverse checking" privilege, a subdirectory reports its events after its READ and SEARCH are removed | Not applicable | Not applicable | No |
 
 ## FreeBSD vs Linux
