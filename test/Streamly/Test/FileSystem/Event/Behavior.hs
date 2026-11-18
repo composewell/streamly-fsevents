@@ -586,7 +586,7 @@ behaviors =
         , skip = permissionNotRemovable denyRead allowRead
         , ops = \p -> do
             denyRead (watchRoot p)
-            settle
+            settlePermission
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
@@ -600,7 +600,7 @@ behaviors =
         , skip = permissionNotRemovable denyRead allowRead
         , ops = \p -> do
             denyRead (deniedDir p)
-            settle
+            settlePermission
             createFile (deniedDir p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
@@ -666,7 +666,7 @@ behaviors =
         , ops = \p -> do
             holdFile p (watchRoot p </> "file")
             denyAll (watchRoot p)
-            settle
+            settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
@@ -683,7 +683,7 @@ behaviors =
         , ops = \p -> do
             holdFile p (deniedDir p </> "file")
             denyAll (deniedDir p)
-            settle
+            settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes No Yes
@@ -701,7 +701,7 @@ behaviors =
         , skip = stillReadable . watchRoot
         , ops = \p -> do
             allowAll (watchRoot p)
-            settle
+            settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform WatchException No WatchException
@@ -718,7 +718,7 @@ behaviors =
         , skip = stillReadable . deniedDir
         , ops = \p -> do
             allowAll (deniedDir p)
-            settle
+            settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = onPlatform No No Yes
@@ -742,7 +742,7 @@ behaviors =
         , ops = \p -> do
             holdFile p (deniedDir p </> "file")
             denyAll (deniedDir p)
-            settle
+            settlePermission
             writeHeldFiles p
         , check = const (modifiedNamed "file")
         , expected = No
@@ -1145,6 +1145,15 @@ behaviors =
 -- been read.
 settle :: IO ()
 settle = threadDelay 1000000
+
+-- | Wait after a permission change during the watch. On macOS the wait is
+-- longer, in case the access check of FSEvents is cached for some time.
+settlePermission :: IO ()
+#if defined(CABAL_OS_DARWIN)
+settlePermission = threadDelay 10000000
+#else
+settlePermission = settle
+#endif
 
 -- | Create marker files in the control root until the consumer reads one.
 -- The watch has started when it is read. Stop if the consumer has ended, it
