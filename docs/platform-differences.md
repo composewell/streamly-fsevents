@@ -39,37 +39,19 @@ On Windows the watch keeps the root open.
   the changes made after the watch is opened. macOS can also report changes
   made shortly before the watch is opened, for example the creation of the
   watch root.
-* A renamed root: on Linux and macOS it is no longer watched, and it
-  reports `isMoved` for the old path of the root. On Linux the library
-  also reports `isRootUnwatched`, because the kernel does not report the
-  new path. On Windows the watch opens the root with `FILE_SHARE_DELETE`,
-  so the root can be renamed; the watch continues and reports the events
-  under the original root path. The rename itself is not reported.
-* A deleted root: all platforms report `isDeleted` for the root, unless the
-  root is a symbolic link and the link is deleted. On macOS FSEvents does
-  not report the entries in the root. Linux reports `isDeleted` for each
+* A renamed root: on Linux the library also reports `isRootUnwatched`,
+  because the kernel does not report the new path. On Windows the watch
+  continues and reports the events under the original root path.
+* A deleted root: a root that is a symbolic link does not report
+  `isDeleted` when the link is deleted. Linux reports `isDeleted` for each
   entry in the root and then, in one event for the root, `isDeleted` and
-  `isRootDeleted`. On Windows the watch opens the root with
-  `FILE_SHARE_DELETE`, so the root can be deleted. A read of the deleted
-  root fails with `ERROR_ACCESS_DENIED` and the directory is delete
-  pending; the library then reports `isDeleted` for the root and ends the
-  watch of the root.
-* The end of the stream: on Linux and Windows a deleted root is not
-  watched again, and the stream ends when none of the roots is watched any
-  more. On Windows this happens when all the roots are deleted, on Linux
-  also when they are renamed. On macOS the stream does not end, the watch
-  is on the path of the root.
-* A new object at the path of a deleted or renamed root: macOS watches it.
-  Linux does not; the consumer must add the path to the watch again after
-  `isRootUnwatched`. A root renamed back, as in `mv d d.bak; mv d.bak d`,
-  stays watched on Linux if both renames happen before the rename event is
-  read, and is unwatched otherwise.
-* A root that does not exist: on Linux and Windows the watch raises an
-  exception. On macOS the path is watched when it is created.
-* A regular file as a root: allowed on Linux and macOS, not on Windows.
-* A FIFO as a root: on Linux and macOS the watch reports a write to the
-  FIFO, and does not open the FIFO. Not allowed on Windows.
-* A root listed twice: all platforms report a change in it once. Paths
+  `isRootDeleted`.
+* The end of the stream: the stream ends when none of the roots is watched
+  any more. On Linux this also happens when all the roots are renamed.
+* A new object at the path of a deleted or renamed root: on Linux the
+  consumer must add the path to the watch again after `isRootUnwatched`.
+* A FIFO as a root: on Linux and macOS the watch does not open the FIFO.
+* A root listed twice: paths
   that differ only in redundant separators and `.` components, for
   example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
   macOS `getRoot` reports the path with these removed, on Windows it
@@ -94,7 +76,7 @@ Tested behavior common to all platforms:
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` for a file in it | Yes | No | Yes |
+| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
 | The stream ends when all the watch roots are deleted | Yes | No | Yes |
 | A watch root deleted and created again is watched | No | Yes | No |
 | A renamed watch root is watched | No | No | Yes |
@@ -319,8 +301,8 @@ Tested behavior common to all platforms:
 * A file created in a directory moved into the tree, before the consumer
   reads the move event, is reported.
 * A file in a directory moved out of the tree is not reported.
-* Deleting a directory in a recursive watch reports `isDeleted` for a file
-  in it.
+* Deleting a directory in a recursive watch reports `isDeleted` for each
+  file in it.
 * Nested roots in a recursive watch report a change in the inner root once
   for each root.
 
