@@ -152,16 +152,6 @@ Windows:
   root is opened. A watch root without the list permission raises an
   exception. A permission removed later does not affect the open handle,
   the events of the root are still reported.
-* `ReadDirectoryChangesW` reports the changes of the whole tree through the
-  handle of the root, the permissions of the subdirectories are not checked
-  if the process has the "Bypass traverse checking" privilege,
-  `SeChangeNotifyPrivilege`. Windows grants this privilege to all users by
-  default. Without it, NTFS checks the traverse permission of the watcher
-  to the subdirectory for each change in it, and does not report the change
-  if the check fails.
-* A process with the backup and restore privileges enabled,
-  `SeBackupPrivilege` and `SeRestorePrivilege`, opens a directory
-  regardless of its permissions. An administrator has these privileges.
 
 ### Permissions
 
@@ -379,6 +369,19 @@ macOS:
   stops reporting its events. A subdirectory without any
   permission at the start of the watch starts reporting its events after its
   permissions are restored.
+
+Windows:
+
+* `ReadDirectoryChangesW` reports the changes of the whole tree through the
+  handle of the root, the permissions of the subdirectories are not checked
+  if the process has the "Bypass traverse checking" privilege,
+  `SeChangeNotifyPrivilege`. Windows grants this privilege to all users by
+  default. Without it, NTFS checks the traverse permission of the watcher
+  to the subdirectory for each change in it, and does not report the change
+  if the check fails.
+* A process with the backup and restore privileges enabled,
+  `SeBackupPrivilege` and `SeRestorePrivilege`, opens a directory
+  regardless of its permissions. An administrator has these privileges.
 
 Subdirectories:
 
