@@ -160,17 +160,20 @@ On Windows the watch keeps the root open.
 * A root that does not exist: on Linux and Windows the watch raises an
   exception. On macOS the path is watched when it is created.
 * A root without read permission: on Linux the watch raises an exception, on
-  Windows it is expected to, this is not tested. On macOS the watch does not
-  raise an exception. FSEvents reports the events of a directory only to a
-  process that can reach it through the file system permissions, a process
-  running as root receives all events. A root with search permission and
-  without read permission reports its events. A root without any
-  permission is expected to report no events, this is not yet observed.
+  Windows it is expected to, this is not tested. On Windows a process with
+  the backup and restore privileges enabled, `SeBackupPrivilege` and
+  `SeRestorePrivilege`, opens a directory regardless of its permissions; an
+  administrator has these privileges. On macOS the watch does not raise an
+  exception. FSEvents reports the events of a directory only to a process
+  that can reach it through the file system permissions, a process running
+  as root receives all events. A root with search permission and without
+  read permission reports its events. A root without any permission does
+  not report its events.
 * A subdirectory without permission in a recursive watch: on Linux a
   subdirectory without read or search permission is not watched and is
   reported as `isAccessDenied`, the rest of the tree stays watched. On macOS
   the watch continues, and the events of the subdirectory are reported if
-  the process can reach it, as for a root. On Windows the events of the
+  the process can reach it. On Windows the events of the
   subdirectory are expected to be reported, this is not tested. A process
   has the "Bypass traverse checking" privilege, `SeChangeNotifyPrivilege`,
   by default. Without it, NTFS is expected to check the traverse permission
@@ -183,8 +186,13 @@ On Windows the watch keeps the root open.
   permission is checked when the handle of the root is opened. Without the
   "Bypass traverse checking" privilege, the traverse permission of a
   subdirectory on Windows is expected to be checked for each change. macOS
-  is expected to stop reporting the events of a directory that the process
-  can no longer reach, this is not yet observed.
+  stops reporting the events of a subdirectory that the process can no
+  longer reach. A root that the process can no longer reach keeps reporting
+  its events on macOS.
+* A permission restored during the watch: on Linux a subdirectory that was
+  not watched because of its permission stays unwatched. macOS is expected
+  to start reporting the events of a root or a subdirectory that the process
+  can reach again, this is not yet observed.
 * A regular file as a root: allowed on Linux and macOS, not on Windows.
 * A FIFO as a root: on Linux and macOS the watch reports a write to the
   FIFO, and does not open the FIFO. Not allowed on Windows.
@@ -325,21 +333,24 @@ in a recursive watch.
 |----------|-------|-------|---------|
 | A watch of a root without read permission raises an exception | Yes | No | Not tested, expected Yes |
 | A root with no read reports its events | No, the watch raises an exception | Yes | Not tested, expected No |
-| A root with none reports its events | No, the watch raises an exception | Expected No | Not tested, expected No |
+| A root with none reports its events | No, the watch raises an exception | No | Not tested, expected No |
 | A recursive watch with a subdirectory with no read is watched | Yes | Yes | Not tested |
 | A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Not tested, expected Yes |
-| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | Expected No | Not tested, expected Yes |
+| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Not tested, expected Yes |
 | A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Not tested |
 | A root reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
 | A subdirectory reports its events after its read permission is removed | Yes | Yes | Not tested, expected Yes |
-| A root reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
-| A subdirectory reports its events after all its permissions are removed | Yes | Expected No | Not tested, expected Yes |
+| A root reports its events after all its permissions are removed | Yes | Yes | Not tested, expected Yes |
+| A subdirectory reports its events after all its permissions are removed | Yes | No | Not tested, expected Yes |
+| A root with none reports its events after its permissions are restored | No, the watch raises an exception | Expected Yes | Not tested, expected No, the watch raises an exception |
+| A subdirectory with none reports its events after its permissions are restored | No | Expected Yes | Not tested, expected Yes |
 | Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | Not tested, expected No |
 
 _Expected_ is the outcome asserted by the test suite that has not yet been
-recorded from the CI. On Windows the test suite cannot remove a permission
-of a directory for the test process, the tests are skipped there and the
-expected outcomes are from the platform documentation.
+recorded from the CI. The Windows outcomes are expected from the platform
+documentation. The CI runner on Windows is an administrator, and the test
+suite disables its backup and restore privileges so that a permission
+removed from a directory applies to the test process.
 
 ### Event reporting
 
