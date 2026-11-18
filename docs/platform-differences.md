@@ -89,25 +89,8 @@ On Windows the watch keeps the root open.
 
 Tested behavior common to all platforms:
 
-* A file deleted and written again in a watched directory reports
-  `isDeleted` and `isModified` for the file.
-* In a recursive watch, a subdirectory created in a new directory before the
-  consumer reads the create event of the directory is watched.
-* A file created in a directory moved into the tree, before the consumer
-  reads the move event, is reported.
-* A file in a directory moved out of the tree is not reported.
-* A rename of a file reports `isMoved` for both the source and the
-  destination.
-* Deleting a directory in a recursive watch reports `isDeleted` for a file
-  in it.
-* A copy of a file reports `isCreated` for the copy.
-* Creating a hard link reports `isCreated`, and deleting one reports
-  `isDeleted`.
-* A non-recursive watch does not report a file created in a subdirectory.
 * A deleted watch root reports `isDeleted` for the root.
-* A root listed twice reports a change in it once.
-* Nested roots in a recursive watch report a change in the inner root once
-  for each root.
+* A root listed twice with the same path reports a change in it once.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -211,6 +194,17 @@ Watch roots:
   watch root, the process still receives the events of the whole tree.
 
 ### Event reporting behavior tests
+
+Tested behavior common to all platforms:
+
+* A file deleted and written again in a watched directory reports
+  `isDeleted` and `isModified` for the file.
+* A rename of a file reports `isMoved` for both the source and the
+  destination.
+* A copy of a file reports `isCreated` for the copy.
+* Creating a hard link reports `isCreated`, and deleting one reports
+  `isDeleted`.
+* A non-recursive watch does not report a file created in a subdirectory.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -334,6 +328,18 @@ directory and every path under it. `setScanNewDirs False` disables the scan
 on Linux.
 
 ### Recursive watch behavior Tests
+
+Tested behavior common to all platforms:
+
+* In a recursive watch, a subdirectory created in a new directory before the
+  consumer reads the create event of the directory is watched.
+* A file created in a directory moved into the tree, before the consumer
+  reads the move event, is reported.
+* A file in a directory moved out of the tree is not reported.
+* Deleting a directory in a recursive watch reports `isDeleted` for a file
+  in it.
+* Nested roots in a recursive watch report a change in the inner root once
+  for each root.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
