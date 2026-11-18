@@ -115,50 +115,26 @@ are not seen until the object is unwatched and watched again.
 Dynamic permission checks: permissions are checked every time an event is
 delivered, changes are effective immediately.
 
-Linux:
-
-* The permissions are checked when the watch of a directory is added.
-  `inotify_add_watch` needs the read permission of the directory. A watch
-  root without LIST permission raises an exception. Later change in
-  permissions?
-
-macOS:
-
-* The watch does not check the permissions when it starts, a watch root
-  without any permission does not raise an exception.
-* A root with the
-  search permission even without the read permission reports its events. A
-  root without any permission does not report its events.
-* The access is checked for each event, not when the watch starts. A root
-  whose permissions are all removed during the watch
-  stops reporting its events. A root without any
-  permission at the start of the watch starts reporting its events after its
-  permissions are restored.
-
-Windows:
-
-* The library opens the watch root with `CreateFile`, for the
-  `FILE_LIST_DIRECTORY` access. The permission is checked once, when the
-  root is opened. A watch root without the list permission raises an
-  exception. A permission removed later does not affect the open handle,
-  the events of the root are still reported.
-
-### Permissions
-
-"No read" is a directory without read permission and with search
-permission, "none" is a directory without any permission. A subdirectory is
-in a recursive watch.
-
-Watch roots:
+Linux and windows require READ permission whereas macOS requires SEARCH
+permission.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A watch of a root without read permission raises an exception | Yes | No | Yes |
-| A root with no read reports its events | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A root with none reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
-| A root reports its events after its read permission is removed | Yes | Yes | Yes |
-| A root reports its events after all its permissions are removed | Yes | No | Yes |
-| A root with none reports its events after its permissions are restored | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A root without READ and SEARCH reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
+| A root with only SEARCH reports its events | Exception | Yes | Exception |
+| A root with only READ reports its events | Yes | Not recorded | Not recorded |
+
+On Windows the test of a root with only READ disables the "Bypass traverse
+checking" privilege. With the privilege, which a process has by default,
+SEARCH is not checked and the root reports its events.
+
+Linux and Windows check the permissions of a watch root statically, macOS
+dynamically.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A root stops reporting events after the required permission is removed | No | Not recorded | No |
+| A root starts reporting events after the required permission is enabled | No, the watch raises an exception | Not recorded | No, the watch raises an exception |
 
 ## Event reporting
 
@@ -400,14 +376,15 @@ Subdirectories:
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A recursive watch with a subdirectory with no read is watched | Yes | Yes | Yes |
-| A subdirectory with no read reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
-| A subdirectory with none reports its events | No, it is reported as `isAccessDenied` | No | Yes |
-| A directory with no read moved into a recursive watch does not end the watch | Yes | Yes | Yes |
-| A subdirectory reports its events after its read permission is removed | Yes | Yes | Yes |
-| A subdirectory reports its events after all its permissions are removed | Yes | No | Yes |
-| A subdirectory with none reports its events after its permissions are restored | No | Yes | Yes |
-| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after all its permissions are removed | Not applicable | Not applicable | No |
+| A recursive watch with a subdirectory without READ is watched | Yes | Yes | Yes |
+| A subdirectory without READ, with SEARCH reports its events | No, it is reported as `isAccessDenied` | Yes | Yes |
+| A subdirectory without READ and SEARCH reports its events | No, it is reported as `isAccessDenied` | No | Yes |
+| A directory without READ moved into a recursive watch does not end the watch | Yes | Yes | Yes |
+| A subdirectory reports its events after its READ is removed | Yes | Yes | Yes |
+| A subdirectory reports its events after its READ and SEARCH are removed | Yes | No | Yes |
+| A subdirectory without READ and SEARCH reports its events after they are restored | No | Yes | Yes |
+| A subdirectory of a root with only READ reports its events | No | Not recorded | Not recorded |
+| Without the "Bypass traverse checking" privilege, a subdirectory reports its events after its READ and SEARCH are removed | Not applicable | Not applicable | No |
 
 ## FreeBSD vs Linux
 
