@@ -59,7 +59,7 @@ import Data.List.NonEmpty (NonEmpty((:|)))
 import System.IO (IOMode(..), hClose, hPutStr, openFile, withFile)
 import System.Posix.Files
     (createNamedPipe, ownerReadMode, ownerWriteMode)
-import System.Posix.Process (executeFile, forkProcess, getProcessStatus)
+import System.Process (callProcess)
 #endif
 import Test.Hspec
 
@@ -1719,12 +1719,12 @@ gcClosed probe =
     retryUntil (performGC >> isWatchClosed probe) >>= (`shouldBe` True)
 
 #if !defined(CABAL_OS_WINDOWS)
--- | The number of fds open in a child process created with fork and exec.
+-- | The number of fds open in a child process. The child inherits the fds
+-- that are not close-on-exec. 'forkProcess' is not used, in a threaded
+-- program the forked child can fail before it runs the command.
 childFds :: FilePath -> IO Int
 childFds out = do
-    pid <- forkProcess $
-        executeFile "/bin/sh" False ["-c", "ls /dev/fd > " ++ out] Nothing
-    _ <- getProcessStatus True False pid
+    callProcess "/bin/sh" ["-c", "ls /dev/fd > " ++ out]
     s <- readFile out
     return $! length (lines s)
 
