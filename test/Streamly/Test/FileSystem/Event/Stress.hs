@@ -37,6 +37,9 @@ import System.Directory
     )
 import System.FilePath ((</>))
 import System.IO (hFlush, stdout)
+#if defined(CABAL_OS_WINDOWS)
+import System.IO.Error (isPermissionError)
+#endif
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Streamly.FileSystem.Event (Config)
@@ -430,7 +433,26 @@ churn root out deadline = go 0
 
     toggle a b = do
         exists <- doesDirectoryExist a
-        if exists then renameDirectory a b else renameDirectory b a
+        if exists then rename 100 a b else rename 100 b a
+
+    -- On Windows a directory cannot be renamed while a handle to a path in
+    -- it is open, the rename fails with "Access is denied". The consumer
+    -- lists the tree on each isEventsLost event ('rescanModel'), and the
+    -- listing holds a handle to each directory while it reads it.
+#if defined(CABAL_OS_WINDOWS)
+    rename :: Int -> FilePath -> FilePath -> IO ()
+    rename n a b = do
+        r <- try (renameDirectory a b)
+        case r of
+            Left e | isPermissionError e && n > 1 -> do
+                threadDelay 10000
+                rename (n - 1) a b
+            Left e -> ioError e
+            Right () -> return ()
+#else
+    rename :: Int -> FilePath -> FilePath -> IO ()
+    rename _ = renameDirectory
+#endif
 
     go i = do
         now <- getMonotonicTime
