@@ -309,7 +309,9 @@ test-suite FileSystem.Event.Behavior
   build-depends: process
   if os(windows)
     build-depends: Win32 >= 2.6 && < 2.15
-  if !((os(linux) && impl(ghc >= 9.4)) || os(darwin) || os(windows))
+  if (os(linux) || os(freebsd)) && impl(ghc < 9.4)
+    buildable: False
+  if !(os(linux) || os(darwin) || os(windows) || os(freebsd))
     buildable: False
 
 test-suite FileSystem.Event.Darwin

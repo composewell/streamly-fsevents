@@ -17,7 +17,9 @@
 --
 -- The expected outcomes were observed on Linux 6.12 and Ubuntu 24.04,
 -- macOS 26 (arm64) and Windows Server 2025. The suite is skipped on Windows
--- older than Windows 10 and Windows Server 2016.
+-- older than Windows 10 and Windows Server 2016. On FreeBSD the expected
+-- outcomes are those of Linux, except for the documented differences of the
+-- FreeBSD inotify API.
 
 module Streamly.Test.FileSystem.Event.Behavior (main) where
 
@@ -69,7 +71,9 @@ import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Internal.FS.Event as Event
 #if defined(CABAL_OS_LINUX)
-import qualified Streamly.Internal.FS.Event.Linux as Linux
+import qualified Streamly.Internal.FS.Event.Linux as Inotify
+#elif defined(CABAL_OS_FREEBSD)
+import qualified Streamly.Internal.FS.Event.FreeBSD as Inotify
 #elif defined(CABAL_OS_DARWIN)
 import qualified Streamly.Internal.FS.Event.Darwin as Darwin
 #else
@@ -127,18 +131,32 @@ data Behavior = Behavior
     , racy :: Bool
     }
 
--- | The arguments are the outcomes on Linux, macOS and Windows.
+-- | The arguments are the outcomes on Linux, macOS and Windows. FreeBSD
+-- uses the inotify backend of Linux, its outcome is the one of Linux, see
+-- 'onFreeBSD' for a difference.
 onPlatform :: Outcome -> Outcome -> Outcome -> Outcome
 platformName :: String
 #if defined(CABAL_OS_LINUX)
 onPlatform linux _ _ = linux
 platformName = "Linux"
+#elif defined(CABAL_OS_FREEBSD)
+onPlatform linux _ _ = linux
+platformName = "FreeBSD"
 #elif defined(CABAL_OS_DARWIN)
 onPlatform _ darwin _ = darwin
 platformName = "macOS"
 #else
 onPlatform _ _ windows = windows
 platformName = "Windows"
+#endif
+
+-- | @onFreeBSD freebsd other@ is the outcome @freebsd@ on FreeBSD and
+-- @other@ elsewhere.
+onFreeBSD :: Outcome -> Outcome -> Outcome
+#if defined(CABAL_OS_FREEBSD)
+onFreeBSD freebsd _ = freebsd
+#else
+onFreeBSD _ other = other
 #endif
 
 createFile :: FilePath -> IO ()
@@ -341,9 +359,9 @@ changeMetadata path = do
 setAttrs :: Bool -> Config -> Config
 -- | Whether the event reports a metadata change.
 metadataChanged :: Event -> Bool
-#if defined(CABAL_OS_LINUX)
-setAttrs = Linux.setAttrsModified
-metadataChanged = Linux.isAttrsModified
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+setAttrs = Inotify.setAttrsModified
+metadataChanged = Inotify.isAttrsModified
 #elif defined(CABAL_OS_DARWIN)
 setAttrs _ = id
 metadataChanged ev = Darwin.isSecurityModified ev || Darwin.isAttrsModified ev
@@ -608,7 +626,9 @@ behaviors =
         , expected = onPlatform WatchException Yes WatchException
         }
     -- On Windows the tests that deny SEARCH disable the "Bypass traverse
-    -- checking" privilege, with it the traverse access is not checked.
+    -- checking" privilege, with it the traverse access is not checked. On
+    -- FreeBSD adding the watch of a directory looks up its entries, it fails
+    -- with EACCES without SEARCH.
     , base
         { title = "A root with only READ reports its events"
         , setup = \p -> do
@@ -621,7 +641,7 @@ behaviors =
         , skip = stillSearchable . watchRoot
         , ops = writeHeldFiles
         , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes No Yes
+        , expected = onFreeBSD WatchException (onPlatform Yes No Yes)
         }
     -- The required permission is READ on Linux and Windows, SEARCH on macOS.
     , base
@@ -767,8 +787,8 @@ behaviors =
         }
     -- On Linux a subdirectory is opened through the root, which needs SEARCH
     -- on the root. Windows checks the traverse access of the subdirectory
-    -- that changed, not of the root. The file "file" in the root is used by
-    -- the skip check.
+    -- that changed, not of the root. On FreeBSD the root cannot be watched
+    -- without SEARCH. The file "file" in the root is used by the skip check.
     , base
         { title = "A subdirectory of a root with only READ reports its events"
         , config = Event.setRecursiveMode True
@@ -784,7 +804,7 @@ behaviors =
         , skip = stillSearchable . watchRoot
         , ops = writeHeldFiles
         , check = const (modifiedNamed "subfile")
-        , expected = onPlatform No No Yes
+        , expected = onFreeBSD WatchException (onPlatform No No Yes)
         }
 #if defined(CABAL_OS_WINDOWS)
     -- Without the "Bypass traverse checking" privilege NTFS checks the
@@ -910,11 +930,12 @@ behaviors =
         { title = "write to an open file after its deletion is reported"
         , expected = onPlatform No Yes Exception
         }
-#if defined(CABAL_OS_LINUX)
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+    -- FreeBSD never reports the events of an unlinked file.
     , deletedOpenFile
         { title = "write to a deleted file, setExcludeUnlinked False"
-        , config = Linux.setExcludeUnlinked False
-        , expected = Yes
+        , config = Inotify.setExcludeUnlinked False
+        , expected = onFreeBSD No Yes
         }
 #endif
     , metadataChange
