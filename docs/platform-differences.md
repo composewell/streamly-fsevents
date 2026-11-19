@@ -79,6 +79,18 @@ object is created on that path. Therefore, on macOS there is no
 | A deleted directory root reports `isDeleted` for the root | Yes | Yes | Yes |
 | A deleted directory root reports `isDeleted` for each file in it | Yes | No | Yes |
 | A deleted symbolic link to a directory root reports `isDeleted` for the root | No | No | No |
+| A deleted directory root in use by a process reports `isDeleted` for the root | No | Yes | Exception |
+| A deleted regular file root reports `isDeleted` for the root | Yes | Yes | No file roots |
+| A deleted open regular file root reports `isDeleted` for the root | No | Yes | No file roots |
+| A deleted regular file root with another hard link reports `isDeleted` for the root | No | Yes | No file roots |
+| A deleted FIFO root reports `isDeleted` for the root | Yes | Yes | No file roots |
+
+Linux reports the deletion of a root when its inode is freed, after the
+last link to it is removed and the last open reference to it is closed.
+An open file, or a directory that is the working directory of a process,
+reports `isDeleted` when it is closed. FreeBSD reports the deletion when
+the last link is removed, an open root reports `isDeleted` immediately.
+On Windows a directory in use by a process cannot be deleted.
 
 On macOS, it has been tested that fseventsd does not report delete
 events for the files inside the root when the root is deleted (e.g. with
