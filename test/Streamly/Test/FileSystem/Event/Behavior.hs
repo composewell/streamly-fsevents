@@ -50,7 +50,15 @@ import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO
     (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (readProcess, readProcessWithExitCode)
+import System.Process
+    ( CreateProcess(..), ProcessHandle, StdStream(NoStream), createProcess
+    , proc, readProcess, readProcessWithExitCode, terminateProcess
+    , waitForProcess
+    )
+#if !defined(CABAL_OS_WINDOWS)
+import System.Posix.Files
+    (createNamedPipe, ownerReadMode, ownerWriteMode, unionFileModes)
+#endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
 import System.Directory (canonicalizePath)
@@ -109,6 +117,8 @@ data Paths = Paths
     , renamedRoot :: FilePath
     -- | The files opened by 'holdFile', closed after the behavior.
     , heldFiles :: IORef [Handle]
+    -- | The processes started by 'holdCwd', ended after the behavior.
+    , heldProcesses :: IORef [ProcessHandle]
     }
 
 data Behavior = Behavior
@@ -199,6 +209,23 @@ holdFile :: Paths -> FilePath -> IO ()
 holdFile p path = do
     h <- openFile path AppendMode
     modifyIORef' (heldFiles p) (h :)
+
+-- | Start a process with the directory as its working directory. The
+-- process keeps the directory in use until it ends.
+holdCwd :: Paths -> FilePath -> IO ()
+holdCwd p dir = do
+    (_, _, _, ph) <-
+        createProcess (proc cmd args)
+            { cwd = Just dir, std_in = NoStream, std_out = NoStream }
+    modifyIORef' (heldProcesses p) (ph :)
+
+    where
+
+#if defined(CABAL_OS_WINDOWS)
+    (cmd, args) = ("ping", ["-n", "120", "127.0.0.1"])
+#else
+    (cmd, args) = ("sleep", ["120"])
+#endif
 
 -- | Append to the files opened by 'holdFile' and keep them open.
 writeHeldFilesOpen :: Paths -> IO ()
@@ -1086,10 +1113,55 @@ behaviors =
             createDirectoryLink (renamedRoot p) (watchRoot p)
             settle
         , ops = removeDirectoryLink . watchRoot
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
+        , check = rootDeleted
         , expected = onPlatform No No No
         }
+    , base
+        { title =
+            "deleted directory root in use by a process reports isDeleted"
+        , setup = \p -> holdCwd p (watchRoot p) >> settle
+        , ops = removeDirectory . watchRoot
+        , check = rootDeleted
+        , expected = onPlatform No Yes Exception
+        }
+    , base
+        { title = "deleted regular file root reports isDeleted for the root"
+        , setup = withFileRoot
+        , ops = removeFile . watchRoot
+        , check = rootDeleted
+        , expected = onPlatform Yes Yes WatchException
+        }
+    , base
+        { title = "deleted open regular file root reports isDeleted"
+        , setup = \p -> withFileRoot p >> holdFile p (watchRoot p)
+        , ops = removeFile . watchRoot
+        , check = rootDeleted
+        , expected = onPlatform No Yes WatchException
+        }
+    , base
+        { title =
+            "deleted regular file root with another hard link reports "
+                ++ "isDeleted"
+        , setup = \p -> do
+            withFileRoot p
+            hardLink (watchRoot p) (renamedRoot p)
+        , ops = removeFile . watchRoot
+        , check = rootDeleted
+        , expected = onPlatform No Yes WatchException
+        }
+#if !defined(CABAL_OS_WINDOWS)
+    , base
+        { title = "deleted FIFO root reports isDeleted for the root"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createNamedPipe (watchRoot p)
+                (ownerReadMode `unionFileModes` ownerWriteMode)
+            settle
+        , ops = removeFile . watchRoot
+        , check = rootDeleted
+        , expected = onPlatform Yes Yes Yes
+        }
+#endif
     , base
         { title = "non-recursive watch reports a file created in a subdir"
         , setup = withDir
@@ -1391,6 +1463,15 @@ behaviors =
 
     onDarwin = platformName == "macOS"
 
+    rootDeleted p =
+        any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
+
+    -- Replace the watch root directory by a regular file.
+    withFileRoot p = do
+        removeDirectory (watchRoot p)
+        createFile (watchRoot p)
+        settle
+
     -- A symbolic link to the watch root, next to it.
     linkRoot p = takeDirectory (watchRoot p) </> "link"
 
@@ -1657,13 +1738,18 @@ runBehavior b =
         let root = dir </> "root"
             control = dir </> "control"
         held <- newIORef []
+        procs <- newIORef []
         let paths =
                 Paths
                     { watchRoot = root
                     , renamedRoot = dir </> "renamed"
                     , heldFiles = held
+                    , heldProcesses = procs
                     }
-            closeHeld = readIORef held >>= mapM_ hClose
+            endProcess ph = terminateProcess ph >> void (waitForProcess ph)
+            closeHeld = do
+                readIORef held >>= mapM_ hClose
+                readIORef procs >>= mapM_ endProcess
         createDirectory root
         createDirectory control
         setup b paths
