@@ -444,8 +444,7 @@ behaviors =
              in any (\ev -> isRoot ev && Event.isMoved ev)
         , expected = onPlatform Yes Yes No
         }
-    -- On Linux the root is removed only if its path no longer refers to the
-    -- watched directory when the rename event is read.
+    -- On Linux the rename event of a directory root removes the root.
     , base
         { title = "root renamed back before the event is read is watched"
         , paused = True
@@ -454,7 +453,7 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p)
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform Yes Yes Yes
+        , expected = onPlatform No Yes Yes
         }
     , base
         { title = "root renamed back after the event is read is watched"

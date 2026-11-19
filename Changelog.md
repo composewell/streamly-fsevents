@@ -18,6 +18,11 @@
   root, the same as on macOS and Windows. When a watch root is renamed,
   `isMoved` is reported for the root, the same as on macOS. Use
   `setRootDeleted False` and `setRootMoved False` to disable them.
+- Linux: after the `isMoved` event of a renamed watch root, or the
+  `isMovedFrom` event of a directory moved out of the tree, the events of
+  the moved directory are not reported, they would report the old path.
+  Only its `isRootUnwatched` event follows. A directory root renamed back
+  before its rename event is read is no longer watched.
 - macOS: with a watch root inside another watch root, an event in the
   inner root is reported once for each root, the same as on Linux and
   Windows. Earlier it was reported for the inner root only.

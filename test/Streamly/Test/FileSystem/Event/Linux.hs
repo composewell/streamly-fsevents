@@ -553,26 +553,26 @@ rootDeletedLast =
             unwatched evs `shouldSatisfy` elem (root, root)
 
 -- The watch stays on the renamed directory until the library processes the
--- rename. A change in the renamed directory before that is reported under
--- the old path, after the isMoved event of the root.
+-- rename. A change in the renamed directory before that would report the old
+-- path, it is dropped.
 rootRenamedEvents :: Spec
 rootRenamedEvents =
-    it "a change after the rename of a root is reported under the old path"
+    it "a change after the rename of a root is not reported"
         $ withRoot Event.defaultConfig $ \root w -> do
             let moved = root ++ "-moved"
             renameDirectory root moved
             createFile (moved </> "file")
             evs <- readUntilUnwatched w
-            pathsOf (\ev -> Event.isMoved ev || Event.isCreated ev) evs
-                `shouldBe` [root, root </> "file"]
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` [root]
+            pathsOf Event.isMoved evs `shouldBe` [root]
             unwatched evs `shouldBe` [(root, root)]
 
 -- A subdirectory moved out of the tree stays watched until the library
--- processes its move. A change in it is reported under its old path, and can
--- follow the isDeleted event of the root.
+-- processes its move. A change in it before that would report the old path,
+-- it is dropped.
 movedOutAfterRootDeleted :: Spec
 movedOutAfterRootDeleted =
-    it "a change in a moved out subdirectory can follow the root's isDeleted"
+    it "no change in a moved out subdirectory follows the root's isDeleted"
         $ withRoot recDefaultCfg $ \root w -> do
             let sub = root </> "sub"
                 out = takeDirectory root </> "out"
@@ -584,7 +584,7 @@ movedOutAfterRootDeleted =
             removePathForcibly root
             createFile (out </> "file")
             evs <- afterRootDeleted root <$> readPastUnwatched sub w
-            pathsOf Event.isCreated evs `shouldBe` [sub </> "file"]
+            pathsOf (not . Event.isRootUnwatched) evs `shouldBe` []
 
 -- No activity follows the operation on the root. 'readUntil' raises an
 -- exception on a timeout if the event is held back until a later event.
@@ -705,17 +705,87 @@ recRootRenamed =
             evs <- renameRootUntil root sub w
             unwatched evs `shouldBe` [(root, root), (root, sub)]
 
--- Both renames are done before the events are read.
+-- | The events other than the 'Event.isRootMoved' and 'Event.isRootUnwatched'
+-- events of a renamed root.
+otherThanRename :: [Event] -> [FilePath]
+otherThanRename =
+    pathsOf (\ev -> not (Event.isRootMoved ev || Event.isRootUnwatched ev))
+
+recRootRenamedDropsEvents :: Spec
+recRootRenamedDropsEvents =
+    it "a renamed recursive root reports no events after isMoved"
+        $ withRoot recCfg $ \root w -> do
+            let sub = root </> "sub"
+                moved = root ++ "-moved"
+            createDirectory sub
+            createFile (root </> "sentinel")
+            _ <- readUntil (isCreatedAt (root </> "sentinel")) w
+            let files = [root </> "file", sub </> "file"]
+                isSubUnwatched ev =
+                    Event.isRootUnwatched ev && getAbsPath ev == sub
+            renamePath root moved
+            createFile (moved </> "file")
+            createFile (moved </> "sub" </> "file")
+            evs <- readUntil isSubUnwatched w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            pathsOf (\ev -> getAbsPath ev `elem` files) evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root), (root, sub)]
+
+-- Both renames are done before the events are read. A directory has one
+-- name, its IN_MOVE_SELF event removes the root.
 rootRenamedBack :: Spec
 rootRenamedBack =
-    it "a root renamed back before the event is read stays watched"
-        $ withRoot watchCfg $ \root w -> do
-            let file = root </> "file"
+    it "a root renamed back before the event is read is unwatched"
+        $ withRoot Event.defaultConfig $ \root w -> do
             renameDirectory root (root ++ "-moved")
             renameDirectory (root ++ "-moved") root
-            createFile file
-            evs <- readUntil (isCreatedAt file) w
-            unwatched evs `shouldBe` []
+            createFile (root </> "file")
+            evs <- readUntil Event.isRootUnwatched w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            otherThanRename evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root)]
+
+-- The rename of a parent of a root generates no event for the root. The root
+-- stays watched, its events report the old path.
+rootParentRenamed :: Spec
+rootParentRenamed =
+    it "a root whose parent is renamed stays watched under the old path"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let parent = fp </> "parent"
+                root = parent </> "root"
+                moved = fp </> "moved"
+            createDirectory parent
+            createDirectory root
+            r <- Path.fromString root
+            bracket
+                (Event.openWatch id (r NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    renameDirectory parent moved
+                    createFile (moved </> "root" </> "file")
+                    evs <- readUntil Event.isCreated w
+                    unwatched evs `shouldBe` []
+                    pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
+
+-- The rename of any hard link of a file reports IN_MOVE_SELF, the root is
+-- kept if its path refers to the file when the event is read.
+fileRootRenamedBack :: Spec
+fileRootRenamedBack =
+    it "a file root renamed back before the event is read stays watched"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let f = fp </> "f"
+            createFile f
+            root <- Path.fromString f
+            bracket
+                (Event.openWatch (const watchCfg) (root NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    renamePath f (f ++ "-moved")
+                    renamePath (f ++ "-moved") f
+                    appendFile f "x"
+                    evs <- readUntil Event.isModified w
+                    unwatched evs `shouldBe` []
+                    pathsOf Event.isModified evs `shouldBe` [f]
 
 -- The rename of one hard link reports IN_MOVE_SELF for both roots.
 rootHardLinkRenamed :: Spec
@@ -822,6 +892,26 @@ recMoveOutSpec :: Spec
 recMoveOutSpec =
     it "removes a directory moved out of the tree"
         $ () <$ recMoveOut recCfg
+
+-- The files are created in the moved out tree before the events are read.
+recMoveOutDropsEvents :: Spec
+recMoveOutDropsEvents =
+    it "reports no events of a moved out tree after the move"
+        $ withRoot recCfg $ \root w -> do
+            let dir = root </> "dir"
+                sub = dir </> "sub"
+                out = takeDirectory root </> "out"
+            createDirectory dir
+            createDirectory sub
+            waitWatched w dir
+            renameDirectory dir out
+            createFile (out </> "file")
+            createFile (out </> "sub" </> "file")
+            evs <- readUntil (isUnwatchedAt sub) w
+            let files = [dir </> "file", sub </> "file"]
+            pathsOf (\ev -> getAbsPath ev `elem` files) evs `shouldBe` []
+            pathsOf Event.isMovedFrom evs `shouldBe` [dir]
+            unwatched evs `shouldBe` [(root, dir), (root, sub)]
 
 -- The kernel watch generates IN_MOVED_FROM to remove the moved directory,
 -- the event is not reported.
@@ -2550,11 +2640,15 @@ watchTests =
                 rootRenamed
                 rootRenamedUnrequested
                 recRootRenamed
+                recRootRenamedDropsEvents
                 rootRenamedBack
+                rootParentRenamed
+                fileRootRenamedBack
                 rootHardLinkRenamed
             describe "recursive mode" $ do
                 recSubdirSelfEvents
                 recMoveOutSpec
+                recMoveOutDropsEvents
                 recMoveOutUnrequested
             describe "recursive mode rename races" $ do
                 recRenameCreateBeforeRead
