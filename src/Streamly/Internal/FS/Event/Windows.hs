@@ -1057,8 +1057,9 @@ removeRoot w@Watch{..} root =
 
 -- | The roots of a watch whose path no longer refers to the directory
 -- watched via the root, as supplied to 'addRoot'. A root becomes stale when
--- it or a parent directory is renamed. The root is still watched, its events
--- report the old path.
+-- it is renamed. The root is still watched, its events report the old path.
+-- A parent directory of a watched root cannot be renamed, the rename raises
+-- an exception.
 --
 -- A root is stale if its path does not exist, or refers to another file,
 -- compared by the volume serial number and the file index recorded when the
@@ -1067,7 +1068,7 @@ removeRoot w@Watch{..} root =
 --
 -- The watch is not changed. To watch the directory now at the path, call
 -- 'removeRoot' and then 'addRoot' with the path. The result can be out of
--- date when the call returns, a parent can be renamed after the check.
+-- date when the call returns, the root can be renamed after the check.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. Returns an empty list if the watch

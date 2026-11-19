@@ -285,10 +285,10 @@ removeRoot = Event.removeRoot
 -- returns.
 --
 -- On Linux and FreeBSD a root becomes stale when a parent directory is
--- renamed, and on Windows when the root or a parent directory is renamed. The
--- root is still watched, its events report the old path. A root is stale if
--- its path does not exist or refers to another file. On macOS a root is
--- watched by its path and is never stale, the list is empty.
+-- renamed, and on Windows when the root is renamed. The root is still
+-- watched, its events report the old path. A root is stale if its path does
+-- not exist or refers to another file. On macOS a root is watched by its path
+-- and is never stale, the list is empty.
 --
 staleRoots :: Watch -> IO [Path]
 staleRoots = Event.staleRoots
