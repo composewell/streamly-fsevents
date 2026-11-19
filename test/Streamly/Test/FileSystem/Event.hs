@@ -33,6 +33,7 @@ import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn)
 import Streamly.Internal.FS.Event (Config, Event)
 import System.Directory
     ( createDirectory
+    , createDirectoryIfMissing
     , createDirectoryLink
     , createFileLink
     , getCurrentDirectory
@@ -1373,6 +1374,51 @@ removeAddAgain =
             evs `shouldUnwatch` [(root, root)]
             createdRoots file evs `shouldBe` [root]
 
+-- The root parent/root2 is stale after it is moved away from its path, and
+-- after a new parent/root2 is created at its path. removeRoot and addRoot
+-- watch the new directory. Windows does not rename a parent of a watched
+-- root, the root itself is renamed. On macOS a root is watched by its path
+-- and is never stale.
+staleRootReAdded :: Spec
+staleRootReAdded =
+    it "a root moved away from its path is stale until it is added again"
+        $ withRootHandle id $ \root w -> do
+            let parent = takeDirectory root </> "parent"
+                root2 = parent </> "root2"
+                file = root2 </> "file"
+            createDirectory parent
+            createDirectory root2
+            p <- Path.fromString root2
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            moveAway parent root2
+            stale w `shouldReturn` expected root2
+            createDirectoryIfMissing True root2
+            stale w `shouldReturn` expected root2
+            Event.removeRoot w p
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [root2]
+
+    where
+
+    stale w = map Path.toString <$> Event.staleRoots w
+
+#if defined(CABAL_OS_WINDOWS)
+    moveAway parent root2 = renameDirectory root2 (parent </> "moved")
+#else
+    moveAway parent _ =
+        renameDirectory parent (takeDirectory parent </> "moved")
+#endif
+
+#if defined(CABAL_OS_DARWIN)
+    expected _ = []
+#else
+    expected r = [r]
+#endif
+
 closedWatchOps :: Spec
 closedWatchOps =
     it "addRoot raises an exception, removeRoot does nothing on a closed watch"
@@ -1557,6 +1603,7 @@ handleTests = do
     removeTwice
     removeWhileReading
     removeAddAgain
+    staleRootReAdded
     closedWatchOps
 #if defined(CABAL_OS_WINDOWS)
     fileRootRaises

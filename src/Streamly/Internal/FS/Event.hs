@@ -39,6 +39,7 @@ module Streamly.Internal.FS.Event
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event
@@ -158,6 +159,21 @@ watchWith = Event.watchWith
 -- for file system events.  Monitoring starts from the current time onwards.
 --
 -- If a watch root is a symbolic link then the target of the link is watched.
+-- Deleting the link does not report 'isDeleted' for the root.
+--
+-- A path listed more than once is one root, its events are reported once.
+-- Paths that differ only in redundant separators and @.@ components, for
+-- example, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@, are the same path. Case is
+-- significant even on a case-insensitive file system. Two different paths
+-- that reach the same directory, for example, a symbolic link and its
+-- target, paths that differ in case, or in a recursive watch a root and a
+-- directory under it, are two roots: a change in the directory is reported
+-- once for each root.
+--
+-- A relative path is relative to the working directory at the time the
+-- watch is started, a later change of the working directory does not
+-- affect the watch. 'getRoot' returns the relative path, 'getAbsPath'
+-- returns an absolute path.
 --
 -- When a watch root is deleted, an 'isDeleted' event is reported for the
 -- root. On Linux, FreeBSD and Windows a deleted root is not watched again,
@@ -196,8 +212,9 @@ watchRecursive = Event.watchRecursive
 -- active when the call returns: a change made after it is reported. Use
 -- 'closeWatch' to close the watch.
 --
--- Raise an exception if the watch cannot be started. On Windows the program
--- must be linked with the threaded RTS.
+-- The paths are interpreted as in 'watch'. Raise an exception if the watch
+-- cannot be started. On Windows the program must be linked with the
+-- threaded RTS.
 --
 openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
 openWatch = Event.openWatch
@@ -241,12 +258,9 @@ eventStream = Event.eventStream
 -- the call returns may not be reported. Raise an exception if the watch is
 -- closed.
 --
--- A relative path is relative to the working directory at the time of the
--- call, a later change of the working directory does not affect the watch.
---
--- A path that is already a root of the watch is not added again. Case is
--- significant in the comparison of the paths, even on a case-insensitive
--- file system.
+-- The path is interpreted as in 'watch', a relative path is relative to the
+-- working directory at the time of the call. A path that is already a root
+-- of the watch is not added again.
 --
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call. On macOS this does not hold on a volume that does not keep a
@@ -276,6 +290,21 @@ addRoot = Event.addRoot
 --
 removeRoot :: Watch -> Path -> IO ()
 removeRoot = Event.removeRoot
+
+-- | The roots of a watch whose path no longer refers to the directory
+-- watched via the root, as supplied to 'addRoot'. The watch is not changed,
+-- to watch the directory now at the path, call 'removeRoot' and then
+-- 'addRoot' with the path. The result can be out of date when the call
+-- returns.
+--
+-- On Linux and FreeBSD a root becomes stale when a parent directory is
+-- renamed, and on Windows when the root is renamed. The root is still
+-- watched, its events report the old path. A root is stale if its path does
+-- not exist or refers to another file. On macOS a root is watched by its path
+-- and is never stale, the list is empty.
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots = Event.staleRoots
 
 -------------------------------------------------------------------------------
 -- Handling Events

@@ -47,6 +47,7 @@ module Streamly.Internal.FS.Event.Darwin
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event
@@ -998,6 +999,16 @@ removeRoot wtch@Watch{..} root =
         else do
             setRoots "removeRoot" wtch gen roots removed
             return st {rsRoots = roots, rsGen = gen}
+
+-- | The roots of a watch whose path no longer refers to the directory
+-- watched via the root. FSEvents watches a root by its path, a root is never
+-- stale, returns an empty list. When a root or a parent directory is renamed
+-- the watch reports the events of the directory at the path.
+--
+-- /Pre-release/
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots _ = return []
 
 -- | Close the read end of the pipe. closeFdWith wakes up the threads
 -- waiting for the fd to become readable, in the threaded RTS.

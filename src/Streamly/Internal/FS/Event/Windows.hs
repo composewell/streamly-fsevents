@@ -43,6 +43,7 @@ module Streamly.Internal.FS.Event.Windows
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)
@@ -71,14 +72,14 @@ import Control.Concurrent (forkIO, rtsSupportsBoundThreads)
 import Control.Concurrent.MVar
     (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
 import Control.Exception
-    (IOException, SomeException, onException, throwIO, try)
-import Control.Monad (unless, void, when)
+    (IOException, SomeException, bracket, onException, throwIO, try)
+import Control.Monad (filterM, unless, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (isAlpha, isAscii)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Foreign.C.Types (CInt(..), CUIntPtr(..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes, free, mallocBytes)
 import Foreign.Marshal.Utils (fillBytes)
@@ -87,7 +88,7 @@ import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr)
 import GHC.Conc
     (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
 import GHC.IO.Exception (IOErrorType(..), IOException(..))
-import System.IO.Error (catchIOError)
+import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Win32.File
     ( BY_HANDLE_FILE_INFORMATION(..)
     , LPOVERLAPPED
@@ -303,9 +304,22 @@ openDirHandle dir = do
         -- No template file
         Nothing
 
+-- | The volume serial number and the file index of a file, they identify the
+-- file on the system.
+data FileId = FileId !DWORD !Word64 deriving Eq
+
+infoFileId :: BY_HANDLE_FILE_INFORMATION -> FileId
+infoFileId info =
+    FileId (bhfiVolumeSerialNumber info) (bhfiFileIndex info)
+
+-- | The 'FileId' of the file of a handle.
+handleFileId :: HANDLE -> IO FileId
+handleFileId h = infoFileId <$> getFileInformationByHandle h
+
 -- | Raise an exception if the handle of @path@ is not a directory. A
 -- regular file can be opened by 'openDirHandle' but cannot be watched.
-checkIsDir :: Path -> HANDLE -> IO ()
+-- Returns the 'FileId' of the directory.
+checkIsDir :: Path -> HANDLE -> IO FileId
 checkIsDir path h = do
     info <- getFileInformationByHandle h
     when (bhfiFileAttributes info .&. fILE_ATTRIBUTE_DIRECTORY == 0)
@@ -318,6 +332,7 @@ checkIsDir path h = do
                 , ioe_errno = Nothing
                 , ioe_filename = Just (Path.toString path)
                 }
+    return (infoFileId info)
 
 -- | Close a handle, ignore a failure.
 closeQuietly :: HANDLE -> IO ()
@@ -551,6 +566,9 @@ data Root = Root
       -- | The absolute path of the root, see 'toAbsolute'
     , rootAbsPath :: Path
     , rootHandle :: HANDLE
+      -- | The 'FileId' of the directory when the root was added, see
+      -- 'staleRoots'
+    , rootId :: FileId
       -- | 'overlappedSize' bytes for the OVERLAPPED structure followed by
       -- 'changeBufferSize' bytes for the changes. The system writes to it
       -- while a read is in progress.
@@ -931,10 +949,13 @@ toAbsolute path
 
     str = Path.toString path
 
--- | Whether the root was added via a path equal to @path@.
+-- | Whether the root was added via a path equal to @path@. Case is
+-- significant, the default of 'Path.ignoreCase' on Windows differs across
+-- streamly-core versions.
 isRootPath :: Path -> Root -> Bool
 isRootPath path =
-    Path.eqPath (Path.allowRelativeEquality True) path . rootPath
+    Path.eqPath (Path.allowRelativeEquality True . Path.ignoreCase False) path
+        . rootPath
 
 -- | @addRoot watch root@ adds the directory @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. The root is watched
@@ -973,7 +994,7 @@ addRoot Watch{..} root =
         absRoot <- toAbsolute root
         h <- openDirHandle root
         flip onException (closeQuietly h) $ do
-            checkIsDir root h
+            fid <- checkIsDir root h
             port <- c_CreateIoCompletionPort h watchPort key 0
             when (port == nullPtr)
                 $ getLastError >>= failWith "CreateIoCompletionPort"
@@ -983,6 +1004,7 @@ addRoot Watch{..} root =
                         { rootPath = root
                         , rootAbsPath = absRoot
                         , rootHandle = h
+                        , rootId = fid
                         , rootMem = mem
                         }
             res <- startRead watchConfig r
@@ -1035,6 +1057,48 @@ removeRoot w@Watch{..} root =
         rs1 <- retireRoots (isRootPath root) rs
         enqueueNow w (map unwatchedItem removed)
         return rs1
+
+-- | The roots of a watch whose path no longer refers to the directory
+-- watched via the root, as supplied to 'addRoot'. A root becomes stale when
+-- it is renamed. The root is still watched, its events report the old path.
+-- A parent directory of a watched root cannot be renamed, the rename raises
+-- an exception.
+--
+-- A root is stale if its path does not exist, or refers to another file,
+-- compared by the volume serial number and the file index recorded when the
+-- root was added. A root whose path cannot be opened because of another
+-- error, for example, a permission error, is not stale.
+--
+-- The watch is not changed. To watch the directory now at the path, call
+-- 'removeRoot' and then 'addRoot' with the path. The result can be out of
+-- date when the call returns, the root can be renamed after the check.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. Returns an empty list if the watch
+-- is closed.
+--
+-- /Pre-release/
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots Watch{..} = do
+    roots <-
+        withMVar watchRoots $ \rs ->
+            return
+                $ if rsClosed rs then [] else Map.elems (rsActive rs)
+    map rootPath <$> filterM isStale roots
+
+    where
+
+    isStale r = do
+        res <-
+            try
+                $ bracket
+                    (openDirHandle (rootAbsPath r))
+                    closeQuietly
+                    handleFileId
+        return $ case res of
+            Right fid -> fid /= rootId r
+            Left e -> isDoesNotExistError e
 
 -- | Open a watch on the paths with the given 'Config', see
 -- 'watchEndsUnwatched' for the 'Bool'.
