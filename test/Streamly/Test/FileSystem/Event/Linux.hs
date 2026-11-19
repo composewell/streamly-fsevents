@@ -753,6 +753,49 @@ rootParentRenamed =
                     unwatched evs `shouldBe` []
                     pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
 
+-- | Open a recursive watch on the directory @parent/root@ in a temporary
+-- directory, rename @parent@ to @moved@, and run the action with the path of
+-- the root, its path after the rename, and the watch.
+withRootParentRenamed :: (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withRootParentRenamed action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let parent = fp </> "parent"
+            root = parent </> "root"
+            moved = fp </> "moved"
+        createDirectory parent
+        createDirectory root
+        r <- Path.fromString root
+        bracket
+            (Event.openWatch (const recCfg) (r NonEmpty.:| []))
+            Event.closeWatch
+            $ \w -> do
+                renameDirectory parent moved
+                action root (moved </> "root") w
+
+-- A directory created in a recursive root after the rename of its parent
+-- cannot be opened by its path under the root, the root is unwatched.
+recRootParentRenamed :: Spec
+recRootParentRenamed =
+    it "a recursive root is unwatched on a mkdir after its parent is renamed"
+        $ withRootParentRenamed $ \root new w -> do
+            createDirectory (new </> "sub")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+
+-- The old path of the root and its subdirectory sub are created again
+-- outside the tree. The sub created in the tree must not add a watch on the
+-- sub at the old path.
+recRootParentRenamedReused :: Spec
+recRootParentRenamedReused =
+    it "does not watch a directory at the old path of a recursive root"
+        $ withRootParentRenamed $ \root new w -> do
+            createDirectory (takeDirectory root)
+            createDirectory root
+            createDirectory (root </> "sub")
+            createDirectory (new </> "sub")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+
 -- The rename of any hard link of a file reports IN_MOVE_SELF, the root is
 -- kept if its path refers to the file when the event is read.
 fileRootRenamedBack :: Spec
@@ -2624,6 +2667,8 @@ watchTests =
                 recRootRenamedDropsEvents
                 rootRenamedBack
                 rootParentRenamed
+                recRootParentRenamed
+                recRootParentRenamedReused
                 fileRootRenamedBack
                 rootHardLinkRenamed
 #if !defined(FILESYSTEM_EVENT_FREEBSD)

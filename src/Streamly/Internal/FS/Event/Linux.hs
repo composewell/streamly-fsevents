@@ -118,7 +118,7 @@ import Control.Concurrent.MVar
     )
 import Control.Exception
     (SomeException, bracket, finally, onException, throwIO, try)
-import Control.Monad (mapAndUnzipM, void, when)
+import Control.Monad (filterM, mapAndUnzipM, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.Functor.Identity (runIdentity)
@@ -128,7 +128,7 @@ import Data.IORef
     ( IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef
     , writeIORef
     )
-import Data.List (find, isPrefixOf, partition)
+import Data.List (find, isPrefixOf, nubBy, partition)
 #if !(MIN_VERSION_base(4,20,0))
 import Data.List (foldl')
 #endif
@@ -148,6 +148,7 @@ import Foreign.C.Error (eEXIST, eMLINK)
 #endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
+import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek, peekByteOff, sizeOf)
 #if !defined(CABAL_OS_FREEBSD)
@@ -166,7 +167,8 @@ import System.IO.Error
     ( catchIOError, illegalOperationErrorType, isDoesNotExistError
     , mkIOError
     )
-import System.Posix.Types (CSsize(..), Fd(..))
+import System.Posix.Internals (c_fstat, sizeof_stat, st_dev, st_ino)
+import System.Posix.Types (CDev, CIno, CSsize(..), Fd(..))
 
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
@@ -786,15 +788,32 @@ scanFlags cfg@Config{..} =
 -- Path representation for events
 -------------------------------------------------------------------------------
 
+-- | The device and inode numbers of a file.
+data FileId = FileId !CDev !CIno deriving Eq
+
+-- | The 'FileId' of the file of an fd.
+fdFileId :: CInt -> IO FileId
+fdFileId fd =
+    allocaBytes sizeof_stat $ \p -> do
+        throwErrnoIfMinus1_ "fstat" $ c_fstat fd p
+        FileId <$> st_dev p <*> st_ino p
+
 -- | A watch root. 'rootPath' is the path supplied by the user, normalized by
 -- 'normalizeRoot', 'getRoot' reports it. 'rootAbs' is the absolute path of
 -- the root: a relative 'rootPath' joined to the working directory at the time
 -- the root was added. The system calls use 'rootAbs', a later change of the
 -- working directory does not change the directory they refer to. For a root
 -- supplied as an absolute path both are the same 'Path'.
+--
+-- 'rootId' is the 'FileId' of the root when it was added, 'Nothing' if it
+-- could not be determined. The rename of a parent of the root does not
+-- generate any event, 'rootAbs' then refers to another file or to none. A
+-- directory opened via 'rootAbs' is checked against 'rootId', see
+-- 'openSubdir' and 'unwatchMovedRoots'.
 data Root = Root
     { rootPath :: !Path
     , rootAbs :: !Path
+    , rootId :: !(Maybe FileId)
     }
 
 type PathRep =
@@ -1393,17 +1412,34 @@ subComponents =
 -- | Open an O_PATH fd of a subdirectory, starting from its root and without
 -- following a symbolic link in any component under the root. Raise an
 -- exception if a component is not a directory.
-openSubdir :: Path -> Path -> IO CInt
+--
+-- The root is opened by 'rootAbs'. If its 'FileId' is not 'rootId', a parent
+-- of the root was renamed, raise an exception with ENOENT, the subdirectory
+-- is not at its path under the root. The subdirectory is opened relative to
+-- the fd of the checked root, a rename after the check does not change the
+-- directory opened.
+openSubdir :: Root -> Path -> IO CInt
 openSubdir root sub = do
     fd <-
-        A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+        A.asCStringUnsafe (Path.toArray (rootAbs root)) $ \ptr ->
             throwErrnoIfMinus1 err
                 $ c_openat3 aT_FDCWD ptr (dirFlags .|. o_CLOEXEC)
-    go fd (subComponents sub)
+    same <- isRootFd fd `onException` c_close fd
+    if same
+    then go fd (subComponents sub)
+    else do
+        _ <- c_close fd
+        ioError (errnoToIOError err eNOENT Nothing Nothing)
 
     where
 
-    err = "add watch: " ++ Path.toString (Path.join root sub)
+    err = "add watch: " ++ Path.toString (Path.join (rootAbs root) sub)
+
+    isRootFd fd =
+        case rootId root of
+            Nothing -> return True
+            Just i -> (== i) <$> fdFileId fd
+
     dirFlags = o_PATH .|. o_DIRECTORY
     subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
 
@@ -1453,10 +1489,9 @@ openDirAt mode flags parent pRep =
             A.asCStringUnsafe (Path.toArray name) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 pfd ptr subFlags
         (_, (root, Just sub))
-            | mode == o_PATH -> openSubdir (rootAbs root) sub
+            | mode == o_PATH -> openSubdir root sub
             | otherwise ->
-                bracket
-                    (openSubdir (rootAbs root) sub) c_close (openDot pRep)
+                bracket (openSubdir root sub) c_close (openDot pRep)
         (_, (root, Nothing)) ->
             A.asCStringUnsafe (Path.toArray (rootAbs root)) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 aT_FDCWD ptr rootFlags
@@ -2079,19 +2114,47 @@ getWorkingDir = go 4096
         then go (size * 2)
         else return (Path.unsafeFromArray (unsafeFreezeWithShrink arr))
 
+-- | Whether the watch follows a root that is a symbolic link.
+followsRootLink :: Config -> Bool
+followsRootLink cfg = createFlags cfg .&. iN_DONT_FOLLOW == 0
+
+-- | The 'FileId' of the file at a path, following a symbolic link in the last
+-- component if the 'Bool' is 'True'. Raise an exception if the path cannot be
+-- opened.
+pathFileId :: Bool -> Path -> IO FileId
+pathFileId follow path =
+    bracket open c_close fdFileId
+
+    where
+
+    flags = o_PATH .|. o_CLOEXEC .|. (if follow then 0 else o_NOFOLLOW)
+
+    open =
+        A.asCStringUnsafe (Path.toArray path) $ \ptr ->
+            throwErrnoIfMinus1 ("open: " ++ Path.toString path)
+                $ c_openat3 aT_FDCWD ptr flags
+
 -- | The 'Root' of a path supplied by the user, the path is normalized by
 -- 'normalizeRoot'. A relative path is resolved against the current working
 -- directory, symbolic links are not resolved.
 --
 -- 'Path.isRooted' is true for @.@, the absolute path of @.@ is the working
 -- directory. A path starting with @.\/@ is not rooted after 'normalizeRoot'.
-makeRoot :: Path -> IO Root
-makeRoot path0
-    | isDotPath path = Root path <$> getWorkingDir
-    | Path.isRooted path = return (Root path path)
-    | otherwise = do
-        cwd <- getWorkingDir
-        return (Root path (Path.join cwd path))
+--
+-- 'rootId' is 'Nothing' if the path cannot be opened, adding the root then
+-- raises the exception.
+makeRoot :: Config -> Path -> IO Root
+makeRoot cfg path0 = do
+    absPath <-
+        if isDotPath path
+        then getWorkingDir
+        else if Path.isRooted path
+        then return path
+        else (`Path.join` path) <$> getWorkingDir
+    r <- try (pathFileId (followsRootLink cfg) absPath)
+    return
+        $ Root path absPath
+        $ either (\(_ :: IOError) -> Nothing) Just r
 
     where
 
@@ -2125,7 +2188,7 @@ makeRoot path0
 --
 addRoot :: Watch -> Path -> IO ()
 addRoot wtch@Watch {watchConfig = cfg} path = do
-    root <- makeRoot path
+    root <- makeRoot cfg path
     denied <- addToWatchAt cfg wtch 0 Nothing (root, Nothing)
     recordSynthEvents wtch (map SynthDenied denied)
 
@@ -2708,11 +2771,7 @@ isMountRoot _ _ = return False
 #else
 isMountRoot cfg pRep =
     A.asCStringUnsafe (Path.toArray (combinePathRep pRep)) $ \ptr ->
-        (== 1) <$> c_isMountRoot ptr (if follow then 1 else 0)
-
-    where
-
-    follow = createFlags cfg .&. iN_DONT_FOLLOW == 0
+        (== 1) <$> c_isMountRoot ptr (if followsRootLink cfg then 1 else 0)
 #endif
 
 -- | Whether the path of a root still refers to the object watched via its
@@ -2765,6 +2824,41 @@ unwatchGoneRoots cfg wtch wd roots = do
     else
         (,) (filter isGone gone)
             <$> unwatchPaths wtch "unwatchGoneRoots" allWds isGone
+
+-- | Whether 'rootAbs' still refers to the file of 'rootId'. 'True' if
+-- 'rootId' is 'Nothing', or if the path cannot be opened because of an error
+-- other than the path not existing or not being a directory, for example, a
+-- permission error.
+isRootAtPath :: Config -> Root -> IO Bool
+isRootAtPath cfg root =
+    case rootId root of
+        Nothing -> return True
+        Just i -> do
+            r <- try (pathFileId (followsRootLink cfg) (rootAbs root))
+            return $ case r of
+                Right j -> j == i
+                Left e -> not (isNotSubdirError e)
+
+-- | Remove the roots of the given paths whose 'rootAbs' no longer refers to
+-- the root, and the paths under them. The rename of a parent of a root does
+-- not generate any event. The check is made before a directory under the
+-- root is added. Returns the paths whose root is kept, and the removed paths,
+-- see 'unwatchPaths'.
+--
+-- A parent renamed after the check is detected by 'openSubdir', the
+-- directory is not added. The root is removed on the next check.
+unwatchMovedRoots ::
+    Config -> Watch -> [PathRep] -> IO ([PathRep], [WdUnwatched])
+unwatchMovedRoots cfg wtch paths = do
+    gone <-
+        filterM (fmap not . isRootAtPath cfg)
+            $ nubBy eqRoot (map getRepRoot paths)
+    let isGone p = any (eqRoot (getRepRoot p)) gone
+    if null gone
+    then return (paths, [])
+    else
+        (,) (filter (not . isGone) paths)
+            <$> unwatchPaths wtch "unwatchMovedRoots" allWds isGone
 
 -- | Remove a directory and the tree under it from the watch. The directory
 -- is no longer at its path, the events read after this are dropped. Returns
@@ -3448,13 +3542,21 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                     -- are added when the stream of the scan is read, before
                     -- the next event is parsed. If the entries are not
                     -- reported, all the watches are added now.
+                    -- A directory is not added under a root whose parent
+                    -- was renamed, see 'unwatchMovedRoots'.
+                    let isDirAdded =
+                            watchRec cfg && (isDirCreated || isDirMovedIn)
+                    (kept, removedGone) <-
+                        if isDirAdded
+                        then unwatchMovedRoots cfg wtch live
+                        else return (live, [])
                     (removedOut, scan) <-
                         if watchRec cfg && isDirCreated
                         then
                             (,) [] . concatStreams
-                                <$> mapM (addDirWithScan cfg wtch) live
+                                <$> mapM (addDirWithScan cfg wtch) kept
                         else if watchRec cfg && isDirMovedIn
-                        then movedInDir cfg wtch cookie live
+                        then movedInDir cfg wtch cookie kept
                         else return ([], S.nil)
                     -- The denied subdirectories and the failures are
                     -- reported even if the entries are not.
@@ -3470,7 +3572,7 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                         $ \m -> (deleteWd (fromIntegral ewd) m, ())
                     let removed =
                             removedPending ++ removedMoved ++ removedRoots
-                                ++ removedOut
+                                ++ removedGone ++ removedOut
                     return
                         $ events moved
                         `S.append` fmap scanItem scanned
@@ -3931,6 +4033,11 @@ isAccessDenied = getFlag accessDeniedFlag
 --
 -- | A path was removed from the watch explicitly using 'removeRoot' or
 -- automatically (file was deleted or renamed, or filesystem was unmounted).
+--
+-- The rename of a parent of a root does not generate any event. A root is
+-- also removed when the library finds that its path no longer refers to it,
+-- before it adds a directory created or moved into a recursive root. This
+-- check is best effort, a root may stay watched under its old path.
 --
 -- Note that in recursive watch mode all the subdirectories are watch roots,
 -- therefore, they will all generate this event.

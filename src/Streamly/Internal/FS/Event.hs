@@ -398,6 +398,12 @@ isEventsLost = Event.isEventsLost
 -- ends because the root is deleted, and on Linux and FreeBSD when a root is
 -- renamed. On macOS a deleted or renamed root stays watched.
 --
+-- The rename of a parent of a root is not reported. On Linux and FreeBSD the
+-- root stays watched under the old path, but this event may be reported for
+-- the root later, when the library finds that the root path no longer refers
+-- to the root, for example, before it adds a directory created in a
+-- recursive root.
+--
 -- On Linux and FreeBSD it is also reported for a directory of a recursive
 -- watch that is no longer watched, 'getAbsPath' returns the directory.
 isRootUnwatched :: Event -> Bool
