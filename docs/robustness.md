@@ -347,9 +347,12 @@ macOS:
   system events, e.g. a read-only or a network volume, the events of the
   other roots that occur during the call may be lost, an `isEventsLost`
   event may be reported in their place.
-* Handle API: after `removeRoot`, the events of the root can be reported
-  for a short time after the call returns, usually a few milliseconds.
-  There is no `isRootUnwatched` event.
+* Handle API: after `removeRoot`, the events of the root that occurred
+  before the call are reported, then its `isRootUnwatched` event, usually
+  within a few milliseconds of the call. The events of the root that occur
+  after the call are not reported. If the root is added again before its
+  `isRootUnwatched` event, the event precedes the events of the root
+  reported after the add.
 * Handle API: with the non-threaded RTS, `closeWatch` does not wake up a
   thread waiting in `readEvent` while a child process created by `fork`
   without `exec` is running, unless the child has closed the file
@@ -362,7 +365,11 @@ Windows:
 * Handle API: `removeRoot` closes the directory handle of the root. No
   event of the root is reported for a change made after the call returns.
   The changes of the root that the watch has not yet read from the system
-  are not reported. There is no `isRootUnwatched` event.
+  are not reported. An `isRootUnwatched` event follows the events of the
+  root already in the event queue of the watch.
+* A deleted root, or a root whose changes the system fails to report, is
+  removed from the watch, an `isRootUnwatched` event follows its
+  `isDeleted` event or the exception.
 * Handle API: `addRoot` and `removeRoot` do not lose or duplicate the
   events of the other roots. Each root has its own directory handle and its
   own event buffer.
