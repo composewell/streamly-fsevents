@@ -28,6 +28,10 @@ import Streamly.Internal.FS.Event.FreeBSD (Event)
 import Streamly.Internal.FS.Event.Linux (Event)
 #endif
 #if !defined(FILESYSTEM_EVENT_FREEBSD)
+import Foreign.C.Error (throwErrnoIfMinus1_)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt(..), CULong(..))
+import Foreign.Ptr (Ptr, nullPtr)
 import System.Environment (lookupEnv)
 #endif
 import System.Directory
@@ -753,6 +757,49 @@ rootParentRenamed =
                     unwatched evs `shouldBe` []
                     pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
 
+-- | Open a recursive watch on the directory @parent/root@ in a temporary
+-- directory, rename @parent@ to @moved@, and run the action with the path of
+-- the root, its path after the rename, and the watch.
+withRootParentRenamed :: (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withRootParentRenamed action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let parent = fp </> "parent"
+            root = parent </> "root"
+            moved = fp </> "moved"
+        createDirectory parent
+        createDirectory root
+        r <- Path.fromString root
+        bracket
+            (Event.openWatch (const recCfg) (r NonEmpty.:| []))
+            Event.closeWatch
+            $ \w -> do
+                renameDirectory parent moved
+                action root (moved </> "root") w
+
+-- A directory created in a recursive root after the rename of its parent
+-- cannot be opened by its path under the root, the root is unwatched.
+recRootParentRenamed :: Spec
+recRootParentRenamed =
+    it "a recursive root is unwatched on a mkdir after its parent is renamed"
+        $ withRootParentRenamed $ \root new w -> do
+            createDirectory (new </> "sub")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+
+-- The old path of the root and its subdirectory sub are created again
+-- outside the tree. The sub created in the tree must not add a watch on the
+-- sub at the old path.
+recRootParentRenamedReused :: Spec
+recRootParentRenamedReused =
+    it "does not watch a directory at the old path of a recursive root"
+        $ withRootParentRenamed $ \root new w -> do
+            createDirectory (takeDirectory root)
+            createDirectory root
+            createDirectory (root </> "sub")
+            createDirectory (new </> "sub")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+
 -- The rename of any hard link of a file reports IN_MOVE_SELF, the root is
 -- kept if its path refers to the file when the event is read.
 fileRootRenamedBack :: Spec
@@ -797,22 +844,79 @@ rootHardLinkRenamed =
                         `shouldBe` [g]
 
 #if !defined(FILESYSTEM_EVENT_FREEBSD)
+-- | Run the test with the directory @FSEVENTS_BIND_MOUNT@, set by
+-- test/bind-mount.sh. The test runs in a mount namespace in which it can
+-- mount and unmount file systems.
+withMountDir :: (FilePath -> IO ()) -> IO ()
+withMountDir action = do
+    v <- lookupEnv "FSEVENTS_BIND_MOUNT"
+    maybe (pendingWith "run test/bind-mount.sh") action v
+
 -- | Run the test with the directory @src@ and its bind mount @mnt@, both
 -- watched as roots. test/bind-mount.sh creates them in the directory
 -- @FSEVENTS_BIND_MOUNT@.
 withBindMount :: (FilePath -> FilePath -> Event.Watch -> IO ()) -> IO ()
-withBindMount action = do
-    v <- lookupEnv "FSEVENTS_BIND_MOUNT"
-    case v of
-        Nothing -> pendingWith "run test/bind-mount.sh"
-        Just dir -> do
-            let src = dir </> "src"
-                mnt = dir </> "mnt"
-            roots <- mapM Path.fromString [src, mnt]
-            bracket
-                (Event.openWatch id (NonEmpty.fromList roots))
-                Event.closeWatch
-                (action src mnt)
+withBindMount action =
+    withMountDir $ \dir -> do
+        let src = dir </> "src"
+            mnt = dir </> "mnt"
+        roots <- mapM Path.fromString [src, mnt]
+        bracket
+            (Event.openWatch id (NonEmpty.fromList roots))
+            Event.closeWatch
+            (action src mnt)
+
+foreign import ccall unsafe "sys/mount.h mount"
+    c_mount :: CString -> CString -> CString -> CULong -> Ptr () -> IO CInt
+
+foreign import ccall unsafe "sys/mount.h umount"
+    c_umount :: CString -> IO CInt
+
+-- | Mount a tmpfs on a directory.
+mountTmpfs :: FilePath -> IO ()
+mountTmpfs dir =
+    withCString "none" $ \src ->
+        withCString dir $ \target ->
+            withCString "tmpfs" $ \fstype ->
+                throwErrnoIfMinus1_ ("mount " ++ dir)
+                    $ c_mount src target fstype 0 nullPtr
+
+-- | Unmount the file system mounted on a directory. Raise an exception if the
+-- unmount fails, for example, with EBUSY.
+unmount :: FilePath -> IO ()
+unmount dir =
+    withCString dir $ \target ->
+        throwErrnoIfMinus1_ ("umount " ++ dir) $ c_umount target
+
+-- The watch does not keep a file of the file system open, the unmount does
+-- not fail with EBUSY. The kernel removes the watches of the file system.
+unmountWatched :: Spec
+unmountWatched =
+    it "a file system can be unmounted while a tree in it is watched"
+        $ withMountDir $ \dir -> do
+            let root = dir </> "tmpfs"
+            createDirectory root
+            mountTmpfs root
+            test root `finally` cleanup root
+
+    where
+
+    test root = do
+        createDirectory (root </> "sub")
+        r <- Path.fromString root
+        bracket
+            (Event.openWatch (const recCfg) (r NonEmpty.:| []))
+            Event.closeWatch
+            $ \w -> do
+                unmount root
+                evs <- readUntil (isUnwatchedOf root) w
+                pathsOf Event.isRootUnmounted evs `shouldContain` [root]
+
+    -- The unmount fails with EINVAL if the test unmounted the file system.
+    cleanup root = void (try (unmount root) :: IO (Either IOException ()))
+
+    isUnwatchedOf path ev =
+        Event.isRootUnwatched ev && getAbsPath ev == path
 
 -- The root of a mount cannot be renamed, the IN_MOVE_SELF of the directory
 -- is for its other path.
@@ -2624,11 +2728,15 @@ watchTests =
                 recRootRenamedDropsEvents
                 rootRenamedBack
                 rootParentRenamed
+                recRootParentRenamed
+                recRootParentRenamedReused
                 fileRootRenamedBack
                 rootHardLinkRenamed
 #if !defined(FILESYSTEM_EVENT_FREEBSD)
             describe "bind mount" $ do
                 bindMountRootRenamed
+            describe "unmount" $ do
+                unmountWatched
 #endif
             describe "recursive mode" $ do
                 recSubdirSelfEvents
