@@ -285,10 +285,9 @@ namespace, with `test/bind-mount.sh`.
 
 ## Overlapping roots on Linux
 
-* A root listed twice reports each event once.
-* Two roots that reach the same directory, for example a recursive root
-  and a root inside it, report each event once for each root.
-* Removing one of the two roots keeps the other one watching.
+Two roots that reach the same directory, for example a recursive root and
+a root inside it, share the inotify watch of the directory. Removing one
+of the two roots keeps the other one watching the directory.
 
 ## Deleted and re-created roots on macOS
 

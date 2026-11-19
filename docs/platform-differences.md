@@ -34,28 +34,17 @@ and close the file after the write.
 On Linux the watch of a root is attached to its inode, on macOS to its path.
 On Windows the watch keeps the root open.
 
-* A deleted root: a root that is a symbolic link does not report
-  `isDeleted` when the link is deleted.
-* A directory reached via two paths that differ otherwise, for example, a
-  symbolic link and its target, or paths that differ in case: all
-  platforms watch it as two roots and report a change in it once for each
-  root.
-* Nested roots, a root and a subdirectory of it, in a recursive watch: all
-  platforms report a change in the subdirectory once for each root.
-* A root supplied as a relative path: on all platforms it is relative to
-  the working directory at the time the watch is started, a later change
-  of the working directory does not affect the watch. `getRoot` returns
-  the relative path, `getAbsPath` returns an absolute path.
+The interpretation of the root paths, which is the same on all platforms,
+is described in the Haddock documentation of `watch`. On Linux and macOS
+`getRoot` returns the root path with redundant separators and `.`
+components removed, on Windows it returns the path as it was supplied.
 
 ### Watch root behavior tests
 
 Tested behavior common to all platforms:
 
-* A root supplied twice with the same path is added only once.
-  Paths that differ only in redundant separators and `.` components, for
-  example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
-  macOS `getRoot` reports a normalized path with these removed, on
-  Windows it reports the path literally as it was supplied.
+* Nested roots in a recursive watch report a change in the inner root once
+  for each root.
 
 **Non directory watch roots** are allowed on Linux and macOS. A watch does
 not affect regular operations on the file being watched e.g. a test
@@ -91,6 +80,7 @@ is no `isRootUnwatched` event generated on deletion of a root.
 |----------|-------|-------|---------|
 | A deleted watch root reports `isDeleted` for the root | Yes | Yes | Yes |
 | A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A deleted symbolic link root reports `isDeleted` for the root | No | No | No |
 
 On macOS, it has been tested that fseventsd does not report delete
 events for the files inside the root when the root is deleted (e.g. with
