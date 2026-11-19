@@ -1118,32 +1118,38 @@ behaviors =
         , check = rootDeleted
         , expected = onPlatform No No No
         }
+    -- Linux reports IN_DELETE_SELF when the inode is freed, an open
+    -- reference delays it. FreeBSD reports it when the last link is removed.
     , base
         { title =
-            "deleted directory root in use by a process reports isDeleted"
+            "A deleted directory root in use by a process reports "
+                ++ "`isDeleted` for the root"
         , setup = \p -> holdCwd p (watchRoot p) >> settle
         , ops = removeDirectory . watchRoot
         , check = rootDeleted
-        , expected = onPlatform No Yes Exception
+        , expected = onFreeBSD Yes (onPlatform No Yes Exception)
         }
     , base
-        { title = "deleted regular file root reports isDeleted for the root"
+        { title =
+            "A deleted regular file root reports `isDeleted` for the root"
         , setup = withFileRoot
         , ops = removeFile . watchRoot
         , check = rootDeleted
         , expected = onPlatform Yes Yes WatchException
         }
     , base
-        { title = "deleted open regular file root reports isDeleted"
+        { title =
+            "A deleted open regular file root reports `isDeleted` for the "
+                ++ "root"
         , setup = \p -> withFileRoot p >> holdFile p (watchRoot p)
         , ops = removeFile . watchRoot
         , check = rootDeleted
-        , expected = onPlatform No Yes WatchException
+        , expected = onFreeBSD Yes (onPlatform No Yes WatchException)
         }
     , base
         { title =
-            "deleted regular file root with another hard link reports "
-                ++ "isDeleted"
+            "A deleted regular file root with another hard link reports "
+                ++ "`isDeleted` for the root"
         , setup = \p -> do
             withFileRoot p
             hardLink (watchRoot p) (renamedRoot p)
@@ -1153,7 +1159,7 @@ behaviors =
         }
 #if !defined(CABAL_OS_WINDOWS)
     , base
-        { title = "deleted FIFO root reports isDeleted for the root"
+        { title = "A deleted FIFO root reports `isDeleted` for the root"
         , setup = \p -> do
             removeDirectory (watchRoot p)
             createNamedPipe (watchRoot p)
