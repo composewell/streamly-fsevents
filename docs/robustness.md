@@ -316,14 +316,14 @@ Linux:
 * Handle API: with the non-threaded RTS, and no free fd or no `/proc`,
   the stream of a thread reading the watch ends when the next event
   arrives after `closeWatch`.
-* Handle API: after `removeRoot`, the events queued for the root before
-  the removal are reported, up to its `isRootUnwatched` event. For a
-  directory that the root shares with another root, this requires `/proc`
-  and a free fd. If `/proc` is not mounted or access to it is denied, the
-  root stops reporting that directory at once, and its `isRootUnwatched`
-  event is reported before the next event. If no fd is free, `removeRoot`
-  throws an exception, the directory stays watched for the root, and the
-  call can be retried.
+* Handle API: `removeRoot` removes the root at once and does not fail for
+  lack of a free fd or of `/proc`. The events of the root already read
+  from the kernel are reported, then its `isRootUnwatched` event, and no
+  other event of the root follows. The events of the root still in the
+  kernel queue are not reported.
+* Handle API: with the non-threaded RTS, and no free fd or no `/proc`, a
+  thread reading the watch reports the `isRootUnwatched` event of a
+  removed root when the next event arrives.
 * Handle API: after an `IOException` from adding or reading a
   directory, for example when no fd is free, the next stream on the
   watch continues with the remaining events. The directory that failed
