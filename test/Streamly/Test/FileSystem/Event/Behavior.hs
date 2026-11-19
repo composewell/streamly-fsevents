@@ -39,9 +39,9 @@ import Data.Maybe (isJust)
 import System.Exit (ExitCode(..), exitFailure)
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, createDirectoryLink
-    , getPermissions, listDirectory, removeDirectory, removeDirectoryLink
-    , removeFile, removePathForcibly, renameDirectory, renameFile
-    , setOwnerWritable, setPermissions
+    , doesDirectoryExist, getPermissions, listDirectory, removeDirectory
+    , removeDirectoryLink, removeFile, removePathForcibly, renameDirectory
+    , renameFile, setOwnerWritable, setPermissions
 #if !defined(CABAL_OS_WINDOWS)
     , emptyPermissions, setOwnerReadable, setOwnerSearchable
 #endif
@@ -1334,17 +1334,40 @@ behaviors =
         , expected = No
         }
     , base
+        { title =
+            "root and a symbolic link to it report a file created in it "
+                ++ "for both"
+        , setup = \p -> do
+            createDirectoryLink (watchRoot p) (linkRoot p)
+            settle
+        , extraRoots = \p -> [linkRoot p]
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdForRoots 2 "file")
+        , expected = Yes
+        }
+    -- The upper case path exists only on a case-insensitive file system.
+    , base
+        { title =
+            "root and its path in upper case report a file created in it "
+                ++ "for both"
+        , extraRoots = \p -> [upperRoot p]
+        , skip = \p -> do
+            exists <- doesDirectoryExist (upperRoot p)
+            return $
+                if exists
+                then Nothing
+                else Just "the file system is case sensitive"
+        , ops = \p -> createFile (watchRoot p </> "file")
+        , check = const (createdForRoots 2 "file")
+        , expected = Yes
+        }
+    , base
         { title = "nested roots report a file in the inner root for both"
         , config = Event.setRecursiveMode True
         , setup = withDir
         , extraRoots = \p -> [watchRoot p </> "dir"]
         , ops = \p -> createFile (watchRoot p </> "dir/file")
-        , check = \_ evs ->
-            let roots =
-                    [ Path.toString (Event.getRoot ev)
-                    | ev <- evs, isNamed "file" ev, Event.isCreated ev
-                    ]
-             in length (nub roots) == 2
+        , check = const (createdForRoots 2 "file")
         , expected = Yes
         }
 #if defined(CABAL_OS_DARWIN)
@@ -1367,6 +1390,21 @@ behaviors =
     onWindows = platformName == "Windows"
 
     onDarwin = platformName == "macOS"
+
+    -- A symbolic link to the watch root, next to it.
+    linkRoot p = takeDirectory (watchRoot p) </> "link"
+
+    -- The watch root is "root".
+    upperRoot p = takeDirectory (watchRoot p) </> "ROOT"
+
+    -- Whether the create events of the file report the given number of
+    -- roots.
+    createdForRoots n name evs =
+        let roots =
+                [ Path.toString (Event.getRoot ev)
+                | ev <- evs, isNamed name ev, Event.isCreated ev
+                ]
+         in length (nub roots) == n
 
     -- A root in the directory "parent", next to the watch root.
     nestedParent p = takeDirectory (watchRoot p) </> "parent"
