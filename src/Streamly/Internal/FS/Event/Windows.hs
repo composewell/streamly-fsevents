@@ -949,10 +949,13 @@ toAbsolute path
 
     str = Path.toString path
 
--- | Whether the root was added via a path equal to @path@.
+-- | Whether the root was added via a path equal to @path@. Case is
+-- significant, the default of 'Path.ignoreCase' on Windows differs across
+-- streamly-core versions.
 isRootPath :: Path -> Root -> Bool
 isRootPath path =
-    Path.eqPath (Path.allowRelativeEquality True) path . rootPath
+    Path.eqPath (Path.allowRelativeEquality True . Path.ignoreCase False) path
+        . rootPath
 
 -- | @addRoot watch root@ adds the directory @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. The root is watched
