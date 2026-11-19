@@ -80,6 +80,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)

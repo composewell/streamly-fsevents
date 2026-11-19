@@ -1373,6 +1373,43 @@ removeAddAgain =
             evs `shouldUnwatch` [(root, root)]
             createdRoots file evs `shouldBe` [root]
 
+-- The root parent/root2 is stale after parent is renamed, and after a new
+-- parent/root2 is created at its path. removeRoot and addRoot watch the new
+-- directory. On macOS a root is watched by its path and is never stale.
+staleRootReAdded :: Spec
+staleRootReAdded =
+    it "a root whose parent is renamed is stale until it is added again"
+        $ withRootHandle id $ \root w -> do
+            let parent = takeDirectory root </> "parent"
+                root2 = parent </> "root2"
+                file = root2 </> "file"
+            createDirectory parent
+            createDirectory root2
+            p <- Path.fromString root2
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            renameDirectory parent (takeDirectory root </> "moved")
+            stale w `shouldReturn` expected root2
+            createDirectory parent
+            createDirectory root2
+            stale w `shouldReturn` expected root2
+            Event.removeRoot w p
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            createFile file
+            evs <- readUntil (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [root2]
+
+    where
+
+    stale w = map Path.toString <$> Event.staleRoots w
+
+#if defined(CABAL_OS_DARWIN)
+    expected _ = []
+#else
+    expected r = [r]
+#endif
+
 closedWatchOps :: Spec
 closedWatchOps =
     it "addRoot raises an exception, removeRoot does nothing on a closed watch"
@@ -1557,6 +1594,7 @@ handleTests = do
     removeTwice
     removeWhileReading
     removeAddAgain
+    staleRootReAdded
     closedWatchOps
 #if defined(CABAL_OS_WINDOWS)
     fileRootRaises

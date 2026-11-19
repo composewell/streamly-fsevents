@@ -39,6 +39,7 @@ module Streamly.Internal.FS.Event
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event
@@ -276,6 +277,21 @@ addRoot = Event.addRoot
 --
 removeRoot :: Watch -> Path -> IO ()
 removeRoot = Event.removeRoot
+
+-- | The roots of a watch whose path no longer refers to the directory
+-- watched via the root, as supplied to 'addRoot'. The watch is not changed,
+-- to watch the directory now at the path, call 'removeRoot' and then
+-- 'addRoot' with the path. The result can be out of date when the call
+-- returns.
+--
+-- On Linux and FreeBSD a root becomes stale when a parent directory is
+-- renamed, and on Windows when the root or a parent directory is renamed. The
+-- root is still watched, its events report the old path. A root is stale if
+-- its path does not exist or refers to another file. On macOS a root is
+-- watched by its path and is never stale, the list is empty.
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots = Event.staleRoots
 
 -------------------------------------------------------------------------------
 -- Handling Events

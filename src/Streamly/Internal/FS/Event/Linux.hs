@@ -65,6 +65,7 @@ module Streamly.Internal.FS.Event.Linux
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)
@@ -2160,6 +2161,20 @@ makeRoot cfg path0 = do
 
     path = normalizeRoot path0
 
+-- | Whether 'rootAbs' still refers to the file of 'rootId'. 'True' if
+-- 'rootId' is 'Nothing', or if the path cannot be opened because of an error
+-- other than the path not existing or not being a directory, for example, a
+-- permission error.
+isRootAtPath :: Config -> Root -> IO Bool
+isRootAtPath cfg root =
+    case rootId root of
+        Nothing -> return True
+        Just i -> do
+            r <- try (pathFileId (followsRootLink cfg) (rootAbs root))
+            return $ case r of
+                Right j -> j == i
+                Left e -> not (isNotSubdirError e)
+
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
 -- @watch@, with the 'Config' used to open the watch. A relative @root@ is
 -- relative to the working directory at the time of the call, a later change
@@ -2657,6 +2672,40 @@ removeRoot wtch@Watch {watchFd = fd} root = do
         $ whenWatchOpen wtch ()
         $ void (queueIgnored "removeRoot" fd) `catchIOError` \_ -> return ()
 
+-- | The roots of a watch whose path no longer refers to the directory or file
+-- watched via the root, as supplied to 'addRoot'. A root becomes stale when
+-- a parent directory is renamed, the rename does not generate any event.
+-- The root is still watched under its old path.
+--
+-- A root is stale if its path does not exist, or refers to another file,
+-- compared by the device and inode numbers recorded when the root was added.
+-- A root whose path cannot be opened because of another error, for example,
+-- a permission error, is not stale.
+--
+-- The watch is not changed. To watch the file now at the path, call
+-- 'removeRoot' and then 'addRoot' with the path. The result can be out of
+-- date when the call returns, a parent can be renamed after the check.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. Returns an empty list if the watch
+-- is closed.
+--
+-- /Pre-release/
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots wtch@Watch {watchConfig = cfg} = do
+    closed <- isWatchClosed wtch
+    if closed
+    then return []
+    else do
+        m <- readIORef (watchWdMap wtch)
+        let roots =
+                nubBy eqRoot
+                    [ getRepRoot (wpRep wp)
+                    | (_, WdUser wps) <- wdEntries m, wp <- wps
+                    ]
+        map rootPath <$> filterM (fmap not . isRootAtPath cfg) roots
+
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
 -- the fd to become readable, in the threaded RTS. The kernel releases the fd
 -- even if close fails.
@@ -2824,20 +2873,6 @@ unwatchGoneRoots cfg wtch wd roots = do
     else
         (,) (filter isGone gone)
             <$> unwatchPaths wtch "unwatchGoneRoots" allWds isGone
-
--- | Whether 'rootAbs' still refers to the file of 'rootId'. 'True' if
--- 'rootId' is 'Nothing', or if the path cannot be opened because of an error
--- other than the path not existing or not being a directory, for example, a
--- permission error.
-isRootAtPath :: Config -> Root -> IO Bool
-isRootAtPath cfg root =
-    case rootId root of
-        Nothing -> return True
-        Just i -> do
-            r <- try (pathFileId (followsRootLink cfg) (rootAbs root))
-            return $ case r of
-                Right j -> j == i
-                Left e -> not (isNotSubdirError e)
 
 -- | Remove the roots of the given paths whose 'rootAbs' no longer refers to
 -- the root, and the paths under them. The rename of a parent of a root does
