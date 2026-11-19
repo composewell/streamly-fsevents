@@ -23,6 +23,10 @@
   the moved directory are not reported, they would report the old path.
   Only its `isRootUnwatched` event follows. A directory root renamed back
   before its rename event is read is no longer watched.
+- Linux: `removeRoot` removes the root at once. The events of the root still
+  in the kernel queue are not reported, its `isRootUnwatched` event follows
+  the events already read. `removeRoot` no longer needs `/proc` or a free
+  file descriptor.
 - macOS: with a watch root inside another watch root, an event in the
   inner root is reported once for each root, the same as on Linux and
   Windows. Earlier it was reported for the inner root only.
