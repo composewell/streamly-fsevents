@@ -808,6 +808,39 @@ rootHardLinkRenamed =
                     map getRoot (filter Event.isModified evs1)
                         `shouldBe` [g]
 
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+-- | Run the test with the directory @src@ and its bind mount @mnt@, both
+-- watched as roots. test/bind-mount.sh creates them in the directory
+-- @FSEVENTS_BIND_MOUNT@.
+withBindMount :: (FilePath -> FilePath -> Event.Watch -> IO ()) -> IO ()
+withBindMount action = do
+    v <- lookupEnv "FSEVENTS_BIND_MOUNT"
+    case v of
+        Nothing -> pendingWith "run test/bind-mount.sh"
+        Just dir -> do
+            let src = dir </> "src"
+                mnt = dir </> "mnt"
+            roots <- mapM Path.fromString [src, mnt]
+            bracket
+                (Event.openWatch id (NonEmpty.fromList roots))
+                Event.closeWatch
+                (action src mnt)
+
+-- The root of a mount cannot be renamed, the IN_MOVE_SELF of the directory
+-- is for its other path.
+bindMountRootRenamed :: Spec
+bindMountRootRenamed =
+    it "renaming the source of a bind mount root unwatches the source only"
+        $ withBindMount $ \src mnt w -> do
+            renameDirectory src (src ++ "-moved")
+            evs <- readUntil Event.isRootUnwatched w
+            unwatched evs `shouldBe` [(src, src)]
+            createFile (mnt </> "file")
+            evs1 <- readUntil Event.isCreated w
+            pathsOf Event.isCreated evs1 `shouldBe` [mnt </> "file"]
+            renameDirectory (src ++ "-moved") src
+#endif
+
 -------------------------------------------------------------------------------
 -- Recursive mode tests
 -------------------------------------------------------------------------------
@@ -2645,6 +2678,10 @@ watchTests =
                 rootParentRenamed
                 fileRootRenamedBack
                 rootHardLinkRenamed
+#if !defined(FILESYSTEM_EVENT_FREEBSD)
+            describe "bind mount" $ do
+                bindMountRootRenamed
+#endif
             describe "recursive mode" $ do
                 recSubdirSelfEvents
                 recMoveOutSpec

@@ -2820,6 +2820,28 @@ foreign import capi
 accessDeniedFlag :: Word32
 accessDeniedFlag = 0x00100000
 
+#if !defined(CABAL_OS_FREEBSD)
+foreign import ccall unsafe "streamly_fsevents_is_mount_root"
+    c_isMountRoot :: CString -> CInt -> IO CInt
+#endif
+
+-- | Whether the path of a root is the root of a mount now, following a
+-- symbolic link if the watch follows a root that is a symbolic link. 'False'
+-- if the path does not exist, or if it cannot be determined, on Linux before
+-- 5.8 and on FreeBSD.
+isMountRoot :: Config -> PathRep -> IO Bool
+#if defined(CABAL_OS_FREEBSD)
+isMountRoot _ _ = return False
+#else
+isMountRoot cfg pRep =
+    A.asCStringUnsafe (Path.toArray (combinePathRep pRep)) $ \ptr ->
+        (== 1) <$> c_isMountRoot ptr (if follow then 1 else 0)
+
+    where
+
+    follow = createFlags cfg .&. iN_DONT_FOLLOW == 0
+#endif
+
 -- | Whether the path of a root still refers to the object watched via its
 -- watch descriptor. The flags of the watch are set to 'watchFlags'.
 isRootAt :: Config -> Watch -> WdPath -> IO Bool
@@ -2833,10 +2855,15 @@ isRootAt cfg wtch (wd, pRep) =
 -- the IN_MOVE_SELF are dropped, see 'Gone'.
 --
 -- A directory has one name, IN_MOVE_SELF means that its root was renamed,
--- all the roots of a directory are removed. A root renamed back before the
--- event is read is removed too. A root at a bind mount of the directory is
--- removed as well when the directory is renamed at its other path, although
--- the path of the root still refers to the directory.
+-- the roots of a directory are removed. A root renamed back before the
+-- event is read is removed too.
+--
+-- A bind mount gives a directory a second path. The root of a mount cannot
+-- be renamed, rename(2) fails with EBUSY, its IN_MOVE_SELF is for a rename at
+-- the other path. A root whose path is the root of a mount when the event is
+-- read is removed only if its path no longer refers to the directory. If it
+-- cannot be determined whether the path is the root of a mount, see
+-- 'isMountRoot', the root is removed.
 --
 -- A file can have more than one name, the rename of any hard link reports
 -- IN_MOVE_SELF. Only the roots whose path no longer refers to the file are
@@ -2849,10 +2876,13 @@ unwatchGoneRoots ::
     Config -> Watch -> Int -> [PathRep] -> IO [WdUnwatched]
 unwatchGoneRoots cfg wtch wd roots = do
     m <- readIORef (watchWdMap wtch)
-    results <-
-        if IntSet.member wd (wmDirRoots m)
-        then return [(root, False) | root <- roots]
-        else mapM (\root -> (,) root <$> isRootAt cfg wtch (wd, root)) roots
+    let isDirRoot = IntSet.member wd (wmDirRoots m)
+        isAt root = do
+            isMount <- if isDirRoot then isMountRoot cfg root else return True
+            if isMount
+            then isRootAt cfg wtch (wd, root)
+            else return False
+    results <- mapM (\root -> (,) root <$> isAt root) roots
     let kept = [root | (root, True) <- results]
         gone = [root | (root, False) <- results]
         isGone p = any (isSameRoot p) gone && not (any (isSameRoot p) kept)
