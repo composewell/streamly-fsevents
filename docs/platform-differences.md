@@ -34,19 +34,14 @@ and close the file after the write.
 On Linux the watch of a root is attached to its inode, on macOS to its path.
 On Windows the watch keeps the root open.
 
-The interpretation of the root paths, which is the same on all platforms,
-is described in the Haddock documentation of `watch`. On Linux and macOS
-`getRoot` returns the root path with redundant separators and `.`
-components removed, on Windows it returns the path as it was supplied.
+### Nested roots
 
-### Watch root behavior tests
+Nested roots in a recursive watch report a change in the inner root once
+for each root, on all platforms.
 
-Tested behavior common to all platforms:
+### Non directory watch roots
 
-* Nested roots in a recursive watch report a change in the inner root once
-  for each root.
-
-**Non directory watch roots** are allowed on Linux and macOS. A watch does
+Non directory watch roots are allowed on Linux and macOS. A watch does
 not affect regular operations on the file being watched e.g. a test
 shows that the watch does not call "open" on a FIFO, therefore it does
 not count as a reader or writer.
@@ -56,25 +51,28 @@ not count as a reader or writer.
 | A regular file can be watched | Yes | Yes | No |
 | A special file (e.g. FIFO) can be watched | Yes | Yes | No |
 
-**Watching non-existing paths:** macOS watches the path of a root, Linux
-and Windows watch the object at the path and not the path itself. The
-following tests are a direct consequence of that difference. macOS can
-watch a missing root, therefore, it also reports the creation of the
-root, which is an event that occurs even before the watch of that root
-started. This is in fact an event on the the parent directory of the
-missing path component.
+### Watching non-existing paths
+
+macOS watches the path of a root, Linux and Windows watch the object at
+the path and not the path itself. The following tests are a direct
+consequence of that difference. macOS can watch a missing root,
+therefore, it also reports the creation of the root, which is an event
+that occurs even before the watch of that root started. This is in fact
+an event on the the parent directory of the missing path component.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A non-existing object path is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 | A watch root deleted and created again is watched | No | Yes | No |
 
-**Delete of a root**: On Linux and Windows the watch of a deleted root
-is removed. The watch ends with the `isRootUnwatched` event that follows
-the `isDeleted` event of the root. macOS watches the path not the
-object, after the `isDeleted` event the path is still watched and events
-start if a new object is created on that path. Therefore, on macOS there
-is no `isRootUnwatched` event generated on deletion of a root.
+### Delete of a root
+
+On Linux and Windows the watch of a deleted root is removed. The watch
+ends with the `isRootUnwatched` event that follows the `isDeleted` event
+of the root. macOS watches the path not the object, after the
+`isDeleted` event the path is still watched and events start if a new
+object is created on that path. Therefore, on macOS there is no
+`isRootUnwatched` event generated on deletion of a root.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -90,11 +88,13 @@ itself is not deleted macOS does report the delete events for the files
 deleted in it. So **if a parent is deleted, applications should remove all
 paths under it automatically.**
 
-**Rename of a root**: On both Windows and Linux the kernel watch is on
-the object and not on the path, so a rename carries the watch along with
-it. The library still maps the object to the old path for the kernel
-events generated for the renamed object.  The old path may no longer exist
-or may refer to another object.
+### Rename of a root
+
+On both Windows and Linux the kernel watch is on the object and not on
+the path, so a rename carries the watch along with it. The library still
+maps the object to the old path for the kernel events generated for the
+renamed object. The old path may no longer exist or may refer to another
+object.
 
 On Linux, the library detects a rename and ends the watch with
 `isRootUnwatched`.
@@ -114,14 +114,15 @@ watched again.
 | A root renamed back to original is watched | No | Yes | Yes |
 | A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
 
-**Rename of a parent of a root**: On Linux the rename of a parent
-directory of a root does not generate any event for the root. The root
-stays watched, and its events report the old path. The library may find
-later that the root path no longer refers to the root, for example, when
-it adds a directory created in a recursive root. It then ends the watch
-of the root with `isRootUnwatched`. This check is best effort: a root in
-which no directory is created or moved in stays watched under the old
-path.
+### Rename of a parent of a root
+
+On Linux the rename of a parent directory of a root does not generate
+any event for the root. The root stays watched, and its events report
+the old path. The library may find later that the root path no longer
+refers to the root, for example, when it adds a directory created in a
+recursive root. It then ends the watch of the root with
+`isRootUnwatched`. This check is best effort: a root in which no
+directory is created or moved in stays watched under the old path.
 
 On macOS the watch is on the path, the events of the root at the new path
 of the parent are not reported.
@@ -139,10 +140,12 @@ handle only, not to its parent directories.
 | A root whose parent is renamed remains watched under the old path | Yes | No | Exception |
 | A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Exception |
 
-**Unmount of the file system of a root**: On Linux a watch does not keep
-a file of the watched file system open, the file system can be unmounted
-while it is watched. The kernel removes the watches of the file system,
-the library reports `isRootUnmounted` and `isRootUnwatched` for the root.
+### Unmount of the file system of a root
+
+On Linux a watch does not keep a file of the watched file system open,
+the file system can be unmounted while it is watched. The kernel removes
+the watches of the file system, the library reports `isRootUnmounted`
+and `isRootUnwatched` for the root.
 
 On macOS the watch is on the path, it does not keep a file of the watched
 file system open.
@@ -169,13 +172,14 @@ without the lock.
 | Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | Not tested | Not tested |
 | Unmount of a watched file system reports an unmount event | Yes | Not tested | Not tested |
 
-**End of watch stream**: On macOS a watch stream never ends even if you
-delete all the watched paths because new objects on those paths can
-be created and watched.  On Linux a deleted or renamed root is gone
-forever therefore the watch stream ends when all the roots are deleted
-or renamed. On Windows a renamed root remains watched, but deleted root
-is gone forever, if all the roots are deleted then the watch stream
-ends.
+### End of watch stream
+
+On macOS a watch stream never ends even if you delete all the watched
+paths because new objects on those paths can be created and watched. On
+Linux a deleted or renamed root is gone forever therefore the watch
+stream ends when all the roots are deleted or renamed. On Windows a
+renamed root remains watched, but deleted root is gone forever, if all
+the roots are deleted then the watch stream ends.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
