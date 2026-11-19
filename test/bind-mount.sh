@@ -1,8 +1,9 @@
 #!/bin/sh
 #
-# Run the bind mount tests of the Linux test suite in an unprivileged user
-# and mount namespace. A directory src and its bind mount mnt are created in
-# a temporary directory, its path is passed in FSEVENTS_BIND_MOUNT.
+# Run the mount tests of the Linux test suite in an unprivileged user and
+# mount namespace. A directory src and its bind mount mnt are created in a
+# temporary directory, its path is passed in FSEVENTS_BIND_MOUNT. The
+# unmount test mounts a tmpfs in that directory.
 #
 # Usage: test/bind-mount.sh [test arguments]
 #
@@ -25,7 +26,8 @@ unshare -rm sh -c '
     mkdir "$dir/src" "$dir/mnt"
     mount --bind "$dir/src" "$dir/mnt"
     status=0
-    FSEVENTS_BIND_MOUNT=$dir "$0" --match "/bind mount/" "$@" || status=$?
+    FSEVENTS_BIND_MOUNT=$dir "$0" --match "/bind mount/" --match "/unmount/" \
+        "$@" || status=$?
     umount "$dir/mnt"
     rm -rf "$dir"
     exit $status
