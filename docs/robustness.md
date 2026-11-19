@@ -276,6 +276,18 @@ with `test/bind-mount.sh`.
   and a root inside it, report each event once for each root.
 * Removing one of the two roots keeps the other one watching.
 
+## Deleted and re-created roots on macOS
+
+* macOS watches a path, if the existing object on that path is deleted
+  and a new object is created, it starts reporting the events for the
+  new object. FSEvents can merge the events, so one event for the root
+  path can report the changes of both the deleted and the newly created
+  object, for example both `isDeleted` and `isCreated`, and it does not
+  tell which change belongs to which object.
+* A directory under the root of a recursive watch, deleted and created
+  again, can also report one event for its path with both `isDeleted`
+  and `isCreated`.
+
 ## Exceptions and resource cleanup
 
 All platforms:
@@ -321,6 +333,9 @@ Linux:
   from the kernel are reported, then its `isRootUnwatched` event, and no
   other event of the root follows. The events of the root still in the
   kernel queue are not reported.
+* A deleted root is removed from the watch, an `isRootUnwatched` event
+  follows its `isDeleted` event. Some events of the root may arrive
+  (rarely though) between `isDeleted` and `isRootUnwatched`.
 * Handle API: with the non-threaded RTS, and no free fd or no `/proc`, a
   thread reading the watch reports the `isRootUnwatched` event of a
   removed root when the next event arrives.

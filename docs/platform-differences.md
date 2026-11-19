@@ -82,16 +82,11 @@ missing path component.
 | A watch root deleted and created again is watched | No | Yes | No |
 
 **Delete of a root**: On Linux and Windows the watch of a deleted root
-is removed. On Windows the watch ends with the `isDeleted` event of the root,
-on Linux with the `isRootUnwatched` event that follows it. On Linux, some
-events may arrive (rarely though) between `isDeleted` and `isRootUnwatched`.
-
-macOS watches the path not the object, after the `isDeleted` event the
-path is still watched and events start if a new object is created on
-that path.  FSEvents can merge the events of a path, so one event for
-the root path can report the changes of both the deleted and the newly
-created object, for example both `isDeleted` and `isCreated`, and it
-does not tell which change belongs to which object.
+is removed. The watch ends with the `isRootUnwatched` event that follows
+the `isDeleted` event of the root. macOS watches the path not the
+object, after the `isDeleted` event the path is still watched and events
+start if a new object is created on that path. Therefore, on macOS there
+is no `isRootUnwatched` event generated on deletion of a root.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -106,39 +101,21 @@ itself is not deleted macOS does report the delete events for the files
 deleted in it. So **if a parent is deleted, applications should remove all
 paths under it automatically.**
 
-**Rename of a root**: On both Windows and Linux the watch is on the
-object and not on the path, so a rename carries the watch along with
-it. The events generated in the renamed object report the old path.
-On Linux, a rename is detected and the library
-ends the watch with `isRootUnwatched`, so that the events do not report
-the old path, which no longer exists or refers to another object.
-On Windows the watch stays on the renamed root, and the events
-report paths under the old root path. Essentially a rename of a root is
-not detected on Windows.
+**Rename of a root**: On both Windows and Linux the kernel watch is on
+the object and not on the path, so a rename carries the watch along with
+it. The library still maps the object to the old path for the kernel
+events generated for the renamed object.  The old path may no longer exist
+or may refer to another object.
 
-On Linux `isRootUnwatched` tells that the watch of a root has ended and
-no more events will come for it. The events between the `isMoved` event
-of a renamed root and its `isRootUnwatched` event would report the old
-path, they are not reported. macOS and Windows have no such event, and
-with the current design they do not need it.
+On Linux, the library detects a rename and ends the watch with
+`isRootUnwatched`.
 
-On Linux a directory root is unwatched on its rename event even if it
-was renamed back before the event is read. A file root renamed back
-before the event is read stays watched: the rename of any hard link of
-a file reports a rename event for the file, so the root is unwatched
-only if its path no longer refers to the file. A root at a bind mount
-point stays watched when the directory is renamed at its other path, on
-Linux 5.8 and later.
+On Windows the rename is not detected and the watch continues on the
+renamed root, and the events continue reporting the old path.
 
 On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
 watched again.
-
-On Linux the rename of a parent directory of a root is not reported.
-The root stays watched and its events report the old path, which no
-longer exists. A mount or an unmount at the path of a root or of a
-parent is not reported either, unless the file system of the root
-itself is unmounted.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -150,11 +127,11 @@ itself is unmounted.
 | A root whose parent is renamed remains watched under the old path | Yes | Not tested | Not tested |
 
 **End of watch stream**: On macOS a watch stream never ends even if you
-delete all the watched paths because they can be recreated and watched
-again. On Linux a deleted or renamed root is gone forever therefore
-the watch stream ends when all the roots are deleted or renamed. On
-Windows a renamed root remains watched therefore, the watch stream does
-not end, however, if all the roots are deleted then the watch stream
+delete all the watched paths because new objects on those paths can
+be created and watched.  On Linux a deleted or renamed root is gone
+forever therefore the watch stream ends when all the roots are deleted
+or renamed. On Windows a renamed root remains watched, but deleted root
+is gone forever, if all the roots are deleted then the watch stream
 ends.
 
 | Behavior | Linux | macOS | Windows |
@@ -163,19 +140,19 @@ ends.
 
 ### Watch root permissions
 
-Static permission checks: permissions are checked once
-before the start and remain effective throughout. Any changes to permissions
-are not seen until the object is unwatched and watched again.
+Static permission checks: permissions are checked once before the watch
+start and remain effective throughout. Any changes to permissions are
+not seen until the object is unwatched and watched again.
 
 Dynamic permission checks: permissions are checked every time an event is
 delivered, changes are effective immediately.
 
-Linux and windows require READ permission whereas macOS requires SEARCH
-permission.
+Linux and windows require READ permission to start a watch whereas macOS
+requires SEARCH permission.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A root without READ and SEARCH reports its events | No, the watch raises an exception | No | No, the watch raises an exception |
+| A root without READ and SEARCH reports its events | Exception | No | Exception |
 | A root with only SEARCH reports its events | Exception | Yes | Exception |
 | A root with only READ reports its events | Yes | No | Yes |
 
@@ -189,7 +166,7 @@ dynamically.
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A root stops reporting events after the required permission is removed | No | Yes | No |
-| A root starts reporting events after the required permission is enabled | No, the watch raises an exception | Yes | No, the watch raises an exception |
+| A root starts reporting events after the required permission is enabled | NA | Yes | NA |
 
 ## Event reporting
 
