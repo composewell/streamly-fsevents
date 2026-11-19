@@ -620,7 +620,7 @@ behaviors =
         , racy = onDarwin
         }
     , base
-        { title = "A deleted watch root reports `isDeleted` for the root"
+        { title = "A deleted directory root reports `isDeleted` for the root"
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
@@ -1106,7 +1106,9 @@ behaviors =
         , expected = onPlatform Yes Yes WatchException
         }
     , base
-        { title = "deleted symbolic link root reports isDeleted for the root"
+        { title =
+            "A deleted symbolic link to a directory root reports "
+                ++ "`isDeleted` for the root"
         , setup = \p -> do
             removeDirectory (watchRoot p)
             createDirectory (renamedRoot p)
@@ -1354,7 +1356,7 @@ behaviors =
         }
     , base
         { title =
-            "A deleted watch root reports `isDeleted` for each file in it"
+            "A deleted directory root reports `isDeleted` for each file in it"
         , setup = \p -> do
             createFile (watchRoot p </> "file")
             createFile (watchRoot p </> "file2")
