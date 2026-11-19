@@ -137,12 +137,47 @@ On macOS the watch is on the path, the events of the root at the new path
 of the parent are not reported.
 
 On Windows the rename of a parent directory of a watched root raises an
-exception. unmount?
+exception. The watch keeps an open handle to the root, and Windows does
+not rename a directory while a file or a directory under it is open. The
+root itself can be renamed because the library opens the root with the
+share mode `FILE_SHARE_DELETE`, which allows other processes to delete or
+rename the file of the handle. The share mode applies to the file of the
+handle only, not to its parent directories.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A root whose parent is renamed remains watched under the old path | Yes | No | Exception |
 | A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Exception |
+
+**Unmount of the file system of a root**: On Linux a watch does not keep
+a file of the watched file system open, the file system can be unmounted
+while it is watched. The kernel removes the watches of the file system,
+the library reports `isRootUnmounted` and `isRootUnwatched` for the root.
+
+On macOS the watch is on the path, it does not keep a file of the watched
+file system open.
+
+On Windows the watch keeps an open handle to the root. A dismount that
+first locks the volume fails while a handle on the volume is open. "Safely
+Remove Hardware", ejecting a drive and detaching a virtual disk lock the
+volume. A forced dismount, for example with `fsutil volume dismount`,
+does not lock the volume, the volume is dismounted and the open handles
+on it become invalid.
+
+The tests mount a new file system at the watch root: a tmpfs on Linux and
+FreeBSD, mounted as root or with `sudo -n`, a disk image attached with
+`hdiutil` on macOS, and a virtual disk created with `diskpart` on
+Windows, which needs an administrator. A test is skipped if the file
+system cannot be mounted, or on Windows if the volume cannot be locked
+before the watch is started. On Windows the unmount test locks the volume
+and then dismounts it, the event tests dismount the volume forcibly,
+without the lock.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A file system can be unmounted while a tree in it is watched | Yes | Not tested | Not tested |
+| Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | Not tested | Not tested |
+| Unmount of a watched file system reports an unmount event | Yes | Not tested | Not tested |
 
 **End of watch stream**: On macOS a watch stream never ends even if you
 delete all the watched paths because new objects on those paths can
