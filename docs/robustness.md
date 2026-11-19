@@ -233,6 +233,42 @@ tree during the sequence. CI runs 2157 sequences. 51436 sequences of up
 to three operations, and of up to four on fewer paths, are run manually
 after a change in the handling of moves or scans.
 
+## Renamed roots and moved directories on Linux
+
+An inotify watch is attached to a directory, not to its path. After a
+watch root is renamed, or a directory is moved out of the tree, the
+kernel still reports the events of the directory, with the old path. The
+old path no longer exists, or refers to another object.
+
+* The events of a moved directory are not reported with the old path.
+  After the `isMoved` event of a renamed root, or the `isMovedFrom` event
+  of a directory moved out of the tree, the only events reported for the
+  directory and the directories under it are their `isRootUnwatched`
+  events.
+* A directory root renamed and renamed back before the rename event is
+  read is unwatched, the same as a root that is renamed only once.
+* A bind mount gives a directory a second path. A rename of the directory
+  at one path reports a rename event for the roots at both paths. The
+  root at the renamed path is unwatched, the root at the mount point
+  stays watched. On Linux before 5.8 the library cannot detect a mount
+  point, and the root at the mount point is unwatched as well.
+* A file with several hard links has several paths. A rename of any of
+  its links reports a rename event for a file root. The root is
+  unwatched only if its path no longer refers to the file when the event
+  is read, so a file root renamed and renamed back before that stays
+  watched.
+* The rename of a parent directory of a root is not reported. The root
+  stays watched and its events report the old path, which no longer
+  exists.
+* A mount or an unmount at the path of a root, or of a parent directory,
+  is not reported unless the file system of the root itself is
+  unmounted. After a bind mount at a root is unmounted, the root stays
+  watched and its events report the root path, which now refers to the
+  directory under the former mount point.
+
+The bind mount test runs in an unprivileged user and mount namespace,
+with `test/bind-mount.sh`.
+
 ## Overlapping roots on Linux
 
 * A root listed twice reports each event once.
