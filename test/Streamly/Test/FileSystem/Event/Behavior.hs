@@ -46,7 +46,7 @@ import System.Directory
     , emptyPermissions, setOwnerReadable, setOwnerSearchable
 #endif
     )
-import System.FilePath ((</>), takeFileName)
+import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO
     (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
@@ -478,6 +478,40 @@ behaviors =
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
         , expected = onPlatform No Yes Yes
+        }
+    -- The root is parent/root, the rename of parent generates no event for
+    -- the root on Linux. The outcomes on macOS and Windows have not been
+    -- observed, they are not asserted.
+    , base
+        { title =
+            "A root whose parent is renamed remains watched under the old path"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = createDirectoryIfMissing True . nestedRoot
+        , ops = \p -> do
+            renameNestedParent p
+            createFile (movedNestedRoot p </> "file")
+        , check = \p ->
+            any (\ev -> absPath ev == nestedRoot p </> "file"
+                    && Event.isCreated ev)
+        , expected = onPlatform Yes No Yes
+        , racy = not onInotify
+        }
+    -- On Linux the directory created after the rename cannot be reached by
+    -- its path under the root, the root is unwatched.
+    , base
+        { title =
+            "A recursive root whose parent is renamed is unwatched on a "
+                ++ "directory create"
+        , config = Event.setRecursiveMode True
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = createDirectoryIfMissing True . nestedRoot
+        , ops = \p -> do
+            renameNestedParent p
+            createDirectory (movedNestedRoot p </> "dir")
+        , check = \p ->
+            any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
+        , expected = onPlatform Yes No No
+        , racy = not onInotify
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
@@ -1133,6 +1167,19 @@ behaviors =
     onWindows = platformName == "Windows"
 
     onDarwin = platformName == "macOS"
+
+    onInotify = platformName `elem` ["Linux", "FreeBSD"]
+
+    -- A root in the directory "parent", next to the watch root.
+    nestedParent p = takeDirectory (watchRoot p) </> "parent"
+
+    nestedRoot p = nestedParent p </> "root"
+
+    movedNestedRoot p = takeDirectory (watchRoot p) </> "moved" </> "root"
+
+    renameNestedParent p = do
+        renameDirectory (nestedParent p) (takeDirectory (movedNestedRoot p))
+        settle
 
     withDir p = do
         createDirectory (watchRoot p </> "dir")
