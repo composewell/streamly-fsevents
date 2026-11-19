@@ -2870,10 +2870,11 @@ isRootAt cfg wtch (wd, pRep) =
 -- removed. A root renamed back before the check stays watched.
 --
 -- The roots are matched by their paths, if a root that is kept has the
--- same path, the paths are kept. Returns the paths removed without a marker,
--- see 'unwatchPaths'.
+-- same path, the paths are kept. Returns the roots removed, they report the
+-- IN_MOVE_SELF event, and the paths removed without a marker, see
+-- 'unwatchPaths'.
 unwatchGoneRoots ::
-    Config -> Watch -> Int -> [PathRep] -> IO [WdUnwatched]
+    Config -> Watch -> Int -> [PathRep] -> IO ([PathRep], [WdUnwatched])
 unwatchGoneRoots cfg wtch wd roots = do
     m <- readIORef (watchWdMap wtch)
     let isDirRoot = IntSet.member wd (wmDirRoots m)
@@ -2887,8 +2888,10 @@ unwatchGoneRoots cfg wtch wd roots = do
         gone = [root | (root, False) <- results]
         isGone p = any (isSameRoot p) gone && not (any (isSameRoot p) kept)
     if null gone
-    then return []
-    else unwatchPaths Gone wtch "unwatchGoneRoots" allWds isGone
+    then return ([], [])
+    else
+        (,) (filter isGone gone)
+            <$> unwatchPaths Gone wtch "unwatchGoneRoots" allWds isGone
 
 -- | Remove a directory and the tree under it from the watch. The directory
 -- is no longer at its path, the events read after this are dropped, see
@@ -3545,11 +3548,18 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                         (recursiveEvents .|. rootEvents)
                             .&. complement (createFlags cfg)
                     isUnrequested = eflags .&. unrequested /= 0
-                    -- A gone path reports its IN_IGNORED event only.
-                    isReported wp =
-                        (isIgnored || not (wpGone wp))
-                            && (not isSelfEvent
-                                    || isNothing (getRepSub (wpRep wp)))
+                    isMoveSelf = eflags .&. iN_MOVE_SELF /= 0
+                    isRootPath wp = isNothing (getRepSub (wpRep wp))
+                    -- The IN_MOVE_SELF of a root that is not removed is
+                    -- reported only if the root is removed, see
+                    -- 'unwatchGoneRoots'. A gone path reports its IN_IGNORED
+                    -- event only.
+                    isReported wp
+                        | isMoveSelf && isRootPath wp && not (wpRemoved wp) =
+                            False
+                        | otherwise =
+                            (isIgnored || not (wpGone wp))
+                                && (not isSelfEvent || isRootPath wp)
                     reported =
                         [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
                 withEffects (if isUnrequested then [] else reported) $ do
@@ -3578,14 +3588,20 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                                 , not (wpRemoved wp)
                                 , isJust (wpMoveCookie wp)
                                 ]
-                    removedRoots <-
-                        effectIf (eflags .&. iN_MOVE_SELF /= 0)
-                            $ unwatchGoneRoots cfg wtch (fromIntegral ewd)
+                    (movedRoots, removedRoots) <-
+                        if isMoveSelf
+                        then
+                            unwatchGoneRoots cfg wtch (fromIntegral ewd)
                                 [ wpRep wp
                                 | wp <- wps
                                 , not (wpRemoved wp)
-                                , isNothing (getRepSub (wpRep wp))
+                                , isRootPath wp
                                 ]
+                        else return ([], [])
+                    let moved =
+                            if isUnrequested
+                            then []
+                            else map (mkEvent ewd) movedRoots
                     -- The watch of a new directory is added before its
                     -- event is delivered. The watches of the tree under it
                     -- are added when the stream of the scan is read, before
@@ -3615,7 +3631,8 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                             removedPending ++ removedMoved ++ removedRoots
                                 ++ removedOut
                     return
-                        $ fmap scanItem scanned
+                        $ events moved
+                        `S.append` fmap scanItem scanned
                         `S.append` events (map mkUnwatched removed)
 
     where

@@ -785,6 +785,7 @@ fileRootRenamedBack =
                     appendFile f "x"
                     evs <- readUntil Event.isModified w
                     unwatched evs `shouldBe` []
+                    pathsOf Event.isMoved evs `shouldBe` []
                     pathsOf Event.isModified evs `shouldBe` [f]
 
 -- The rename of one hard link reports IN_MOVE_SELF for both roots.
@@ -805,6 +806,7 @@ rootHardLinkRenamed =
                     unwatched evs `shouldBe` [(f, f)]
                     appendFile g "x"
                     evs1 <- readUntil Event.isModified w
+                    pathsOf Event.isMoved (evs ++ evs1) `shouldBe` [f]
                     map getRoot (filter Event.isModified evs1)
                         `shouldBe` [g]
 
@@ -837,6 +839,7 @@ bindMountRootRenamed =
             unwatched evs `shouldBe` [(src, src)]
             createFile (mnt </> "file")
             evs1 <- readUntil Event.isCreated w
+            pathsOf Event.isMoved (evs ++ evs1) `shouldBe` [src]
             pathsOf Event.isCreated evs1 `shouldBe` [mnt </> "file"]
             renameDirectory (src ++ "-moved") src
 #endif
