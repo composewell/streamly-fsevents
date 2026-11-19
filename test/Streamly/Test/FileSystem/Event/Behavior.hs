@@ -36,7 +36,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (group, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode(..), exitFailure)
 import System.Directory
     ( createDirectory, createDirectoryIfMissing, createDirectoryLink
     , getPermissions, listDirectory, removeDirectory, removeDirectoryLink
@@ -50,12 +50,15 @@ import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO
     (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (readProcess)
+import System.Process (readProcess, readProcessWithExitCode)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
+import System.Directory (canonicalizePath)
 import Data.Char (isDigit)
 import Data.Word (Word32)
-import Foreign.C.String (CWString, withCWString)
+import Control.Exception (bracket)
+import Data.Bits ((.|.))
+import Foreign.C.String (CWString, peekCWString, withCWString)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek, poke, pokeByteOff)
@@ -370,6 +373,179 @@ setAttrs = Windows.setAttrsModified
 metadataChanged = Event.isModified
 #endif
 
+-- | Run a command. Raise an exception, with the output of the command, if
+-- the command fails.
+runCommand :: FilePath -> [String] -> IO ()
+runCommand cmd args = do
+    (code, out, err) <- readProcessWithExitCode cmd args ""
+    case code of
+        ExitSuccess -> return ()
+        ExitFailure n ->
+            ioError $ userError $
+                unwords (cmd : args) ++ ": exit code " ++ show n ++ "\n"
+                    ++ out ++ err
+
+ignoreIOError :: IO () -> IO ()
+ignoreIOError action = void (try action :: IO (Either IOException ()))
+
+-- | @mountVolume dir root@ mounts a new file system at the directory @root@.
+-- The files needed for the mount are created in @dir@. Raise an exception if
+-- the file system cannot be mounted, for example, without the privilege. On
+-- Windows also raise an exception if the volume cannot be locked, before the
+-- watch opens a handle on it.
+mountVolume :: FilePath -> FilePath -> IO ()
+-- | Unmount the file system mounted by 'mountVolume'. On Windows lock the
+-- volume and then dismount it, the lock fails if a handle on the volume is
+-- open.
+unmountVolume :: FilePath -> FilePath -> IO ()
+-- | On Windows dismount the volume without locking it, the open handles on
+-- the volume become invalid. Elsewhere the same as 'unmountVolume'.
+forceUnmountVolume :: FilePath -> FilePath -> IO ()
+-- | Undo 'mountVolume', after 'unmountVolume' or if 'unmountVolume' failed.
+-- Ignore the errors.
+removeVolume :: FilePath -> FilePath -> IO ()
+-- | The unmount event of the platform. Windows does not have one.
+unmountReported :: Event -> Bool
+#if defined(CABAL_OS_WINDOWS)
+foreign import ccall unsafe "windows.h GetVolumeNameForVolumeMountPointW"
+    c_GetVolumeNameForVolumeMountPointW ::
+        CWString -> CWString -> DWORD -> IO BOOL
+
+foreign import ccall unsafe "windows.h DeviceIoControl"
+    c_DeviceIoControl ::
+           HANDLE -> DWORD -> Ptr () -> DWORD -> Ptr () -> DWORD -> Ptr DWORD
+        -> Ptr () -> IO BOOL
+
+-- | The volume name, @\\\\?\\Volume{GUID}\\@, of the volume mounted at the
+-- directory. The buffer holds the longest volume name, 49 characters and
+-- the terminating null.
+volumeName :: FilePath -> IO String
+volumeName root =
+    withCWString (root ++ "\\") $ \mountPoint ->
+        allocaBytes (50 * 2) $ \buf -> do
+            ok <- c_GetVolumeNameForVolumeMountPointW mountPoint buf 50
+            unless ok
+                $ getLastError >>= failWith "GetVolumeNameForVolumeMountPointW"
+            peekCWString buf
+
+-- | Open the volume mounted at the directory. The volume is opened by its
+-- name without the trailing backslash, with the trailing backslash the
+-- root directory of the volume is opened.
+withVolume :: FilePath -> (HANDLE -> IO a) -> IO a
+withVolume root action = do
+    name <- volumeName root
+    bracket
+        (Win32.createFile
+            (reverse (dropWhile (== '\\') (reverse name)))
+            (Win32.gENERIC_READ .|. Win32.gENERIC_WRITE)
+            (Win32.fILE_SHARE_READ .|. Win32.fILE_SHARE_WRITE)
+            Nothing
+            Win32.oPEN_EXISTING
+            Win32.fILE_ATTRIBUTE_NORMAL
+            Nothing)
+        Win32.closeHandle
+        action
+
+-- | A DeviceIoControl request without input or output.
+volumeControl :: String -> DWORD -> HANDLE -> IO ()
+volumeControl name code h =
+    alloca $ \bytes -> do
+        ok <- c_DeviceIoControl h code nullPtr 0 nullPtr 0 bytes nullPtr
+        unless ok $ getLastError >>= failWith name
+
+-- | Fails if a handle on the volume is open, other than the handle of the
+-- request. Closing the handle of the request unlocks the volume.
+lockVolume :: HANDLE -> IO ()
+lockVolume = volumeControl "FSCTL_LOCK_VOLUME" 0x00090018
+
+unlockVolume :: HANDLE -> IO ()
+unlockVolume = volumeControl "FSCTL_UNLOCK_VOLUME" 0x0009001C
+
+dismountVolume :: HANDLE -> IO ()
+dismountVolume = volumeControl "FSCTL_DISMOUNT_VOLUME" 0x00090020
+
+-- diskpart and the volume functions need the long path, without the 8.3
+-- names of the temporary directory.
+mountVolume dir root = do
+    image <- volumeImage dir
+    root1 <- canonicalizePath root
+    diskpart dir
+        [ "create vdisk file=\"" ++ image ++ "\" maximum=16 type=fixed"
+        , "attach vdisk"
+        , "convert mbr"
+        , "create partition primary"
+        , "format fs=ntfs quick"
+        , "assign mount=\"" ++ root1 ++ "\""
+        ]
+    -- Another process, for example an indexer or an antivirus, may keep a
+    -- handle on the new volume open.
+    withVolume root1 $ \h -> lockVolume h >> unlockVolume h
+
+unmountVolume _ root = do
+    root1 <- canonicalizePath root
+    withVolume root1 $ \h -> lockVolume h >> dismountVolume h
+
+forceUnmountVolume _ root = do
+    root1 <- canonicalizePath root
+    withVolume root1 dismountVolume
+
+removeVolume dir root = do
+    image <- volumeImage dir
+    root1 <- canonicalizePath root
+    ignoreIOError $ runCommand "mountvol" [root1 ++ "\\", "/d"]
+    ignoreIOError
+        $ diskpart dir
+            ["select vdisk file=\"" ++ image ++ "\"", "detach vdisk"]
+
+unmountReported _ = False
+
+volumeImage :: FilePath -> IO FilePath
+volumeImage dir = (</> "volume.vhd") <$> canonicalizePath dir
+
+diskpart :: FilePath -> [String] -> IO ()
+diskpart dir commands = do
+    let script = dir </> "diskpart.txt"
+    writeFile script (unlines commands)
+    runCommand "diskpart" ["/s", script]
+#elif defined(CABAL_OS_DARWIN)
+mountVolume dir root = do
+    let image = dir </> "volume.dmg"
+    runCommand "hdiutil"
+        [ "create", "-size", "16m", "-fs", "HFS+", "-volname", "fsevents"
+        , image
+        ]
+    runCommand "hdiutil"
+        ["attach", "-nobrowse", "-noautoopen", "-mountpoint", root, image]
+
+unmountVolume _ root = runCommand "hdiutil" ["detach", root]
+
+forceUnmountVolume = unmountVolume
+
+removeVolume _ root =
+    ignoreIOError $ runCommand "hdiutil" ["detach", "-force", root]
+
+unmountReported = Darwin.isUnmounted
+#else
+-- A tmpfs, mounted as root or with sudo. In a user namespace the user is
+-- root.
+mountVolume _ root = asRoot "mount" ["-t", "tmpfs", "tmpfs", root]
+
+unmountVolume _ root = asRoot "umount" [root]
+
+forceUnmountVolume = unmountVolume
+
+removeVolume dir root = ignoreIOError (unmountVolume dir root)
+
+unmountReported = Inotify.isRootUnmounted
+
+asRoot :: FilePath -> [String] -> IO ()
+asRoot cmd args = do
+    uid <- readProcess "id" ["-u"] ""
+    if words uid == ["0"]
+    then runCommand cmd args
+    else runCommand "sudo" ("-n" : cmd : args)
+#endif
+
 base :: Behavior
 base =
     Behavior
@@ -511,6 +687,31 @@ behaviors =
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
         , expected = onPlatform Yes No Exception
+        }
+    -- A new file system is mounted at the watch root. On Windows the
+    -- watch keeps a handle on the volume open, the lock of the volume
+    -- fails. The outcomes other than on Linux have not been observed, they
+    -- are not asserted.
+    , unmount
+        { title =
+            "A file system can be unmounted while a tree in it is watched"
+        , ops = \p -> unmountVolume (volumeDir p) (watchRoot p)
+        , check = \_ _ -> True
+        , expected = onPlatform Yes Yes Exception
+        }
+    -- On Windows the volume is dismounted forcibly.
+    , unmount
+        { title =
+            "Unmount of a watched file system reports `isRootUnwatched` for "
+                ++ "the root"
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
+        , expected = onPlatform Yes No WatchException
+        }
+    , unmount
+        { title = "Unmount of a watched file system reports an unmount event"
+        , check = const (any unmountReported)
+        , expected = onPlatform Yes Yes WatchException
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
@@ -1173,6 +1374,21 @@ behaviors =
     nestedRoot p = nestedParent p </> "root"
 
     movedNestedRoot p = takeDirectory (watchRoot p) </> "moved" </> "root"
+
+    volumeDir = takeDirectory . watchRoot
+
+    unmount =
+        base
+            { skip = \p -> do
+                r <- try (mountVolume (volumeDir p) (watchRoot p))
+                return $ case r of
+                    Left (e :: IOException) ->
+                        Just ("the file system cannot be mounted: " ++ show e)
+                    Right () -> Nothing
+            , cleanup = \p -> removeVolume (volumeDir p) (watchRoot p)
+            , ops = \p -> forceUnmountVolume (volumeDir p) (watchRoot p)
+            , racy = platformName /= "Linux"
+            }
 
     renameNestedParent p = do
         renameDirectory (nestedParent p) (takeDirectory (movedNestedRoot p))
