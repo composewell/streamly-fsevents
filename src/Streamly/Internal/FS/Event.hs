@@ -26,11 +26,10 @@ module Streamly.Internal.FS.Event
 
     -- ** Handle APIs
     -- TODO: When these are exported from Streamly.FileSystem.Event, add a
-    -- "Handle API" section to docs/platform-differences.md: no
-    -- isRootUnwatched event on macOS and Windows, on macOS the events of a
-    -- removed root can be reported until the FSEvents replay ends; no
-    -- FSEvents history on read-only and network volumes, a root change may
-    -- report isEventsLost; on Windows removeRoot drops the changes of the
+    -- "Handle API" section to docs/platform-differences.md: on macOS
+    -- isRootUnwatched is reported only after removeRoot; no FSEvents
+    -- history on read-only and network volumes, a root change may report
+    -- isEventsLost; on Windows removeRoot drops the changes of the
     -- root not yet read from the system, and a deleted root is removed from
     -- the watch.
     , Watch
@@ -52,6 +51,9 @@ module Streamly.Internal.FS.Event
     , isDeleted
     , isMoved
     , isModified
+
+    -- ** Root events
+    , isRootUnwatched
 
     -- ** Exception Conditions
     , isEventsLost
@@ -260,11 +262,11 @@ addRoot = Event.addRoot
 -- are reported. Does nothing if the watch is closed or the path is not a
 -- root.
 --
--- On Linux the end of the events of the root is reported by @isRootUnwatched@
--- events. On macOS and Windows there is no such event. On macOS the events of
--- the root may be reported for a short time after the call returns, usually a
--- few milliseconds. On Windows the changes of the root that the watch has not
--- yet read from the system are not reported.
+-- An 'isRootUnwatched' event for the root follows the events of the root.
+-- On Linux and Windows the changes of the root that the watch has not yet
+-- read from the system are not reported. On macOS the events of the root
+-- that occur before the call are reported, and the 'isRootUnwatched' event
+-- follows them, usually within a few milliseconds of the call.
 --
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call. On macOS this does not hold on a volume that does not keep a
@@ -389,6 +391,17 @@ isModified = Event.isModified
 -- event, a new watch has to be opened to continue.
 isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
+
+-- | The root returned by 'getRoot' is no longer watched, no more events of
+-- the root follow. It is reported after 'removeRoot' on all platforms. On
+-- Linux, FreeBSD and Windows it is also reported when the watch of a root
+-- ends because the root is deleted, and on Linux and FreeBSD when a root is
+-- renamed. On macOS a deleted or renamed root stays watched.
+--
+-- On Linux and FreeBSD it is also reported for a directory of a recursive
+-- watch that is no longer watched, 'getAbsPath' returns the directory.
+isRootUnwatched :: Event -> Bool
+isRootUnwatched = Event.isRootUnwatched
 
 -------------------------------------------------------------------------------
 -- Debugging

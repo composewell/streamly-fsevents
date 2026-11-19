@@ -35,7 +35,8 @@
 -- deleted while it is watched. After a rename, the watch continues and the
 -- events report paths under the original root path. On Linux and macOS a
 -- renamed watch root is no longer watched. When a watch root is deleted,
--- 'isDeleted' is reported for the root and the watch of the root ends.
+-- 'isDeleted' is reported for the root and the watch of the root ends with
+-- an 'isRootUnwatched' event.
 --
 -- When recursive mode is True, the whole directory tree under the path is
 -- watched recursively.  When recursive mode is False, only the files and
@@ -108,6 +109,9 @@ module Streamly.FileSystem.Event.Windows
     , isMoved
     , isMovedFrom
     , isMovedTo
+
+    -- ** Root Level Events
+    , isRootUnwatched
 
     -- ** Exception Conditions
     , isEventsLost

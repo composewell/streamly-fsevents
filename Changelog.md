@@ -32,6 +32,15 @@
   Windows. Earlier it was reported for the inner root only.
 - Windows: a path listed twice in the watch roots is watched once, its
   events are reported once, the same as on Linux and macOS.
+- Windows: a deleted watch root reports an `isRootUnwatched` event after
+  its `isDeleted` event, the same as on Linux. It is the last event of the
+  root.
+- macOS: `removeRoot` does not report the events of the root that occur
+  after the call. Earlier they could be reported for a short time after
+  the call returned.
+- `isRootUnwatched` is reported after `removeRoot` on all platforms, it
+  follows the events of the removed root. It is exported by
+  `Streamly.Internal.FS.Event`.
 - Linux: the stream ends when none of its roots is watched any more, for
   example, when all the roots are deleted or renamed, the same as on
   Windows when all the roots are deleted. Earlier the stream waited

@@ -173,26 +173,31 @@ shouldModify evs paths =
 
     modified = pathsOf Event.isModified evs
 
--- | Whether the event is the @isRootUnwatched@ event of Linux and FreeBSD.
--- macOS and
--- Windows do not report a root or a directory that is no longer watched.
-isUnwatched :: Event -> Bool
+onInotify :: Bool
 #if defined(INOTIFY_BACKEND)
-isUnwatched = Inotify.isRootUnwatched
+onInotify = True
 #else
-isUnwatched = const False
+onInotify = False
 #endif
 
--- | On Linux and FreeBSD the @isRootUnwatched@ events must be for the given
--- roots and paths, in order. Nothing is checked on macOS and Windows.
+-- | Whether the event is an @isRootUnwatched@ event. Linux and FreeBSD
+-- also report it for a directory of a recursive watch, macOS and Windows
+-- only for a root.
+isUnwatched :: Event -> Bool
+isUnwatched = Event.isRootUnwatched
+
+-- | The @isRootUnwatched@ events must be for the given roots and paths, in
+-- order. On macOS and Windows only the expected events whose path is the
+-- root are checked.
 shouldUnwatch :: [Event] -> [(FilePath, FilePath)] -> Expectation
-#if defined(INOTIFY_BACKEND)
 shouldUnwatch evs expected =
     [(rootPath ev, absPath ev) | ev <- evs, isUnwatched ev]
-        `shouldBe` expected
-#else
-shouldUnwatch _ _ = return ()
-#endif
+        `shouldBe` checked
+
+    where
+
+    checked =
+        if onInotify then expected else filter (uncurry (==)) expected
 
 createFile :: FilePath -> IO ()
 createFile file = writeFile file ""
@@ -206,13 +211,6 @@ onWindows :: Bool
 onWindows = True
 #else
 onWindows = False
-#endif
-
-onInotify :: Bool
-#if defined(INOTIFY_BACKEND)
-onInotify = True
-#else
-onInotify = False
 #endif
 
 -- | Run the test except on Windows.
@@ -256,17 +254,17 @@ readUntil p w = do
                 | p ev -> return (reverse (ev : acc))
                 | otherwise -> go (ev : acc)
 
--- | On Linux, read the events up to the @isRootUnwatched@ event of the path
--- for the root. On macOS and Windows nothing is read.
+-- | Read the events up to the @isRootUnwatched@ event of the path for the
+-- root. On macOS and Windows nothing is read if the path is not the root.
 readUnwatched :: Event.Watch -> FilePath -> FilePath -> IO [Event]
-#if defined(INOTIFY_BACKEND)
 readUnwatched w root path =
-    readUntil
-        (\ev -> isUnwatched ev && rootPath ev == root && absPath ev == path)
-        w
-#else
-readUnwatched _ _ _ = return []
-#endif
+    if not onInotify && root /= path
+    then return []
+    else
+        readUntil
+            (\ev ->
+                isUnwatched ev && rootPath ev == root && absPath ev == path)
+            w
 
 -- | On macOS a watch reports changes made shortly before it was opened.
 -- Create a file @ready@ in each root, read the events up to the last of
@@ -524,6 +522,7 @@ deletedRootsEnd title names =
                 let isRootDeleted ev =
                         Event.isDeleted ev && relPath ev == Nothing
                 sort (pathsOf isRootDeleted evs) `shouldBe` sort roots
+                sort (pathsOf isUnwatched evs) `shouldBe` sort roots
 
 deletedRootsEndStream :: Spec
 deletedRootsEndStream = do
@@ -1287,62 +1286,25 @@ keepEventsWhileAdding =
     n = 2000 :: Int
     adds = 20 :: Int
 
--- On macOS the events of the removed root can be reported until the
--- FSEvents stream of the watch is replaced. A file is created in the removed
--- root and a marker in the other root until the marker is reported without
--- the file.
+-- A change made in the removed root after removeRoot returns is not
+-- reported, before or after the isRootUnwatched event of the root.
 removeStops :: Spec
 removeStops =
     it "a removed root stops reporting its events"
         $ withRootHandle id $ \root w -> do
             let root2 = takeDirectory root </> "root2"
+                file = root2 </> "file"
+                marker = root </> "marker"
             createDirectory root2
             p <- Path.fromString root2
             Event.addRoot w p
             Event.removeRoot w p
-            let try1 i = do
-                    let file = root2 </> ("file" ++ show i)
-                        marker = root </> ("marker" ++ show i)
-                    createFile file
-                    createFile marker
-                    evs <- readUntil (isCreatedAt marker) w
-                    return (file `notElem` pathsOf Event.isCreated evs)
-                go i
-                    | i > (100 :: Int) =
-                        expectationFailure "the removed root still reports"
-                    | otherwise = do
-                        stopped <- try1 i
-                        if stopped then check (i + 1) else go (i + 1)
-                check i = do
-                    let file = root2 </> ("file" ++ show i)
-                        marker = root </> ("marker" ++ show i)
-                    createFile file
-                    createFile marker
-                    evs <- readUntil (isCreatedAt marker) w
-                    filter (isUnder root2) (pathsOf isChange evs)
-                        `shouldBe` []
-            go 1
-
--- | On macOS the events of a removed root can be reported for a short time
--- after 'Event.removeRoot' returns. On macOS and Windows, run the action
--- with 1, 2, ... until it returns 'True', at most 100 times. On Linux the
--- action is not run, a removed root reports nothing after its
--- @isRootUnwatched@ event.
-untilRemoved :: (Int -> IO Bool) -> IO ()
-#if defined(INOTIFY_BACKEND)
-untilRemoved _ = return ()
-#else
-untilRemoved action = go 1
-
-    where
-
-    go i
-        | i > (100 :: Int) =
-            expectationFailure "the removed root still reports"
-        | otherwise = do
-            stopped <- action i
-            unless stopped $ go (i + 1)
-#endif
+            createFile file
+            evs <- readUnwatched w root2 root2
+            createFile marker
+            evs1 <- readUntil (isCreatedAt marker) w
+            filter (isUnder root2) (pathsOf isChange (evs ++ evs1))
+                `shouldBe` []
 
 -- On Linux the second removeRoot runs before the isRootUnwatched event is
 -- read.
@@ -1360,19 +1322,17 @@ removeTwice =
             evs1 <- readUntil (isCreatedAt file) w
             createdRoots file evs1 `shouldBe` [root2]
 
--- The reader thread is blocked reading the watch. On Linux the
--- isRootUnwatched event of the removed root ends the read, on macOS and
--- Windows the event of the file in the other root does.
+-- The reader thread is blocked reading the watch, the isRootUnwatched event
+-- of the removed root ends the read. On macOS the event can follow the
+-- event of the file in the other root.
 removeWhileReading :: Spec
 removeWhileReading =
     it "removeRoot does not block while another thread reads the events"
         $ withTwoRoots $ \root1 root2 w -> do
             let file = root2 </> "file"
-                done ev = isUnwatched ev || isCreatedAt file ev
             p <- Path.fromString root1
-            (r, evs) <- whileReading done w $ do
+            (r, evs) <- whileReading isUnwatched w $ do
                 r <- timeout 2000000 $ Event.removeRoot w p
-                -- Unblock the reader if removeRoot did not
                 createFile file
                 return r
             r `shouldBe` Just ()
@@ -1394,9 +1354,6 @@ overlapRemoveInner =
             Event.removeRoot w =<< Path.fromString sub
             evs <- readUnwatched w sub sub
             evs `shouldUnwatch` [(sub, sub)]
-            untilRemoved $ \i -> do
-                (_, evs1) <- changeBoth i
-                return (sub `notElem` map rootPath evs1)
             (file1, evs1) <- changeBoth (0 :: Int)
             createdRoots file1 evs1 `shouldBe` [root]
             filter (== sub) (map rootPath evs1) `shouldBe` []
