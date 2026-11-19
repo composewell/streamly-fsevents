@@ -116,6 +116,14 @@ On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
 watched again.
 
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A renamed watch root remains watched | No | No | Yes |
+| A renamed watch root reports `isMoved` | Yes | Yes | No |
+| A renamed watch root reports `isRootUnwatched` | Yes | No | No |
+| A root renamed back to original is watched | No | Yes | Yes |
+| A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
+
 **Rename of a parent of a root**: On Linux the rename of a parent
 directory of a root does not generate any event for the root. The root
 stays watched, and its events report the old path. The library may find
@@ -125,15 +133,16 @@ of the root with `isRootUnwatched`. This check is best effort: a root in
 which no directory is created or moved in stays watched under the old
 path.
 
+On macOS the watch is on the path, the events of the root at the new path
+of the parent are not reported.
+
+On Windows the rename of a parent directory of a watched root raises an
+exception. unmount?
+
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A renamed watch root remains watched | No | No | Yes |
-| A renamed watch root reports `isMoved` | Yes | Yes | No |
-| A renamed watch root reports `isRootUnwatched` | Yes | Not applicable | Not applicable |
-| A root renamed back to original is watched | No | Yes | Yes |
-| A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
-| A root whose parent is renamed remains watched under the old path | Yes | Not tested | Not tested |
-| A recursive root whose parent is renamed is unwatched on a directory create | Yes | Not tested | Not tested |
+| A root whose parent is renamed remains watched under the old path | Yes | No | Exception |
+| A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Exception |
 
 **End of watch stream**: On macOS a watch stream never ends even if you
 delete all the watched paths because new objects on those paths can
