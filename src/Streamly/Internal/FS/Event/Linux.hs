@@ -892,7 +892,7 @@ type WdUnwatched = (Int, PathRep)
 
 -- | The map entry of a watch descriptor: the paths watched via it, in the
 -- order added.
-data WdEntry = WdUser [WatchPath]
+newtype WdEntry = WdUser [WatchPath]
 
 -- | Build a 'WdUser' entry with its paths evaluated. An unevaluated path
 -- would keep the old entry, its paths and their bytes alive until the entry
@@ -1666,7 +1666,7 @@ relocatePending :: Int -> PathRep -> WdMap -> WdMap
 relocatePending wd pRep m =
     case lookupWd wd m of
         Just (WdUser wps)
-            | (q : _) <- [wpRep wp | wp <- wps, isPending wp] ->
+            | (q : _) <- [wpRep wp | wp <- wps, wpPending wp] ->
                 if eqPathRep q pRep
                 then insertWdUser wd (map clear wps) m
                 else renamePaths q pRep (clearPending wd m)
@@ -1674,7 +1674,6 @@ relocatePending wd pRep m =
 
     where
 
-    isPending wp = wpPending wp
     clear wp = wp {wpPending = False}
 
 -- Returns 'False' if the path is already being watched.
