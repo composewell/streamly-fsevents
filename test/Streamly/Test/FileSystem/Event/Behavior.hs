@@ -1357,6 +1357,7 @@ runWatch Behavior{..} paths control = do
                 createFile (root </> "blocked")
                 readMVar blocked
             r <- tryIO (ops paths)
+            printException r
             putMVar resume ()
             settle
             r1 <- if isLeft r then return r else tryIO (laterOps paths)
@@ -1371,6 +1372,7 @@ runWatch Behavior{..} paths control = do
     createFile (control </> "stop")
 
     evs <- timeout 30000000 (takeMVar result)
+    mapM_ printException evs
     return $ case evs of
         Nothing -> error "the stream did not end"
         Just (Left e)
@@ -1385,6 +1387,12 @@ runWatch Behavior{..} paths control = do
 
     tryIO :: IO () -> IO (Either IOException ())
     tryIO = try
+
+    -- The outcome does not include the exception, it is printed for the CI
+    -- logs.
+    printException :: Show e => Either e a -> IO ()
+    printException =
+        either (\e -> putStrLn ("  exception: " ++ show e)) (const (return ()))
 
     isIOException :: SomeException -> Bool
     isIOException e = isJust (fromException e :: Maybe IOException)
