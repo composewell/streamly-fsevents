@@ -267,6 +267,10 @@ old path no longer exists, or refers to another object.
   created in the tree or moved into it. The check is best effort, a root
   in which no directory is created or moved in stays watched under the
   old path.
+* `staleRoots` returns the roots whose path no longer refers to the root,
+  it does not change the watch. An application can call it periodically,
+  and call `removeRoot` and then `addRoot` for a root it returns, to watch
+  the directory now at the path.
 * A watch does not keep a file of the watched file system open. The file
   system of a watched tree can be unmounted, the watch then reports
   `isRootUnmounted` and `isRootUnwatched`.
