@@ -36,11 +36,6 @@ On Windows the watch keeps the root open.
 
 * A deleted root: a root that is a symbolic link does not report
   `isDeleted` when the link is deleted.
-* A root listed twice: paths
-  that differ only in redundant separators and `.` components, for
-  example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
-  macOS `getRoot` reports the path with these removed, on Windows it
-  reports the path as supplied.
 * A directory reached via two paths that differ otherwise, for example, a
   symbolic link and its target, or paths that differ in case: all
   platforms watch it as two roots and report a change in it once for each
@@ -56,7 +51,11 @@ On Windows the watch keeps the root open.
 
 Tested behavior common to all platforms:
 
-* A root listed twice with the same path reports a change in it once.
+* A root supplied twice with the same path is added only once.
+  Paths that differ only in redundant separators and `.` components, for
+  example, `x//y`, `x/./y` and `./x/y`, are the same root. On Linux and
+  macOS `getRoot` reports a normalized path with these removed, on
+  Windows it reports the path literally as it was supplied.
 
 **Non directory watch roots** are allowed on Linux and macOS. A watch does
 not affect regular operations on the file being watched e.g. a test
@@ -117,6 +116,15 @@ On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
 watched again.
 
+**Rename of a parent of a root**: On Linux the rename of a parent
+directory of a root does not generate any event for the root. The root
+stays watched, and its events report the old path. The library may find
+later that the root path no longer refers to the root, for example, when
+it adds a directory created in a recursive root. It then ends the watch
+of the root with `isRootUnwatched`. This check is best effort: a root in
+which no directory is created or moved in stays watched under the old
+path.
+
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A renamed watch root remains watched | No | No | Yes |
@@ -125,6 +133,7 @@ watched again.
 | A root renamed back to original is watched | No | Yes | Yes |
 | A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
 | A root whose parent is renamed remains watched under the old path | Yes | Not tested | Not tested |
+| A recursive root whose parent is renamed is unwatched on a directory create | Yes | Not tested | Not tested |
 
 **End of watch stream**: On macOS a watch stream never ends even if you
 delete all the watched paths because new objects on those paths can

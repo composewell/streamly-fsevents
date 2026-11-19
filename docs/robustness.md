@@ -259,15 +259,25 @@ old path no longer exists, or refers to another object.
   watched.
 * The rename of a parent directory of a root is not reported. The root
   stays watched and its events report the old path, which no longer
-  exists.
+  exists or refers to another object. A directory at the old path is
+  never watched in place of a directory in the tree.
+* The library may find later that the root path no longer refers to the
+  root, and then ends the watch of the root with `isRootUnwatched`. In
+  recursive mode it checks the root path before it adds a directory
+  created in the tree or moved into it. The check is best effort, a root
+  in which no directory is created or moved in stays watched under the
+  old path.
+* A watch does not keep a file of the watched file system open. The file
+  system of a watched tree can be unmounted, the watch then reports
+  `isRootUnmounted` and `isRootUnwatched`.
 * A mount or an unmount at the path of a root, or of a parent directory,
   is not reported unless the file system of the root itself is
   unmounted. After a bind mount at a root is unmounted, the root stays
   watched and its events report the root path, which now refers to the
   directory under the former mount point.
 
-The bind mount test runs in an unprivileged user and mount namespace,
-with `test/bind-mount.sh`.
+The bind mount and unmount tests run in an unprivileged user and mount
+namespace, with `test/bind-mount.sh`.
 
 ## Overlapping roots on Linux
 
