@@ -78,9 +78,9 @@ is no `isRootUnwatched` event generated on deletion of a root.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A deleted watch root reports `isDeleted` for the root | Yes | Yes | Yes |
-| A deleted watch root reports `isDeleted` for each file in it | Yes | No | Yes |
-| A deleted symbolic link root reports `isDeleted` for the root | No | No | No |
+| A deleted directory root reports `isDeleted` for the root | Yes | Yes | Yes |
+| A deleted directory root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A deleted symbolic link to a directory root reports `isDeleted` for the root | No | No | No |
 
 On macOS, it has been tested that fseventsd does not report delete
 events for the files inside the root when the root is deleted (e.g. with
