@@ -77,6 +77,7 @@ import qualified Streamly.Internal.FS.Event.FreeBSD as Inotify
 import GHC.IO.Exception (IOErrorType(InappropriateType))
 import System.IO.Error (ioeGetErrorType)
 import qualified System.Win32.File as Win32
+import qualified Streamly.Internal.FS.Event.Windows as Windows
 #endif
 
 import Streamly.Test.FileSystem.Event.Common
@@ -173,23 +174,30 @@ shouldModify evs paths =
 
     modified = pathsOf Event.isModified evs
 
--- | Whether the event is the @isRootUnwatched@ event of Linux and FreeBSD.
--- macOS and
--- Windows do not report a root or a directory that is no longer watched.
+-- | Whether the event is the @isRootUnwatched@ event of Linux, FreeBSD and
+-- Windows. macOS does not report a root or a directory that is no longer
+-- watched. Windows reports it only for a root.
 isUnwatched :: Event -> Bool
 #if defined(INOTIFY_BACKEND)
 isUnwatched = Inotify.isRootUnwatched
+#elif defined(CABAL_OS_WINDOWS)
+isUnwatched = Windows.isRootUnwatched
 #else
 isUnwatched = const False
 #endif
 
 -- | On Linux and FreeBSD the @isRootUnwatched@ events must be for the given
--- roots and paths, in order. Nothing is checked on macOS and Windows.
+-- roots and paths, in order. On Windows they must be for the given roots
+-- whose path is the root. Nothing is checked on macOS.
 shouldUnwatch :: [Event] -> [(FilePath, FilePath)] -> Expectation
 #if defined(INOTIFY_BACKEND)
 shouldUnwatch evs expected =
     [(rootPath ev, absPath ev) | ev <- evs, isUnwatched ev]
         `shouldBe` expected
+#elif defined(CABAL_OS_WINDOWS)
+shouldUnwatch evs expected =
+    [(rootPath ev, absPath ev) | ev <- evs, isUnwatched ev]
+        `shouldBe` filter (uncurry (==)) expected
 #else
 shouldUnwatch _ _ = return ()
 #endif
@@ -257,13 +265,18 @@ readUntil p w = do
                 | otherwise -> go (ev : acc)
 
 -- | On Linux, read the events up to the @isRootUnwatched@ event of the path
--- for the root. On macOS and Windows nothing is read.
+-- for the root. On Windows the same if the path is the root, otherwise
+-- nothing is read. On macOS nothing is read.
 readUnwatched :: Event.Watch -> FilePath -> FilePath -> IO [Event]
-#if defined(INOTIFY_BACKEND)
+#if defined(INOTIFY_BACKEND) || defined(CABAL_OS_WINDOWS)
 readUnwatched w root path =
-    readUntil
-        (\ev -> isUnwatched ev && rootPath ev == root && absPath ev == path)
-        w
+    if not onInotify && root /= path
+    then return []
+    else
+        readUntil
+            (\ev ->
+                isUnwatched ev && rootPath ev == root && absPath ev == path)
+            w
 #else
 readUnwatched _ _ _ = return []
 #endif
@@ -524,6 +537,7 @@ deletedRootsEnd title names =
                 let isRootDeleted ev =
                         Event.isDeleted ev && relPath ev == Nothing
                 sort (pathsOf isRootDeleted evs) `shouldBe` sort roots
+                sort (pathsOf isUnwatched evs) `shouldBe` sort roots
 
 deletedRootsEndStream :: Spec
 deletedRootsEndStream = do
@@ -1360,9 +1374,9 @@ removeTwice =
             evs1 <- readUntil (isCreatedAt file) w
             createdRoots file evs1 `shouldBe` [root2]
 
--- The reader thread is blocked reading the watch. On Linux the
--- isRootUnwatched event of the removed root ends the read, on macOS and
--- Windows the event of the file in the other root does.
+-- The reader thread is blocked reading the watch. On Linux and Windows the
+-- isRootUnwatched event of the removed root ends the read, on macOS the
+-- event of the file in the other root does.
 removeWhileReading :: Spec
 removeWhileReading =
     it "removeRoot does not block while another thread reads the events"

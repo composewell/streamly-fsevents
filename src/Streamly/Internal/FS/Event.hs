@@ -27,7 +27,7 @@ module Streamly.Internal.FS.Event
     -- ** Handle APIs
     -- TODO: When these are exported from Streamly.FileSystem.Event, add a
     -- "Handle API" section to docs/platform-differences.md: no
-    -- isRootUnwatched event on macOS and Windows, on macOS the events of a
+    -- isRootUnwatched event on macOS, on macOS the events of a
     -- removed root can be reported until the FSEvents replay ends; no
     -- FSEvents history on read-only and network volumes, a root change may
     -- report isEventsLost; on Windows removeRoot drops the changes of the
@@ -260,10 +260,10 @@ addRoot = Event.addRoot
 -- are reported. Does nothing if the watch is closed or the path is not a
 -- root.
 --
--- On Linux the end of the events of the root is reported by @isRootUnwatched@
--- events. On macOS and Windows there is no such event. On macOS the events of
--- the root may be reported for a short time after the call returns, usually a
--- few milliseconds. On Windows the changes of the root that the watch has not
+-- On Linux and Windows the end of the events of the root is reported by
+-- @isRootUnwatched@ events. On macOS there is no such event, the events of
+-- the root may be reported for a short time after the call returns, usually
+-- a few milliseconds. On Windows the changes of the root that the watch has not
 -- yet read from the system are not reported.
 --
 -- The events of the other roots of the watch are not lost or duplicated by
