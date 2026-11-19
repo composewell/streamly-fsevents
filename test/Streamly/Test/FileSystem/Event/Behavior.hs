@@ -480,8 +480,9 @@ behaviors =
         , expected = onPlatform No Yes Yes
         }
     -- The root is parent/root, the rename of parent generates no event for
-    -- the root on Linux. The outcomes on macOS and Windows have not been
-    -- observed, they are not asserted.
+    -- the root on Linux. macOS watches the path, the root is not watched
+    -- after the rename. Windows does not rename a directory that has a
+    -- watched root under it.
     , base
         { title =
             "A root whose parent is renamed remains watched under the old path"
@@ -493,8 +494,7 @@ behaviors =
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p </> "file"
                     && Event.isCreated ev)
-        , expected = onPlatform Yes No Yes
-        , racy = not onInotify
+        , expected = onPlatform Yes No Exception
         }
     -- On Linux the directory created after the rename cannot be reached by
     -- its path under the root, the root is unwatched.
@@ -510,8 +510,7 @@ behaviors =
             createDirectory (movedNestedRoot p </> "dir")
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
-        , expected = onPlatform Yes No No
-        , racy = not onInotify
+        , expected = onPlatform Yes No Exception
         }
     , newDir
         { title = "file created in a new dir before it is read is reported"
@@ -1167,8 +1166,6 @@ behaviors =
     onWindows = platformName == "Windows"
 
     onDarwin = platformName == "macOS"
-
-    onInotify = platformName `elem` ["Linux", "FreeBSD"]
 
     -- A root in the directory "parent", next to the watch root.
     nestedParent p = takeDirectory (watchRoot p) </> "parent"
