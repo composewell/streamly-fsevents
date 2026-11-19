@@ -285,7 +285,7 @@ Tested behavior common to all platforms:
 | Creating a hard link reports a metadata change on the directory | No | Yes | No |
 | Two writes to a file before the consumer reads the first report one `isModified` | Yes | Usually | No |
 | Interleaved writes to two files report each `isModified` | Yes | Usually not | Yes |
-| One overwrite of a file reports several `isModified` | No | No | Yes |
+| One overwrite of a file reports several `isModified` | No | Sometimes | Yes |
 | One event reports both `isCreated` and `isDeleted` for a file | No | Yes | No |
 | One event reports both `isCreated` and `isMoved` for a file | No | Yes | No |
 | A file deleted after its create event is read reports `isCreated` again | No | Usually | No |
