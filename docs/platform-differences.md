@@ -315,6 +315,9 @@ Events for the objects inside a watch root, not for the root itself.
 | Change the permissions of the directory | `isAttrsModified` for the directory | Yes | No |
 | Set the access and modification times of the directory | `isAttrsModified` for the directory | Yes | Yes |
 
+macOS reports a change of the permissions of the directory as
+`isSecurityModified` for the directory.
+
 On Windows these changes are reported under `isModified`:
 
 | Operation | Event | Config | Status |
@@ -383,6 +386,7 @@ macOS reports additional metadata changes as `isSecurityModified`,
 | Operation | Event |
 |-----------|-------|
 | Make a file read-only | `isSecurityModified` for the file |
+| Change the permissions of a subdirectory | `isSecurityModified` for the subdirectory |
 
 Windows reports file content modification as well as metadata changes as
 `isModified` event. Which changes trigger this event is controlled by
@@ -403,14 +407,15 @@ The Windows config options for metadata changes and the
 `FILE_NOTIFY_CHANGE_LAST_ACCESS` and `FILE_NOTIFY_CHANGE_CREATION` flags.
 
 `isModified` for the changed file or subdirectory, with the default
-config, and with one option enabled and the other options disabled:
+config, and with one option enabled and the other options disabled
+(`setFileNameEvents` stays enabled):
 
 | Operation | Default config | `setAttrsModified` | `setSizeModified` | `setLastWriteTimeModified` | `setSecurityModified` |
 |-----------|----------------|--------------------|-------------------|----------------------------|-----------------------|
-| Make a file read-only | ? | ? | ? | ? | ? |
-| Set the access and modification times of a file | ? | ? | ? | ? | ? |
-| Set the hidden attribute of a subdirectory | ? | ? | ? | ? | ? |
-| Set the access and modification times of a subdirectory | ? | ? | ? | ? | ? |
+| Make a file read-only | No | ? | ? | ? | ? |
+| Set the access and modification times of a file | Yes | ? | ? | ? | ? |
+| Set the hidden attribute of a subdirectory | No | ? | ? | ? | ? |
+| Set the access and modification times of a subdirectory | Yes | ? | ? | ? | ? |
 
 With `setAttrsModified True` added to the default config, making a file
 read-only and setting the times of a file report `isModified` for the
