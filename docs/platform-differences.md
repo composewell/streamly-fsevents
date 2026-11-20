@@ -88,9 +88,8 @@ object is created on that path. Therefore, on macOS there is no
 Linux reports the deletion of a root when its inode is freed, after the
 last link to it is removed and the last open reference to it is closed.
 An open file, or a directory that is the working directory of a process,
-reports `isDeleted` when it is closed. FreeBSD reports the deletion when
-the last link is removed, an open root reports `isDeleted` immediately.
-On Windows a directory in use by a process cannot be deleted.
+reports `isDeleted` when it is closed. On Windows a directory in use by
+a process cannot be deleted.
 
 On macOS, it has been tested that fseventsd does not report delete
 events for the files inside the root when the root is deleted (e.g. with
@@ -180,9 +179,9 @@ without the lock.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A file system can be unmounted while a tree in it is watched | Yes | Not tested | Not tested |
-| Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | Not tested | Not tested |
-| Unmount of a watched file system reports an unmount event | Yes | Not tested | Not tested |
+| A file system can be unmounted while a tree in it is watched | Yes | Yes | No, a dismount that locks the volume raises an exception |
+| Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | No | No |
+| Unmount of a watched file system reports an unmount event | Yes | Yes | No |
 
 ### End of watch stream
 
@@ -496,6 +495,12 @@ except for the following differences:
 
 * An open file after it is deleted: reads and writes through the open file
   are never reported, `setExcludeUnlinked False` has no effect.
+* Delete of a root: the kernel reports the deletion when the last link to
+  the root is removed. An open file root, or a directory root that is the
+  working directory of a process, reports `isDeleted` immediately, Linux
+  reports it when the root is closed.
+* Unmount: a file system cannot be unmounted while a tree in it is
+  watched, `umount` fails with `Device busy`.
 * Link count changes: `unlink`, `link` and a rename over an existing file
   report `isAttrsModified` only to a watch on the file itself, not to a
   watch on its directory. Linux reports `isAttrsModified` for the entry to
