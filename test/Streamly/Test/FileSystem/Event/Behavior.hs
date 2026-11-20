@@ -1617,7 +1617,6 @@ behaviors =
         , expected = onPlatform Yes No Yes
         }
 #if defined(CABAL_OS_DARWIN)
-    -- Not verified yet.
     , base
         { title =
             "changing the permissions of the directory reports "
@@ -1912,9 +1911,10 @@ behaviors =
 
 #if defined(CABAL_OS_WINDOWS)
     -- Each metadata change with the default config, and with one config
-    -- option enabled and the other tunable events disabled. The last field
-    -- of an operation lists the configs expected to report isModified, these
-    -- are not verified yet.
+    -- option enabled and the other tunable events disabled. The file name
+    -- events stay enabled, 'waitStarted' needs them. The last field of an
+    -- operation lists the configs that report isModified, the ones other
+    -- than the default config are not verified yet.
     windowsConfigBehaviors =
         [ base
             { title =
@@ -1951,7 +1951,8 @@ behaviors =
         , ("only setSecurityModified", only Windows.setSecurityModified)
         ]
 
-    only f = f True . Windows.setAllEvents False
+    only f =
+        f True . Windows.setFileNameEvents True . Windows.setAllEvents False
 #endif
 
     withDirFile p = do
