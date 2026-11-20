@@ -1987,8 +1987,8 @@ behaviors =
     -- Each metadata change with the default config, and with one config
     -- option enabled and the other tunable events disabled. The file name
     -- events stay enabled, 'waitStarted' needs them. The last field of an
-    -- operation lists the configs that report isModified, the ones other
-    -- than the default config are not verified yet.
+    -- operation lists the configs that report isModified. The outcomes of
+    -- the truncate are not verified yet.
     windowsConfigBehaviors =
         [ base
             { title =
