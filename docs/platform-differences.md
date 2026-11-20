@@ -372,16 +372,10 @@ Linux and macOS report basic metadata changes as `isAttrsModified`.
 
 | Operation | Event | Linux | macOS |
 |-----------|-------|-------|-------|
-| Make a file read-only | `isModified` for the file | No | Sometimes |
-| Make a file read-only | `isAttrsModified` for the file | Yes | Yes |
-| Set the access and modification times of a file | `isModified` for the file | No | Sometimes |
+| Make a file read-only | `isAttrsModified` for the file | Yes | Sometimes |
 | Set the access and modification times of a file | `isAttrsModified` for the file | Yes | Yes |
-| Change the permissions of a subdirectory | `isAttrsModified` for the subdirectory | Yes | ? |
-| Set the access and modification times of a subdirectory | `isAttrsModified` for the subdirectory | Yes | ? |
-
-On macOS FSEvents can report the flags of an earlier change to a path with
-a later event of the same path. The `isModified` for a file written before
-its metadata change is then reported with the metadata change event.
+| Change the permissions of a subdirectory | `isAttrsModified` for the subdirectory | Yes | No |
+| Set the access and modification times of a subdirectory | `isAttrsModified` for the subdirectory | Yes | Yes |
 
 macOS reports additional metadata changes as `isSecurityModified`,
 `isFinderInfoModified` and `isXAttrsModified`.
@@ -394,12 +388,34 @@ Windows reports file content modification as well as metadata changes as
 `isModified` event. Which changes trigger this event is controlled by
 config options.
 
-| Operation | Config option | Event |
-|-----------|---------------|-------|
-| Make a file read-only | | `isModified` for the file |
-| Set the access and modification times of a file | | `isModified` for the file |
-| Set the hidden attribute of a subdirectory | `setAllEvents True` | `isModified` for the subdirectory |
-| Set the access and modification times of a subdirectory | `setAllEvents True` | `isModified` for the subdirectory |
+The Windows config options for metadata changes and the
+`ReadDirectoryChangesW` filter flag each one sets:
+
+| Config option | Filter flag | Default |
+|---------------|-------------|---------|
+| `setAttrsModified` | `FILE_NOTIFY_CHANGE_ATTRIBUTES` | False |
+| `setSizeModified` | `FILE_NOTIFY_CHANGE_SIZE` | True |
+| `setLastWriteTimeModified` | `FILE_NOTIFY_CHANGE_LAST_WRITE` | True |
+| `setSecurityModified` | `FILE_NOTIFY_CHANGE_SECURITY` | False |
+
+`setAllEvents` sets all of these and `setFileNameEvents` and
+`setDirNameEvents`. The implementation does not have options for the
+`FILE_NOTIFY_CHANGE_LAST_ACCESS` and `FILE_NOTIFY_CHANGE_CREATION` flags.
+
+`isModified` for the changed file or subdirectory, with the default
+config, and with one option enabled and the other options disabled:
+
+| Operation | Default config | `setAttrsModified` | `setSizeModified` | `setLastWriteTimeModified` | `setSecurityModified` |
+|-----------|----------------|--------------------|-------------------|----------------------------|-----------------------|
+| Make a file read-only | ? | ? | ? | ? | ? |
+| Set the access and modification times of a file | ? | ? | ? | ? | ? |
+| Set the hidden attribute of a subdirectory | ? | ? | ? | ? | ? |
+| Set the access and modification times of a subdirectory | ? | ? | ? | ? | ? |
+
+With `setAttrsModified True` added to the default config, making a file
+read-only and setting the times of a file report `isModified` for the
+file. With `setAllEvents True`, setting the hidden attribute and setting
+the times of a subdirectory report `isModified` for the subdirectory.
 
 Creating or deleting a hardlink does not generate any metadata change
 event for the file on any platform.
@@ -474,6 +490,16 @@ path with a later event of the path, and the delete reported `isCreated` in
 most CI runs but not in all of them. The coalescing of the events of a
 directory and its subdirectory into `isEventsLost` on macOS is based on the
 platform documentation.
+
+On macOS FSEvents can report the flags of an earlier change to a path with
+a later event of the same path. The `isModified` for a file written before
+its metadata change is then reported with the metadata change event. We
+sometimes observe the following:
+
+| Operation | Event |
+|-----------|-------|
+| Make a file read-only | `isModified` for the file |
+| Set the access and modification times of a file | `isModified` for the file |
 
 ### Deletion of a directory
 
