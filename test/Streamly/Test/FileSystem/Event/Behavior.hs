@@ -28,7 +28,8 @@ import Control.Concurrent
     , takeMVar, threadDelay, tryPutMVar, tryReadMVar
     )
 import Control.Exception
-    (IOException, SomeException, evaluate, finally, fromException, try)
+    ( IOException, SomeException, bracket, evaluate, finally, fromException
+    , try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
@@ -49,7 +50,8 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO
-    (Handle, IOMode(AppendMode), hClose, hFlush, hPutStr, openFile)
+    ( Handle, IOMode(AppendMode, ReadWriteMode), hClose, hFlush, hPutStr
+    , hSetFileSize, openFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process
     ( CreateProcess(..), ProcessHandle, StdStream(NoStream), createProcess
@@ -69,7 +71,6 @@ import System.Timeout (timeout)
 import System.Directory (canonicalizePath)
 import Data.Char (isDigit)
 import Data.Word (Word32)
-import Control.Exception (bracket)
 import Data.Bits ((.|.))
 import Foreign.C.String (CWString, peekCWString, withCWString)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
@@ -249,6 +250,12 @@ writeHeldFiles :: Paths -> IO ()
 writeHeldFiles p = do
     writeHeldFilesOpen p
     readIORef (heldFiles p) >>= mapM_ hClose
+
+-- | Set the size of a file to zero with @ftruncate@ on POSIX, @SetEndOfFile@
+-- on Windows, without a write.
+truncateFile :: FilePath -> IO ()
+truncateFile path =
+    bracket (openFile path ReadWriteMode) hClose (`hSetFileSize` 0)
 
 -- | Close the files opened by 'holdFile' and end the processes started by
 -- 'holdCwd'. The lists are emptied, a second call does nothing.
@@ -992,6 +999,16 @@ behaviors =
         , ops = \p -> do
             holdFile p (watchRoot p </> "file")
             writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = onPlatform Yes Yes Yes
+        }
+    -- The macOS and Windows outcomes are not verified yet.
+    , base
+        { title = "truncating a file without a write reports isModified"
+        , setup = \p -> do
+            writeFile (watchRoot p </> "file") "old"
+            settle
+        , ops = \p -> truncateFile (watchRoot p </> "file")
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
@@ -1923,6 +1940,12 @@ behaviors =
         settle
 
 #if defined(CABAL_OS_WINDOWS)
+    withFileContents p = do
+        writeFile (watchRoot p </> "file") "old"
+        settle
+#endif
+
+#if defined(CABAL_OS_WINDOWS)
     only f =
         f True . Windows.setFileNameEvents True . Windows.setAllEvents False
 
@@ -1951,6 +1974,9 @@ behaviors =
         , ( "setting the file creation time", "file", withFile
           , setFileTimes True False False
           , ["only setCreationTimeModified"])
+        , ( "truncating a file", "file", withFileContents, truncateFile
+          , [ "the default config", "only setSizeModified"
+            , "only setLastWriteTimeModified"])
         , ( "setting the hidden attribute of a subdirectory", "dir", withDir
           , changeDirMode, ["only setAttrsModified"])
         , ("setting the subdirectory times", "dir", withDir, setTimes
