@@ -61,7 +61,8 @@ import System.Posix.Files
     (createNamedPipe, ownerReadMode, ownerWriteMode, unionFileModes)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified System.Posix.Files as Posix
-    (createLink, setFileMode, setFileTimesHiRes)
+    (createLink, createSymbolicLink, ownerModes, setFileMode
+    , setFileTimesHiRes)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
@@ -413,8 +414,9 @@ makeReadOnly path = Posix.setFileMode path ownerReadMode
 
 -- | Set the access and the modification times of a file to the current
 -- time with one system call: @utimensat@ on POSIX, @SetFileTime@ on
--- Windows. On Linux, setting the modification time only is reported as
--- @IN_MODIFY@, setting both as @IN_ATTRIB@.
+-- Windows. The path can be a file or a directory. On Linux, setting the
+-- modification time only is reported as @IN_MODIFY@, setting both as
+-- @IN_ATTRIB@.
 setTimes :: FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
 setTimes path =
@@ -426,7 +428,7 @@ setTimes path =
                 .|. Win32.fILE_SHARE_DELETE)
             Nothing
             Win32.oPEN_EXISTING
-            Win32.fILE_ATTRIBUTE_NORMAL
+            (Win32.fILE_ATTRIBUTE_NORMAL .|. Win32.fILE_FLAG_BACKUP_SEMANTICS)
             Nothing)
         Win32.closeHandle
         $ \h -> do
@@ -457,6 +459,33 @@ attrsModified = Inotify.isAttrsModified
 attrsModified = Darwin.isAttrsModified
 #else
 attrsModified = const False
+#endif
+
+-- | Whether the event reports a change of the metadata of a directory:
+-- 'isAttrsModified' on Linux and macOS, 'isModified' on Windows.
+dirMetadataModified :: Event -> Bool
+#if defined(CABAL_OS_WINDOWS)
+dirMetadataModified = Event.isModified
+#else
+dirMetadataModified = attrsModified
+#endif
+
+-- | The setting for the directory metadata change events: the metadata
+-- change events on Linux, all events on Windows.
+dirMetadataConfig :: Config -> Config
+#if defined(CABAL_OS_WINDOWS)
+dirMetadataConfig = Windows.setAllEvents True
+#else
+dirMetadataConfig = setAttrs True
+#endif
+
+-- | Change the permissions of a directory to read, write and search for the
+-- owner only. On Windows set the hidden attribute of the directory.
+changeDirMode :: FilePath -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+changeDirMode path = Win32.setFileAttributes path Win32.fILE_ATTRIBUTE_HIDDEN
+#else
+changeDirMode path = Posix.setFileMode path Posix.ownerModes
 #endif
 
 -- | Whether the event is 'isSecurityModified'. Only macOS has this event.
@@ -1518,7 +1547,8 @@ behaviors =
         { title =
             "creating, then deleting a hard link reports isAttrsModified for "
                 ++ "the directory"
-        , steps = [(createLink, linkDirAttrs), (deleteLink, linkDirAttrs)]
+        , config = dirMetadataConfig
+        , steps = [(createLink, dirMetadata), (deleteLink, dirMetadata)]
         , expected =
             onPlatform (Steps [No, No]) (Steps [Yes, Yes]) (Steps [No, No])
         }
@@ -1528,6 +1558,55 @@ behaviors =
                 ++ "the file"
         , steps = [(createLink, linkFileAttrs), (deleteLink, linkFileAttrs)]
         , expected = Steps [No, No]
+        }
+    , dirAttrsChange
+        { title = "creating a file reports isAttrsModified for the directory"
+        , ops = \p -> createFile (watchRoot p </> "file")
+        }
+    , dirAttrsChange
+        { title = "deleting a file reports isAttrsModified for the directory"
+        , setup = withFile
+        , ops = \p -> removeFile (watchRoot p </> "file")
+        }
+    , dirAttrsChange
+        { title = "renaming a file reports isAttrsModified for the directory"
+        , setup = withFile
+        , ops = \p ->
+            renameFile (watchRoot p </> "file") (watchRoot p </> "renamed")
+        }
+    , dirAttrsChange
+        { title =
+            "creating a subdirectory reports isAttrsModified for the directory"
+        , ops = \p -> createDirectory (watchRoot p </> "dir")
+        }
+    , dirAttrsChange
+        { title =
+            "deleting a subdirectory reports isAttrsModified for the directory"
+        , setup = withDir
+        , ops = \p -> removeDirectory (watchRoot p </> "dir")
+        }
+#if !defined(CABAL_OS_WINDOWS)
+    , dirAttrsChange
+        { title =
+            "creating a symbolic link reports isAttrsModified for the "
+                ++ "directory"
+        , setup = withFile
+        , ops = \p -> Posix.createSymbolicLink "file" (watchRoot p </> "link")
+        }
+#endif
+    , dirAttrsChange
+        { title =
+            "changing the permissions of the directory reports "
+                ++ "isAttrsModified for the directory"
+        , ops = changeDirMode . watchRoot
+        , expected = onPlatform Yes Yes No
+        }
+    , dirAttrsChange
+        { title =
+            "setting the times of the directory reports isAttrsModified for "
+                ++ "the directory"
+        , ops = setTimes . watchRoot
+        , expected = onPlatform Yes Yes No
         }
     -- On Linux, the kernel merges the second write into the first because the
     -- first is the last event in the queue and it has not been read. On macOS
@@ -1896,7 +1975,17 @@ behaviors =
 
     deleteLink p = removeFile (watchRoot p </> "link")
 
-    linkDirAttrs p = any (\ev -> absPath ev == watchRoot p && attrsModified ev)
+    dirMetadata p =
+        any (\ev -> absPath ev == watchRoot p && dirMetadataModified ev)
+
+    -- The title names the Linux and macOS event, on Windows the check is
+    -- isModified. The macOS and Windows outcomes are not verified yet.
+    dirAttrsChange =
+        base
+            { config = dirMetadataConfig
+            , check = dirMetadata
+            , expected = onPlatform No Yes No
+            }
 
     -- The file has two names, the event can report either of them.
     linkFileAttrs _ =
