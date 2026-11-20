@@ -415,10 +415,10 @@ config, and with one option enabled and the other options disabled
 |-----------|----------------|--------------------|-------------------|----------------------------|-----------------------------|---------------------------|-----------------------|
 | Make a file read-only | No | Yes | No | No | No | No | No |
 | Set the access and modification times of a file | Yes | No | No | Yes | Yes | No | No |
-| Set the modification time of a file | ? | ? | ? | ? | ? | ? | ? |
+| Set the modification time of a file | Yes | No | No | Yes | No | No | No |
 | Set the access time of a file | No | No | No | No | Yes | No | No |
 | Set the creation time of a file | No | No | No | No | No | Yes | No |
-| Truncate a file to zero size, without a write | ? | ? | ? | ? | ? | ? | ? |
+| Truncate a file to zero size, without a write | Yes | No | Yes | Yes | Yes | No | No |
 | Set the hidden attribute of a subdirectory | No | Yes | No | No | No | No | No |
 | Set the access and modification times of a subdirectory | Yes | No | No | Yes | Yes | No | No |
 
@@ -443,7 +443,7 @@ file is closed.
 |-----------|-------|-------|-------|---------|
 | Write to an open file, before it is closed | `isModified` for the file | Yes | Usually not | No |
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
-| Truncate a file to zero size, without a write | `isModified` for the file | Yes | ? | ? |
+| Truncate a file to zero size, without a write | `isModified` for the file | Yes | Yes | Yes |
 
 A write to a file changes its modification time on all platforms. The
 converse is not true, the modification time can be set without a write:
@@ -451,16 +451,18 @@ converse is not true, the modification time can be set without a write:
 | Operation | Linux | macOS | Windows |
 |-----------|-------|-------|---------|
 | Write to a file | `isModified` | `isModified` | `isModified` |
-| Set the modification time only | `isModified`, no `isAttrsModified` | ? | ? |
+| Set the modification time only | `isModified`, no `isAttrsModified` | `isAttrsModified`, no `isModified` | `isModified` |
 | Set the access and modification times | `isAttrsModified`, no `isModified` | `isAttrsModified`, no `isModified` | `isModified` |
 
 On Linux `utimensat` reports setting the modification time only as
 `IN_MODIFY`, the event of a write, and setting both times as `IN_ATTRIB`.
-`isModified` does not distinguish a write from setting the modification
-time only.
+On Linux and Windows `isModified` does not distinguish a write from
+setting the modification time only. FreeBSD reports setting the
+modification time only as `IN_ATTRIB`, `isAttrsModified` and no
+`isModified`.
 
-On macOS the event of setting the times sometimes has `isModified` as
-well. This is the `isModified` of an earlier write to the file, FSEvents
+On macOS the event of setting the times, or the modification time only,
+sometimes has `isModified` as well. This is the `isModified` of an earlier write to the file, FSEvents
 can report the flags of earlier changes to a path with a later event of the
 same path.
 
