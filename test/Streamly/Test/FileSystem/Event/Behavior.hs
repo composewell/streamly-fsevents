@@ -413,6 +413,20 @@ setAttrs = Windows.setAttrsModified
 metadataChanged = Event.isModified
 #endif
 
+-- | Whether the event reports the source, or the destination, of a move.
+-- macOS has one predicate for both.
+movedFrom, movedTo :: Event -> Bool
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+movedFrom = Inotify.isMovedFrom
+movedTo = Inotify.isMovedTo
+#elif defined(CABAL_OS_DARWIN)
+movedFrom = Darwin.isMoved
+movedTo = Darwin.isMoved
+#else
+movedFrom = Windows.isMovedFrom
+movedTo = Windows.isMovedTo
+#endif
+
 -- | Run a command. Raise an exception, with the output of the command, if
 -- the command fails.
 runCommand :: FilePath -> [String] -> IO ()
@@ -1348,6 +1362,20 @@ behaviors =
             let moved name = any (\ev -> isNamed name ev && Event.isMoved ev)
              in moved "file" evs && moved "moved" evs
         , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title =
+            "A move reports the source and the destination as separate "
+                ++ "predicates"
+        , setup = withFile
+        , ops = \p ->
+            renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
+        , check = \_ evs ->
+            let reported name f g =
+                    any (\ev -> isNamed name ev && f ev && not (g ev)) evs
+             in reported "file" movedFrom movedTo
+                    && reported "moved" movedTo movedFrom
+        , expected = onPlatform Yes No Yes
         }
     , dirChange
         { title =
