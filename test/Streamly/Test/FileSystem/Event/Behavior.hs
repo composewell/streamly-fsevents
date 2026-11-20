@@ -1968,6 +1968,9 @@ behaviors =
         , ("setting the file times", "file", withFile, setTimes
           , [ "the default config", "only setLastWriteTimeModified"
             , "only setLastAccessTimeModified"])
+        , ( "setting the file modification time", "file", withFile
+          , setFileTimes False False True
+          , ["the default config", "only setLastWriteTimeModified"])
         , ( "setting the file access time", "file", withFile
           , setFileTimes False True False
           , ["only setLastAccessTimeModified"])
@@ -1988,7 +1991,8 @@ behaviors =
     -- option enabled and the other tunable events disabled. The file name
     -- events stay enabled, 'waitStarted' needs them. The last field of an
     -- operation lists the configs that report isModified. The outcomes of
-    -- the truncate are not verified yet.
+    -- the truncate and of setting the modification time are not verified
+    -- yet.
     windowsConfigBehaviors =
         [ base
             { title =
