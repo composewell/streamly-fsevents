@@ -11,8 +11,11 @@ suite `FileSystem.Event.Behavior`.
 
 Each entry is the result of the test suite `FileSystem.Event.Behavior` on that
 platform, except where noted below the table. The results were recorded on
-Ubuntu 24.04, macOS 26 (arm64) and Windows Server 2025. _Exception_ means that the file system operation raises an exception
-because the file is open.
+Ubuntu 24.04, macOS 26 (arm64) and Windows Server 2025.
+
+_Operation fails_ means that the file system operation of the test, for
+example a delete or a rename, raises an exception, so there is no event to
+report. _Watch fails_ means that the watch raises an exception.
 
 ## Directory permissions
 
@@ -29,9 +32,26 @@ directory applies to the test process. The tests of a directory without
 any permission write to a file opened before the permissions are removed,
 and close the file after the write.
 
+## Watch on path vs object
+
+On Linux and Windows the watch of a root is attached to its inode, on
+macOS to its path. Therefore, on Linux and Windows, natively, the watch
+follows the object, if the object is moved to another path the watch
+stays. This is a fundamental difference in implementations.  Since macOS
+watches the path, and whatever comes on that path, it allows watching
+non-existing paths, whatever and whenever something lives on that path
+it is watched.
+
+Watch following the object is usually not desired, therefore, this
+library breaks the watch if the object moves to an unwatched location.
+
+To watch non-existing paths like macOS would be a significantly
+complex implementation to do in the library, therefore in the portable
+implementation we try to make macOS behave like Linux rather than the
+opposite.
+
 ## Watch roots
 
-On Linux the watch of a root is attached to its inode, on macOS to its path.
 On Windows the watch keeps the root open.
 
 ### Nested roots
@@ -50,6 +70,7 @@ not count as a reader or writer.
 |----------|-------|-------|---------|
 | A regular file can be watched | Yes | Yes | No |
 | A special file (e.g. FIFO) can be watched | Yes | Yes | No |
+| A symbolic link itself, not its target, can be watched | Yes, with `setFollowRootSymLinks False` | No | No |
 
 ### Watching non-existing paths
 
@@ -65,7 +86,7 @@ an event on the the parent directory of the missing path component.
 | A non-existing object path is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
 | A watch root deleted and created again is watched | No | Yes | No |
 
-### Delete of a root
+### Deletion of watch root
 
 On Linux and Windows the watch of a deleted root is removed. The watch
 ends with the `isRootUnwatched` event that follows the `isDeleted` event
@@ -74,16 +95,24 @@ of the root. macOS watches the path not the object, after the
 object is created on that path. Therefore, on macOS there is no
 `isRootUnwatched` event generated on deletion of a root.
 
+File roots, Windows does not support file roots:
+
+| Behavior | Linux | macOS |
+|----------|-------|-------|
+| A deleted regular file root reports `isDeleted` for the root | Yes | Yes |
+| A deleted regular file root with another hard link reports `isDeleted` for the root | No | Yes |
+| A deleted FIFO root reports `isDeleted` for the root | Yes | Yes |
+
+On Linux, a symlink deletion is reported if the symlink itself is watched and
+not the target.
+
+Directory roots:
+
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A deleted directory root reports `isDeleted` for the root | Yes | Yes | Yes |
 | A deleted directory root reports `isDeleted` for each file in it | Yes | No | Yes |
 | A deleted symbolic link to a directory root reports `isDeleted` for the root | No | No | No |
-| A deleted directory root in use by a process reports `isDeleted` for the root | No | Yes | Exception |
-| A deleted regular file root reports `isDeleted` for the root | Yes | Yes | No file roots |
-| A deleted open regular file root reports `isDeleted` for the root | No | Yes | No file roots |
-| A deleted regular file root with another hard link reports `isDeleted` for the root | No | Yes | No file roots |
-| A deleted FIFO root reports `isDeleted` for the root | Yes | Yes | No file roots |
 
 Linux reports the deletion of a root when its inode is freed, after the
 last link to it is removed and the last open reference to it is closed.
@@ -111,12 +140,27 @@ On Linux, the library detects a rename and ends the watch with
 `isRootUnwatched`.
 
 On Windows the rename is not detected and the watch continues on the
-renamed root, and the events continue reporting the old path. A directory
-that is the working directory of a process cannot be renamed.
+renamed root, and the events continue reporting the old path.
 
 On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
 watched again.
+
+File roots, Windows does not support file roots:
+
+| Behavior | Linux | macOS |
+|----------|-------|-------|
+| A renamed regular file root reports `isMoved` for the root | Yes | Yes |
+| A renamed regular file root with another hard link reports `isMoved` for the root | Yes | Yes |
+| A renamed FIFO root reports `isMoved` for the root | Yes | Yes |
+
+On Linux, a file root renamed back quickly (before the rename event is
+read) is watched, otherwise the watch is removed.
+
+On Linux, a symlink move is reported if the symlink itself is watched and
+not the target.
+
+Directory roots:
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -124,14 +168,41 @@ watched again.
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
 | A renamed watch root reports `isRootUnwatched` | Yes | No | No |
 | A root renamed back to original is watched | No | Yes | Yes |
-| A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
 | A renamed directory root reports `isMoved` for each file in it | No | No | No |
 | A renamed symbolic link to a directory root reports `isMoved` for the root | No | No | No |
-| A renamed directory root in use by a process reports `isMoved` for the root | Yes | Yes | Exception |
-| A renamed regular file root reports `isMoved` for the root | Yes | Yes | No file roots |
-| A renamed open regular file root reports `isMoved` for the root | Yes | Yes | No file roots |
-| A renamed regular file root with another hard link reports `isMoved` for the root | Yes | Yes | No file roots |
-| A renamed FIFO root reports `isMoved` for the root | Yes | Yes | No file roots |
+
+<!--
+| A root renamed back quickly (before the rename event is read) is watched | No | Yes | Yes |
+-->
+
+### Renaming or deleting in-use objects
+
+Windows processes open the directory without FILE_SHARE_DELETE, therefore, a
+directory in-use by a process cannot be deleted or renamed.
+
+macOS sends a delete event as soon as the path is unlinked from the
+inode i.e. when the path is deleted, Linux sends a delete when all
+references to the inode are gone i.e. when the inode is deleted.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A deleted open regular file root reports `isDeleted` for the root | No | Yes | Not Applicable |
+| A deleted directory root in use by a process reports `isDeleted` for the root | No | Yes | Delete fails |
+
+Linux watch is on the object, it reports the deletion when the deleted
+but still in-use object is closed or the process ends:
+
+| Behavior | Linux |
+|----------|-------|
+| A deleted open regular file root reports `isDeleted` for the root after the file is closed | Yes |
+| A deleted directory root in use by a process reports `isDeleted` for the root after the process ends | Yes |
+
+Renaming has same behavior on Linux and macOS:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A renamed open regular file root reports `isMoved` for the root | Yes | Yes | Not Applicable |
+| A renamed directory root in use by a process reports `isMoved` for the root | Yes | Yes | Rename fails |
 
 ### Rename of a parent of a root
 
@@ -146,18 +217,17 @@ directory is created or moved in stays watched under the old path.
 On macOS the watch is on the path, the events of the root at the new path
 of the parent are not reported.
 
-On Windows the rename of a parent directory of a watched root raises an
-exception. The watch keeps an open handle to the root, and Windows does
+On Windows, the watch keeps an open handle to the root, and Windows does
 not rename a directory while a file or a directory under it is open. The
 root itself can be renamed because the library opens the root with the
-share mode `FILE_SHARE_DELETE`, which allows other processes to delete or
-rename the file of the handle. The share mode applies to the file of the
-handle only, not to its parent directories.
+share mode `FILE_SHARE_DELETE`, which allows other processes to delete
+or rename the file of the handle. The share mode applies to the file of
+the handle only, not to its parent directories.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A root whose parent is renamed remains watched under the old path | Yes | No | Exception |
-| A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Exception |
+| A root whose parent is renamed remains watched under the old path | Yes | No | Operation fails |
+| A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Operation fails |
 
 ### Unmount of the file system of a root
 
@@ -218,8 +288,8 @@ requires SEARCH permission.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A root without READ and SEARCH reports its events | Exception | No | Exception |
-| A root with only SEARCH reports its events | Exception | Yes | Exception |
+| A root without READ and SEARCH reports its events | Watch fails | No | Watch fails |
+| A root with only SEARCH reports its events | Watch fails | Yes | Watch fails |
 | A root with only READ reports its events | Yes | No | Yes |
 
 On Windows the test of a root with only READ disables the "Bypass traverse
@@ -292,7 +362,7 @@ Tested behavior common to all platforms:
 | `isModified` is reported for a directory | No | No | Sometimes, in a recursive watch |
 | A write to a file is reported before the file is closed | Yes | Usually not | No |
 | A write to a file is reported after the file is closed | Yes | Yes | Yes |
-| Writes to an open file after it is deleted are reported | Only if `setExcludeUnlinked` is `False` | Yes | Exception |
+| Writes to an open file after it is deleted are reported | Only if `setExcludeUnlinked` is `False` | Yes | Operation fails |
 | Metadata changes are reported by default | Yes | Yes | No |
 | Metadata change reporting can be disabled | Yes | No | Yes |
 | Creating a hard link reports a metadata change on the directory | No | Yes | No |
