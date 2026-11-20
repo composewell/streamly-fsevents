@@ -65,6 +65,12 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified System.Posix.Files as Posix
     (createLink, createSymbolicLink, ownerModes, setFileMode
     , setFileTimesHiRes)
+import Foreign.C.Error (throwErrnoPathIfMinus1_)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt(..), CLong)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (pokeByteOff)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
@@ -443,9 +449,7 @@ setFileTimes creation access write path =
 
 -- | Set the access and the modification times of a file to the current
 -- time with one system call: @utimensat@ on POSIX, @SetFileTime@ on
--- Windows. The path can be a file or a directory. On Linux, setting the
--- modification time only is reported as @IN_MODIFY@, setting both as
--- @IN_ATTRIB@.
+-- Windows. The path can be a file or a directory.
 setTimes :: FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
 setTimes = setFileTimes False True True
@@ -453,6 +457,41 @@ setTimes = setFileTimes False True True
 setTimes path = do
     t <- getPOSIXTime
     Posix.setFileTimesHiRes path t t
+#endif
+
+#if !defined(CABAL_OS_WINDOWS)
+foreign import ccall unsafe "sys/stat.h utimensat"
+    c_utimensat :: CInt -> CString -> Ptr () -> CInt -> IO CInt
+
+-- | Set the modification time of a file to the current time and leave its
+-- access time unchanged, with one @utimensat@ call. The two @timespec@
+-- structures assume a 64-bit @time_t@ and @long@.
+setModTime :: FilePath -> IO ()
+setModTime path =
+    allocaBytes 32 $ \ts -> do
+        pokeByteOff ts 0 (0 :: CLong)
+        pokeByteOff ts 8 utimeOmit
+        pokeByteOff ts 16 (0 :: CLong)
+        pokeByteOff ts 24 utimeNow
+        withCString path $ \cpath ->
+            throwErrnoPathIfMinus1_ "utimensat" path
+                (c_utimensat atFdcwd cpath ts 0)
+
+    where
+
+#if defined(CABAL_OS_LINUX)
+    atFdcwd = -100
+    utimeNow = 2 ^ (30 :: Int) - 1 :: CLong
+    utimeOmit = 2 ^ (30 :: Int) - 2 :: CLong
+#elif defined(CABAL_OS_FREEBSD)
+    atFdcwd = -100
+    utimeNow = -1 :: CLong
+    utimeOmit = -2 :: CLong
+#else
+    atFdcwd = -2
+    utimeNow = -1 :: CLong
+    utimeOmit = -2 :: CLong
+#endif
 #endif
 
 -- | The setting for the metadata change events, if the platform has one.
@@ -1563,6 +1602,24 @@ behaviors =
         , expected = onPlatform No No Yes
         , racy = onDarwin
         }
+#if !defined(CABAL_OS_WINDOWS)
+    -- The macOS outcomes are not verified yet. Windows sets the modification
+    -- time only in the tests of each config option.
+    , setTimesChange
+        { title = "setting only the file modification time reports isModified"
+        , ops = \p -> setModTime (watchRoot p </> "file")
+        , check = metadataEvent Event.isModified
+        , expected = onPlatform Yes No No
+        , racy = onDarwin
+        }
+    , setTimesChange
+        { title =
+            "setting only the file modification time reports isAttrsModified"
+        , ops = \p -> setModTime (watchRoot p </> "file")
+        , check = metadataEvent attrsModified
+        , expected = onPlatform No Yes No
+        }
+#endif
     , hardLinkSteps
         { title =
             "creating, then deleting a hard link reports isCreated, then "
