@@ -1509,6 +1509,7 @@ behaviors =
         { title = "making a file read-only reports isAttrsModified"
         , check = metadataEvent attrsModified
         , expected = onPlatform Yes Yes No
+        , racy = onDarwin
         }
     , metadataChange
         { title = "making a file read-only reports isSecurityModified"
@@ -1613,7 +1614,30 @@ behaviors =
             "changing the permissions of a subdirectory reports "
                 ++ "isAttrsModified for the subdirectory"
         , ops = \p -> changeDirMode (watchRoot p </> "dir")
+        , expected = onPlatform Yes No Yes
         }
+#if defined(CABAL_OS_DARWIN)
+    -- Not verified yet.
+    , base
+        { title =
+            "changing the permissions of the directory reports "
+                ++ "isSecurityModified for the directory"
+        , ops = changeDirMode . watchRoot
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && securityModified ev)
+        , expected = Yes
+        }
+    , base
+        { title =
+            "changing the permissions of a subdirectory reports "
+                ++ "isSecurityModified for the subdirectory"
+        , setup = withDir
+        , ops = \p -> changeDirMode (watchRoot p </> "dir")
+        , check =
+            const (any (\ev -> isNamed "dir" ev && securityModified ev))
+        , expected = Yes
+        }
+#endif
     , subdirAttrsChange
         { title =
             "setting the times of a subdirectory reports isAttrsModified for "
@@ -1809,6 +1833,9 @@ behaviors =
         }
 #endif
     ]
+#if defined(CABAL_OS_WINDOWS)
+    ++ windowsConfigBehaviors
+#endif
 
     where
 
@@ -1882,6 +1909,50 @@ behaviors =
     withFile p = do
         createFile (watchRoot p </> "file")
         settle
+
+#if defined(CABAL_OS_WINDOWS)
+    -- Each metadata change with the default config, and with one config
+    -- option enabled and the other tunable events disabled. The last field
+    -- of an operation lists the configs expected to report isModified, these
+    -- are not verified yet.
+    windowsConfigBehaviors =
+        [ base
+            { title =
+                opName ++ " reports isModified for the " ++ name ++ " with "
+                    ++ cfgName
+            , config = cfg
+            , setup = setupOp
+            , ops = \p -> op (watchRoot p </> name)
+            , check =
+                const (any (\ev -> isNamed name ev && Event.isModified ev))
+            , expected = if cfgName `elem` yes then Yes else No
+            }
+        | (opName, name, setupOp, op, yes) <- windowsMetadataOps
+        , (cfgName, cfg) <- windowsConfigs
+        ]
+
+    windowsMetadataOps =
+        [ ("making a file read-only", "file", withFile, makeReadOnly
+          , ["only setAttrsModified"])
+        , ("setting the file times", "file", withFile, setTimes
+          , ["the default config", "only setLastWriteTimeModified"])
+        , ( "setting the hidden attribute of a subdirectory", "dir", withDir
+          , changeDirMode, ["only setAttrsModified"])
+        , ("setting the subdirectory times", "dir", withDir, setTimes
+          , ["the default config", "only setLastWriteTimeModified"])
+        ]
+
+    windowsConfigs =
+        [ ("the default config", id)
+        , ("only setAttrsModified", only Windows.setAttrsModified)
+        , ("only setSizeModified", only Windows.setSizeModified)
+        , ( "only setLastWriteTimeModified"
+          , only Windows.setLastWriteTimeModified)
+        , ("only setSecurityModified", only Windows.setSecurityModified)
+        ]
+
+    only f = f True . Windows.setAllEvents False
+#endif
 
     withDirFile p = do
         createDirectory (watchRoot p </> "dir")
