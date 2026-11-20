@@ -412,14 +412,11 @@ makeReadOnly path = Win32.setFileAttributes path Win32.fILE_ATTRIBUTE_READONLY
 makeReadOnly path = Posix.setFileMode path ownerReadMode
 #endif
 
--- | Set the access and the modification times of a file to the current
--- time with one system call: @utimensat@ on POSIX, @SetFileTime@ on
--- Windows. The path can be a file or a directory. On Linux, setting the
--- modification time only is reported as @IN_MODIFY@, setting both as
--- @IN_ATTRIB@.
-setTimes :: FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
-setTimes path =
+-- | @setFileTimes creation access write path@ sets the selected times of a
+-- file or a directory to the current time with one @SetFileTime@ call.
+setFileTimes :: Bool -> Bool -> Bool -> FilePath -> IO ()
+setFileTimes creation access write path =
     bracket
         (Win32.createFile
             path
@@ -433,7 +430,18 @@ setTimes path =
         Win32.closeHandle
         $ \h -> do
             t <- Win32.getSystemTimeAsFileTime
-            Win32.setFileTime h Nothing (Just t) (Just t)
+            let at b = if b then Just t else Nothing
+            Win32.setFileTime h (at creation) (at access) (at write)
+#endif
+
+-- | Set the access and the modification times of a file to the current
+-- time with one system call: @utimensat@ on POSIX, @SetFileTime@ on
+-- Windows. The path can be a file or a directory. On Linux, setting the
+-- modification time only is reported as @IN_MODIFY@, setting both as
+-- @IN_ATTRIB@.
+setTimes :: FilePath -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+setTimes = setFileTimes False True True
 #else
 setTimes path = do
     t <- getPOSIXTime
@@ -1910,6 +1918,41 @@ behaviors =
         settle
 
 #if defined(CABAL_OS_WINDOWS)
+    only f =
+        f True . Windows.setFileNameEvents True . Windows.setAllEvents False
+
+    windowsConfigs =
+        [ ("the default config", id)
+        , ("only setAttrsModified", only Windows.setAttrsModified)
+        , ("only setSizeModified", only Windows.setSizeModified)
+        , ( "only setLastWriteTimeModified"
+          , only Windows.setLastWriteTimeModified)
+        , ( "only setLastAccessTimeModified"
+          , only Windows.setLastAccessTimeModified)
+        , ( "only setCreationTimeModified"
+          , only Windows.setCreationTimeModified)
+        , ("only setSecurityModified", only Windows.setSecurityModified)
+        ]
+
+    windowsMetadataOps =
+        [ ("making a file read-only", "file", withFile, makeReadOnly
+          , ["only setAttrsModified"])
+        , ("setting the file times", "file", withFile, setTimes
+          , [ "the default config", "only setLastWriteTimeModified"
+            , "only setLastAccessTimeModified"])
+        , ( "setting the file access time", "file", withFile
+          , setFileTimes False True False
+          , ["only setLastAccessTimeModified"])
+        , ( "setting the file creation time", "file", withFile
+          , setFileTimes True False False
+          , ["only setCreationTimeModified"])
+        , ( "setting the hidden attribute of a subdirectory", "dir", withDir
+          , changeDirMode, ["only setAttrsModified"])
+        , ("setting the subdirectory times", "dir", withDir, setTimes
+          , [ "the default config", "only setLastWriteTimeModified"
+            , "only setLastAccessTimeModified"])
+        ]
+
     -- Each metadata change with the default config, and with one config
     -- option enabled and the other tunable events disabled. The file name
     -- events stay enabled, 'waitStarted' needs them. The last field of an
@@ -1930,29 +1973,6 @@ behaviors =
         | (opName, name, setupOp, op, yes) <- windowsMetadataOps
         , (cfgName, cfg) <- windowsConfigs
         ]
-
-    windowsMetadataOps =
-        [ ("making a file read-only", "file", withFile, makeReadOnly
-          , ["only setAttrsModified"])
-        , ("setting the file times", "file", withFile, setTimes
-          , ["the default config", "only setLastWriteTimeModified"])
-        , ( "setting the hidden attribute of a subdirectory", "dir", withDir
-          , changeDirMode, ["only setAttrsModified"])
-        , ("setting the subdirectory times", "dir", withDir, setTimes
-          , ["the default config", "only setLastWriteTimeModified"])
-        ]
-
-    windowsConfigs =
-        [ ("the default config", id)
-        , ("only setAttrsModified", only Windows.setAttrsModified)
-        , ("only setSizeModified", only Windows.setSizeModified)
-        , ( "only setLastWriteTimeModified"
-          , only Windows.setLastWriteTimeModified)
-        , ("only setSecurityModified", only Windows.setSecurityModified)
-        ]
-
-    only f =
-        f True . Windows.setFileNameEvents True . Windows.setAllEvents False
 #endif
 
     withDirFile p = do
