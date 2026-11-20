@@ -308,56 +308,85 @@ dynamically.
 
 Events for the objects inside a watch root, not for the root itself.
 
-### Moves
+### Root Directory changes
+
+File create/delete events:
+
+| Operation | Event | Linux | macOS | Windows |
+|-----------|-------|-------|-------|---------|
+| Create a file | `isCreated` for the new file | Yes | Yes | Yes |
+| Delete a file | `isDeleted` for the file | Yes | Yes | Yes |
+| Create a hard link | `isCreated` for the file | Yes | Yes | Yes |
+| Delete a hard link | `isDeleted` for the file | Yes | Yes | Yes |
+
+Moves:
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Rename a file | `isMovedFrom` for the source, `isMovedTo` for the destination | Yes | No | Yes |
 | Rename a file | `isMoved` for the source and the destination | Yes | Yes | Yes |
 
-### Creates, copies and hard links
+Directory metadata events on Linux/macOS:
+
+| Operation | Event | Linux | macOS |
+|-----------|-------|-------|-------|
+| Create a hard link | `isAttrsModified` for the directory | No | Yes |
+| Delete a hard link | `isAttrsModified` for the directory | No | Yes |
+
+Directory metadata events on Windows are reported under `isModified`:
+
+| Operation | Event | Status |
+|-----------|-------|--------|
+| Create a hard link | `isModified` for the directory | No |
+| Delete a hard link | `isModified` for the directory | No |
+
+### Subdirectory changes
+
+In non-recursive mode, creation, deletion, modification of files inside a
+subdirectory do not generate any events, not even attribute modification
+events for the subdir?  is this true? the directory gets modified, so ideally
+the directory as a child object is modified.
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
-| Copy a file | `isCreated` for the new file | Yes | Yes | Yes |
-| Create a hard link | `isCreated` for the link | Yes | Yes | Yes |
-| Create a hard link | `isAttrsModified` for the directory | No | Yes | No |
-| Delete a hard link | `isDeleted` for the link | Yes | Yes | Yes |
+| Create a file in a subdirectory | Any | No | No | No |
+| Modify a file in a subdirectory | Any | No | No | No |
 
-### Modification of a directory
+<!--
+On macOS FSEvents can only watch a tree. The library
+starts a recursive watch and drops the events more than one level below
+a watch root, the process still receives the events of the whole tree.
+-->
 
-Linux and macOS do not report `isModified` for a directory when an entry
-is created in or deleted from the directory. Windows does not report it
-for a file created in the directory. For a file deleted from a directory
-in a recursive watch, Windows reports it in some runs.
+### File metadata changes
 
-| Operation | Event | Linux | macOS | Windows |
-|-----------|-------|-------|-------|---------|
-| Create a file in a subdirectory, non-recursive watch | `isModified` for the subdirectory | No | No | No |
-| Create a file in a subdirectory, recursive watch | `isModified` for the subdirectory | No | No | No |
-| Delete a file from a subdirectory, recursive watch | `isModified` for the subdirectory | No | No | Sometimes |
+Linux and macOS report basic metadata changes as `isAttrsModified`.
 
-### Metadata changes
+| Operation | Event | Linux | macOS |
+|-----------|-------|-------|-------|
+| Make a file read-only | `isModified` for the file | No | Sometimes |
+| Make a file read-only | `isAttrsModified` for the file | Yes | Yes |
+| Set the access and modification times of a file | `isAttrsModified` for the file | Yes | Yes |
 
-Linux reports metadata changes as `isAttrsModified`, unless
-`setAttrsModified` is `False`. macOS always reports them, as
-`isAttrsModified`, `isSecurityModified`, `isFinderInfoModified` and
-`isXAttrsModified`. Windows reports them as `isModified`, only if
-`setAttrsModified` is `True`, the default is `False`.
+macOS reports additional metadata changes as `isSecurityModified`,
+`isFinderInfoModified` and `isXAttrsModified`.
+| Operation | Event |
+|-----------|-------|
+| Make a file read-only | `isSecurityModified` for the file |
 
-| Operation | Event | Linux | macOS | Windows |
-|-----------|-------|-------|-------|---------|
-| Remove the write permission of a file | `isAttrsModified` for the file | Yes | Yes | No |
-| Remove the write permission of a file | `isSecurityModified` for the file | No | Yes | No |
-| Remove the write permission of a file | `isModified` for the file | No | No | No |
-| Remove the write permission of a file, `setAttrsModified False` | `isAttrsModified` for the file | No | Yes | No |
-| Remove the write permission of a file, `setAttrsModified False` | `isSecurityModified` for the file | No | Yes | No |
-| Remove the write permission of a file, `setAttrsModified False` | `isModified` for the file | No | No | No |
-| Remove the write permission of a file, `setAttrsModified True` | `isAttrsModified` for the file | Yes | Yes | No |
-| Remove the write permission of a file, `setAttrsModified True` | `isSecurityModified` for the file | No | Yes | No |
-| Remove the write permission of a file, `setAttrsModified True` | `isModified` for the file | No | No | Yes |
+Windows reports file content modification as well as metadata changes as
+`isModified` event. Which changes trigger this event is controlled by
+config options.
 
-### Writes to a file
+| Operation | Config option | Event |
+|-----------|---------------|-------|
+| Make a file read-only | | `isModified` for the file |
+| Set the access and modification times of a file | | `isModified` for the file |
+
+Creating or deleting a hardlink does not generate any metadata change
+event for the file on any platform.
+
+### File content changes
 
 Linux reports a write to a file that stays open when the write is made.
 macOS and Windows may not report it until the file is closed, they report
@@ -371,6 +400,9 @@ file is closed.
 | Write to an open file, before it is closed | `isModified` for the file | Yes | Usually not | No |
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
 | Delete a file and write it again | `isDeleted` and `isModified` for the file | Yes | Yes | Yes |
+
+XXX On Windows we need an option to enable/disable file content modification
+reporting, do we have one?
 
 ### Writes to a deleted open file
 
@@ -414,20 +446,6 @@ one event, for the root only, and does not report the entries in the
 root, in recursive and non-recursive watches. On Windows
 `ReadDirectoryChangesW` does not report the deletion of the watch root,
 the library reports `isDeleted` for the root.
-
-### Scope of a non-recursive watch
-
-On macOS FSEvents can only watch a tree. The library
-starts a recursive watch and drops the events more than one level below
-a watch root, the process still receives the events of the whole tree.
-
-| Operation | Event | Linux | macOS | Windows |
-|-----------|-------|-------|-------|---------|
-| Create a file in a subdirectory, non-recursive watch | `isCreated` for the file | No | No | No |
-| Any change more than one level below the root, non-recursive watch | The event is delivered to the process | No | Yes, the library drops it | No |
-
-The row for the delivery of events in a non-recursive watch has no test,
-it is based on the platform documentation and the library code.
 
 ### Related documents
 
@@ -543,6 +561,11 @@ Tested behavior common to all platforms:
 | A file created and deleted in a new directory, before the consumer reads the directory's create event, is reported | No | Yes | Yes |
 | A write to a file in a directory renamed twice before the consumer reads the first rename, the first new path taken by another directory, reports `isModified` at the path of the file | No | Yes | No |
 
+| Operation | Event | Linux | macOS | Windows |
+|-----------|-------|-------|-------|---------|
+| Create a file in a subdirectory | `isModified` for the subdirectory | No | No | No |
+| Delete a file from a subdirectory | `isModified` for the subdirectory | No | No | Sometimes |
+
 ### Subdirectory permissions
 
 Linux:
@@ -622,10 +645,8 @@ except for the following differences:
   reports it when the root is closed.
 * Unmount: a file system cannot be unmounted while a tree in it is
   watched, `umount` fails with `Device busy`.
-* Link count changes: `unlink`, `link` and a rename over an existing file
-  report `isAttrsModified` only to a watch on the file itself, not to a
-  watch on its directory. Linux reports `isAttrsModified` for the entry to
-  the watch on the directory. `rmdir` does not report `isAttrsModified`.
+* `rmdir` does not report `isAttrsModified` for the deleted directory,
+  Linux reports it.
 * Hard links: an access to a file through any of its hard links reports an
   event in each watched directory that has a link to the file, even if the
   access used a link in an unwatched directory. A watched directory with two
