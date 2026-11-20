@@ -308,9 +308,23 @@ dynamically.
 
 Events for the objects inside a watch root, not for the root itself.
 
-### Root Directory changes
+### Root Directory metadata changes
 
-File create/delete events:
+| Operation | Event | Linux | macOS |
+|-----------|-------|-------|-------|
+| Change the permissions of the directory | `isAttrsModified` for the directory | Yes | No |
+| Set the access and modification times of the directory | `isAttrsModified` for the directory | Yes | Yes |
+
+On Windows these changes are reported under `isModified`:
+
+| Operation | Event | Config | Status |
+|-----------|-------|--------|--------|
+| Set the hidden attribute of the directory | `isModified` for the directory | `setAllEvents True` | No |
+| Set the access and modification times of the directory | `isModified` for the directory | `setAllEvents True` | No |
+
+### Root Directory content changes
+
+File create/delete events due to directory operations:
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
@@ -319,62 +333,40 @@ File create/delete events:
 | Create a hard link | `isCreated` for the file | Yes | Yes | Yes |
 | Delete a hard link | `isDeleted` for the file | Yes | Yes | Yes |
 
-Moves:
+File move events due to directory operations:
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Rename a file | `isMovedFrom` for the source, `isMovedTo` for the destination | Yes | No | Yes |
 | Rename a file | `isMoved` for the source and the destination | Yes | Yes | Yes |
 
-Directory metadata events on Linux/macOS:
+Directory metadata events due to directory operations on Linux/macOS:
 
 | Operation | Event | Linux | macOS |
 |-----------|-------|-------|-------|
-| Create a file | `isAttrsModified` for the directory | No | ? |
-| Delete a file | `isAttrsModified` for the directory | No | ? |
-| Rename a file | `isAttrsModified` for the directory | No | ? |
-| Create a subdirectory | `isAttrsModified` for the directory | No | ? |
-| Delete a subdirectory | `isAttrsModified` for the directory | No | ? |
-| Create a symbolic link | `isAttrsModified` for the directory | No | ? |
+| Create a file | `isAttrsModified` for the directory | No | No |
+| Delete a file | `isAttrsModified` for the directory | No | No |
+| Rename a file | `isAttrsModified` for the directory | No | No |
+| Create a subdirectory | `isAttrsModified` for the directory | No | No |
+| Delete a subdirectory | `isAttrsModified` for the directory | No | No |
+| Create a symbolic link | `isAttrsModified` for the directory | No | No |
 | Create a hard link | `isAttrsModified` for the directory | No | Yes |
-| Delete a hard link | `isAttrsModified` for the directory | No | Yes |
-| Change the permissions of the directory | `isAttrsModified` for the directory | Yes | ? |
-| Set the access and modification times of the directory | `isAttrsModified` for the directory | Yes | ? |
+| Delete a hard link | `isAttrsModified` for the directory | No | No |
 
-Directory metadata events on Windows are reported under `isModified` enabled by
-appropriate config options:
+Directory metadata events due to directory operations on Windows are
+reported under `isModified` enabled by appropriate config options:
 
 | Operation | Event | Config | Status |
 |-----------|-------|--------|--------|
-| Create a file | `isModified` for the directory | `setAllEvents True` | ? |
-| Delete a file | `isModified` for the directory | `setAllEvents True` | ? |
-| Rename a file | `isModified` for the directory | `setAllEvents True` | ? |
-| Create a subdirectory | `isModified` for the directory | `setAllEvents True` | ? |
-| Delete a subdirectory | `isModified` for the directory | `setAllEvents True` | ? |
-| Create a hard link | `isModified` for the directory | `setAllEvents True` | ? |
-| Delete a hard link | `isModified` for the directory | `setAllEvents True` | ? |
-| Set the hidden attribute of the directory | `isModified` for the directory | `setAllEvents True` | ? |
-| Set the access and modification times of the directory | `isModified` for the directory | `setAllEvents True` | ? |
+| Create a file | `isModified` for the directory | `setAllEvents True` | No |
+| Delete a file | `isModified` for the directory | `setAllEvents True` | No |
+| Rename a file | `isModified` for the directory | `setAllEvents True` | No |
+| Create a subdirectory | `isModified` for the directory | `setAllEvents True` | No |
+| Delete a subdirectory | `isModified` for the directory | `setAllEvents True` | No |
+| Create a hard link | `isModified` for the directory | `setAllEvents True` | No |
+| Delete a hard link | `isModified` for the directory | `setAllEvents True` | No |
 
-### Subdirectory changes
-
-In non-recursive mode, creation, deletion, modification of files inside a
-subdirectory do not generate any events, not even attribute modification
-events for the subdir?  is this true? the directory gets modified, so ideally
-the directory as a child object is modified.
-
-| Operation | Event | Linux | macOS | Windows |
-|-----------|-------|-------|-------|---------|
-| Create a file in a subdirectory | Any | No | No | No |
-| Modify a file in a subdirectory | Any | No | No | No |
-
-<!--
-On macOS FSEvents can only watch a tree. The library
-starts a recursive watch and drops the events more than one level below
-a watch root, the process still receives the events of the whole tree.
--->
-
-### File metadata changes
+### File/subdirectory metadata changes
 
 Linux and macOS report basic metadata changes as `isAttrsModified`.
 
@@ -382,7 +374,14 @@ Linux and macOS report basic metadata changes as `isAttrsModified`.
 |-----------|-------|-------|-------|
 | Make a file read-only | `isModified` for the file | No | Sometimes |
 | Make a file read-only | `isAttrsModified` for the file | Yes | Yes |
+| Set the access and modification times of a file | `isModified` for the file | No | Sometimes |
 | Set the access and modification times of a file | `isAttrsModified` for the file | Yes | Yes |
+| Change the permissions of a subdirectory | `isAttrsModified` for the subdirectory | Yes | ? |
+| Set the access and modification times of a subdirectory | `isAttrsModified` for the subdirectory | Yes | ? |
+
+On macOS FSEvents can report the flags of an earlier change to a path with
+a later event of the same path. The `isModified` for a file written before
+its metadata change is then reported with the metadata change event.
 
 macOS reports additional metadata changes as `isSecurityModified`,
 `isFinderInfoModified` and `isXAttrsModified`.
@@ -399,6 +398,8 @@ config options.
 |-----------|---------------|-------|
 | Make a file read-only | | `isModified` for the file |
 | Set the access and modification times of a file | | `isModified` for the file |
+| Set the hidden attribute of a subdirectory | `setAllEvents True` | `isModified` for the subdirectory |
+| Set the access and modification times of a subdirectory | `setAllEvents True` | `isModified` for the subdirectory |
 
 Creating or deleting a hardlink does not generate any metadata change
 event for the file on any platform.
@@ -418,8 +419,29 @@ file is closed.
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
 | Delete a file and write it again | `isDeleted` and `isModified` for the file | Yes | Yes | Yes |
 
+Changing the file modification time is equivalent to changing the file
+contents, one implies the other.
+
 XXX On Windows we need an option to enable/disable file content modification
 reporting, do we have one?
+
+### Subdirectory content changes
+
+In non-recursive mode, creation, deletion, modification of files inside a
+subdirectory do not generate any events, not even attribute modification
+events for the subdir?  is this true? the directory gets modified, so ideally
+the directory as a child object is modified.
+
+| Operation | Event | Linux | macOS | Windows |
+|-----------|-------|-------|-------|---------|
+| Create a file in a subdirectory | Any | No | No | No |
+| Modify a file in a subdirectory | Any | No | No | No |
+
+<!--
+On macOS FSEvents can only watch a tree. The library
+starts a recursive watch and drops the events more than one level below
+a watch root, the process still receives the events of the whole tree.
+-->
 
 ### Writes to a deleted open file
 
