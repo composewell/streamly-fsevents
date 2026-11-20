@@ -1041,7 +1041,6 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
-    -- The macOS and Windows outcomes are not verified yet.
     , base
         { title = "truncating a file without a write reports isModified"
         , setup = \p -> do
@@ -1603,13 +1602,13 @@ behaviors =
         , racy = onDarwin
         }
 #if !defined(CABAL_OS_WINDOWS)
-    -- The macOS outcomes are not verified yet. Windows sets the modification
-    -- time only in the tests of each config option.
+    -- Windows sets the modification time only in the tests of each config
+    -- option. Linux reports it as IN_MODIFY, FreeBSD as IN_ATTRIB.
     , setTimesChange
         { title = "setting only the file modification time reports isModified"
         , ops = \p -> setModTime (watchRoot p </> "file")
         , check = metadataEvent Event.isModified
-        , expected = onPlatform Yes No No
+        , expected = onPlatform (onFreeBSD No Yes) No No
         , racy = onDarwin
         }
     , setTimesChange
@@ -1617,7 +1616,7 @@ behaviors =
             "setting only the file modification time reports isAttrsModified"
         , ops = \p -> setModTime (watchRoot p </> "file")
         , check = metadataEvent attrsModified
-        , expected = onPlatform No Yes No
+        , expected = onPlatform (onFreeBSD Yes No) Yes No
         }
 #endif
     , hardLinkSteps
@@ -2036,7 +2035,8 @@ behaviors =
           , ["only setCreationTimeModified"])
         , ( "truncating a file", "file", withFileContents, truncateFile
           , [ "the default config", "only setSizeModified"
-            , "only setLastWriteTimeModified"])
+            , "only setLastWriteTimeModified"
+            , "only setLastAccessTimeModified"])
         , ( "setting the hidden attribute of a subdirectory", "dir", withDir
           , changeDirMode, ["only setAttrsModified"])
         , ("setting the subdirectory times", "dir", withDir, setTimes
@@ -2047,9 +2047,7 @@ behaviors =
     -- Each metadata change with the default config, and with one config
     -- option enabled and the other tunable events disabled. The file name
     -- events stay enabled, 'waitStarted' needs them. The last field of an
-    -- operation lists the configs that report isModified. The outcomes of
-    -- the truncate and of setting the modification time are not verified
-    -- yet.
+    -- operation lists the configs that report isModified.
     windowsConfigBehaviors =
         [ base
             { title =
