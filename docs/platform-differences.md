@@ -413,13 +413,13 @@ config, and with one option enabled and the other options disabled
 
 | Operation | Default config | `setAttrsModified` | `setSizeModified` | `setLastWriteTimeModified` | `setLastAccessTimeModified` | `setCreationTimeModified` | `setSecurityModified` |
 |-----------|----------------|--------------------|-------------------|----------------------------|-----------------------------|---------------------------|-----------------------|
-| Make a file read-only | No | ? | ? | ? | ? | ? | ? |
-| Set the access and modification times of a file | Yes | ? | ? | ? | ? | ? | ? |
-| Set the access time of a file | ? | ? | ? | ? | ? | ? | ? |
-| Set the creation time of a file | ? | ? | ? | ? | ? | ? | ? |
+| Make a file read-only | No | Yes | No | No | No | No | No |
+| Set the access and modification times of a file | Yes | No | No | Yes | Yes | No | No |
+| Set the access time of a file | No | No | No | No | Yes | No | No |
+| Set the creation time of a file | No | No | No | No | No | Yes | No |
 | Truncate a file to zero size, without a write | ? | ? | ? | ? | ? | ? | ? |
-| Set the hidden attribute of a subdirectory | No | ? | ? | ? | ? | ? | ? |
-| Set the access and modification times of a subdirectory | Yes | ? | ? | ? | ? | ? | ? |
+| Set the hidden attribute of a subdirectory | No | Yes | No | No | No | No | No |
+| Set the access and modification times of a subdirectory | Yes | No | No | Yes | Yes | No | No |
 
 With `setAttrsModified True` added to the default config, making a file
 read-only and setting the times of a file report `isModified` for the
@@ -447,8 +447,24 @@ file is closed.
 Changing the file modification time is equivalent to changing the file
 contents, one implies the other.
 
-XXX On Windows we need an option to enable/disable file content modification
-reporting, do we have one?
+Windows does not have a filter for content changes only. A write to a
+file changes its last write time, and its size if the write extends the
+file. The default config reports content changes as `isModified` and does
+not report the other metadata changes:
+
+| Config option | Default | Reports a change of |
+|---------------|---------|---------------------|
+| `setSizeModified` | True | the size of a file |
+| `setLastWriteTimeModified` | True | the last write time of a file |
+| `setAttrsModified` | False | the attributes of a file, e.g. read-only or hidden |
+| `setLastAccessTimeModified` | False | the last access time of a file |
+| `setCreationTimeModified` | False | the creation time of a file |
+| `setSecurityModified` | False | the security descriptor of a file |
+
+To stop the content change events, set both `setSizeModified` and
+`setLastWriteTimeModified` to `False`. `setLastWriteTimeModified` also
+reports setting the last write time with `SetFileTime` without a write,
+the event does not distinguish the two cases.
 
 ### Subdirectory content changes
 
