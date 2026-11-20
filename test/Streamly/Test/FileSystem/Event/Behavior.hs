@@ -711,6 +711,11 @@ base =
 
 behaviors :: [Behavior]
 behaviors =
+    -- On Linux and Windows a watch root that is deleted and created again is
+    -- not watched, the watch is on the object, not on the path. This test
+    -- checks that a file inside a watched directory does not have this
+    -- problem: the watch of the directory reports the events of the file
+    -- after it is deleted and created again.
     [ base
         { title = "file deleted and created again in a watched dir is reported"
         , ops = \p -> do
