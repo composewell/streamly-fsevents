@@ -88,6 +88,8 @@ module Streamly.FileSystem.Event.Windows
     , setSecurityModified
     , setSizeModified
     , setLastWriteTimeModified
+    , setLastAccessTimeModified
+    , setCreationTimeModified
     , setAllEvents
 
     -- ** Watch APIs

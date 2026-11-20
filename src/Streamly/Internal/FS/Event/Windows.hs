@@ -28,6 +28,8 @@ module Streamly.Internal.FS.Event.Windows
     , setSecurityModified
     , setSizeModified
     , setLastWriteTimeModified
+    , setLastAccessTimeModified
+    , setCreationTimeModified
     , setAllEvents
 
     -- ** Watch APIs
@@ -215,6 +217,34 @@ setSizeModified = setFlag fILE_NOTIFY_CHANGE_SIZE
 setLastWriteTimeModified :: Bool -> Config -> Config
 setLastWriteTimeModified = setFlag fILE_NOTIFY_CHANGE_LAST_WRITE
 
+-- | The Win32 package does not export these two flags. The values are
+-- the ones in @winnt.h@.
+fILE_NOTIFY_CHANGE_LAST_ACCESS, fILE_NOTIFY_CHANGE_CREATION :: DWORD
+fILE_NOTIFY_CHANGE_LAST_ACCESS = 0x00000020
+fILE_NOTIFY_CHANGE_CREATION = 0x00000040
+
+-- | Generate an 'isModified' event when the last access timestamp of a file
+-- or directory is changed.
+--
+-- From Windows API documentation: Any change to the last access time of
+-- files in the watched directory or subtree causes a change notification
+-- wait operation to return.
+--
+-- /default: False/
+setLastAccessTimeModified :: Bool -> Config -> Config
+setLastAccessTimeModified = setFlag fILE_NOTIFY_CHANGE_LAST_ACCESS
+
+-- | Generate an 'isModified' event when the creation timestamp of a file or
+-- directory is changed.
+--
+-- From Windows API documentation: Any change to the creation time of files
+-- in the watched directory or subtree causes a change notification wait
+-- operation to return.
+--
+-- /default: False/
+setCreationTimeModified :: Bool -> Config -> Config
+setCreationTimeModified = setFlag fILE_NOTIFY_CHANGE_CREATION
+
 -- | Generate an 'isModified' event when any security-descriptor change occurs
 -- in the watched directory or subtree.
 --
@@ -229,6 +259,8 @@ setSecurityModified = setFlag fILE_NOTIFY_CHANGE_SECURITY
 -- * setAttrsModified
 -- * setSizeModified
 -- * setLastWriteTimeModified
+-- * setLastAccessTimeModified
+-- * setCreationTimeModified
 -- * setSecurityModified
 setAllEvents :: Bool -> Config -> Config
 setAllEvents s =
@@ -237,6 +269,8 @@ setAllEvents s =
     . setAttrsModified s
     . setSizeModified s
     . setLastWriteTimeModified s
+    . setLastAccessTimeModified s
+    . setCreationTimeModified s
     . setSecurityModified s
 
 -- | The tunable events that are enabled by default are:
