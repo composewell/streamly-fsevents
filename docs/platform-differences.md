@@ -415,6 +415,7 @@ config, and with one option enabled and the other options disabled
 |-----------|----------------|--------------------|-------------------|----------------------------|-----------------------------|---------------------------|-----------------------|
 | Make a file read-only | No | Yes | No | No | No | No | No |
 | Set the access and modification times of a file | Yes | No | No | Yes | Yes | No | No |
+| Set the modification time of a file | ? | ? | ? | ? | ? | ? | ? |
 | Set the access time of a file | No | No | No | No | Yes | No | No |
 | Set the creation time of a file | No | No | No | No | No | Yes | No |
 | Truncate a file to zero size, without a write | ? | ? | ? | ? | ? | ? | ? |
@@ -444,8 +445,19 @@ file is closed.
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
 | Truncate a file to zero size, without a write | `isModified` for the file | Yes | ? | ? |
 
-Changing the file modification time is equivalent to changing the file
-contents, one implies the other.
+A write to a file changes its modification time on all platforms. The
+converse is not true, the modification time can be set without a write:
+
+| Operation | Linux | macOS | Windows |
+|-----------|-------|-------|---------|
+| Write to a file | `isModified` | `isModified` | `isModified` |
+| Set the modification time only | `isModified` | ? | ? |
+| Set the access and modification times | `isAttrsModified` | `isAttrsModified` | `isModified` |
+
+On Linux `utimensat` reports setting the modification time only as
+`IN_MODIFY`, the event of a write, and setting both times as `IN_ATTRIB`.
+`isModified` does not distinguish a write from setting the modification
+time only.
 
 Windows does not have a filter for content changes only. A write to a
 file changes its last write time, and its size if the write extends the
