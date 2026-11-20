@@ -417,6 +417,7 @@ config, and with one option enabled and the other options disabled
 | Set the access and modification times of a file | Yes | ? | ? | ? | ? | ? | ? |
 | Set the access time of a file | ? | ? | ? | ? | ? | ? | ? |
 | Set the creation time of a file | ? | ? | ? | ? | ? | ? | ? |
+| Truncate a file to zero size, without a write | ? | ? | ? | ? | ? | ? | ? |
 | Set the hidden attribute of a subdirectory | No | ? | ? | ? | ? | ? | ? |
 | Set the access and modification times of a subdirectory | Yes | ? | ? | ? | ? | ? | ? |
 
@@ -441,6 +442,7 @@ file is closed.
 |-----------|-------|-------|-------|---------|
 | Write to an open file, before it is closed | `isModified` for the file | Yes | Usually not | No |
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
+| Truncate a file to zero size, without a write | `isModified` for the file | Yes | ? | ? |
 
 Changing the file modification time is equivalent to changing the file
 contents, one implies the other.
