@@ -41,9 +41,10 @@ import System.Directory
     ( createDirectory, createDirectoryIfMissing, createDirectoryLink
     , doesDirectoryExist, getPermissions, listDirectory, removeDirectory
     , removeDirectoryLink, removeFile, removePathForcibly, renameDirectory
-    , renameFile, renamePath, setOwnerWritable, setPermissions
+    , renameFile, renamePath
 #if !defined(CABAL_OS_WINDOWS)
     , emptyPermissions, setOwnerReadable, setOwnerSearchable
+    , setOwnerWritable, setPermissions
 #endif
     )
 import System.FilePath ((</>), takeDirectory, takeFileName)
@@ -58,6 +59,8 @@ import System.Process
 #if !defined(CABAL_OS_WINDOWS)
 import System.Posix.Files
     (createNamedPipe, ownerReadMode, ownerWriteMode, unionFileModes)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import qualified System.Posix.Files as Posix (setFileMode, setFileTimesHiRes)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
@@ -75,6 +78,7 @@ import System.Process (readCreateProcess, shell)
 import System.Win32.HardLink (createHardLink)
 import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
 import qualified System.Win32.File as Win32
+import qualified System.Win32.Time as Win32
 #endif
 import Streamly.Internal.FS.Event (Config, Event)
 
@@ -392,11 +396,41 @@ copyFile source copy = Win32.copyFile source copy True
 copyFile source copy = void $ readProcess "cp" [source, copy] ""
 #endif
 
--- | Change the metadata of a file, without changing its contents.
-changeMetadata :: FilePath -> IO ()
-changeMetadata path = do
-    perms <- getPermissions path
-    setPermissions path (setOwnerWritable False perms)
+-- | Make a file read-only with one system call: @chmod@ on POSIX,
+-- @SetFileAttributes@ on Windows.
+makeReadOnly :: FilePath -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+makeReadOnly path = Win32.setFileAttributes path Win32.fILE_ATTRIBUTE_READONLY
+#else
+makeReadOnly path = Posix.setFileMode path ownerReadMode
+#endif
+
+-- | Set the access and the modification times of a file to the current
+-- time with one system call: @utimensat@ on POSIX, @SetFileTime@ on
+-- Windows. On Linux, setting the modification time only is reported as
+-- @IN_MODIFY@, setting both as @IN_ATTRIB@.
+setTimes :: FilePath -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+setTimes path =
+    bracket
+        (Win32.createFile
+            path
+            Win32.fILE_WRITE_ATTRIBUTES
+            (Win32.fILE_SHARE_READ .|. Win32.fILE_SHARE_WRITE
+                .|. Win32.fILE_SHARE_DELETE)
+            Nothing
+            Win32.oPEN_EXISTING
+            Win32.fILE_ATTRIBUTE_NORMAL
+            Nothing)
+        Win32.closeHandle
+        $ \h -> do
+            t <- Win32.getSystemTimeAsFileTime
+            Win32.setFileTime h Nothing (Just t) (Just t)
+#else
+setTimes path = do
+    t <- getPOSIXTime
+    Posix.setFileTimesHiRes path t t
+#endif
 
 -- | The setting for the metadata change events, if the platform has one.
 setAttrs :: Bool -> Config -> Config
@@ -1431,64 +1465,36 @@ behaviors =
         , expected = onFreeBSD No Yes
         }
 #endif
+    -- The metadata change events are enabled. On macOS FSEvents can report
+    -- the flags of earlier changes to a path with a later event of the path,
+    -- isModified of the file created in the setup is reported with the
+    -- change in some runs.
     , metadataChange
-        { title = "permission change reports isAttrsModified"
+        { title = "making a file read-only reports isAttrsModified"
         , check = metadataEvent attrsModified
         , expected = onPlatform Yes Yes No
         }
     , metadataChange
-        { title = "permission change reports isSecurityModified"
+        { title = "making a file read-only reports isSecurityModified"
         , check = metadataEvent securityModified
         , expected = onPlatform No Yes No
         }
     , metadataChange
-        { title = "permission change reports isModified"
-        , check = metadataEvent Event.isModified
-        , expected = onPlatform No No No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isAttrsModified, setAttrsModified False"
-        , config = setAttrs False
-        , check = metadataEvent attrsModified
-        , expected = onPlatform No Yes No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isSecurityModified, "
-                ++ "setAttrsModified False"
-        , config = setAttrs False
-        , check = metadataEvent securityModified
-        , expected = onPlatform No Yes No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isModified, setAttrsModified False"
-        , config = setAttrs False
-        , check = metadataEvent Event.isModified
-        , expected = onPlatform No No No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isAttrsModified, setAttrsModified True"
-        , config = setAttrs True
-        , check = metadataEvent attrsModified
-        , expected = onPlatform Yes Yes No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isSecurityModified, "
-                ++ "setAttrsModified True"
-        , config = setAttrs True
-        , check = metadataEvent securityModified
-        , expected = onPlatform No Yes No
-        }
-    , metadataChange
-        { title =
-            "permission change reports isModified, setAttrsModified True"
-        , config = setAttrs True
+        { title = "making a file read-only reports isModified"
         , check = metadataEvent Event.isModified
         , expected = onPlatform No No Yes
+        , racy = onDarwin
+        }
+    , setTimesChange
+        { title = "setting the file times reports isAttrsModified"
+        , check = metadataEvent attrsModified
+        , expected = onPlatform Yes Yes No
+        }
+    , setTimesChange
+        { title = "setting the file times reports isModified"
+        , check = metadataEvent Event.isModified
+        , expected = onPlatform No No Yes
+        , racy = onDarwin
         }
     , hardLinkCreate
         { title = "creating a hard link reports isCreated"
@@ -1860,8 +1866,16 @@ behaviors =
 
     metadataChange =
         base
-            { setup = withFile
-            , ops = \p -> changeMetadata (watchRoot p </> "file")
+            { config = setAttrs True
+            , setup = withFile
+            , ops = \p -> makeReadOnly (watchRoot p </> "file")
+            }
+
+    setTimesChange =
+        base
+            { config = setAttrs True
+            , setup = withFile
+            , ops = \p -> setTimes (watchRoot p </> "file")
             }
 
     metadataEvent f _ = any (\ev -> isNamed "file" ev && f ev)
