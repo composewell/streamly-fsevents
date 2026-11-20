@@ -111,7 +111,8 @@ On Linux, the library detects a rename and ends the watch with
 `isRootUnwatched`.
 
 On Windows the rename is not detected and the watch continues on the
-renamed root, and the events continue reporting the old path.
+renamed root, and the events continue reporting the old path. A directory
+that is the working directory of a process cannot be renamed.
 
 On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
@@ -124,6 +125,13 @@ watched again.
 | A renamed watch root reports `isRootUnwatched` | Yes | No | No |
 | A root renamed back to original is watched | No | Yes | Yes |
 | A root renamed back quickly (before the rename event is read) is watched | No, a file root is | Yes | Yes |
+| A renamed directory root reports `isMoved` for each file in it | No | No | No |
+| A renamed symbolic link to a directory root reports `isMoved` for the root | No | No | No |
+| A renamed directory root in use by a process reports `isMoved` for the root | Yes | Yes | Exception |
+| A renamed regular file root reports `isMoved` for the root | Yes | Yes | No file roots |
+| A renamed open regular file root reports `isMoved` for the root | Yes | Yes | No file roots |
+| A renamed regular file root with another hard link reports `isMoved` for the root | Yes | Yes | No file roots |
+| A renamed FIFO root reports `isMoved` for the root | Yes | Yes | No file roots |
 
 ### Rename of a parent of a root
 
