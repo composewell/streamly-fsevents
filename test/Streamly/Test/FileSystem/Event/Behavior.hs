@@ -400,17 +400,31 @@ changeMetadata path = do
 
 -- | The setting for the metadata change events, if the platform has one.
 setAttrs :: Bool -> Config -> Config
--- | Whether the event reports a metadata change.
-metadataChanged :: Event -> Bool
 #if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
 setAttrs = Inotify.setAttrsModified
-metadataChanged = Inotify.isAttrsModified
 #elif defined(CABAL_OS_DARWIN)
 setAttrs _ = id
-metadataChanged ev = Darwin.isSecurityModified ev || Darwin.isAttrsModified ev
 #else
 setAttrs = Windows.setAttrsModified
-metadataChanged = Event.isModified
+#endif
+
+-- | Whether the event is 'isAttrsModified'. Windows does not have this
+-- event.
+attrsModified :: Event -> Bool
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+attrsModified = Inotify.isAttrsModified
+#elif defined(CABAL_OS_DARWIN)
+attrsModified = Darwin.isAttrsModified
+#else
+attrsModified = const False
+#endif
+
+-- | Whether the event is 'isSecurityModified'. Only macOS has this event.
+securityModified :: Event -> Bool
+#if defined(CABAL_OS_DARWIN)
+securityModified = Darwin.isSecurityModified
+#else
+securityModified = const False
 #endif
 
 -- | Whether the event reports the source, or the destination, of a move.
@@ -1418,18 +1432,63 @@ behaviors =
         }
 #endif
     , metadataChange
-        { title = "metadata change is reported by default"
+        { title = "permission change reports isAttrsModified"
+        , check = metadataEvent attrsModified
         , expected = onPlatform Yes Yes No
         }
     , metadataChange
-        { title = "metadata change is reported with the setting disabled"
-        , config = setAttrs False
+        { title = "permission change reports isSecurityModified"
+        , check = metadataEvent securityModified
         , expected = onPlatform No Yes No
         }
     , metadataChange
-        { title = "metadata change is reported with the setting enabled"
+        { title = "permission change reports isModified"
+        , check = metadataEvent Event.isModified
+        , expected = onPlatform No No No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isAttrsModified, setAttrsModified False"
+        , config = setAttrs False
+        , check = metadataEvent attrsModified
+        , expected = onPlatform No Yes No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isSecurityModified, "
+                ++ "setAttrsModified False"
+        , config = setAttrs False
+        , check = metadataEvent securityModified
+        , expected = onPlatform No Yes No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isModified, setAttrsModified False"
+        , config = setAttrs False
+        , check = metadataEvent Event.isModified
+        , expected = onPlatform No No No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isAttrsModified, setAttrsModified True"
         , config = setAttrs True
-        , expected = onPlatform Yes Yes Yes
+        , check = metadataEvent attrsModified
+        , expected = onPlatform Yes Yes No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isSecurityModified, "
+                ++ "setAttrsModified True"
+        , config = setAttrs True
+        , check = metadataEvent securityModified
+        , expected = onPlatform No Yes No
+        }
+    , metadataChange
+        { title =
+            "permission change reports isModified, setAttrsModified True"
+        , config = setAttrs True
+        , check = metadataEvent Event.isModified
+        , expected = onPlatform No No Yes
         }
     , hardLinkCreate
         { title = "creating a hard link reports isCreated"
@@ -1437,9 +1496,10 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , hardLinkCreate
-        { title = "creating a hard link reports a metadata change on the dir"
+        { title =
+            "creating a hard link reports isAttrsModified for the directory"
         , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && metadataChanged ev)
+            any (\ev -> absPath ev == watchRoot p && attrsModified ev)
         , expected = onPlatform No Yes No
         }
     , base
@@ -1802,9 +1862,9 @@ behaviors =
         base
             { setup = withFile
             , ops = \p -> changeMetadata (watchRoot p </> "file")
-            , check = \_ ->
-                any (\ev -> isNamed "file" ev && metadataChanged ev)
             }
+
+    metadataEvent f _ = any (\ev -> isNamed "file" ev && f ev)
 
     hardLinkCreate =
         base
