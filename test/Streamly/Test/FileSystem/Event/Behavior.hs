@@ -41,7 +41,7 @@ import System.Directory
     ( createDirectory, createDirectoryIfMissing, createDirectoryLink
     , doesDirectoryExist, getPermissions, listDirectory, removeDirectory
     , removeDirectoryLink, removeFile, removePathForcibly, renameDirectory
-    , renameFile, setOwnerWritable, setPermissions
+    , renameFile, renamePath, setOwnerWritable, setPermissions
 #if !defined(CABAL_OS_WINDOWS)
     , emptyPermissions, setOwnerReadable, setOwnerSearchable
 #endif
@@ -635,6 +635,15 @@ behaviors =
             any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
         , expected = onPlatform Yes No Yes
         }
+    -- On Windows the rename of a root is not reported, the watch continues.
+    , base
+        { title =
+            "A renamed watch root reports `isRootUnwatched` for the root"
+        , ops = renameRoot
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
+        , expected = onPlatform Yes No No
+        }
     , base
         { title = "root deleted and created again is watched"
         , ops = \p -> do
@@ -1118,6 +1127,19 @@ behaviors =
         , check = rootDeleted
         , expected = onPlatform No No No
         }
+    , base
+        { title =
+            "A renamed symbolic link to a directory root reports `isMoved` "
+                ++ "for the root"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (renamedRoot p)
+            createDirectoryLink (renamedRoot p) (watchRoot p)
+            settle
+        , ops = renameRoot
+        , check = rootMoved
+        , expected = onPlatform No No No
+        }
     -- Linux reports IN_DELETE_SELF when the inode is freed, an open
     -- reference delays it. FreeBSD reports it when the last link is removed.
     , base
@@ -1129,12 +1151,31 @@ behaviors =
         , check = rootDeleted
         , expected = onFreeBSD Yes (onPlatform No Yes Exception)
         }
+    -- Windows does not rename a directory that is the working directory of
+    -- a process.
+    , base
+        { title =
+            "A renamed directory root in use by a process reports `isMoved` "
+                ++ "for the root"
+        , setup = \p -> holdCwd p (watchRoot p) >> settle
+        , ops = renameRoot
+        , check = rootMoved
+        , expected = onPlatform Yes Yes Exception
+        }
     , base
         { title =
             "A deleted regular file root reports `isDeleted` for the root"
         , setup = withFileRoot
         , ops = removeFile . watchRoot
         , check = rootDeleted
+        , expected = onPlatform Yes Yes WatchException
+        }
+    , base
+        { title =
+            "A renamed regular file root reports `isMoved` for the root"
+        , setup = withFileRoot
+        , ops = renameRoot
+        , check = rootMoved
         , expected = onPlatform Yes Yes WatchException
         }
     , base
@@ -1148,6 +1189,14 @@ behaviors =
         }
     , base
         { title =
+            "A renamed open regular file root reports `isMoved` for the root"
+        , setup = \p -> withFileRoot p >> holdFile p (watchRoot p)
+        , ops = renameRoot
+        , check = rootMoved
+        , expected = onPlatform Yes Yes WatchException
+        }
+    , base
+        { title =
             "A deleted regular file root with another hard link reports "
                 ++ "`isDeleted` for the root"
         , setup = \p -> do
@@ -1156,6 +1205,17 @@ behaviors =
         , ops = removeFile . watchRoot
         , check = rootDeleted
         , expected = onPlatform No Yes WatchException
+        }
+    , base
+        { title =
+            "A renamed regular file root with another hard link reports "
+                ++ "`isMoved` for the root"
+        , setup = \p -> do
+            withFileRoot p
+            hardLink (watchRoot p) (renamedRoot p)
+        , ops = renameRoot
+        , check = rootMoved
+        , expected = onPlatform Yes Yes WatchException
         }
 #if !defined(CABAL_OS_WINDOWS)
     , base
@@ -1167,6 +1227,17 @@ behaviors =
             settle
         , ops = removeFile . watchRoot
         , check = rootDeleted
+        , expected = onPlatform Yes Yes Yes
+        }
+    , base
+        { title = "A renamed FIFO root reports `isMoved` for the root"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createNamedPipe (watchRoot p)
+                (ownerReadMode `unionFileModes` ownerWriteMode)
+            settle
+        , ops = renameRoot
+        , check = rootMoved
         , expected = onPlatform Yes Yes Yes
         }
 #endif
@@ -1373,6 +1444,19 @@ behaviors =
         }
     , base
         { title =
+            "A renamed directory root reports `isMoved` for each file in it"
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createFile (watchRoot p </> "file2")
+            settle
+        , ops = renameRoot
+        , check = \_ evs ->
+            all (\name -> any (\ev -> isNamed name ev && Event.isMoved ev) evs)
+                ["file", "file2"]
+        , expected = onPlatform No No No
+        }
+    , base
+        { title =
             "Deleting a directory in a recursive watch reports `isDeleted` "
                 ++ "for each file in it"
         , config = Event.setRecursiveMode True
@@ -1473,6 +1557,15 @@ behaviors =
 
     rootDeleted p =
         any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
+
+    -- The watch root is renamed to "moved", next to it.
+    movedRoot p = takeDirectory (watchRoot p) </> "moved"
+
+    renameRoot p = renamePath (watchRoot p) (movedRoot p)
+
+    rootMoved p =
+        let isRoot ev = absPath ev `elem` [watchRoot p, movedRoot p]
+         in any (\ev -> isRoot ev && Event.isMoved ev)
 
     -- Replace the watch root directory by a regular file.
     withFileRoot p = do
