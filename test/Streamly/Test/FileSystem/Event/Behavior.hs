@@ -1550,7 +1550,7 @@ behaviors =
         , config = dirMetadataConfig
         , steps = [(createLink, dirMetadata), (deleteLink, dirMetadata)]
         , expected =
-            onPlatform (Steps [No, No]) (Steps [Yes, Yes]) (Steps [No, No])
+            onPlatform (Steps [No, No]) (Steps [Yes, No]) (Steps [No, No])
         }
     , hardLinkSteps
         { title =
@@ -1599,7 +1599,7 @@ behaviors =
             "changing the permissions of the directory reports "
                 ++ "isAttrsModified for the directory"
         , ops = changeDirMode . watchRoot
-        , expected = onPlatform Yes Yes No
+        , expected = onPlatform Yes No No
         }
     , dirAttrsChange
         { title =
@@ -1607,6 +1607,18 @@ behaviors =
                 ++ "the directory"
         , ops = setTimes . watchRoot
         , expected = onPlatform Yes Yes No
+        }
+    , subdirAttrsChange
+        { title =
+            "changing the permissions of a subdirectory reports "
+                ++ "isAttrsModified for the subdirectory"
+        , ops = \p -> changeDirMode (watchRoot p </> "dir")
+        }
+    , subdirAttrsChange
+        { title =
+            "setting the times of a subdirectory reports isAttrsModified for "
+                ++ "the subdirectory"
+        , ops = \p -> setTimes (watchRoot p </> "dir")
         }
     -- On Linux, the kernel merges the second write into the first because the
     -- first is the last event in the queue and it has not been read. On macOS
@@ -1979,12 +1991,23 @@ behaviors =
         any (\ev -> absPath ev == watchRoot p && dirMetadataModified ev)
 
     -- The title names the Linux and macOS event, on Windows the check is
-    -- isModified. The macOS and Windows outcomes are not verified yet.
+    -- isModified.
     dirAttrsChange =
         base
             { config = dirMetadataConfig
             , check = dirMetadata
-            , expected = onPlatform No Yes No
+            , expected = onPlatform No No No
+            }
+
+    -- The title names the Linux and macOS event, on Windows the check is
+    -- isModified. The macOS and Windows outcomes are not verified yet.
+    subdirAttrsChange =
+        base
+            { config = dirMetadataConfig
+            , setup = withDir
+            , check =
+                const (any (\ev -> isNamed "dir" ev && dirMetadataModified ev))
+            , expected = onPlatform Yes Yes Yes
             }
 
     -- The file has two names, the event can report either of them.
