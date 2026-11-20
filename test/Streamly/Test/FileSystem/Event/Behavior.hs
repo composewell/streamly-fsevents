@@ -1195,6 +1195,17 @@ behaviors =
         , check = rootDeleted
         , expected = onFreeBSD Yes (onPlatform No Yes Exception)
         }
+#if defined(CABAL_OS_LINUX)
+    , base
+        { title =
+            "A deleted directory root in use by a process reports "
+                ++ "`isDeleted` for the root after the process ends"
+        , setup = \p -> holdCwd p (watchRoot p) >> settle
+        , ops = \p -> removeDirectory (watchRoot p) >> releaseHeld p
+        , check = rootDeleted
+        , expected = Yes
+        }
+#endif
     -- Windows does not rename a directory that is the working directory of
     -- a process.
     , base
@@ -1231,6 +1242,17 @@ behaviors =
         , check = rootDeleted
         , expected = onFreeBSD Yes (onPlatform No Yes WatchException)
         }
+#if defined(CABAL_OS_LINUX)
+    , base
+        { title =
+            "A deleted open regular file root reports `isDeleted` for the "
+                ++ "root after the file is closed"
+        , setup = \p -> withFileRoot p >> holdFile p (watchRoot p)
+        , ops = \p -> removeFile (watchRoot p) >> releaseHeld p
+        , check = rootDeleted
+        , expected = Yes
+        }
+#endif
     , base
         { title =
             "A renamed open regular file root reports `isMoved` for the root"
