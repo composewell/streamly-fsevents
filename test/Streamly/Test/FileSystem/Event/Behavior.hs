@@ -1153,6 +1153,37 @@ behaviors =
         , check = rootMoved
         , expected = onPlatform No No No
         }
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+    -- Without following, the watch is on the symbolic link itself.
+    , base
+        { title =
+            "A deleted symbolic link to a directory root watched in "
+                ++ "no-follow mode reports `isDeleted` for the root"
+        , config = Inotify.setFollowRootSymLinks False
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (renamedRoot p)
+            createDirectoryLink (renamedRoot p) (watchRoot p)
+            settle
+        , ops = removeDirectoryLink . watchRoot
+        , check = rootDeleted
+        , expected = Yes
+        }
+    , base
+        { title =
+            "A renamed symbolic link to a directory root watched in "
+                ++ "no-follow mode reports `isMoved` for the root"
+        , config = Inotify.setFollowRootSymLinks False
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (renamedRoot p)
+            createDirectoryLink (renamedRoot p) (watchRoot p)
+            settle
+        , ops = renameRoot
+        , check = rootMoved
+        , expected = Yes
+        }
+#endif
     -- Linux reports IN_DELETE_SELF when the inode is freed, an open
     -- reference delays it. FreeBSD reports it when the last link is removed.
     , base
