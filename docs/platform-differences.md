@@ -330,15 +330,31 @@ Directory metadata events on Linux/macOS:
 
 | Operation | Event | Linux | macOS |
 |-----------|-------|-------|-------|
+| Create a file | `isAttrsModified` for the directory | No | ? |
+| Delete a file | `isAttrsModified` for the directory | No | ? |
+| Rename a file | `isAttrsModified` for the directory | No | ? |
+| Create a subdirectory | `isAttrsModified` for the directory | No | ? |
+| Delete a subdirectory | `isAttrsModified` for the directory | No | ? |
+| Create a symbolic link | `isAttrsModified` for the directory | No | ? |
 | Create a hard link | `isAttrsModified` for the directory | No | Yes |
 | Delete a hard link | `isAttrsModified` for the directory | No | Yes |
+| Change the permissions of the directory | `isAttrsModified` for the directory | Yes | ? |
+| Set the access and modification times of the directory | `isAttrsModified` for the directory | Yes | ? |
 
-Directory metadata events on Windows are reported under `isModified`:
+Directory metadata events on Windows are reported under `isModified` enabled by
+appropriate config options:
 
-| Operation | Event | Status |
-|-----------|-------|--------|
-| Create a hard link | `isModified` for the directory | No |
-| Delete a hard link | `isModified` for the directory | No |
+| Operation | Event | Config | Status |
+|-----------|-------|--------|--------|
+| Create a file | `isModified` for the directory | `setAllEvents True` | ? |
+| Delete a file | `isModified` for the directory | `setAllEvents True` | ? |
+| Rename a file | `isModified` for the directory | `setAllEvents True` | ? |
+| Create a subdirectory | `isModified` for the directory | `setAllEvents True` | ? |
+| Delete a subdirectory | `isModified` for the directory | `setAllEvents True` | ? |
+| Create a hard link | `isModified` for the directory | `setAllEvents True` | ? |
+| Delete a hard link | `isModified` for the directory | `setAllEvents True` | ? |
+| Set the hidden attribute of the directory | `isModified` for the directory | `setAllEvents True` | ? |
+| Set the access and modification times of the directory | `isModified` for the directory | `setAllEvents True` | ? |
 
 ### Subdirectory changes
 
@@ -370,6 +386,7 @@ Linux and macOS report basic metadata changes as `isAttrsModified`.
 
 macOS reports additional metadata changes as `isSecurityModified`,
 `isFinderInfoModified` and `isXAttrsModified`.
+
 | Operation | Event |
 |-----------|-------|
 | Make a file read-only | `isSecurityModified` for the file |
