@@ -451,13 +451,18 @@ converse is not true, the modification time can be set without a write:
 | Operation | Linux | macOS | Windows |
 |-----------|-------|-------|---------|
 | Write to a file | `isModified` | `isModified` | `isModified` |
-| Set the modification time only | `isModified` | ? | ? |
-| Set the access and modification times | `isAttrsModified` | `isAttrsModified` | `isModified` |
+| Set the modification time only | `isModified`, no `isAttrsModified` | ? | ? |
+| Set the access and modification times | `isAttrsModified`, no `isModified` | `isAttrsModified`, no `isModified` | `isModified` |
 
 On Linux `utimensat` reports setting the modification time only as
 `IN_MODIFY`, the event of a write, and setting both times as `IN_ATTRIB`.
 `isModified` does not distinguish a write from setting the modification
 time only.
+
+On macOS the event of setting the times sometimes has `isModified` as
+well. This is the `isModified` of an earlier write to the file, FSEvents
+can report the flags of earlier changes to a path with a later event of the
+same path.
 
 Windows does not have a filter for content changes only. A write to a
 file changes its last write time, and its size if the write extends the
