@@ -441,7 +441,6 @@ file is closed.
 |-----------|-------|-------|-------|---------|
 | Write to an open file, before it is closed | `isModified` for the file | Yes | Usually not | No |
 | Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
-| Delete a file and write it again | `isDeleted` and `isModified` for the file | Yes | Yes | Yes |
 
 Changing the file modification time is equivalent to changing the file
 contents, one implies the other.
