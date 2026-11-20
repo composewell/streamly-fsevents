@@ -32,7 +32,7 @@ import Control.Exception
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.Function ((&))
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (group, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
@@ -238,6 +238,19 @@ writeHeldFiles :: Paths -> IO ()
 writeHeldFiles p = do
     writeHeldFilesOpen p
     readIORef (heldFiles p) >>= mapM_ hClose
+
+-- | Close the files opened by 'holdFile' and end the processes started by
+-- 'holdCwd'. The lists are emptied, a second call does nothing.
+releaseHeld :: Paths -> IO ()
+releaseHeld p = do
+    readIORef (heldFiles p) >>= mapM_ hClose
+    writeIORef (heldFiles p) []
+    readIORef (heldProcesses p) >>= mapM_ endProcess
+    writeIORef (heldProcesses p) []
+
+    where
+
+    endProcess ph = terminateProcess ph >> void (waitForProcess ph)
 
 -- | Remove the permission to list a directory, keep the permission to create
 -- a file in it.
@@ -1847,14 +1860,10 @@ runBehavior b =
                     , heldFiles = held
                     , heldProcesses = procs
                     }
-            endProcess ph = terminateProcess ph >> void (waitForProcess ph)
-            closeHeld = do
-                readIORef held >>= mapM_ hClose
-                readIORef procs >>= mapM_ endProcess
         createDirectory root
         createDirectory control
         setup b paths
-        flip finally (cleanup b paths >> closeHeld) $ do
+        flip finally (cleanup b paths >> releaseHeld paths) $ do
             reason <- skip b paths
             maybe (runWatch b paths control) (return . Skipped) reason
 
