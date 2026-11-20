@@ -60,7 +60,8 @@ import System.Process
 import System.Posix.Files
     (createNamedPipe, ownerReadMode, ownerWriteMode, unionFileModes)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import qualified System.Posix.Files as Posix (setFileMode, setFileTimesHiRes)
+import qualified System.Posix.Files as Posix
+    (createLink, setFileMode, setFileTimesHiRes)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
@@ -113,6 +114,7 @@ data Outcome =
     | WatchException -- ^ The watch raised an exception.
     | Failed String -- ^ The test could not determine the outcome.
     | Skipped String -- ^ The test does not apply in this environment.
+    | Steps [Outcome] -- ^ The outcome of each of the 'steps'.
     deriving (Eq, Show)
 
 -- | The paths used by a behavior.
@@ -142,6 +144,10 @@ data Behavior = Behavior
     -- | Run after the consumer has processed the events of 'ops'.
     , laterOps :: Paths -> IO ()
     , check :: Paths -> [Event] -> Bool
+    -- | Run after 'ops', one at a time, each followed by 'settle'. Each check
+    -- receives the events read during its step only, the outcome is
+    -- 'Steps'. 'check' is not used if there are steps.
+    , steps :: [(Paths -> IO (), Paths -> [Event] -> Bool)]
     , expected :: Outcome
     -- | The outcome depends on a race or on the OS version. It is printed but
     -- does not fail the test when it differs from 'expected'.
@@ -379,7 +385,7 @@ denySearch path =
 
 bypassTraverse _ = return ()
 
-hardLink source link = void $ readProcess "ln" [source, link] ""
+hardLink = Posix.createLink
 #endif
 
 -- | @copyFile source copy@. On macOS the copy is a clone of the source.
@@ -661,6 +667,7 @@ base =
         , ops = const (return ())
         , laterOps = const (return ())
         , check = \_ _ -> False
+        , steps = []
         , expected = Exception
         , racy = False
         }
@@ -1496,28 +1503,31 @@ behaviors =
         , expected = onPlatform No No Yes
         , racy = onDarwin
         }
-    , hardLinkCreate
-        { title = "creating a hard link reports isCreated"
-        , check = const (createdNamed "link")
-        , expected = onPlatform Yes Yes Yes
-        }
-    , hardLinkCreate
+    , hardLinkSteps
         { title =
-            "creating a hard link reports isAttrsModified for the directory"
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && attrsModified ev)
-        , expected = onPlatform No Yes No
+            "creating, then deleting a hard link reports isCreated, then "
+                ++ "isDeleted for the link"
+        , steps =
+            [ (createLink, const (createdNamed "link"))
+            , (deleteLink, \_ -> any (\ev -> isNamed "link" ev
+                && Event.isDeleted ev))
+            ]
+        , expected = Steps [Yes, Yes]
         }
-    , base
-        { title = "deleting a hard link reports isDeleted"
-        , setup = \p -> do
-            createFile (watchRoot p </> "file")
-            hardLink (watchRoot p </> "file") (watchRoot p </> "link")
-            settle
-        , ops = \p -> removeFile (watchRoot p </> "link")
-        , check = \_ ->
-            any (\ev -> isNamed "link" ev && Event.isDeleted ev)
-        , expected = onPlatform Yes Yes Yes
+    , hardLinkSteps
+        { title =
+            "creating, then deleting a hard link reports isAttrsModified for "
+                ++ "the directory"
+        , steps = [(createLink, linkDirAttrs), (deleteLink, linkDirAttrs)]
+        , expected =
+            onPlatform (Steps [No, No]) (Steps [Yes, Yes]) (Steps [No, No])
+        }
+    , hardLinkSteps
+        { title =
+            "creating, then deleting a hard link reports isAttrsModified for "
+                ++ "the file"
+        , steps = [(createLink, linkFileAttrs), (deleteLink, linkFileAttrs)]
+        , expected = Steps [No, No]
         }
     -- On Linux, the kernel merges the second write into the first because the
     -- first is the last event in the queue and it has not been read. On macOS
@@ -1880,12 +1890,18 @@ behaviors =
 
     metadataEvent f _ = any (\ev -> isNamed "file" ev && f ev)
 
-    hardLinkCreate =
-        base
-            { setup = withFile
-            , ops = \p ->
-                hardLink (watchRoot p </> "file") (watchRoot p </> "link")
-            }
+    hardLinkSteps = base {setup = withFile}
+
+    createLink p = hardLink (watchRoot p </> "file") (watchRoot p </> "link")
+
+    deleteLink p = removeFile (watchRoot p </> "link")
+
+    linkDirAttrs p = any (\ev -> absPath ev == watchRoot p && attrsModified ev)
+
+    -- The file has two names, the event can report either of them.
+    linkFileAttrs _ =
+        any (\ev -> (isNamed "file" ev || isNamed "link" ev)
+            && attrsModified ev)
 
     newDir =
         base
@@ -1938,6 +1954,7 @@ runWatch Behavior{..} paths control = do
     blocked <- newEmptyMVar
     resume <- newEmptyMVar
     result <- newEmptyMVar
+    step <- newIORef (0 :: Int)
 
     -- The control root stays in place when a behavior changes the watch
     -- root. Its stop file ends the stream in all cases.
@@ -1947,14 +1964,15 @@ runWatch Behavior{..} paths control = do
             when (isNamed "blocked" ev) $ do
                 void $ tryPutMVar blocked ()
                 readMVar resume
-            return ev
+            i <- readIORef step
+            return (i, ev)
         consumer = do
             rootPath <- Path.fromString root
             extraPaths <- mapM Path.fromString (extraRoots paths)
             controlPath <- Path.fromString control
             Event.watchWith config (rootPath :| extraPaths ++ [controlPath])
                 & Stream.mapM observe
-                & Stream.takeWhile (not . isNamed "stop")
+                & Stream.takeWhile (not . isNamed "stop" . snd)
                 & Stream.fold Fold.toList
         runOps = do
             when paused $ do
@@ -1966,7 +1984,12 @@ runWatch Behavior{..} paths control = do
             settle
             r1 <- if isLeft r then return r else tryIO (laterOps paths)
             settle
-            return r1
+            if isLeft r1 then return r1 else tryIO runSteps
+        runSteps =
+            forM_ (zip [1 ..] steps) $ \(i, (op, _)) -> do
+                writeIORef step i
+                op paths
+                settle
 
     void $ forkIO (try consumer >>= putMVar result)
     waitStarted result control started
@@ -1984,13 +2007,20 @@ runWatch Behavior{..} paths control = do
             | otherwise -> error (show e)
         Just (Right xs)
             | isLeft r1 -> Exception
-            | check paths xs -> Yes
+            | not (null steps) ->
+                Steps
+                    [ toOutcome (chk paths [ev | (j, ev) <- xs, j == i])
+                    | (i, (_, chk)) <- zip [1 ..] steps
+                    ]
+            | check paths (map snd xs) -> Yes
             | otherwise -> No
 
     where
 
     tryIO :: IO () -> IO (Either IOException ())
     tryIO = try
+
+    toOutcome b = if b then Yes else No
 
     -- The outcome does not include the exception, it is printed for the CI
     -- logs.
