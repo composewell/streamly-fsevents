@@ -698,17 +698,6 @@ Subdirectories:
 | A subdirectory of a root with only READ reports its events | No | No | Yes |
 | Without the "Bypass traverse checking" privilege, a subdirectory reports its events after its READ and SEARCH are removed | Not applicable | Not applicable | No |
 
-### Missing, out of order events
-
-TBD: move this section to robustness doc.
-
-* On macOS, when a root is deleted the deletion events of its children may be
-  missed.  In general, if a parent is deleted, applications should
-  remove all paths under it automatically.
-* Overflow can cause events to be missed.
-* On macOS events can be batched, so create and delete of the same file can be
-  one event and we do not know the order.
-
 ## FreeBSD vs Linux
 
 FreeBSD 14.5, 15.0 and later releases have an inotify API compatible with
