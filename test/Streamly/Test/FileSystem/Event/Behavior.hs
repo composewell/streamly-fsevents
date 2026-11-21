@@ -1542,16 +1542,30 @@ behaviors =
 #endif
     , base
         { title =
-            "non-recursive watch reports an event when a file in a subdir is"
-                ++ " created, written and deleted"
+            "non-recursive watch reports an event when a file is created in"
+                ++ " a subdir"
         , setup = withDir
-        , ops = \p -> do
-            let file = watchRoot p </> "dir/file"
-            createFile file
-            appendFile file "x"
-            removeFile file
+        , ops = \p -> createFile (watchRoot p </> "dir/file")
         , check = const (any notControl)
         , expected = onPlatform No No No
+        }
+    , base
+        { title =
+            "non-recursive watch reports an event when a file in a subdir is"
+                ++ " written"
+        , setup = withDirFile
+        , ops = \p -> appendFile (watchRoot p </> "dir/file") "x"
+        , check = const (any notControl)
+        , expected = onPlatform No No No
+        }
+    , base
+        { title =
+            "non-recursive watch reports an event when a file in a subdir is"
+                ++ " deleted"
+        , setup = withDirFile
+        , ops = \p -> removeFile (watchRoot p </> "dir/file")
+        , check = const (any notControl)
+        , expected = onPlatform No No Yes
         }
     -- On Linux, dir2 is a new directory when IN_MOVED_TO of dir2 is read, the
     -- watch of the renamed directory is removed then and added again on
@@ -1609,20 +1623,14 @@ behaviors =
         , config = Event.setRecursiveMode True
         , expected = onPlatform No No No
         }
-    -- On Windows the outcome is Yes on Windows Server 2025 and No on Windows
-    -- Server 2012 R2.
     , dirChange
         { title =
             "recursive watch reports isModified for a dir when a file is"
                 ++ " deleted from it"
         , config = Event.setRecursiveMode True
-        , setup = \p -> do
-            createDirectory (watchRoot p </> "dir")
-            createFile (watchRoot p </> "dir/file")
-            settle
+        , setup = withDirFile
         , ops = \p -> removeFile (watchRoot p </> "dir/file")
-        , expected = onPlatform No No No
-        , racy = onWindows
+        , expected = onPlatform No No Yes
         }
     , deletedOpenFile
         { title = "write to an open file after its deletion is reported"
@@ -1990,8 +1998,6 @@ behaviors =
 #endif
 
     where
-
-    onWindows = platformName == "Windows"
 
     onDarwin = platformName == "macOS"
 
