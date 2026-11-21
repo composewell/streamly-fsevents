@@ -412,10 +412,13 @@ Linux and macOS report basic metadata changes as `isAttrsModified`.
 
 | Operation | Event | Linux | macOS |
 |-----------|-------|-------|-------|
-| Make a file read-only | `isAttrsModified` for the file | Yes | Sometimes |
+| Make a file read-only | `isAttrsModified` for the file | Yes | No |
 | Set the access and modification times of a file | `isAttrsModified` for the file | Yes | Yes |
 | Change the permissions of a subdirectory | `isAttrsModified` for the subdirectory | Yes | No |
 | Set the access and modification times of a subdirectory | `isAttrsModified` for the subdirectory | Yes | Yes |
+
+On macOS, making a file read-only with `chmod` also reports
+`isAttrsModified` for the file in some runs.
 
 macOS reports additional metadata changes as `isSecurityModified`,
 `isFinderInfoModified` and `isXAttrsModified`.
@@ -617,6 +620,11 @@ first true predicate misses the other changes reported by the event.
   the old path for which both `isCreated` and `isMoved` are true. Events in
   a directory and its subdirectory can be coalesced into one event for which
   `isEventsLost` is true, without an overflow.
+  FSEvents can report the flags of earlier changes of a path with a later
+  event of the path, even after the consumer has read the events of the
+  earlier changes. In the test suite, a file is created, the consumer
+  reads its `isCreated` event, and the file is deleted one second later.
+  The event of the delete has `isCreated` true in most runs.
 * Windows: the documentation does not say whether identical changes are
   merged. Each event has one type. One save of a file can report several
   `isModified` events, because the write and the truncate are separate
