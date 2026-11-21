@@ -15,6 +15,11 @@
 -- A racy outcome, one that depends on a race or on the OS version, is not
 -- asserted, it is recorded from the CI logs.
 --
+-- On macOS FSEvents can report the flags of earlier changes to a path with
+-- a later event of the path. The expected outcome on macOS is Yes only for
+-- an event that the operation always reports. An event reported only in
+-- some runs is expected No, and the behavior is racy on macOS.
+--
 -- The expected outcomes were observed on Linux 6.12 and Ubuntu 24.04,
 -- macOS 26 (arm64) and Windows Server 2025. The suite is skipped on Windows
 -- older than Windows 10 and Windows Server 2016. On FreeBSD the expected
@@ -1569,16 +1574,23 @@ behaviors =
         , expected = onFreeBSD No Yes
         }
 #endif
-    -- The metadata change events are enabled. On macOS FSEvents can report
-    -- the flags of earlier changes to a path with a later event of the path,
-    -- isModified of the file created in the setup is reported with the
-    -- change in some runs.
+    -- The metadata change events are enabled. On macOS chmod reports
+    -- isSecurityModified in every run, isAttrsModified and isModified in
+    -- some runs. Whether these are the flags of the create in the setup, or
+    -- the change of an attribute by chmod, e.g. its ctime, is not known.
     , metadataChange
         { title = "making a file read-only reports isAttrsModified"
         , check = metadataEvent attrsModified
-        , expected = onPlatform Yes Yes No
+        , expected = onPlatform Yes No No
         , racy = onDarwin
         }
+#if defined(CABAL_OS_DARWIN)
+    -- Whether isAttrsModified is still reported with a longer time between
+    -- the create and the chmod.
+    , readOnlyAfter 5
+    , readOnlyAfter 15
+    , readOnlyAfter 30
+#endif
     , metadataChange
         { title = "making a file read-only reports isSecurityModified"
         , check = metadataEvent securityModified
@@ -2153,6 +2165,21 @@ behaviors =
             , setup = withFile
             , ops = \p -> makeReadOnly (watchRoot p </> "file")
             }
+
+#if defined(CABAL_OS_DARWIN)
+    readOnlyAfter seconds =
+        metadataChange
+            { title =
+                "making a file read-only " ++ show seconds
+                    ++ " s after its create reports isAttrsModified"
+            , setup = \p -> do
+                createFile (watchRoot p </> "file")
+                threadDelay (seconds * 1000000)
+            , check = metadataEvent attrsModified
+            , expected = No
+            , racy = True
+            }
+#endif
 
     setTimesChange =
         base
