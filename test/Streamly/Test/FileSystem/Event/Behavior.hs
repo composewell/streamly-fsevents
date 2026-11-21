@@ -71,12 +71,14 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified System.Posix.Files as Posix
     (createLink, createSymbolicLink, ownerModes, setFileMode
     , setFileTimesHiRes)
-import Foreign.C.Error (throwErrnoPathIfMinus1_)
+import Foreign.C.Error (throwErrnoIfMinus1_, throwErrnoPathIfMinus1_)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CLong)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (pokeByteOff)
+import GHC.IO.Handle.FD (handleToFd)
+import qualified GHC.IO.FD as FD (fdFD)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
@@ -90,7 +92,8 @@ import Foreign.Storable (peek, poke, pokeByteOff)
 import System.Exit (exitSuccess)
 import System.Process (readCreateProcess, shell)
 import System.Win32.HardLink (createHardLink)
-import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError)
+import System.Win32.Types
+    (BOOL, DWORD, HANDLE, failWith, getLastError, withHandleToHANDLE)
 import qualified System.Win32.File as Win32
 import qualified System.Win32.Time as Win32
 #endif
@@ -253,10 +256,29 @@ holdCwd p dir = do
     (cmd, args) = ("sleep", ["120"])
 #endif
 
--- | Append to the files opened by 'holdFile' and keep them open.
+#if !defined(CABAL_OS_WINDOWS)
+foreign import ccall safe "unistd.h fsync"
+    c_fsync :: CInt -> IO CInt
+#endif
+
+-- | Write the OS cache of an open file to the disk: @fsync@ on POSIX,
+-- @FlushFileBuffers@ on Windows.
+syncHandle :: Handle -> IO ()
+#if defined(CABAL_OS_WINDOWS)
+syncHandle h = withHandleToHANDLE h Win32.flushFileBuffers
+#else
+syncHandle h = do
+    fd <- handleToFd h
+    throwErrnoIfMinus1_ "fsync" (c_fsync (FD.fdFD fd))
+#endif
+
+-- | Append to the files opened by 'holdFile', write the data to the disk
+-- and keep the files open. On Windows @ReadDirectoryChangesW@ detects a
+-- write when the data is written to the disk.
 writeHeldFilesOpen :: Paths -> IO ()
 writeHeldFilesOpen p =
-    readIORef (heldFiles p) >>= mapM_ (\h -> hPutStr h "x" >> hFlush h)
+    readIORef (heldFiles p)
+        >>= mapM_ (\h -> hPutStr h "x" >> hFlush h >> syncHandle h)
 
 -- | Append to the files opened by 'holdFile' and close them. On macOS and
 -- Windows a write to a file that stays open may not be reported.
