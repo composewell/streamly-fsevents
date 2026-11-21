@@ -9,7 +9,7 @@ tables at the end list each difference as recorded by the test suite
 `FileSystem.Event.Behavior`.
 
 Related documents: Lost events and the recovery are described in
-[robustness.md](robustness.md), the limits of each platform in
+[robust-applications.md](robust-applications.md), the limits of each platform in
 [watch-limits.md](watch-limits.md).
 
 ## Architectural Differences

@@ -43,6 +43,7 @@ extra-doc-files:
     Changelog.md
     README.md
     docs/platform-differences.md
+    docs/robust-applications.md
     docs/robustness.md
     docs/watch-limits.md
 
