@@ -519,10 +519,6 @@ this is a repeated event from earlier operations.
 
 A program cannot count changes by counting events, on any platform.
 
-More than one predicate can be true for one event. A portable consumer
-must test every predicate it is interested in; a chain that stops at the
-first true predicate misses the other changes reported by the event.
-
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Write a file twice before the consumer reads the first write | One `isModified` for the file | Yes | Usually | No |
@@ -555,10 +551,9 @@ coalescing of the events of a directory and its subdirectory into
   changes.
 
 An event reports what changed, not the state of the path after the
-change. A consumer that needs the state, for example whether a path
-reported with both `isCreated` and `isDeleted` exists, calls `stat` on the
-path. The coalescing of FSEvents is described in the "Handling Events"
-section of Apple's
+change. How an application handles merged events is described in
+[robust-applications.md](robust-applications.md). The coalescing of
+FSEvents is described in the "Handling Events" section of Apple's
 [File System Events Programming Guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
 and in
 [this Stack Overflow question](https://stackoverflow.com/questions/18415285/osx-fseventstreameventflags-not-working-correctly).
