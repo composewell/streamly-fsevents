@@ -1084,9 +1084,7 @@ behaviors =
         { title = "truncating a file without a write reports isModified"
         , setup = \p -> do
             writeFile (watchRoot p </> "file") "old"
-            -- TODO: revert to settle. Checks whether isAttrsModified on macOS
-            -- is a flag of the write in the setup.
-            threadDelay 30000000
+            settle
         , ops = \p -> truncateFile (watchRoot p </> "file")
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes Yes Yes
