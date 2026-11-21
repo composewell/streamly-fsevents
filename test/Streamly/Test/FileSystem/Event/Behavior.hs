@@ -54,7 +54,8 @@ import System.Directory
     , setOwnerWritable, setPermissions
 #endif
     )
-import System.FilePath ((</>), makeRelative, takeDirectory, takeFileName)
+import System.FilePath
+    ( (</>), makeRelative, splitDirectories, takeDirectory, takeFileName)
 import System.IO
     ( Handle, IOMode(AppendMode, ReadWriteMode), hClose, hFlush, hPutStr
     , hSetFileSize, openFile)
@@ -209,6 +210,10 @@ absPath = Path.toString . Event.getAbsPath
 
 isNamed :: String -> Event -> Bool
 isNamed name ev = takeFileName (absPath ev) == name
+
+-- | Whether the event is for a path outside the control root.
+notControl :: Event -> Bool
+notControl ev = "control" `notElem` splitDirectories (absPath ev)
 
 createdNamed :: String -> [Event] -> Bool
 createdNamed name = any (\ev -> isNamed name ev && Event.isCreated ev)
@@ -1513,10 +1518,16 @@ behaviors =
         }
 #endif
     , base
-        { title = "non-recursive watch reports a file created in a subdir"
+        { title =
+            "non-recursive watch reports an event when a file in a subdir is"
+                ++ " created, written and deleted"
         , setup = withDir
-        , ops = \p -> createFile (watchRoot p </> "dir/file")
-        , check = const (createdNamed "file")
+        , ops = \p -> do
+            let file = watchRoot p </> "dir/file"
+            createFile file
+            appendFile file "x"
+            removeFile file
+        , check = const (any notControl)
         , expected = onPlatform No No No
         }
     -- On Linux, dir2 is a new directory when IN_MOVED_TO of dir2 is read, the
@@ -1589,12 +1600,6 @@ behaviors =
         , ops = \p -> removeFile (watchRoot p </> "dir/file")
         , expected = onPlatform No No No
         , racy = onWindows
-        }
-    , dirChange
-        { title =
-            "non-recursive watch reports isModified for a dir when a file"
-                ++ " is created in it"
-        , expected = onPlatform No No No
         }
     , deletedOpenFile
         { title = "write to an open file after its deletion is reported"
