@@ -1068,7 +1068,7 @@ behaviors =
             holdFile p (watchRoot p </> "file")
             writeHeldFilesOpen p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform Yes No No
+        , expected = onPlatform Yes No Yes
         , racy = onDarwin
         }
     , base
