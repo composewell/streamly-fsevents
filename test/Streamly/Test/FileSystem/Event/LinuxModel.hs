@@ -430,7 +430,7 @@ runCase base w ops1 split ops2 = do
     setupTree base (wTree w)
     roots <- mapM (Path.fromString . (base </>)) (wRoots w)
     bracket
-        (Event.openWatch (wConfig w) (NonEmpty.fromList roots))
+        (Event.openWatch (const (wConfig w)) (NonEmpty.fromList roots))
         Event.closeWatch
         go
 

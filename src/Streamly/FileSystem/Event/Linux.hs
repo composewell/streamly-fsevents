@@ -34,16 +34,25 @@
 --
 -- /Watch root:/
 --
--- * If a watch root is deleted, its watch ends with an 'isRootUnwatched'
--- event.
--- * If a watch root is renamed, its watch ends with an 'isRootUnwatched'
--- event. The kernel does not report the new path of the root.
+-- * If a watch root is deleted, it reports an 'isDeleted' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event.
+-- * If a watch root is renamed, it reports an 'isMoved' event for which
+-- 'getRelPath' returns 'Nothing', and its watch ends with an
+-- 'isRootUnwatched' event. The kernel does not report the new path of the
+-- root. The events between the two would report the old path, they are not
+-- reported.
 -- * An object created at the path of a removed root later, or renamed to it,
--- is not watched, including the root renamed back. Add the path to the watch
--- again to watch it.
+-- is not watched, including the root renamed back. Start a new watch to
+-- watch it. A root that is a file and is renamed back before its 'isMoved'
+-- event is read stays watched: the rename of any hard link of a file reports
+-- 'isMoved', the root is removed only if its path no longer refers to the
+-- file.
+-- * The rename of a parent directory of a root is not reported. The root
+-- stays watched and its events report the old path, which no longer exists.
+-- * The stream ends when none of the roots is watched any more.
 --
--- Use 'setRootPathEvents' to receive the 'isRootDeleted' and 'isRootMoved'
--- events. Objects inside a watched directory do not have these limitations. A
+-- Objects inside a watched directory do not have these limitations. A
 -- file deleted and created again in a watched directory reports 'isDeleted'
 -- and 'isCreated', and its later events are reported.
 --
@@ -51,9 +60,11 @@
 -- non-existing path.
 --
 -- /Overlapping Paths:/ A path listed more than once is watched once, its
--- events are reported once. If two different paths reach the same file or
--- directory, for example, a recursive root and a root inside it, its events
--- are reported once for each path.
+-- events are reported once. Paths that differ only in redundant separators
+-- and @.@ components, for example, @x\/\/y@ and @x\/y@, are the same path.
+-- Case is significant even in a case-insensitive directory. If two different
+-- paths reach the same file or directory, for example, a recursive root and
+-- a root inside it, its events are reported once for each path.
 --
 -- /Coalescing:/ Identical successive events may be coalesced into a single
 -- event.
@@ -99,7 +110,7 @@ module Streamly.FileSystem.Event.Linux
       Config
     , setRecursiveMode
     , setScanNewDirs
-    , setFollowSymLinks
+    , setFollowRootSymLinks
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
@@ -143,8 +154,6 @@ module Streamly.FileSystem.Event.Linux
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
-    , isRootDeleted
-    , isRootMoved
     , isRootUnmounted
 
     -- ** Item Level Metadata change

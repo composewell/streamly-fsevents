@@ -34,6 +34,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     -- ** Watch Behavior
     , setRecursiveMode
     , setScanNewDirs
+    , setFollowRootSymLinks
     , setFollowSymLinks
     , setExcludeUnlinked
     , setUnwatchMoved
@@ -79,6 +80,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)

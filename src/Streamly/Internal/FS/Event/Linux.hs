@@ -19,6 +19,7 @@ module Streamly.Internal.FS.Event.Linux
     -- ** Watch Behavior
     , setRecursiveMode
     , setScanNewDirs
+    , setFollowRootSymLinks
     , setFollowSymLinks
     , setExcludeUnlinked
     , setUnwatchMoved
@@ -64,6 +65,7 @@ module Streamly.Internal.FS.Event.Linux
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)
@@ -117,15 +119,17 @@ import Control.Concurrent.MVar
     )
 import Control.Exception
     (SomeException, bracket, finally, onException, throwIO, try)
-import Control.Monad (mapAndUnzipM, void, when)
+import Control.Monad (filterM, mapAndUnzipM, void, when)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Char (ord)
 import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
 import Data.IntSet (IntSet)
 import Data.IORef
-    (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
-import Data.List (find, isPrefixOf)
+    ( IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef
+    , writeIORef
+    )
+import Data.List (find, isPrefixOf, nubBy, partition)
 #if !(MIN_VERSION_base(4,20,0))
 import Data.List (foldl')
 #endif
@@ -137,14 +141,15 @@ import Data.Semigroup (Semigroup(..))
 import Data.Word (Word8, Word32)
 import Foreign.C.Error
     ( Errno(..), eACCES, eAGAIN, eINTR, eINVAL, eLOOP, eNOENT, eNOTDIR, ePERM
-    , eWOULDBLOCK, errnoToIOError, getErrno, throwErrno, throwErrnoIfMinus1
-    , throwErrnoIfMinus1_
+    , eRANGE, eWOULDBLOCK, errnoToIOError, getErrno, throwErrno
+    , throwErrnoIfMinus1, throwErrnoIfMinus1_
     )
 #if defined(CABAL_OS_FREEBSD)
 import Foreign.C.Error (eEXIST, eMLINK)
 #endif
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..), CSize(..), CUInt(..))
+import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek, peekByteOff, sizeOf)
 #if !defined(CABAL_OS_FREEBSD)
@@ -163,10 +168,12 @@ import System.IO.Error
     ( catchIOError, illegalOperationErrorType, isDoesNotExistError
     , mkIOError
     )
-import System.Posix.Types (CSsize(..), Fd(..))
+import System.Posix.Internals (c_fstat, sizeof_stat, st_dev, st_ino)
+import System.Posix.Types (CDev, CIno, CSsize(..), Fd(..))
 
 import Streamly.Internal.Data.Array (unsafeFreezeWithShrink)
 import Streamly.Internal.FileSystem.Path (Path)
+import Streamly.Internal.FS.Event.RootPath (isDotPath, normalizeRoot)
 
 import qualified Control.Exception as Exception
     (interruptible, mask, mask_, uninterruptibleMask_)
@@ -226,7 +233,7 @@ setFlag mask status cfg@Config{..} =
 -- immediate children of the directory.
 --
 -- A symbolic link inside the tree is not followed, whatever the value of
--- 'setFollowSymLinks'.
+-- 'setFollowRootSymLinks'.
 --
 -- /Created in the tree/: A directory created in the tree is added to the watch
 -- when its create event is processed, which is some time after the directory
@@ -243,8 +250,8 @@ setFlag mask status cfg@Config{..} =
 -- /Moved out of the tree/: A directory moved out of the tree reports
 -- 'isMovedFrom'. The directory and the subdirectories under it are removed
 -- from the watch, and each of them reports 'isRootUnwatched' under its old
--- path. Until then, the events of the moved out tree are reported under the
--- old path. The kernel queues an @IN_IGNORED@ event for each removed watch,
+-- path. The events generated in the moved out tree after the move are not
+-- reported. The kernel queues an @IN_IGNORED@ event for each removed watch,
 -- so moving out a tree of more than
 -- @\/proc\/sys\/fs\/inotify\/max_queued_events@ directories, 16384 by
 -- default, overflows the queue and reports 'isEventsLost'.
@@ -368,19 +375,29 @@ setScanNewDirs scan cfg@Config{} = cfg {scanNewDirs = scan}
 foreign import capi
     "sys/inotify.h value IN_DONT_FOLLOW" iN_DONT_FOLLOW :: Word32
 
--- | If the pathname to be watched is a symbolic link then watch the target of
--- the symbolic link instead of the symbolic link itself. Applies to the watch
+-- | If a watch root is a symbolic link then watch the target of the
+-- symbolic link instead of the symbolic link itself. Applies to the watch
 -- roots only, and only to the last component of the root path: symbolic
 -- links in the parent components are always resolved. When this is 'False',
 -- in recursive mode the directory tree of the target of a symlink is not
 -- watched.
 --
+-- A symbolic link inside a watched directory tree is never followed.
+--
 -- Note that the path location in the events is through the original symbolic
 -- link path rather than the resolved path.
 --
 -- /default: True/
+setFollowRootSymLinks :: Bool -> Config -> Config
+setFollowRootSymLinks s = setFlag iN_DONT_FOLLOW (not s)
+
+-- | Same as 'setFollowRootSymLinks'.
+--
+-- /Pre-release/
+--
+{-# DEPRECATED setFollowSymLinks "Use setFollowRootSymLinks" #-}
 setFollowSymLinks :: Bool -> Config -> Config
-setFollowSymLinks s = setFlag iN_DONT_FOLLOW (not s)
+setFollowSymLinks = setFollowRootSymLinks
 
 #if HAVE_DECL_IN_EXCL_UNLINK
 foreign import capi
@@ -464,33 +481,36 @@ setOnlyDir = setFlag iN_ONLYDIR
 foreign import capi
     "sys/inotify.h value IN_DELETE_SELF" iN_DELETE_SELF :: Word32
 
--- | Report when the watched path itself gets deleted.
+-- | Report when the watched path itself gets deleted, as an 'isDeleted'
+-- event for which 'getRelPath' returns 'Nothing'.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
--- deletion of a subdirectory is reported as 'isDeleted'.
+-- deletion of a subdirectory is reported as 'isDeleted' for its path under
+-- its parent.
 --
--- /default: False/
+-- /default: True/
 setRootDeleted :: Bool -> Config -> Config
 setRootDeleted = setFlag iN_DELETE_SELF
 
 foreign import capi
     "sys/inotify.h value IN_MOVE_SELF" iN_MOVE_SELF :: Word32
 
--- | Report when the watched root path itself gets renamed. A renamed root is
--- removed from the watch whether or not this is enabled, see 'isRootMoved'.
+-- | Report when the watched root path itself gets renamed, as an 'isMoved'
+-- event for which 'getRelPath' returns 'Nothing'. A renamed root is removed
+-- from the watch whether or not this is enabled, and 'isRootUnwatched' is
+-- reported later.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- rename of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
 --
--- /default: False/
+-- /default: True/
 setRootMoved :: Bool -> Config -> Config
 setRootMoved = setFlag iN_MOVE_SELF
 
 -- | Report when the watched root path itself gets deleted or renamed.
+-- Equivalent to setting 'setRootDeleted' and 'setRootMoved'.
 --
 -- In recursive mode, the events are reported for the watch roots only.
---
--- /default: False/
 setRootPathEvents :: Bool -> Config -> Config
 setRootPathEvents = setFlag (iN_DELETE_SELF .|. iN_MOVE_SELF)
 
@@ -635,7 +655,7 @@ setAllEvents s =
 -- | The default configuration settings are:
 --
 -- * 'setScanNewDirs' 'True'
--- * 'setFollowSymLinks' 'True'
+-- * 'setFollowRootSymLinks' 'True'
 -- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
@@ -644,6 +664,8 @@ setAllEvents s =
 --
 -- * setCreated True
 -- * setDeleted True
+-- * setRootDeleted True
+-- * setRootMoved True
 -- * setMovedFrom True
 -- * setMovedTo True
 -- * setModified True
@@ -656,6 +678,8 @@ defaultConfig =
       setExcludeUnlinked True
     $ setCreated True
     $ setDeleted True
+    $ setRootDeleted True
+    $ setRootMoved True
     $ setMovedFrom True
     $ setMovedTo True
     $ setModified True
@@ -668,8 +692,7 @@ defaultConfig =
 
 -- | The events that the kernel watch must generate in both recursive and
 -- non-recursive mode. A root that reports IN_MOVE_SELF is removed from the
--- watch if its path no longer refers to the watched object, see
--- 'unwatchGoneRoots'.
+-- watch, see 'unwatchGoneRoots'.
 --
 -- FreeBSD 15.0 and 15.1 do not generate IN_IGNORED for a deleted object, and
 -- do not remove its watch, unless the watch has IN_DELETE_SELF. The deleted
@@ -766,15 +789,44 @@ scanFlags cfg@Config{..} =
 -- Path representation for events
 -------------------------------------------------------------------------------
 
+-- | The device and inode numbers of a file.
+data FileId = FileId !CDev !CIno deriving Eq
+
+-- | The 'FileId' of the file of an fd.
+fdFileId :: CInt -> IO FileId
+fdFileId fd =
+    allocaBytes sizeof_stat $ \p -> do
+        throwErrnoIfMinus1_ "fstat" $ c_fstat fd p
+        FileId <$> st_dev p <*> st_ino p
+
+-- | A watch root. 'rootPath' is the path supplied by the user, normalized by
+-- 'normalizeRoot', 'getRoot' reports it. 'rootAbs' is the absolute path of
+-- the root: a relative 'rootPath' joined to the working directory at the time
+-- the root was added. The system calls use 'rootAbs', a later change of the
+-- working directory does not change the directory they refer to. For a root
+-- supplied as an absolute path both are the same 'Path'.
+--
+-- 'rootId' is the 'FileId' of the root when it was added, 'Nothing' if it
+-- could not be determined. The rename of a parent of the root does not
+-- generate any event, 'rootAbs' then refers to another file or to none. A
+-- directory opened via 'rootAbs' is checked against 'rootId', see
+-- 'openSubdir' and 'unwatchMovedRoots'.
+data Root = Root
+    { rootPath :: !Path
+    , rootAbs :: !Path
+    , rootId :: !(Maybe FileId)
+    }
+
 type PathRep =
-    ( Path       -- Absolute path of the watch root
+    ( Root       -- The watch root
     , Maybe Path -- Path of subdir relative to watch root
     )
 
+-- | The absolute path of a 'PathRep', for the system calls.
 {-# INLINE combinePathRep #-}
 combinePathRep :: PathRep -> Path
-combinePathRep (root, Nothing) = root
-combinePathRep (root, Just sub) = Path.join root sub
+combinePathRep (root, Nothing) = rootAbs root
+combinePathRep (root, Just sub) = Path.join (rootAbs root) sub
 
 {-# INLINE addSub #-}
 addSub :: PathRep -> Path -> PathRep
@@ -782,7 +834,7 @@ addSub (root, Nothing) sub = (root, Just sub)
 addSub (root, Just sub0) sub1 = (root, Just (Path.join sub0 sub1))
 
 {-# INLINE getRepRoot #-}
-getRepRoot :: PathRep -> Path
+getRepRoot :: PathRep -> Root
 getRepRoot = fst
 
 {-# INLINE getRepSub #-}
@@ -794,15 +846,30 @@ getRepSub = snd
 eqPath :: Path -> Path -> Bool
 eqPath p1 p2 = Path.toArray p1 == Path.toArray p2
 
+-- | Two roots are the same if both their paths are equal. The same relative
+-- path added from two different working directories gives two roots.
+eqRoot :: Root -> Root -> Bool
+eqRoot r1 r2 =
+    eqPath (rootPath r1) (rootPath r2) && eqPath (rootAbs r1) (rootAbs r2)
+
+compareRoot :: Root -> Root -> Ordering
+compareRoot r1 r2 =
+    compare (Path.toArray (rootPath r1)) (Path.toArray (rootPath r2))
+        <> compare (Path.toArray (rootAbs r1)) (Path.toArray (rootAbs r2))
+
+-- | Whether the two paths are under the same root.
+isSameRoot :: PathRep -> PathRep -> Bool
+isSameRoot p1 p2 = eqRoot (getRepRoot p1) (getRepRoot p2)
+
 eqPathRep :: PathRep -> PathRep -> Bool
 eqPathRep (r1, s1) (r2, s2) =
-    eqPath r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
+    eqRoot r1 r2 && fmap Path.toArray s1 == fmap Path.toArray s2
 
 -- | @isInSubtree dir pRep@ is 'True' if @pRep@ is the subdirectory @dir@ of a
 -- root or a path under it, via the same root.
 isInSubtree :: PathRep -> PathRep -> Bool
 isInSubtree (r1, Just s1) (r2, Just s2) =
-    eqPath r1 r2 && (b2 == b1 || (b1 ++ [sep]) `isPrefixOf` b2)
+    eqRoot r1 r2 && (b2 == b1 || (b1 ++ [sep]) `isPrefixOf` b2)
 
     where
 
@@ -824,12 +891,8 @@ isInSubtree _ _ = False
 -- * a symlink followed to a watched directory
 -- * a bind mount of a watched directory
 -- * two hard links to the same file, added as roots
--- * a root added again before its removal is complete
 data WatchPath = WatchPath
     { wpRep :: !PathRep
-    -- | 'removeRoot' was called for the root, the path reports the
-    -- events until its 'isRootUnwatched' event.
-    , wpRemoved :: !Bool
     -- | The cookie of the IN_MOVED_FROM event read for the path, if its
     -- IN_MOVED_TO or IN_MOVE_SELF event has not been read yet.
     , wpMoveCookie :: !(Maybe Word32)
@@ -842,21 +905,14 @@ data WatchPath = WatchPath
 -- | A path with the watch descriptor of its directory.
 type WdPath = (Int, PathRep)
 
--- | A path marked removed or removed from the watch, with its user watch
--- descriptor, to be reported as 'isRootUnwatched'. The watch descriptor is
--- not removed if other paths share it.
+-- | A path removed from the watch, with its watch descriptor, to be reported
+-- as 'isRootUnwatched'. The watch descriptor is not removed if other paths
+-- share it.
 type WdUnwatched = (Int, PathRep)
 
--- | The map entry of a watch descriptor. A user watch descriptor and a
--- marker watch descriptor are different watch descriptors, see
--- 'addRemovalMarker' for markers.
-data WdEntry =
-    -- | Entry for a user watch descriptor: the paths watched via it, in the
-    -- order added.
-      WdUser [WatchPath]
-    -- | Entry for a marker watch descriptor: the removed paths, to be
-    -- reported 'isRootUnwatched' when its IN_IGNORED event is read.
-    | WdMarker [WdUnwatched]
+-- | The map entry of a watch descriptor: the paths watched via it, in the
+-- order added.
+newtype WdEntry = WdUser [WatchPath]
 
 -- | Build a 'WdUser' entry with its paths evaluated. An unevaluated path
 -- would keep the old entry, its paths and their bytes alive until the entry
@@ -908,7 +964,7 @@ newtype PathKey = PathKey PathRep
 #endif
 comparePathKey :: PathKey -> PathKey -> Ordering
 comparePathKey (PathKey (r1, s1)) (PathKey (r2, s2)) =
-    compareSub s1 s2 <> compare (Path.toArray r1) (Path.toArray r2)
+    compareSub s1 s2 <> compareRoot r1 r2
 
 instance Eq PathKey where
     a == b = comparePathKey a b == EQ
@@ -917,7 +973,7 @@ instance Ord PathKey where
     compare = comparePathKey
 
 -- | The map of the watch descriptors of a watch, and the indexes derived
--- from it. Only 'insertWdUser', 'insertMarker' and 'deleteWd' change the map,
+-- from it. Only 'insertWdUser', 'markDirRoot' and 'deleteWd' change the map,
 -- they keep the indexes up to date.
 --
 -- A directory event is handled in time proportional to the number of paths
@@ -927,7 +983,7 @@ instance Ord PathKey where
 data WdMap = WdMap
     { -- | Map key is the watch descriptor.
       wmEntries :: !(IntMap WdEntry)
-      -- | The watch descriptors that have a given path, removed or not.
+      -- | The watch descriptors that have a given path.
     , wmPaths :: !(OrdMap.Map PathKey IntSet)
       -- | The watch descriptors that have a path with a cookie, see
       -- 'markMoved'.
@@ -935,10 +991,14 @@ data WdMap = WdMap
       -- | The watch descriptors that have a pending path, see
       -- 'markPending'.
     , wmPending :: !IntSet
+      -- | The watch descriptors of the roots that are directories, see
+      -- 'unwatchGoneRoots'.
+    , wmDirRoots :: !IntSet
     }
 
 emptyWdMap :: WdMap
-emptyWdMap = WdMap Map.empty OrdMap.empty IntSet.empty IntSet.empty
+emptyWdMap =
+    WdMap Map.empty OrdMap.empty IntSet.empty IntSet.empty IntSet.empty
 
 lookupWd :: Int -> WdMap -> Maybe WdEntry
 lookupWd wd = Map.lookup wd . wmEntries
@@ -951,13 +1011,13 @@ wdEntries = Map.toList . wmEntries
 allWds :: WdMap -> [Int]
 allWds = Map.keys . wmEntries
 
--- | The paths of a user watch descriptor. Empty for a marker, and for a
--- watch descriptor that is not in the map.
+-- | The paths of a watch descriptor. Empty for a watch descriptor that is not
+-- in the map.
 wdUserPaths :: Int -> WdMap -> [WatchPath]
 wdUserPaths wd m =
     case lookupWd wd m of
         Just (WdUser wps) -> wps
-        _ -> []
+        Nothing -> []
 
 -- | Remove a watch descriptor from the index entries of the given paths.
 unindexPaths ::
@@ -1003,6 +1063,7 @@ insertWdUser wd wps m =
                     $ unindexPaths wd (wdUserPaths wd m) (wmPaths m)
             , wmMoved = member (any (isJust . wpMoveCookie) wps) (wmMoved m)
             , wmPending = member (any wpPending wps) (wmPending m)
+            , wmDirRoots = wmDirRoots m
             }
 
     where
@@ -1017,13 +1078,12 @@ deleteWd wd m =
         , wmPaths = unindexPaths wd (wdUserPaths wd m) (wmPaths m)
         , wmMoved = IntSet.delete wd (wmMoved m)
         , wmPending = IntSet.delete wd (wmPending m)
+        , wmDirRoots = IntSet.delete wd (wmDirRoots m)
         }
 
--- | Add the entry of a marker watch descriptor, see 'WdMarker'.
-insertMarker :: Int -> [WdUnwatched] -> WdMap -> WdMap
-insertMarker wd paths m =
-    let m1 = deleteWd wd m
-     in m1 {wmEntries = Map.insert wd (WdMarker paths) (wmEntries m1)}
+-- | Record that the watch descriptor is of a root that is a directory.
+markDirRoot :: Int -> WdMap -> WdMap
+markDirRoot wd m = m {wmDirRoots = IntSet.insert wd (wmDirRoots m)}
 
 -- | Change the paths of the given user watch descriptors. The function
 -- returns 'Nothing' if the paths of a watch descriptor do not change.
@@ -1037,14 +1097,13 @@ adjustWds wds f m0 = foldl' step m0 wds
             Just (WdUser wps) | Just wps1 <- f wps -> insertWdUser wd wps1 m
             _ -> m
 
--- | The watch descriptors that have the given path, removed or not, in the
--- ascending order.
+-- | The watch descriptors that have the given path, in the ascending order.
 pathWds :: PathRep -> WdMap -> [Int]
 pathWds pRep =
     foldMap IntSet.toAscList . OrdMap.lookup (PathKey pRep) . wmPaths
 
 -- | The watch descriptors that have the given subdirectory of a root or a
--- path under it, removed or not, in the ascending order. See 'isInSubtree'.
+-- path under it, in the ascending order. See 'isInSubtree'.
 -- The watch descriptors of the same subdirectory path in other roots are
 -- included, the caller selects the paths with 'isInSubtree'.
 subtreeWds :: PathRep -> WdMap -> [Int]
@@ -1097,8 +1156,8 @@ data SynthEvent =
     -- | A subdirectory not added because of a permission error, reported as
     -- 'isAccessDenied'.
       SynthDenied PathRep
-    -- | A path removed without a marker, as (user watch descriptor, path),
-    -- reported as 'isRootUnwatched'. See 'addRemovalMarker'.
+    -- | A path removed from the watch, as (watch descriptor, path),
+    -- reported as 'isRootUnwatched'. See 'unwatchPaths'.
     | SynthUnwatched Int PathRep
 
 -- | The state of the fd of a watch.
@@ -1116,7 +1175,8 @@ data Event = Event
    { eventWd :: CInt
    , eventFlags :: Word32
    , eventCookie :: Word32
-   , eventRoot :: Path
+   , eventRoot :: Path -- ^ The watch root as supplied, normalized
+   , eventAbsRoot :: Path -- ^ The absolute path of the watch root
    , eventRelPath :: Maybe Path
    , eventScanned :: Bool
    }
@@ -1134,23 +1194,39 @@ data StreamItem =
       -- | The stream ends, the items after it are not reported.
     | ItemEnd
 
+-- | The part of the event stream of a watch that is not returned to the
+-- application yet, see 'readEvent'.
+data Undelivered = Undelivered
+    { -- | An event, or a failure, taken out of the stream by a read that
+      -- was interrupted by an async exception before it could return it.
+      -- The next read returns it.
+      udItem :: Maybe (Either IOException Event)
+      -- | The rest of the event stream: the events read from the fd but
+      -- not yet returned to the application, and the entries of a new
+      -- directory scan not yet returned, followed by the reads of the fd
+      -- still to be made. 'Nothing' until the first event is taken.
+    , udStream :: Maybe (Stream IO StreamItem)
+    }
+
 -- | A handle for a watch.
 --
 data Watch = Watch
     { watchConfig :: Config -- ^ The config used to open the watch
+      -- | End the event stream when no path is watched and no event is
+      -- left to report. 'True' for the watch of 'watchWith', whose roots
+      -- cannot be changed: when all of them are deleted or renamed the
+      -- watch cannot report another event.
+    , watchEndsUnwatched :: Bool
     , watchFd :: CInt -- ^ The inotify fd
       -- | Held during a system call on the fd, 'closeWatch' cannot close the
       -- fd, and the fd number cannot be reused, while the system call is in
       -- progress. The system calls made with the lock held must not block.
     , watchLock :: MVar FdState
     , watchWdMap :: IORef WdMap
-      -- | The rest of the event stream of 'eventStream': the events
-      -- read from the fd but not yet returned to the application, and the
-      -- entries of a new directory scan not yet returned, followed by the
-      -- reads of the fd still to be made. 'Nothing' until the first event
-      -- is taken. A stream that stops reading leaves the rest here, the
-      -- next stream on the watch continues from it.
-    , watchUndelivered :: MVar (Maybe (Stream IO StreamItem))
+      -- | The rest of the event stream of 'eventStream'. A stream that
+      -- stops reading leaves the rest here, the next stream on the watch
+      -- continues from it. Empty while a read is in progress.
+    , watchUndelivered :: MVar Undelivered
       -- | The synthetic events, most recent first. A thread waiting for
       -- events in the threaded RTS is woken up when one is added.
     , watchSynthEvents :: TVar [SynthEvent]
@@ -1182,12 +1258,12 @@ foreign import capi
 #endif
 
 -- | Create a 'Watch' handle. 'addRoot' can be used to add paths being
--- monitored by this watch.
+-- monitored by this watch. See 'watchEndsUnwatched' for the 'Bool'.
 --
 -- /Pre-release/
 --
-createWatch :: Config -> IO Watch
-createWatch cfg = do
+createWatch :: Bool -> Config -> IO Watch
+createWatch endsUnwatched cfg = do
     -- The fd must not be inherited by child processes. An inherited fd
     -- keeps the inotify instance and its watches alive after 'closeWatch',
     -- and counts against the max_user_instances limit.
@@ -1201,11 +1277,12 @@ createWatch cfg = do
         newMVar
             FdState {fsWatchClosed = False, fsFdOpen = True, fsFdWaiters = 0}
     emptyMapRef <- newIORef emptyWdMap
-    undeliveredRef <- newMVar Nothing
+    undeliveredRef <- newMVar (Undelivered Nothing Nothing)
     synthVar <- newTVarIO []
     return
         $ Watch
             { watchConfig = cfg
+            , watchEndsUnwatched = endsUnwatched
             , watchFd = fd
             , watchLock = lock
             , watchWdMap = emptyMapRef
@@ -1336,17 +1413,34 @@ subComponents =
 -- | Open an O_PATH fd of a subdirectory, starting from its root and without
 -- following a symbolic link in any component under the root. Raise an
 -- exception if a component is not a directory.
-openSubdir :: Path -> Path -> IO CInt
+--
+-- The root is opened by 'rootAbs'. If its 'FileId' is not 'rootId', a parent
+-- of the root was renamed, raise an exception with ENOENT, the subdirectory
+-- is not at its path under the root. The subdirectory is opened relative to
+-- the fd of the checked root, a rename after the check does not change the
+-- directory opened.
+openSubdir :: Root -> Path -> IO CInt
 openSubdir root sub = do
     fd <-
-        A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+        A.asCStringUnsafe (Path.toArray (rootAbs root)) $ \ptr ->
             throwErrnoIfMinus1 err
                 $ c_openat3 aT_FDCWD ptr (dirFlags .|. o_CLOEXEC)
-    go fd (subComponents sub)
+    same <- isRootFd fd `onException` c_close fd
+    if same
+    then go fd (subComponents sub)
+    else do
+        _ <- c_close fd
+        ioError (errnoToIOError err eNOENT Nothing Nothing)
 
     where
 
-    err = "add watch: " ++ Path.toString (Path.join root sub)
+    err = "add watch: " ++ Path.toString (Path.join (rootAbs root) sub)
+
+    isRootFd fd =
+        case rootId root of
+            Nothing -> return True
+            Just i -> (== i) <$> fdFileId fd
+
     dirFlags = o_PATH .|. o_DIRECTORY
     subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
 
@@ -1397,9 +1491,10 @@ openDirAt mode flags parent pRep =
                 throwErrnoIfMinus1 err $ c_openat3 pfd ptr subFlags
         (_, (root, Just sub))
             | mode == o_PATH -> openSubdir root sub
-            | otherwise -> bracket (openSubdir root sub) c_close (openDot pRep)
+            | otherwise ->
+                bracket (openSubdir root sub) c_close (openDot pRep)
         (_, (root, Nothing)) ->
-            A.asCStringUnsafe (Path.toArray root) $ \ptr ->
+            A.asCStringUnsafe (Path.toArray (rootAbs root)) $ \ptr ->
                 throwErrnoIfMinus1 err $ c_openat3 aT_FDCWD ptr rootFlags
 
     where
@@ -1568,7 +1663,7 @@ renamePaths from to m0 = adjustWds (subtreeWds from m0) step m0
 
     subBytes = foldMap (A.toList . Path.toArray) . getRepSub
 
-    isMoving wp = not (wpRemoved wp) && isInSubtree from (wpRep wp)
+    isMoving wp = isInSubtree from (wpRep wp)
 
     newPath wp =
         case drop (prefixLen + 1) (subBytes (wpRep wp)) of
@@ -1581,7 +1676,7 @@ renamePaths from to m0 = adjustWds (subtreeWds from m0) step m0
             let moved = map newPath (filter isMoving wps)
                 isTarget wp = any (eqPathRep (wpRep wp) . wpRep) moved
                 isReplaced wp =
-                    not (isMoving wp) && not (wpRemoved wp) && isTarget wp
+                    not (isMoving wp) && isTarget wp
              in Just
                     [ if isMoving wp then newPath wp else wp
                     | wp <- wps
@@ -1607,7 +1702,7 @@ relocatePending :: Int -> PathRep -> WdMap -> WdMap
 relocatePending wd pRep m =
     case lookupWd wd m of
         Just (WdUser wps)
-            | (q : _) <- [wpRep wp | wp <- wps, isPending wp] ->
+            | (q : _) <- [wpRep wp | wp <- wps, wpPending wp] ->
                 if eqPathRep q pRep
                 then insertWdUser wd (map clear wps) m
                 else renamePaths q pRep (clearPending wd m)
@@ -1615,7 +1710,6 @@ relocatePending wd pRep m =
 
     where
 
-    isPending wp = wpPending wp && not (wpRemoved wp)
     clear wp = wp {wpPending = False}
 
 -- Returns 'False' if the path is already being watched.
@@ -1633,11 +1727,10 @@ insertPath wd pRep m0 =
     new =
         WatchPath
             { wpRep = pRep
-            , wpRemoved = False
             , wpMoveCookie = Nothing
             , wpPending = False
             }
-    isSame wp = not (wpRemoved wp) && eqPathRep (wpRep wp) pRep
+    isSame wp = eqPathRep (wpRep wp) pRep
 
 -- | Add a watch using the given action on the inotify fd, and insert the
 -- path in the map.
@@ -1804,8 +1897,15 @@ updateWatch :: Word32 -> Watch -> Int -> PathRep -> IO Bool
 updateWatch flags wtch wd pRep =
     (== ProbeSame) <$> probeWatch flags wtch wd pRep
 
+-- | The config of the watch of a subdirectory in recursive mode.
+--
+-- IN_DELETE_SELF is not requested. The deletion of a subdirectory is reported
+-- by the watch of its parent, its own IN_DELETE_SELF event would not be
+-- reported and would use a slot of the kernel event queue for each deleted
+-- directory. On FreeBSD 'watchFlags' requests it for every watch.
 subdirConfig :: Config -> Config
-subdirConfig = setOnlyDir True . setFollowSymLinks False
+subdirConfig =
+    setOnlyDir True . setFollowRootSymLinks False . setRootDeleted False
 
 -- | Return the default value if the action fails because the subdirectory
 -- does not exist, is not a directory, or if the watch is closed.
@@ -1931,8 +2031,8 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
     --   second d in between.
     -- * mkdir d, mv d e, mv f d, where f is watched: IN_CREATE of d finds
     --   the watch descriptor of f and adds d as its second path. Until the
-    --   marker queued by IN_MOVED_TO of e, the events in f are reported
-    --   twice, under f and under d.
+    --   IN_MOVED_TO of e is handled, the events in f are reported twice,
+    --   under f and under d.
     --
     -- * mkdir d, rmdir d, mv f d: IN_CREATE of d adds d as the second path of
     --   f, nothing removes it. 'renamePaths' changes f to d and drops the
@@ -1955,7 +2055,12 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
     -- 'isAccessDenied', see 'ignoreInvalidOrInaccessible'.
     --
     (wd, subdirs) <- withAddedDir (scanFlags cfg) watch0 parent pRep
-        $ \(wd, isNew) dir ->
+        $ \(wd, isNew) dir -> do
+            case (pRep, dir) of
+                ((_, Nothing), DirOpened _) ->
+                    atomicModifyIORef' (watchWdMap watch0)
+                        $ \m -> (markDirRoot wd m, ())
+                _ -> return ()
             -- Now add the children. If we missed any creates while we were
             -- adding the parent, this will make sure they are added too.
             case dir of
@@ -1980,9 +2085,106 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
             $ addToWatchAt
                 (subdirConfig cfg) watch0 (level + 1) subParent sub
 
+foreign import ccall unsafe "unistd.h getcwd"
+    c_getcwd :: Ptr Word8 -> CSize -> IO (Ptr Word8)
+
+foreign import ccall unsafe "string.h strlen"
+    c_strlen :: Ptr Word8 -> IO CSize
+
+-- | The current working directory of the process.
+getWorkingDir :: IO Path
+getWorkingDir = go 4096
+
+    where
+
+    -- getcwd fails with ERANGE if the buffer is too small for the path.
+    go size = do
+        failed <- newIORef False
+        arr <-
+            MArray.unsafeCreateWithPtr' size $ \p -> do
+                r <- c_getcwd p (fromIntegral size)
+                if r /= nullPtr
+                then fromIntegral <$> c_strlen p
+                else do
+                    errno <- getErrno
+                    when (errno /= eRANGE) $ throwErrno "getcwd"
+                    writeIORef failed True
+                    return 0
+        tooSmall <- readIORef failed
+        if tooSmall
+        then go (size * 2)
+        else return (Path.unsafeFromArray (unsafeFreezeWithShrink arr))
+
+-- | Whether the watch follows a root that is a symbolic link.
+followsRootLink :: Config -> Bool
+followsRootLink cfg = createFlags cfg .&. iN_DONT_FOLLOW == 0
+
+-- | The 'FileId' of the file at a path, following a symbolic link in the last
+-- component if the 'Bool' is 'True'. Raise an exception if the path cannot be
+-- opened.
+pathFileId :: Bool -> Path -> IO FileId
+pathFileId follow path =
+    bracket open c_close fdFileId
+
+    where
+
+    flags = o_PATH .|. o_CLOEXEC .|. (if follow then 0 else o_NOFOLLOW)
+
+    open =
+        A.asCStringUnsafe (Path.toArray path) $ \ptr ->
+            throwErrnoIfMinus1 ("open: " ++ Path.toString path)
+                $ c_openat3 aT_FDCWD ptr flags
+
+-- | The 'Root' of a path supplied by the user, the path is normalized by
+-- 'normalizeRoot'. A relative path is resolved against the current working
+-- directory, symbolic links are not resolved.
+--
+-- 'Path.isRooted' is true for @.@, the absolute path of @.@ is the working
+-- directory. A path starting with @.\/@ is not rooted after 'normalizeRoot'.
+--
+-- 'rootId' is 'Nothing' if the path cannot be opened, adding the root then
+-- raises the exception.
+makeRoot :: Config -> Path -> IO Root
+makeRoot cfg path0 = do
+    absPath <-
+        if isDotPath path
+        then getWorkingDir
+        else if Path.isRooted path
+        then return path
+        else (`Path.join` path) <$> getWorkingDir
+    r <- try (pathFileId (followsRootLink cfg) absPath)
+    return
+        $ Root path absPath
+        $ either (\(_ :: IOError) -> Nothing) Just r
+
+    where
+
+    path = normalizeRoot path0
+
+-- | Whether 'rootAbs' still refers to the file of 'rootId'. 'True' if
+-- 'rootId' is 'Nothing', or if the path cannot be opened because of an error
+-- other than the path not existing or not being a directory, for example, a
+-- permission error.
+isRootAtPath :: Config -> Root -> IO Bool
+isRootAtPath cfg root =
+    case rootId root of
+        Nothing -> return True
+        Just i -> do
+            r <- try (pathFileId (followsRootLink cfg) (rootAbs root))
+            return $ case r of
+                Right j -> j == i
+                Left e -> not (isNotSubdirError e)
+
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
--- @watch@, with the 'Config' used to open the watch. @root@ must be an
--- absolute path.
+-- @watch@, with the 'Config' used to open the watch. A relative @root@ is
+-- relative to the working directory at the time of the call, a later change
+-- of the working directory does not affect the watch.
+--
+-- The path is normalized: redundant separators and @.@ components are
+-- removed, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. 'getRoot'
+-- reports the normalized path. A path that is already a root of the watch is
+-- not added again. Case is significant even in a case-insensitive directory,
+-- @\/tmp\/Foo@ and @\/tmp\/foo@ are two roots.
 --
 -- If the same directory is added via two different roots, for example, a
 -- recursive root and a root inside it, its events are reported once for each
@@ -1990,12 +2192,18 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
--- event. Raise an exception if the watch is closed.
+-- event. Raise an exception if the watch is closed, if @root@ does not exist,
+-- or if the process does not have read permission on @root@.
+--
+-- A @root@ that is not a directory is watched as a file, the events of the
+-- file itself are reported. On Linux this includes a special file, for
+-- example, a FIFO or a device, the file is not opened.
 --
 -- /Pre-release/
 --
 addRoot :: Watch -> Path -> IO ()
-addRoot wtch@Watch {watchConfig = cfg} root = do
+addRoot wtch@Watch {watchConfig = cfg} path = do
+    root <- makeRoot cfg path
     denied <- addToWatchAt cfg wtch 0 Nothing (root, Nothing)
     recordSynthEvents wtch (map SynthDenied denied)
 
@@ -2010,7 +2218,7 @@ addRoot wtch@Watch {watchConfig = cfg} root = do
 -- skipped because of a permission error, see 'addToWatchAt'.
 --
 -- The subdirectory is added with 'setOnlyDir' and without
--- 'setFollowSymLinks', the add fails with ENOTDIR if the path is now a file
+-- 'setFollowRootSymLinks', the add fails with ENOTDIR if the path is a file
 -- or a symbolic link. The scan does not follow symbolic links either.
 addSubdirToWatch :: Config -> Watch -> PathRep -> IO [PathRep]
 addSubdirToWatch cfg wtch pRep =
@@ -2276,62 +2484,38 @@ foreign import ccall unsafe "unistd.h pipe2"
 
 foreign import capi "fcntl.h value O_CLOEXEC" o_CLOEXEC :: CInt
 
--- | Mark the paths of the given watch descriptors that satisfy the predicate
--- as removed. The watch descriptors are in the ascending order. Returns the
--- watch descriptors whose paths are now all removed, and the removed paths of
--- the other watch descriptors, both in the ascending order of watch
--- descriptors.
-markRemoved ::
+-- | Remove the paths of the given watch descriptors that satisfy the
+-- predicate from the map. The watch descriptors are in the ascending order.
+-- Returns the watch descriptors that have no path left, and the removed
+-- paths, both in the ascending order of watch descriptors.
+removePaths ::
        [Int]
     -> (PathRep -> Bool)
     -> WdMap
     -> (WdMap, ([Int], [WdUnwatched]))
-markRemoved candidates p m0 =
-    let (m1, wds, shared) = foldl' step (m0, [], []) candidates
-     in (m1, (reverse wds, reverse shared))
+removePaths candidates p m0 =
+    let (m1, wds, removed) = foldl' step (m0, [], []) candidates
+     in (m1, (reverse wds, reverse removed))
 
     where
 
-    isRemoving wp = not (wpRemoved wp) && p (wpRep wp)
-    setRemoved wp = if isRemoving wp then wp {wpRemoved = True} else wp
-
-    step acc@(!m, wds, shared) wd =
-        let wps = wdUserPaths wd m
-            removing = filter isRemoving wps
-            wps1 = map setRemoved wps
-            shared1 = reverse [(wd, wpRep wp) | wp <- removing] ++ shared
-            m1 = insertWdUser wd wps1 m
-         in if null removing
+    step acc@(!m, wds, removed) wd =
+        let (gone, kept) = partition (p . wpRep) (wdUserPaths wd m)
+            removed1 = reverse [(wd, wpRep wp) | wp <- gone] ++ removed
+         in if null gone
             then acc
-            else if all wpRemoved wps1
-            then (m1, wd : wds, shared)
-            else (m1, wds, shared1)
-
--- | Undo 'markRemoved' for the listed paths. For each path, the first path of
--- its watch descriptor that is marked removed and equal to it is unmarked.
--- Identical paths of a watch descriptor report the same events, it does not
--- matter which one is unmarked.
-unmarkRemoved :: [WdUnwatched] -> WdMap -> WdMap
-unmarkRemoved paths m0 = foldl' step m0 paths
-
-    where
-
-    step m (wd, pRep) =
-        let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) pRep
-         in case break isMatch (wdUserPaths wd m) of
-                (xs, wp : ys) ->
-                    let wp1 = wp {wpRemoved = False}
-                     in insertWdUser wd (xs ++ wp1 : ys) m
-                _ -> m
+            else if null kept
+            then (deleteWd wd m, wd : wds, removed1)
+            else (insertWdUser wd kept m, wds, removed1)
 
 -- | Queue an IN_IGNORED event on the inotify fd by adding a watch and
--- removing it. The action is run with the watch descriptor after adding the
--- watch and before removing it. The watch descriptor is not shared with any
--- user path. The string is used in the exception messages.
+-- removing it, to wake up a thread waiting for the fd. The watch descriptor
+-- is not shared with any user path, its event is dropped. The string is used
+-- in the exception messages.
 --
--- Returns 'False' and does not run the action if the watch cannot be added,
--- see below. Throw an exception on any other failure.
-queueIgnored :: String -> CInt -> (CInt -> IO ()) -> IO Bool
+-- Returns 'False' if the watch cannot be added, see below. Throw an exception
+-- on any other failure.
+queueIgnored :: String -> CInt -> IO Bool
 #if defined(CABAL_OS_FREEBSD)
 -- FreeBSD has no @\/proc\/self\/fd@ and cannot watch a pipe. The directory
 -- @\/@ is watched instead, or @\/dev@ if that fails. With IN_MASK_CREATE the
@@ -2339,7 +2523,7 @@ queueIgnored :: String -> CInt -> (CInt -> IO ()) -> IO Bool
 -- fd, instead of returning the watch descriptor of the user path. Returns
 -- 'False' if the inotify fd already watches both, or access to both is
 -- denied.
-queueIgnored err fd action = add "/" ["/dev"]
+queueIgnored err fd = add "/" ["/dev"]
 
     where
 
@@ -2350,7 +2534,6 @@ queueIgnored err fd action = add "/" ["/dev"]
         errno <- getErrno
         case dirs of
             _ | wd /= -1 -> do
-                action wd
                 throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
                 return True
             next : rest -> add next rest
@@ -2361,14 +2544,14 @@ queueIgnored err fd action = add "/" ["/dev"]
 #else
 -- Returns 'False' if @\/proc@ is not mounted or access to it is denied.
 -- Requires a free fd for a pipe, throw an exception if not.
-queueIgnored err fd action =
+queueIgnored err fd =
     allocaArray 2 $ \fds -> do
-        -- For the marker event we need an inode that no user path can use,
+        -- For the event we need an inode that no user path can use,
         -- otherwise it may share the watch descriptor of a user watch. A temp
         -- file could be watched by the user. We use a pipe for this purpose,
         -- no path in a mounted file system reaches a pipe, and each pipe is a
-        -- new inode, so each marker gets its own watch descriptor. Closing the
-        -- pipe frees the inode, there is no file to clean up.
+        -- new inode, so it gets its own watch descriptor. Closing the pipe
+        -- frees the inode, there is no file to clean up.
         -- inotify_add_watch takes a path, we use the pipe path at
         -- @\/proc\/self\/fd@ to add to the watch.
         throwErrnoIfMinus1_ err $ c_pipe2 fds o_CLOEXEC
@@ -2381,7 +2564,6 @@ queueIgnored err fd action =
             errno <- getErrno
             if wd /= -1
             then do
-                action wd
                 throwErrnoIfMinus1_ err $ c_inotify_rm_watch fd wd
                 return True
             else if errno == eNOENT || errno == eACCES
@@ -2389,72 +2571,39 @@ queueIgnored err fd action =
             else ioError (errnoToIOError err errno Nothing Nothing)
 #endif
 
--- | Remove the given removed paths from the map. Returns the paths that were
--- still in the map.
-removeListed :: [WdUnwatched] -> WdMap -> (WdMap, [WdUnwatched])
-removeListed paths m0 =
-    let (m1, removed) = foldl' step (m0, []) paths
-     in (m1, reverse removed)
-
-    where
-
-    step (!m, acc) (wd, pRep) =
-        let isMatch wp = wpRemoved wp && eqPathRep (wpRep wp) pRep
-         in case break isMatch (wdUserPaths wd m) of
-                (xs, _ : ys) -> (update wd (xs ++ ys) m, (wd, pRep) : acc)
-                _ -> (m, acc)
-
-    update wd [] m = deleteWd wd m
-    update wd wps m = insertWdUser wd wps m
-
--- | When multiple paths are being watched through the same wd and we remove
--- only one path we cannot remove the wd but we still need to identify the
--- point in the event queue up to which we need to report the events for the
--- path being removed.
+-------------------------------------------------------------------------------
+-- IMPORTANT: Dependency on the allocation of watch descriptors
+-------------------------------------------------------------------------------
 --
--- To do that we force queue an IN_IGNORED event by creating and immediately
--- deleting a watch. All the watch descriptors of an inotify fd share one event
--- queue. When the IN_IGNORED event for this wd shows up in the inotify queue
--- we know that's the end point we were looking for.
+-- 'unwatchPaths' removes a watch descriptor from the map without waiting for
+-- its IN_IGNORED event. A watch descriptor whose watch the kernel removes, for
+-- a deleted directory, stays in the map until its IN_IGNORED event is read.
+-- Both assume that the kernel does not give the number of a removed watch to
+-- a new watch before the IN_IGNORED event of the removed watch is read. If it
+-- did, the late IN_IGNORED event would remove the entry of the new watch.
 --
--- If the marker cannot be queued, see 'queueIgnored', the paths are then
--- removed from the map at once, and the paths
--- still in the map are returned, to be reported 'isRootUnwatched' by the
--- caller. The events already queued for the paths and not yet read are not
--- reported. Returns an empty list if the marker is queued.
+-- The kernel frees the number of a removed watch when it queues the
+-- IN_IGNORED event, and allocates the numbers in a cycle, a number is reused
+-- only after about 2^31 allocations:
 --
-addRemovalMarker :: Watch -> [WdUnwatched] -> IO [WdUnwatched]
-addRemovalMarker Watch {watchFd = fd, watchWdMap = wdMapRef} paths = do
-    queued <-
-        queueIgnored err fd $ \wd ->
-            -- The marker must be in the map before its IN_IGNORED is read.
-            atomicModifyIORef' wdMapRef
-                $ \m -> (insertMarker (fromIntegral wd) paths m, ())
-    if queued
-    then return []
-    else atomicModifyIORef' wdMapRef (removeListed paths)
-
-    where
-
-    err = "unwatchPaths: marker " ++ show (map fst paths)
+-- * Linux: idr_alloc_cyclic in inotify_add_to_idr,
+--   fs/notify/inotify/inotify_user.c.
+-- * FreeBSD: sc->nextwatch++ in vn_inotify_add_watch, sys/kern/vfs_inotify.c.
+--
+-- inotify(7) does not document this.
 
 -- | Remove the paths that satisfy the predicate from the watch. The string
 -- describes the paths in the exception message. The function returns the
 -- watch descriptors that can have such paths, in the ascending order, see
 -- 'allWds' and 'subtreeWds'.
 --
--- The events already queued for the paths are reported, followed by an
--- 'isRootUnwatched' event for each path.
---
--- If the marker cannot be queued, see 'queueIgnored', a path that shares
--- the directory with another path is removed at once: the events queued for
--- it and not yet read are not reported. Returns such paths, the caller
--- reports their 'isRootUnwatched' events. See 'removeRoot'.
---
--- On Linux, removing a path that shares the directory with another path
--- requires a free fd for a pipe, throw an exception if not. The paths of the
--- shared watch descriptors are not removed in that case, the call can be
--- retried.
+-- The paths are removed from the map at once. A watch descriptor that has no
+-- path left is removed from the kernel watch. The events of the removed paths
+-- that are not handled yet are dropped, the events of a watch descriptor that
+-- is not in the map are dropped, see 'handleEvent'. This includes the
+-- IN_IGNORED event queued by inotify_rm_watch, see the IMPORTANT note above.
+-- Returns the removed paths, the caller reports their 'isRootUnwatched'
+-- events.
 --
 -- Does nothing if the watch is closed, closing the watch removes all the
 -- paths.
@@ -2468,37 +2617,12 @@ unwatchPaths
     wtch@Watch {watchFd = fd, watchWdMap = wdMapRef} desc candidates p =
     whenWatchOpen wtch [] $ do
         -- A watch descriptor can be shared by more than one path, see
-        -- 'WatchPath' for the cases.
-        --
-        -- Only when all the paths of a watch descriptor are removed we remove
-        -- the kernel watch. Otherwise, the kernel watch is still needed for
-        -- the other paths.
-        --
-        (wds, shared) <-
-            atomicModifyIORef' wdMapRef
-                (\m -> markRemoved (candidates m) p m)
-
-        -- The kernel queues an IN_IGNORED event for a removed watch. After
-        -- calling inotify_rm_watch, a path still stays in the map until an
-        -- IN_IGNORED event arrives, so that the events already queued for the
-        -- removed path, including IN_IGNORED, reports the path.
+        -- 'WatchPath' for the cases. The kernel watch is removed only when
+        -- all the paths of the watch descriptor are removed.
+        (wds, removed) <-
+            atomicModifyIORef' wdMapRef (\m -> removePaths (candidates m) p m)
         mapM_ rmWatch wds
-
-        -- If the kernel watch is still needed for the other paths, we do not
-        -- remove the watch, therefore, no IN_IGNORED event will arrive for it.
-        -- But we still need to read and report all the events queued on this
-        -- wd till this moment, for our current that is being removed. To do so
-        -- we add another watch to our inotify instance and immediately delete
-        -- that watch, this will force an IN_IGNORED event for that watch which
-        -- will arrive after all the events queued till now. By identifying the
-        -- wd of that marker watch we can issue an end-of-watch event for our
-        -- path being remove from the shared wd.
-        --
-        if null shared
-        then return []
-        else addRemovalMarker wtch shared
-                `onException` atomicModifyIORef' wdMapRef
-                    (\m -> (unmarkRemoved shared m, ()))
+        return removed
 
     where
 
@@ -2511,27 +2635,23 @@ unwatchPaths
             -- example, when the directory was deleted.
             when (errno /= eINVAL) $ throwErrno err
 
--- | Remove an absolute root path from a 'Watch', if a path was moved after
--- adding you need to provide the original path which was used to add the
--- Watch.
+-- | Remove a root path from a 'Watch'. The path must be the same as the one
+-- used to add the root, with the same case, ignoring redundant separators
+-- and @.@ components. If the root was moved after it was added, the
+-- original path must be supplied.
 --
--- The events already queued for the root are reported, followed by an
--- 'isRootUnwatched' event for each path watched under the root. A directory
--- that is also watched via another root remains watched for that root.
+-- The root is removed at once, an 'isRootUnwatched' event is reported for
+-- each path watched under the root, and no other event of the root follows
+-- it. The events of the root already read from the kernel are reported
+-- before it. The events still in the kernel queue are not reported. A
+-- directory that is also watched via another root remains watched for that
+-- root.
 --
--- On Linux, if @\/proc@ is not mounted or access to it is denied, and on
--- FreeBSD, if the watch also watches both @\/@ and @\/dev@, the directories
--- that the root shares with another root are removed for the root at once:
--- the events queued for them and not yet read are not reported for the root,
--- and their 'isRootUnwatched' events are reported before the events of the
--- next read of the fd, the events already read are reported first. A thread
--- waiting for events reports them at once in the threaded RTS, and when the
--- next event arrives in the non-threaded RTS.
---
--- On Linux, removing a root that shares a directory with another root
--- requires a free file descriptor, raise an exception if none is free. The
--- shared directories remain watched for the root in that case, the call can
--- be retried.
+-- A thread waiting for events reports the 'isRootUnwatched' events at once.
+-- In the non-threaded RTS, waking up the thread requires, on Linux, @\/proc@
+-- to be mounted and a free file descriptor, and on FreeBSD, that the watch
+-- does not watch both @\/@ and @\/dev@. If not, the events are reported when
+-- the next event arrives.
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
@@ -2540,12 +2660,51 @@ unwatchPaths
 -- /Pre-release/
 --
 removeRoot :: Watch -> Path -> IO ()
-removeRoot wtch root = do
+removeRoot wtch@Watch {watchFd = fd} root = do
     removed <-
         unwatchPaths
             wtch (show (Path.toString root)) allWds
-            (eqPath root . getRepRoot)
+            (eqPath (normalizeRoot root) . rootPath . getRepRoot)
     recordSynthEvents wtch (map (uncurry SynthUnwatched) removed)
+    -- In the threaded RTS the waiting thread also waits for the recorded
+    -- events, see 'readEvents'.
+    when (not rtsSupportsBoundThreads && not (null removed))
+        $ whenWatchOpen wtch ()
+        $ void (queueIgnored "removeRoot" fd) `catchIOError` \_ -> return ()
+
+-- | The roots of a watch whose path no longer refers to the directory or file
+-- watched via the root, as supplied to 'addRoot'. A root becomes stale when
+-- a parent directory is renamed, the rename does not generate any event.
+-- The root is still watched under its old path.
+--
+-- A root is stale if its path does not exist, or refers to another file,
+-- compared by the device and inode numbers recorded when the root was added.
+-- A root whose path cannot be opened because of another error, for example,
+-- a permission error, is not stale.
+--
+-- The watch is not changed. To watch the file now at the path, call
+-- 'removeRoot' and then 'addRoot' with the path. The result can be out of
+-- date when the call returns, a parent can be renamed after the check.
+--
+-- Can be called from any thread, including while another thread reads the
+-- events of the watch using 'eventStream'. Returns an empty list if the watch
+-- is closed.
+--
+-- /Pre-release/
+--
+staleRoots :: Watch -> IO [Path]
+staleRoots wtch@Watch {watchConfig = cfg} = do
+    closed <- isWatchClosed wtch
+    if closed
+    then return []
+    else do
+        m <- readIORef (watchWdMap wtch)
+        let roots =
+                nubBy eqRoot
+                    [ getRepRoot (wpRep wp)
+                    | (_, WdUser wps) <- wdEntries m, wp <- wps
+                    ]
+        map rootPath <$> filterM (fmap not . isRootAtPath cfg) roots
 
 -- | Close the fd of a watch. closeFdWith wakes up the threads waiting for
 -- the fd to become readable, in the threaded RTS. The kernel releases the fd
@@ -2584,13 +2743,27 @@ closeWatch Watch {watchFd = fd, watchLock = lock} =
         else do
             -- The waiting threads find the watch closed and do not read the
             -- event.
-            void (queueIgnored "closeWatch" fd (\_ -> return ()))
+            void (queueIgnored "closeWatch" fd)
                 `catchIOError` \_ -> return ()
             return st {fsWatchClosed = True}
 
--- | Given a 'Config' and list of @paths@ ("/" separated byte arrays) start
--- monitoring the paths for file system events. Returns a 'Watch' handle which
--- can then be used to read the event stream or to close the watch.
+-- | Open a watch on the paths with the given 'Config', see
+-- 'watchEndsUnwatched' for the 'Bool'.
+openWatchWith :: Bool -> Config -> NonEmpty Path -> IO Watch
+openWatchWith endsUnwatched cfg paths =
+    -- The handle is not returned to the caller if adding a path fails, the
+    -- caller cannot close it. 'mask' ensures that an async exception cannot
+    -- arrive between creating the watch and installing the handler.
+    Exception.mask $ \restore -> do
+        w <- createWatch endsUnwatched cfg
+        restore (mapM_ (addRoot w) (NonEmpty.toList paths))
+            `onException` closeWatch w
+        return w
+
+-- | Start monitoring the @paths@ ("/" separated byte arrays) for file system
+-- events, with the supplied modifications applied to the 'defaultConfig'.
+-- Returns a 'Watch' handle which can then be used to read the event stream
+-- or to close the watch.
 --
 -- The 'Config' is kept in the 'Watch', 'readEvent', 'eventStream' and
 -- 'addRoot' use it.
@@ -2599,16 +2772,8 @@ closeWatch Watch {watchFd = fd, watchLock = lock} =
 --
 -- /Pre-release/
 --
-openWatch :: Config -> NonEmpty Path -> IO Watch
-openWatch cfg paths =
-    -- The handle is not returned to the caller if adding a path fails, the
-    -- caller cannot close it. 'mask' ensures that an async exception cannot
-    -- arrive between creating the watch and installing the handler.
-    Exception.mask $ \restore -> do
-        w <- createWatch cfg
-        restore (mapM_ (addRoot w) (NonEmpty.toList paths))
-            `onException` closeWatch w
-        return w
+openWatch :: (Config -> Config) -> NonEmpty Path -> IO Watch
+openWatch f = openWatchWith False (f defaultConfig)
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle
@@ -2640,42 +2805,99 @@ foreign import capi
 accessDeniedFlag :: Word32
 accessDeniedFlag = 0x00100000
 
+#if !defined(CABAL_OS_FREEBSD)
+foreign import ccall unsafe "streamly_fsevents_is_mount_root"
+    c_isMountRoot :: CString -> CInt -> IO CInt
+#endif
+
+-- | Whether the path of a root is the root of a mount now, following a
+-- symbolic link if the watch follows a root that is a symbolic link. 'False'
+-- if the path does not exist, or if it cannot be determined, on Linux before
+-- 5.8 and on FreeBSD.
+isMountRoot :: Config -> PathRep -> IO Bool
+#if defined(CABAL_OS_FREEBSD)
+isMountRoot _ _ = return False
+#else
+isMountRoot cfg pRep =
+    A.asCStringUnsafe (Path.toArray (combinePathRep pRep)) $ \ptr ->
+        (== 1) <$> c_isMountRoot ptr (if followsRootLink cfg then 1 else 0)
+#endif
+
 -- | Whether the path of a root still refers to the object watched via its
 -- watch descriptor. The flags of the watch are set to 'watchFlags'.
 isRootAt :: Config -> Watch -> WdPath -> IO Bool
 isRootAt cfg wtch (wd, pRep) =
     ignoreInvalid wtch False $ updateWatch (watchFlags cfg) wtch wd pRep
 
--- | Remove the roots whose path no longer refers to the watched object, and
--- the paths under them. Such a root was renamed, deleted or replaced. Its
--- events would report the old path, which does not exist or refers to another
--- object, and the kernel does not report the new path of a root.
+-- | Remove the renamed roots of a watch descriptor that reported
+-- IN_MOVE_SELF, and the paths under them. The kernel does not report the new
+-- path of a root, the events after the rename would report the old path,
+-- which does not exist or refers to another object. The events read after
+-- the IN_MOVE_SELF are dropped, see 'unwatchPaths'.
 --
--- Called with the roots of a watch descriptor that reported IN_MOVE_SELF. A
--- root renamed back before the check stays watched. Two hard links
--- watched as roots share the watch descriptor, the rename of one link reports
--- IN_MOVE_SELF for both, only the renamed one is removed.
+-- A directory has one name, IN_MOVE_SELF means that its root was renamed,
+-- the roots of a directory are removed. A root renamed back before the
+-- event is read is removed too.
+--
+-- A bind mount gives a directory a second path. The root of a mount cannot
+-- be renamed, rename(2) fails with EBUSY, its IN_MOVE_SELF is for a rename at
+-- the other path. A root whose path is the root of a mount when the event is
+-- read is removed only if its path no longer refers to the directory. If it
+-- cannot be determined whether the path is the root of a mount, see
+-- 'isMountRoot', the root is removed.
+--
+-- A file can have more than one name, the rename of any hard link reports
+-- IN_MOVE_SELF. Only the roots whose path no longer refers to the file are
+-- removed. A root renamed back before the check stays watched.
 --
 -- The roots are matched by their paths, if a root that is kept has the
--- same path, the paths are kept. Returns the paths removed without a marker,
--- see 'unwatchPaths'.
+-- same path, the paths are kept. Returns the roots removed, they report the
+-- IN_MOVE_SELF event, and the removed paths, see
+-- 'unwatchPaths'.
 unwatchGoneRoots ::
-    Config -> Watch -> [WdPath] -> IO [WdUnwatched]
-unwatchGoneRoots cfg wtch roots = do
-    results <- mapM (\root -> (,) (snd root) <$> isRootAt cfg wtch root) roots
+    Config -> Watch -> Int -> [PathRep] -> IO ([PathRep], [WdUnwatched])
+unwatchGoneRoots cfg wtch wd roots = do
+    m <- readIORef (watchWdMap wtch)
+    let isDirRoot = IntSet.member wd (wmDirRoots m)
+        isAt root = do
+            isMount <- if isDirRoot then isMountRoot cfg root else return True
+            if isMount
+            then isRootAt cfg wtch (wd, root)
+            else return False
+    results <- mapM (\root -> (,) root <$> isAt root) roots
     let kept = [root | (root, True) <- results]
         gone = [root | (root, False) <- results]
-        isGone p = any (isUnder p) gone && not (any (isUnder p) kept)
+        isGone p = any (isSameRoot p) gone && not (any (isSameRoot p) kept)
     if null gone
-    then return []
-    else unwatchPaths wtch "unwatchGoneRoots" allWds isGone
+    then return ([], [])
+    else
+        (,) (filter isGone gone)
+            <$> unwatchPaths wtch "unwatchGoneRoots" allWds isGone
 
-    where
+-- | Remove the roots of the given paths whose 'rootAbs' no longer refers to
+-- the root, and the paths under them. The rename of a parent of a root does
+-- not generate any event. The check is made before a directory under the
+-- root is added. Returns the paths whose root is kept, and the removed paths,
+-- see 'unwatchPaths'.
+--
+-- A parent renamed after the check is detected by 'openSubdir', the
+-- directory is not added. The root is removed on the next check.
+unwatchMovedRoots ::
+    Config -> Watch -> [PathRep] -> IO ([PathRep], [WdUnwatched])
+unwatchMovedRoots cfg wtch paths = do
+    gone <-
+        filterM (fmap not . isRootAtPath cfg)
+            $ nubBy eqRoot (map getRepRoot paths)
+    let isGone p = any (eqRoot (getRepRoot p)) gone
+    if null gone
+    then return (paths, [])
+    else
+        (,) (filter (not . isGone) paths)
+            <$> unwatchPaths wtch "unwatchMovedRoots" allWds isGone
 
-    isUnder p root = eqPath (getRepRoot p) (getRepRoot root)
-
--- | Remove a directory and the tree under it from the watch. Returns the
--- paths removed without a marker, see 'unwatchPaths'.
+-- | Remove a directory and the tree under it from the watch. The directory
+-- is no longer at its path, the events read after this are dropped. Returns
+-- the removed paths, see 'unwatchPaths'.
 unwatchSubtree :: Watch -> PathRep -> IO [WdUnwatched]
 unwatchSubtree wtch pRep =
     unwatchPaths wtch
@@ -2770,7 +2992,7 @@ markMoved cookie paths m0 =
     where
 
     isSource wp =
-        not (wpRemoved wp) && any (eqPathRep (wpRep wp)) paths
+        any (eqPathRep (wpRep wp)) paths
 
     step wps
         | any isSource wps =
@@ -2794,7 +3016,7 @@ takeMoved cookie m =
 
     where
 
-    isMatch wp = not (wpRemoved wp) && wpMoveCookie wp == Just cookie
+    isMatch wp = wpMoveCookie wp == Just cookie
 
 -- | Add a directory that arrived at the path @to@ by a move, and return all
 -- the entries under it if they are reported, see 'reportsScan', whether the
@@ -2816,10 +3038,7 @@ addMovedDir cfg wtch@Watch {watchWdMap = wdMapRef} to = do
 
     where
 
-    isStale wp =
-        not (wpRemoved wp)
-            && isJust (wpMoveCookie wp)
-            && eqPathRep (wpRep wp) to
+    isStale wp = isJust (wpMoveCookie wp) && eqPathRep (wpRep wp) to
 
     hasStale m wd = any isStale (wdUserPaths wd m)
 
@@ -2852,7 +3071,7 @@ markPending wd pRep = adjustWds [wd] (Just . map step)
     where
 
     step wp =
-        if not (wpRemoved wp) && eqPathRep (wpRep wp) pRep
+        if eqPathRep (wpRep wp) pRep
         then wp {wpPending = True}
         else wp
 
@@ -2866,10 +3085,7 @@ takeNamedPending paths m =
 
     where
 
-    isNamed wp =
-        wpPending wp
-            && not (wpRemoved wp)
-            && any (eqPathRep (wpRep wp)) paths
+    isNamed wp = wpPending wp && any (eqPathRep (wpRep wp)) paths
     found =
         [ (wd, wpRep wp)
         | wd <- IntSet.toAscList (wmPending m)
@@ -2881,7 +3097,7 @@ takeNamedPending paths m =
 -- the NOTE above 'clearMoved'. Returns all the entries under the new path if
 -- they are reported, see 'reportsScan', whether the watch is kept or not. A
 -- new path that does not exist is pending, see the NOTE above 'markPending'.
--- Also returns the paths removed without a marker, see 'unwatchPaths'.
+-- Also returns the removed paths, see 'unwatchPaths'.
 renameDir ::
        Config
     -> Watch
@@ -2951,8 +3167,8 @@ renameDir cfg wtch@Watch {watchWdMap = wdMapRef} (wd, from) to = do
 -- their roots, such a pair is a rename between two roots of the watch, the
 -- directory stays watched. The remaining new paths are moved in, and the
 -- remaining paths moved out are removed. Returns the entries found by the
--- renames and in the directories moved in, and the paths removed without a
--- marker, see 'unwatchPaths'.
+-- renames and in the directories moved in, and the removed paths, see
+-- 'unwatchPaths'.
 movedInDir ::
        Config
     -> Watch
@@ -2961,8 +3177,7 @@ movedInDir ::
     -> IO ([WdUnwatched], Stream IO ScanItem)
 movedInDir cfg wtch@Watch {watchWdMap = wdMapRef} cookie paths = do
     froms <- atomicModifyIORef' wdMapRef (takeMoved cookie)
-    let isSameRoot p1 p2 = eqPath (getRepRoot p1) (getRepRoot p2)
-        sameRootFrom to = find (isSameRoot to . snd) froms
+    let sameRootFrom to = find (isSameRoot to . snd) froms
         movedOut = filter (\f -> not (any (isSameRoot (snd f)) paths)) froms
         movedIn = filter (isNothing . sameRootFrom) paths
         acrossRoots = zip movedIn movedOut
@@ -2985,7 +3200,8 @@ mkSynth wd flags (root, sub) =
         { eventWd = wd
         , eventFlags = flags
         , eventCookie = 0
-        , eventRoot = root
+        , eventRoot = rootPath root
+        , eventAbsRoot = rootAbs root
         , eventRelPath = sub
         , eventScanned = False
         }
@@ -3184,7 +3400,7 @@ withEffects evs action = do
 -- is kept and its cookie is removed: the IN_MOVED_FROM was for another
 -- directory at the path, for example, in @mkdir d; mv d out; mkdir d@ read
 -- after all three, the create event watches the second @d@. The other paths
--- are removed as moved out. Returns the paths removed without a marker as
+-- are removed as moved out. Returns the removed paths as
 -- 'isRootUnwatched' events, see 'unwatchPaths'.
 unwatchMovedOut :: Watch -> IO (Stream IO StreamItem)
 unwatchMovedOut wtch@Watch {watchConfig = cfg, watchWdMap = wdMapRef} =
@@ -3205,7 +3421,7 @@ unwatchMovedOut wtch@Watch {watchConfig = cfg, watchWdMap = wdMapRef} =
 
     where
 
-    isMovedPath wp = not (wpRemoved wp) && isJust (wpMoveCookie wp)
+    isMovedPath wp = isJust (wpMoveCookie wp)
 
     unwatchGone (wd, pRep) = do
         r <- probeWatch (watchFlags (subdirConfig cfg)) wtch wd pRep
@@ -3229,10 +3445,8 @@ isDrained n = n + 16 + 256 <= readBufSize
 -- An event is reported once for each path of its watch descriptor. An
 -- IN_IGNORED event removes its watch descriptor from the map, the event
 -- itself still reports the root. Events for a watch descriptor that is not in
--- the map are dropped.
---
--- The IN_IGNORED event of a marker reports 'isRootUnwatched' for the paths
--- listed in the marker, and removes the paths and the marker from the map.
+-- the map are dropped, the watch descriptors removed by 'unwatchPaths' among
+-- them.
 --
 -- An IN_Q_OVERFLOW event reports 'isEventsLost' for each root, closes the
 -- watch and ends the stream.
@@ -3249,7 +3463,8 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                 { eventWd = wd
                 , eventFlags = eflags
                 , eventCookie = cookie
-                , eventRoot = root
+                , eventRoot = rootPath root
+                , eventAbsRoot = rootAbs root
                 , eventRelPath = rel
                 , eventScanned = False
                 }
@@ -3273,8 +3488,7 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
     -- the overflow event are not reported, see "Overflow: the stream ends" in
     -- dev/design.linux.md.
     -- The roots are the paths without a sub path; a path with a sub path is a
-    -- subdirectory added under a recursive root. Marker entries are skipped,
-    -- they are not watched paths.
+    -- subdirectory added under a recursive root.
     if eflags .&. iN_Q_OVERFLOW /= 0
     then do
         let lost =
@@ -3288,32 +3502,19 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
     else
         case lookupWd (fromIntegral ewd) wdm of
             Nothing -> return S.nil
-            Just (WdMarker paths)
-                | isIgnored -> do
-                    removed <-
-                        atomicModifyIORef' wdMapRef
-                            $ removeListed paths . deleteWd (fromIntegral ewd)
-                    return
-                        $ events
-                            [ mkEvent (fromIntegral wd) pRep
-                            | (wd, pRep) <- removed
-                            ]
-                | otherwise -> return S.nil
             Just (WdUser wps) -> do
                 let addName wp =
                         wp {wpRep = maybe id (flip addSub) mpth (wpRep wp)}
                     wps1 = map addName wps
-                    -- Do not add or remove the directories of a removed
-                    -- root.
-                    live = map wpRep $ filter (not . wpRemoved) wps1
+                    live = map wpRep wps1
                     -- Check for "ISDIR" first because it is less likely
                     isDirEv = eflags .&. iN_ISDIR /= 0
                     isDirCreated = isDirEv && eflags .&. iN_CREATE /= 0
                     isDirMovedIn = isDirEv && eflags .&. iN_MOVED_TO /= 0
                     isDirMovedOut = isDirEv && eflags .&. iN_MOVED_FROM /= 0
                     isDirDeleted = isDirEv && eflags .&. iN_DELETE /= 0
-                    -- The paths removed without a marker are reported
-                    -- after the event and its scan.
+                    -- The removed paths are reported after the event and its
+                    -- scan.
                     effectIf c action = if c then action else return []
                     unwatchAll = fmap concat . mapM (unwatchSubtree wtch)
                     -- The parent of a subdirectory reports its deletion and
@@ -3327,8 +3528,13 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                         (recursiveEvents .|. rootEvents)
                             .&. complement (createFlags cfg)
                     isUnrequested = eflags .&. unrequested /= 0
+                    isMoveSelf = eflags .&. iN_MOVE_SELF /= 0
+                    isRootPath wp = isNothing (getRepSub (wpRep wp))
+                    -- The IN_MOVE_SELF of a root is reported only if the root
+                    -- is removed, see 'unwatchGoneRoots'.
                     isReported wp =
-                        not isSelfEvent || isNothing (getRepSub (wpRep wp))
+                        not isMoveSelf
+                            && (not isSelfEvent || isRootPath wp)
                     reported =
                         [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
                 withEffects (if isUnrequested then [] else reported) $ do
@@ -3354,29 +3560,38 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                             $ unwatchAll
                                 [ wpRep wp
                                 | wp <- wps
-                                , not (wpRemoved wp)
                                 , isJust (wpMoveCookie wp)
                                 ]
-                    removedRoots <-
-                        effectIf (eflags .&. iN_MOVE_SELF /= 0)
-                            $ unwatchGoneRoots cfg wtch
-                                [ (fromIntegral ewd, wpRep wp)
-                                | wp <- wps
-                                , not (wpRemoved wp)
-                                , isNothing (getRepSub (wpRep wp))
-                                ]
+                    (movedRoots, removedRoots) <-
+                        if isMoveSelf
+                        then
+                            unwatchGoneRoots cfg wtch (fromIntegral ewd)
+                                [wpRep wp | wp <- wps, isRootPath wp]
+                        else return ([], [])
+                    let moved =
+                            if isUnrequested
+                            then []
+                            else map (mkEvent ewd) movedRoots
                     -- The watch of a new directory is added before its
                     -- event is delivered. The watches of the tree under it
                     -- are added when the stream of the scan is read, before
                     -- the next event is parsed. If the entries are not
                     -- reported, all the watches are added now.
+                    -- A directory is not added under a root whose parent
+                    -- was renamed, see 'unwatchMovedRoots'.
+                    let isDirAdded =
+                            watchRec cfg && (isDirCreated || isDirMovedIn)
+                    (kept, removedGone) <-
+                        if isDirAdded
+                        then unwatchMovedRoots cfg wtch live
+                        else return (live, [])
                     (removedOut, scan) <-
                         if watchRec cfg && isDirCreated
                         then
                             (,) [] . concatStreams
-                                <$> mapM (addDirWithScan cfg wtch) live
+                                <$> mapM (addDirWithScan cfg wtch) kept
                         else if watchRec cfg && isDirMovedIn
-                        then movedInDir cfg wtch cookie live
+                        then movedInDir cfg wtch cookie kept
                         else return ([], S.nil)
                     -- The denied subdirectories and the failures are
                     -- reported even if the entries are not.
@@ -3392,9 +3607,10 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                         $ \m -> (deleteWd (fromIntegral ewd) m, ())
                     let removed =
                             removedPending ++ removedMoved ++ removedRoots
-                                ++ removedOut
+                                ++ removedGone ++ removedOut
                     return
-                        $ fmap scanItem scanned
+                        $ events moved
+                        `S.append` fmap scanItem scanned
                         `S.append` events (map mkUnwatched removed)
 
     where
@@ -3418,7 +3634,8 @@ readBufSize = 32 * 1024
 -- | Read the events available on the fd of a watch, and take the events
 -- recorded by 'recordSynthEvents'. The array is empty if no event is
 -- available on the fd. If there are none of either, returns an action that
--- waits for an event. Returns 'Nothing' if the watch is closed.
+-- waits for an event. Returns 'Nothing' if the watch is closed, or if there
+-- are none of either, no path is watched and 'watchEndsUnwatched' is set.
 --
 -- The wait is registered, or counted, before the action is returned. The
 -- caller must mask async exceptions and must run the action. The action can
@@ -3435,7 +3652,15 @@ readEvents
             synth <- takeSynthEvents wtch
             if not (null arrs) || not (null synth)
             then return (st, Just $ Right (synth, arrs))
-            else fmap (Just . Left) <$> register st
+            else do
+                -- A watch descriptor stays in the map until its
+                -- IN_IGNORED event is handled or its paths are removed.
+                -- With an empty map and an empty queue no event of a
+                -- watched path can arrive.
+                m <- readIORef (watchWdMap wtch)
+                if watchEndsUnwatched wtch && Map.null (wmEntries m)
+                then return (st, Nothing)
+                else fmap (Just . Left) <$> register st
 
     where
 
@@ -3531,10 +3756,17 @@ readEvents
 -- and the 'isScanEvent' events of its entries. When the watch is closed,
 -- every reader gets 'Nothing'.
 --
--- A read that is interrupted by an async exception while it waits for an
--- event, for example, by a timeout, does not lose any event. The next read
--- returns the first event not yet read. The scan of a new directory
--- continues in the next read, see 'setScanNewDirs'.
+-- A read that is interrupted by an async exception, for example, by a
+-- timeout, does not take an event out of the watch. The next read returns
+-- the first event not yet read. The scan of a new directory continues in the
+-- next read, see 'setScanNewDirs'.
+--
+-- The read returns the event with the masking state of the caller. If async
+-- exceptions are not masked, an exception that arrives after the read has
+-- taken the event and before the caller records it loses the event. To avoid
+-- that, call 'readEvent' and the code that records the event with async
+-- exceptions masked. The read can still be interrupted: while it waits for an
+-- event, and before it takes an event that is available.
 --
 -- If the read raises an 'IOException', for example, when a directory
 -- cannot be added because the process has reached the
@@ -3548,8 +3780,9 @@ readEvent :: Watch -> IO (Maybe Event)
 readEvent
     wtch@Watch {watchConfig = cfg, watchUndelivered = undeliveredRef} =
     Exception.mask_ $ do
-        r <- takeMVar undeliveredRef
-        next (fromMaybe items r)
+        Undelivered {..} <- takeMVar undeliveredRef
+        let stream = fromMaybe items udStream
+        maybe (next stream) (`deliver` stream) udItem
 
     where
 
@@ -3594,7 +3827,7 @@ readEvent
 
     items = S.concatMap readOne fdReads
 
-    save = putMVar undeliveredRef . Just
+    save item rest = putMVar undeliveredRef (Undelivered item (Just rest))
 
     -- The rest of the stream is not a pure value, it refers to the open
     -- directories of a scan in progress, and running a part of it changes
@@ -3612,6 +3845,9 @@ readEvent
     -- * An 'IOException' is returned as an item, by 'handleEvent' and by the
     --   stream of a scan, and is raised after the rest of the stream is
     --   saved.
+    -- * An async exception that arrived during the step is raised before
+    --   the event of the step is returned, and the event is saved, see
+    --   'deliver'.
     --
     -- Any other exception leaves the stream in an unknown state. It is
     -- saved in place of the stream, every later read raises it again.
@@ -3628,21 +3864,33 @@ readEvent
                 --
                 -- The watch cannot be recovered after such an exception,
                 -- it has to be closed and opened again.
-                save (S.concatEffect (throwIO e))
+                save Nothing (S.concatEffect (throwIO e))
                 throwIO e
-            Right Nothing -> save S.nil >> return Nothing
-            -- An async exception that arrived during the step is raised
-            -- when 'mask_' ends, and the event is lost. See
-            -- dev/design-issues.md.
-            Right (Just (ItemEvent ev, rest)) ->
-                save rest >> return (Just ev)
-            -- Similarly, the async exception replaces the 'IOException'
-            -- when 'mask_' ends, and the failure is not reported.
-            Right (Just (ItemFailed e, rest)) -> save rest >> ioError e
-            Right (Just (ItemEnd, _)) -> save S.nil >> return Nothing
+            Right Nothing -> save Nothing S.nil >> return Nothing
+            Right (Just (ItemEvent ev, rest)) -> deliver (Right ev) rest
+            Right (Just (ItemFailed e, rest)) -> deliver (Left e) rest
+            Right (Just (ItemEnd, _)) -> save Nothing S.nil >> return Nothing
             Right (Just (ItemWait wait, rest)) -> do
-                wait `onException` save rest
+                wait `onException` save Nothing rest
                 next rest
+
+    -- An async exception that arrived during the step is pending. Raise it
+    -- now and save the item along with the rest of the stream, the next
+    -- read returns the item. Otherwise the exception would be raised when
+    -- 'mask_' ends, after the item is taken out, and the event, or the
+    -- 'IOException', would be lost. If the caller has masked async
+    -- exceptions, this is the only point other than the wait where the read
+    -- can be interrupted.
+    --
+    -- The item is not put back in the stream with a cons: the rest of the
+    -- stream would run through one more layer after each interrupted read.
+    deliver item rest = do
+        r <- try (Exception.interruptible (return ()))
+        case r of
+            Left (e :: SomeException) -> save (Just item) rest >> throwIO e
+            Right () -> do
+                save Nothing rest
+                either ioError (return . Just) item
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
 -- stream does not close the watch, use 'closeWatch' to close it. The stream
@@ -3678,23 +3926,25 @@ eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 --
 -- @
 -- watchWith
---      ('setFollowSymLinks' True . 'setExcludeUnlinked' False)
+--      ('setFollowRootSymLinks' True . 'setExcludeUnlinked' False)
 --      [Path.fromString "dir"]
 -- @
 --
 -- Each run of the stream opens a new watch and closes it when the stream
--- ends. The handle of the watch is not exposed, so the roots of the watch
--- are the given paths for as long as the stream runs. To add or remove
--- roots while reading the events, open the watch using 'openWatch', read it
--- using 'eventStream' and change the roots using 'addRoot' and
--- 'removeRoot'.
+-- ends. The stream ends after the 'isRootUnwatched' event of the last root
+-- when none of the roots is watched any more, for example, when all the
+-- roots are deleted or renamed. The handle of the watch is not exposed, so
+-- the roots of the watch are the given paths for as long as the stream runs.
+-- To add or remove roots while reading the events, open the watch using
+-- 'openWatch', read it using 'eventStream' and change the roots using
+-- 'addRoot' and 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before after eventStream
 
     where
 
     cfg = f defaultConfig
-    before = openWatch cfg paths
+    before = openWatchWith True cfg paths
     after = closeWatch
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
@@ -3716,7 +3966,8 @@ watch = watchWith id
 -- Examine event stream
 -------------------------------------------------------------------------------
 
--- | Get the watch root corresponding to the 'Event'.
+-- | Get the watch root corresponding to the 'Event', as it was supplied to
+-- the watch API, with redundant separators and @.@ components removed.
 --
 -- If a directory is watched via more than one root, for example, a recursive
 -- root and a root inside it, its events are reported once for each root.
@@ -3744,15 +3995,19 @@ getRelPath Event{..} = eventRelPath
 
 -- | Get the absolute file system object path for which the event is generated.
 --
+-- If the watch root was supplied as a relative path, it is taken relative to
+-- the working directory at the time the root was added to the watch.
+--
 -- When the watch root is a symlink, the absolute path returned is via the
 -- original symlink and not through the resolved path.
 --
--- If the event is for the watch root this is the same as 'getRoot'.
+-- If the event is for the watch root, and the root was supplied as an
+-- absolute path, this is the same as 'getRoot'.
 getAbsPath :: Event -> Path
-getAbsPath ev =
-    case getRelPath ev of
-        Just relPath -> Path.join (getRoot ev) relPath
-        Nothing -> getRoot ev
+getAbsPath Event{..} =
+    case eventRelPath of
+        Just relPath -> Path.join eventAbsRoot relPath
+        Nothing -> eventAbsRoot
 
 -- XXX should we use a Maybe?
 -- | Cookie is set when a rename occurs. The cookie value can be used to
@@ -3814,16 +4069,22 @@ isAccessDenied = getFlag accessDeniedFlag
 -- | A path was removed from the watch explicitly using 'removeRoot' or
 -- automatically (file was deleted or renamed, or filesystem was unmounted).
 --
+-- The rename of a parent of a root does not generate any event. A root is
+-- also removed when the library finds that its path no longer refers to it,
+-- before it adds a directory created or moved into a recursive root. This
+-- check is best effort, a root may stay watched under its old path.
+--
 -- Note that in recursive watch mode all the subdirectories are watch roots,
 -- therefore, they will all generate this event.
 --
 -- This event refers to the directory that was at the path, it does not mean
 -- that the path is unwatched at the time the event is read. In recursive mode,
--- in @mv d \/outside; mkdir d@ this event of the old @d@ is emitted after the
--- create event of the new @d@, and the new @d@ is watched. Similarly, in
--- @mkdir d; mv d e; mv f d@ with @f@ watched, this event of the new directory
--- is emitted for the path @d@ after @f@ is renamed to @d@, and @d@ stays
--- watched.
+-- in @mkdir d; mv d e; mv f d@ with @f@ watched, this event of the new
+-- directory is emitted for the path @d@ after @f@ is renamed to @d@, and @d@
+-- stays watched.
+--
+-- No other event of the path follows this event, until the path is watched
+-- again.
 --
 -- /Occurs only for a watched path/
 isRootUnwatched :: Event -> Bool
@@ -3833,7 +4094,16 @@ isRootUnwatched = getFlag iN_IGNORED
 -- object is moved to another filesystem, since mv(1) in effect copies the file
 -- to the other filesystem and then deletes it from the original filesystem.)
 -- In addition, an 'isRootUnwatched' event will subsequently be generated
--- for the watch descriptor.
+-- for the watch descriptor. 'isDeleted' is also true for this event.
+--
+-- 'isRootDeleted' is the same as 'isDeleted' for an event for which
+-- 'getRelPath' returns 'Nothing': the deletion of an entry of a directory
+-- always has the path of the entry. The portable API reports the deletion of
+-- a root this way on all platforms. Not exported by the public Linux and
+-- FreeBSD modules.
+--
+-- A regular file that has other hard links is not deleted when the watched
+-- path is unlinked, this event is not reported for it.
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- deletion of a subdirectory is reported as 'isDeleted'.
@@ -3843,6 +4113,8 @@ isRootDeleted :: Event -> Bool
 isRootDeleted = getFlag iN_DELETE_SELF
 
 -- | Watched file/directory was itself moved within the file system.
+-- 'isMoved' is also true for this event, 'isMovedFrom' and 'isMovedTo' are
+-- not.
 --
 -- The root is removed from the watch, and 'isRootUnwatched' is reported
 -- later. The root is removed whether or not this event is enabled by
@@ -3850,6 +4122,10 @@ isRootDeleted = getFlag iN_DELETE_SELF
 --
 -- In recursive mode, the event is reported for the watch roots only, the
 -- move of a subdirectory is reported as 'isMovedFrom' and 'isMovedTo'.
+--
+-- 'isRootMoved' is the same as 'isMoved' for an event for which 'getRelPath'
+-- returns 'Nothing': the move of an entry of a directory always has the path
+-- of the entry. Not exported by the public Linux and FreeBSD modules.
 --
 -- /Occurs only for a watched path/
 isRootMoved :: Event -> Bool
@@ -3941,9 +4217,13 @@ isCreated = getFlag iN_CREATE
 
 -- | File/directory deleted from watched directory.
 --
--- /Occurs only for an object inside the watched directory/
+-- This is also true when a watch root itself is deleted, if 'setRootDeleted'
+-- is enabled, which is the default. 'getRelPath' returns 'Nothing' for such
+-- an event.
+--
+-- /Can occur for a watch root or an object inside it/
 isDeleted :: Event -> Bool
-isDeleted = getFlag iN_DELETE
+isDeleted = getFlag (iN_DELETE .|. iN_DELETE_SELF)
 
 -- | Generated for the original path when an object is moved from under a
 -- monitored directory.
@@ -3980,11 +4260,15 @@ isMovedTo = getFlag iN_MOVED_TO
 -- | Generated for a path that is moved from or moved to the monitored
 -- directory.
 --
--- >>> isMoved ev = isMovedFrom ev || isMovedTo ev
+-- This is also true when a watch root itself is renamed, if 'setRootMoved'
+-- is enabled, which is the default. 'getRelPath' returns 'Nothing' for such
+-- an event, and the event reports the old path of the root.
 --
--- /Occurs only for an object inside the watched directory/
+-- >>> isMoved ev = isMovedFrom ev || isMovedTo ev || isRootMoved ev
+--
+-- /Can occur for a watch root or an object inside it/
 isMoved :: Event -> Bool
-isMoved ev = isMovedFrom ev || isMovedTo ev
+isMoved ev = isMovedFrom ev || isMovedTo ev || isRootMoved ev
 
 -- | Determine whether the event indicates modification of an object within the
 -- monitored path. This event is generated only for files and not directories.

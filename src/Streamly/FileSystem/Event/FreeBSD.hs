@@ -61,7 +61,7 @@ module Streamly.FileSystem.Event.FreeBSD
       Config
     , setRecursiveMode
     , setScanNewDirs
-    , setFollowSymLinks
+    , setFollowRootSymLinks
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
@@ -105,8 +105,6 @@ module Streamly.FileSystem.Event.FreeBSD
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
-    , isRootDeleted
-    , isRootMoved
     , isRootUnmounted
 
     -- ** Item Level Metadata change

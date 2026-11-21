@@ -2,7 +2,9 @@
 
 Each limit below is a limit of the operating system. These limits are important
 to understand for using the library.
-See [robustness.md](robustness.md) for how the library handles error scenarios.
+See [robustness.md](robustness.md) for how the library handles error
+scenarios, and [robust-applications.md](robust-applications.md) for how an
+application handles lost events.
 
 ## Limits on Linux
 
@@ -77,8 +79,8 @@ The system holds the changes under each root in a buffer of 63 KB until the
 watch reads them. If the program does not read events fast enough and the
 buffer overflows, all the changes in it are lost. The watch then reports one
 `isEventsLost` event for that root and continues. The program scans the tree
-under the root to learn its current state; [robustness.md](robustness.md)
-describes the recovery.
+under the root to learn its current state;
+[robust-applications.md](robust-applications.md) describes the recovery.
 
 Each watch root uses one directory handle, Windows has no specific limit on
 the number of these handles. Each watch also uses one thread and one I/O

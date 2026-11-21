@@ -17,7 +17,8 @@ import Data.Either (lefts)
 import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Foreign.C.Types (CUInt(..))
-import System.Directory (createDirectory, listDirectory)
+import System.Directory
+    (canonicalizePath, createDirectory, listDirectory, removePathForcibly)
 import System.Exit (ExitCode(ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -245,6 +246,55 @@ nestedDirEvents =
             rels `shouldSatisfy` notElem (Just "nested")
             rels `shouldSatisfy` elem Nothing
 
+-- | Debug test, it does not assert anything. Print the events of a root with
+-- two files deleted by 'removePathForcibly', in a non-recursive and in a
+-- recursive watch. The behavior test of a deleted root finds no 'isDeleted'
+-- event for the files on macOS, although the files are deleted before the
+-- root. An event whose path does not match the canonical path of the root
+-- is dropped in a non-recursive watch, and kept without a root in a
+-- recursive watch. The "OS Path" printed by 'Event.showEvent' is the path
+-- reported by FSEvents.
+deletedRootEvents :: Spec
+deletedRootEvents = do
+    test "non-recursive" id
+    test "recursive" (Event.setRecursiveMode True)
+
+    where
+
+    test name cfg =
+        it ("debug: events of a deleted root, " ++ name) $
+            withSystemTempDirectory "fsevent_dir" $ \dir -> do
+                let rootDir = dir </> "root"
+                createDirectory rootDir
+                writeFile (rootDir </> "file") ""
+                writeFile (rootDir </> "file2") ""
+                canonical <- canonicalizePath rootDir
+                root <- Path.fromString rootDir
+                started <- newEmptyMVar
+                evs <- newIORef []
+                let record ev = do
+                        modifyIORef evs (ev :)
+                        _ <- tryPutMVar started ()
+                        return ev
+                watcher <- forkIO $ Stream.drain $ Stream.mapM record
+                    $ Event.watchWith cfg (NonEmpty.fromList [root])
+                -- Repeat the write, the watch may not be started for the
+                -- first
+                probe <- forkIO $ forever $ do
+                    writeFile (rootDir </> "probe") ""
+                    threadDelay 100000
+                takeMVar started
+                killThread probe
+                threadDelay 1000000
+                writeIORef evs []
+                removePathForcibly rootDir
+                threadDelay 3000000
+                killThread watcher
+                reported <- reverse <$> readIORef evs
+                putStrLn $ "Root: " ++ show rootDir
+                putStrLn $ "Canonical root: " ++ show canonical
+                mapM_ (putStr . Event.showEvent) reported
+
 -- TODO:
 -- Creation/deletion/move of hard links
 -- Deletion of last hard link
@@ -328,8 +378,10 @@ main = do
     runRec SymLinkOrigPath symLinkRecTests
     runRec FileType fileRootTests
 
-    hspec $ describe moduleName $ describe "robustness" $ do
-        closeWithSigPipe
-        closeWithReader
-        nestedDirEvents
-        manyWatches
+    hspec $ describe moduleName $ do
+        describe "robustness" $ do
+            closeWithSigPipe
+            closeWithReader
+            nestedDirEvents
+            manyWatches
+        describe "debug" deletedRootEvents
