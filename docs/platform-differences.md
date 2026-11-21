@@ -144,7 +144,9 @@ Linux reports the deletion of a root when its inode is freed, after the
 last link to it is removed and the last open reference to it is closed.
 An open file, or a directory that is the working directory of a process,
 reports `isDeleted` when it is closed. On Windows a directory in use by
-a process cannot be deleted.
+a process cannot be deleted. On Windows `ReadDirectoryChangesW` does not
+report the deletion of the watch root, the library reports `isDeleted`
+for the root.
 
 On macOS, it has been tested that fseventsd does not report delete
 events for the files inside the root when the root is deleted (e.g. with
@@ -414,35 +416,23 @@ event is reported for that item:
 | Operation | Linux | macOS | Windows |
 |-----------|-------|-------|---------|
 | Set the modification time only | `isModified` | `isAttrsModified` | `isModified` |
-| Set the access and modification times of an item | `isAttrsModified` | `isAttrsModified` | `isModified` |
+| Set the access and modification times | `isAttrsModified` | `isAttrsModified` | `isModified` |
 | Change the permissions of an item | `isAttrsModified` | `isSecurityModified` | `isModified` |
 
-A write to a file changes its modification time, which is also a
-metadata change, but on Linux and macOS the write is reported as
-`isModified` without `isAttrsModified`. The library reports the flags
-of the operating system as they are, and does not add `isAttrsModified`
-to a write. An application that needs to know whether the contents or
-the metadata of a file changed must check both `isModified` and
-`isAttrsModified`. On Windows both changes are reported as `isModified`.
+<!--
+On Linux setting only modification time is reported as `isModified`
+but if access time is set in the same system call it is reported as
+`isAttrsModified`.  FreeBSD reports setting the modification time only
+as `IN_ATTRIB`, `isAttrsModified` and no `isModified`.
+On Windows a write is same as modification time
+update.
+-->
 
-On Linux `utimensat` reports setting the modification time only as
-`IN_MODIFY`, the event of a write, and setting both times as `IN_ATTRIB`.
-On Linux and Windows `isModified` does not distinguish a write from
-setting the modification time only. FreeBSD reports setting the
-modification time only as `IN_ATTRIB`, `isAttrsModified` and no
-`isModified`.
-
-On macOS the event of setting the times, or the modification time only,
-sometimes has `isModified` as well. This is the `isModified` of an
-earlier write to the file, FSEvents can report the flags of earlier
-changes to a path with a later event of the same path.
-
-On macOS, making a file read-only with `chmod` also reports
-`isAttrsModified` for the file in some runs. macOS reports additional
-metadata changes as `isFinderInfoModified` and `isXAttrsModified`.
+macOS reports additional metadata changes as `isFinderInfoModified` and
+`isXAttrsModified`.
 
 Windows reports file content modification as well as metadata changes as
-`isModified` event. Which changes trigger this event is controlled by
+`isModified` event. Which actions trigger this event is controlled by
 config options.
 
 | Operation | Reported by config |
@@ -462,8 +452,8 @@ event for the file on any platform.
 Events for the content modification of non-directory objects contained
 in the watch root directory.
 
-All platforms except macOS report an event as soon as data is flushed
-after a write, macOS reports when the file handle is closed after a
+All platforms except macOS report an event as soon as data is flushed to
+disk after a write, macOS reports when the file handle is closed after a
 write.  All the events reported for the file by each platform:
 
 | Operation | Linux | macOS | Windows |
@@ -479,14 +469,14 @@ configs enabled it includes other attribute changes as well.
 ### Subdirectory content changes
 
 In non-recursive mode, creation, deletion, modification of files inside a
-subdirectory do not generate any events, not even attribute modification
-events for the subdir?  is this true? the directory gets modified, so ideally
-the directory as a child object is modified.
+subdirectory do not generate any events, neither for the file nor for the
+subdirectory, though the modification time of the subdirectory changes.
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Create a file in a subdirectory | Any | No | No | No |
 | Modify a file in a subdirectory | Any | No | No | No |
+| Delete a file in a subdirectory | Any | No | No | No |
 
 <!--
 On macOS FSEvents can only watch a tree. The library
@@ -505,47 +495,25 @@ an exception.
 |-----------|-------|-------|-------|---------|
 | Write to an open file after it is deleted | `isModified` for the file | Only if `setExcludeUnlinked` is `False` | Yes | Operation fails |
 
-### Merged and repeated events
+### Repeated events
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
-| Write a file twice before the consumer reads the first write | One `isModified` for the file | Yes | Usually | No |
-| Write `file`, write `other`, write `file` again, before the consumer reads them | Two `isModified` for `file` | Yes | Usually not | Yes |
 | Overwrite a file once | More than one `isModified` for the file | No | Sometimes | Yes |
-| Create and delete a file before the consumer reads the create | One event with both `isCreated` and `isDeleted` for the file | No | Yes | No |
-| Create and rename a file before the consumer reads the create | One event with both `isCreated` and `isMoved` for the old path | No | Yes | No |
 | Delete a file after the consumer reads its create | `isCreated` again for the file | No | Usually | No |
 
-On macOS two writes to a file are merged into one event only if FSEvents
-reports them in the same batch. The macOS entries of the two rows for writes
-are from several runs in the CI, the test suite does not assert them. The
-same holds for the macOS entry of the row for a file deleted after its
-create event is read: FSEvents can report the flags of earlier changes to a
-path with a later event of the path, and the delete reported `isCreated` in
-most CI runs but not in all of them. The coalescing of the events of a
-directory and its subdirectory into `isEventsLost` on macOS is based on the
-platform documentation.
+On macOS FSEvents can report the flags of earlier changes of a path with a
+later event of the path, even after the consumer has read the events of the
+earlier changes. In the test suite, a file is created, the consumer reads
+its `isCreated` event, and the file is deleted one second later. The event
+of the delete has `isCreated` true in most CI runs but not in all of them,
+so the test suite does not assert the macOS entry of this row.
 
-On macOS FSEvents can report the flags of an earlier change to a path with
-a later event of the same path. The `isModified` for a file written before
-its metadata change is then reported with the metadata change event. We
-sometimes observe the following:
-
-| Operation | Event |
-|-----------|-------|
-| Make a file read-only | `isModified` for the file |
-| Set the access and modification times of a file | `isModified` for the file |
-
-### Deletion of a directory
-
-Deleting a directory in a recursive watch, as with `rm -rf dir`, reports
-`isDeleted` for each entry in it on all platforms. Deleting a watch root
-reports `isDeleted` for the root on all platforms. Linux and Windows also
-report `isDeleted` for each entry in the root. On macOS FSEvents reports
-one event, for the root only, and does not report the entries in the
-root, in recursive and non-recursive watches. On Windows
-`ReadDirectoryChangesW` does not report the deletion of the watch root,
-the library reports `isDeleted` for the root.
+The macOS test results could be confusing because of earlier events
+getting combined with the one being tested.  Therefore, for macOS tests
+we use a delay of 30 second or more to be sure, and watch the results
+over many runs. If an event is reported sometimes, it is likely that
+this is a repeated event from earlier operations.
 
 ## Event coalescing
 
@@ -554,6 +522,19 @@ A program cannot count changes by counting events, on any platform.
 More than one predicate can be true for one event. A portable consumer
 must test every predicate it is interested in; a chain that stops at the
 first true predicate misses the other changes reported by the event.
+
+| Operation | Event | Linux | macOS | Windows |
+|-----------|-------|-------|-------|---------|
+| Write a file twice before the consumer reads the first write | One `isModified` for the file | Yes | Usually | No |
+| Write `file`, write `other`, write `file` again, before the consumer reads them | Two `isModified` for `file` | Yes | Usually not | Yes |
+| Create and delete a file before the consumer reads the create | One event with both `isCreated` and `isDeleted` for the file | No | Yes | No |
+| Create and rename a file before the consumer reads the create | One event with both `isCreated` and `isMoved` for the old path | No | Yes | No |
+
+On macOS two writes to a file are merged into one event only if FSEvents
+reports them in the same batch. The macOS entries of the two rows for writes
+are from several runs in the CI, the test suite does not assert them. The
+coalescing of the events of a directory and its subdirectory into
+`isEventsLost` on macOS is based on the platform documentation.
 
 * Linux: inotify merges two identical events that are adjacent in the kernel
   queue, if the older one has not been read. Two consecutive writes to `foo`
@@ -568,11 +549,6 @@ first true predicate misses the other changes reported by the event.
   the old path for which both `isCreated` and `isMoved` are true. Events in
   a directory and its subdirectory can be coalesced into one event for which
   `isEventsLost` is true, without an overflow.
-  FSEvents can report the flags of earlier changes of a path with a later
-  event of the path, even after the consumer has read the events of the
-  earlier changes. In the test suite, a file is created, the consumer
-  reads its `isCreated` event, and the file is deleted one second later.
-  The event of the delete has `isCreated` true in most runs.
 * Windows: the documentation does not say whether identical changes are
   merged. Each event has one type. One save of a file can report several
   `isModified` events, because the write and the truncate are separate
@@ -635,6 +611,11 @@ A directory moved out of the tree reports one event for the directory on all
 platforms, the entries under it are not reported. The consumer removes the
 directory and every path under it. `setScanNewDirs False` disables the scan
 on Linux.
+
+### Deletion of a subdirectory
+
+Deleting a directory in a recursive watch, as with `rm -rf dir`, reports
+`isDeleted` for each entry in it on all platforms.
 
 ### Recursive watch behavior Tests
 
