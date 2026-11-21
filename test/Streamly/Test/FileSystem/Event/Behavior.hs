@@ -94,7 +94,9 @@ import System.Exit (exitSuccess)
 import System.Process (readCreateProcess, shell)
 import System.Win32.HardLink (createHardLink)
 import System.Win32.Types
-    (BOOL, DWORD, HANDLE, failWith, getLastError, withHandleToHANDLE)
+    ( BOOL, DWORD, HANDLE, failWith, getLastError, hANDLEToHandle
+    , withHandleToHANDLE
+    )
 import qualified System.Win32.File as Win32
 import qualified System.Win32.Time as Win32
 #endif
@@ -275,6 +277,27 @@ syncHandle h = withHandleToHANDLE h Win32.flushFileBuffers
 syncHandle h = do
     fd <- handleToFd h
     throwErrnoIfMinus1_ "fsync" (c_fsync (FD.fdFD fd))
+#endif
+
+-- | Open an existing file for writing. On Windows the file is opened with
+-- the share mode @FILE_SHARE_DELETE@, so that the file can be deleted while
+-- it is open. @System.IO.openFile@ with the default I/O manager does not
+-- use @FILE_SHARE_DELETE@.
+openDeletable :: FilePath -> IO Handle
+#if defined(CABAL_OS_WINDOWS)
+openDeletable path = do
+    h <- Win32.createFile
+            path
+            Win32.gENERIC_WRITE
+            (Win32.fILE_SHARE_READ .|. Win32.fILE_SHARE_WRITE
+                .|. Win32.fILE_SHARE_DELETE)
+            Nothing
+            Win32.oPEN_EXISTING
+            Win32.fILE_ATTRIBUTE_NORMAL
+            Nothing
+    hANDLEToHandle h
+#else
+openDeletable path = openFile path AppendMode
 #endif
 
 -- | Append to the files opened by 'holdFile', write the data to the disk
@@ -1603,7 +1626,7 @@ behaviors =
         }
     , deletedOpenFile
         { title = "write to an open file after its deletion is reported"
-        , expected = onPlatform No Yes Exception
+        , expected = onPlatform No Yes No
         }
 #if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
     -- FreeBSD never reports the events of an unlinked file.
@@ -2184,7 +2207,7 @@ behaviors =
             { setup = withFile
             , ops = \p -> do
                 let file = watchRoot p </> "file"
-                h <- openFile file AppendMode
+                h <- openDeletable file
                 removeFile file
                 hPutStr h "x"
                 hFlush h
