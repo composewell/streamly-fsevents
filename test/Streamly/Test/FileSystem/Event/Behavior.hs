@@ -541,11 +541,17 @@ dirMetadataConfig = Windows.setAllEvents True
 dirMetadataConfig = setAttrs True
 #endif
 
+#if defined(CABAL_OS_WINDOWS)
+-- | Set the hidden attribute of a file or a directory.
+makeHidden :: FilePath -> IO ()
+makeHidden path = Win32.setFileAttributes path Win32.fILE_ATTRIBUTE_HIDDEN
+#endif
+
 -- | Change the permissions of a directory to read, write and search for the
 -- owner only. On Windows set the hidden attribute of the directory.
 changeDirMode :: FilePath -> IO ()
 #if defined(CABAL_OS_WINDOWS)
-changeDirMode path = Win32.setFileAttributes path Win32.fILE_ATTRIBUTE_HIDDEN
+changeDirMode = makeHidden
 #else
 changeDirMode path = Posix.setFileMode path Posix.ownerModes
 #endif
@@ -2036,30 +2042,31 @@ behaviors =
         , ("only setSecurityModified", only Windows.setSecurityModified)
         ]
 
+    -- The items an operation is applied to, a file or a subdirectory of the
+    -- watch root.
+    fileItem = ("file", withFile)
+    dirItem = ("dir", withDir)
+
     windowsMetadataOps =
-        [ ("making a file read-only", "file", withFile, makeReadOnly
+        [ ("making the item read-only", makeReadOnly, [fileItem, dirItem]
           , ["only setAttrsModified"])
-        , ("setting the file times", "file", withFile, setTimes
+        , ("setting the item times", setTimes, [fileItem, dirItem]
           , [ "the default config", "only setLastWriteTimeModified"
             , "only setLastAccessTimeModified"])
-        , ( "setting the file modification time", "file", withFile
-          , setFileTimes False False True
+        , ( "setting the item modification time"
+          , setFileTimes False False True, [fileItem, dirItem]
           , ["the default config", "only setLastWriteTimeModified"])
-        , ( "setting the file access time", "file", withFile
-          , setFileTimes False True False
-          , ["only setLastAccessTimeModified"])
-        , ( "setting the file creation time", "file", withFile
-          , setFileTimes True False False
-          , ["only setCreationTimeModified"])
-        , ( "truncating a file", "file", withFileContents, truncateFile
+        , ( "setting the item access time", setFileTimes False True False
+          , [fileItem, dirItem], ["only setLastAccessTimeModified"])
+        , ( "setting the item creation time", setFileTimes True False False
+          , [fileItem, dirItem], ["only setCreationTimeModified"])
+        , ( "truncating the item", truncateFile
+          , [("file", withFileContents)]
           , [ "the default config", "only setSizeModified"
             , "only setLastWriteTimeModified"
             , "only setLastAccessTimeModified"])
-        , ( "setting the hidden attribute of a subdirectory", "dir", withDir
-          , changeDirMode, ["only setAttrsModified"])
-        , ("setting the subdirectory times", "dir", withDir, setTimes
-          , [ "the default config", "only setLastWriteTimeModified"
-            , "only setLastAccessTimeModified"])
+        , ( "setting the hidden attribute of the item", makeHidden
+          , [fileItem, dirItem], ["only setAttrsModified"])
         ]
 
     -- Each metadata change with the default config, and with one config
@@ -2078,7 +2085,8 @@ behaviors =
                 const (any (\ev -> isNamed name ev && Event.isModified ev))
             , expected = if cfgName `elem` yes then Yes else No
             }
-        | (opName, name, setupOp, op, yes) <- windowsMetadataOps
+        | (opName, op, items, yes) <- windowsMetadataOps
+        , (name, setupOp) <- items
         , (cfgName, cfg) <- windowsConfigs
         ]
 #endif
