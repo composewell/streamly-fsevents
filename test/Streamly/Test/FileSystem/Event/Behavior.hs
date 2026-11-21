@@ -1618,13 +1618,6 @@ behaviors =
         , expected = onPlatform Yes No No
         , racy = onDarwin
         }
-#if defined(CABAL_OS_DARWIN)
-    -- Whether isAttrsModified is still reported with a longer time between
-    -- the create and the chmod.
-    , readOnlyAfter 5
-    , readOnlyAfter 15
-    , readOnlyAfter 30
-#endif
     , metadataChange
         { title = "making a file read-only reports isSecurityModified"
         , check = metadataEvent securityModified
@@ -2202,21 +2195,6 @@ behaviors =
             , ops = \p -> makeReadOnly (watchRoot p </> "file")
             }
 
-#if defined(CABAL_OS_DARWIN)
-    readOnlyAfter seconds =
-        metadataChange
-            { title =
-                "making a file read-only " ++ show seconds
-                    ++ " s after its create reports isAttrsModified"
-            , setup = \p -> do
-                createFile (watchRoot p </> "file")
-                threadDelay (seconds * 1000000)
-            , check = metadataEvent attrsModified
-            , expected = No
-            , racy = True
-            }
-#endif
-
     setTimesChange =
         base
             { config = setAttrs True
@@ -2284,6 +2262,14 @@ behaviors =
 -- been read.
 settle :: IO ()
 settle = threadDelay 1000000
+
+-- | Seconds to wait after the setup of a behavior, before its watch starts.
+-- On macOS FSEvents can report the flags of the changes made by the setup
+-- with a later event of the same path. Set it to 30 in a manual run to check
+-- whether a flag is reported by the operation itself. The delay counts
+-- towards the timeout of a behavior.
+setupDelay :: Int
+setupDelay = 0
 
 -- | Create marker files in the control root until the consumer reads one.
 -- The watch has started when it is read. Stop if the consumer has ended, it
@@ -2439,6 +2425,7 @@ runBehavior eventLog b =
         createDirectory root
         createDirectory control
         setup b paths
+        threadDelay (setupDelay * 1000000)
         flip finally (cleanup b paths >> releaseHeld paths) $ do
             reason <- skip b paths
             -- On macOS the event paths are canonical, the temporary
