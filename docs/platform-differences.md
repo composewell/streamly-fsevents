@@ -408,94 +408,22 @@ reported under `isModified` enabled by appropriate config options:
 Events for the metadata modification of objects contained in the watch
 root directory.
 
-Linux and macOS report basic metadata changes as `isAttrsModified`.
-
-| Operation | Event | Linux | macOS |
-|-----------|-------|-------|-------|
-| Make a file read-only | `isAttrsModified` for the file | Yes | No |
-| Set the access and modification times of a file | `isAttrsModified` for the file | Yes | Yes |
-| Change the permissions of a subdirectory | `isAttrsModified` for the subdirectory | Yes | No |
-| Set the access and modification times of a subdirectory | `isAttrsModified` for the subdirectory | Yes | Yes |
-
-On macOS, making a file read-only with `chmod` also reports
-`isAttrsModified` for the file in some runs.
-
-macOS reports additional metadata changes as `isSecurityModified`,
-`isFinderInfoModified` and `isXAttrsModified`.
-
-| Operation | Event |
-|-----------|-------|
-| Make a file read-only | `isSecurityModified` for the file |
-| Change the permissions of a subdirectory | `isSecurityModified` for the subdirectory |
-
-Windows reports file content modification as well as metadata changes as
-`isModified` event. Which changes trigger this event is controlled by
-config options.
-
-The Windows config options for metadata changes and the
-`ReadDirectoryChangesW` filter flag each one sets:
-
-| Config option | Filter flag | Default |
-|---------------|-------------|---------|
-| `setAttrsModified` | `FILE_NOTIFY_CHANGE_ATTRIBUTES` | False |
-| `setSizeModified` | `FILE_NOTIFY_CHANGE_SIZE` | True |
-| `setLastWriteTimeModified` | `FILE_NOTIFY_CHANGE_LAST_WRITE` | True |
-| `setLastAccessTimeModified` | `FILE_NOTIFY_CHANGE_LAST_ACCESS` | False |
-| `setCreationTimeModified` | `FILE_NOTIFY_CHANGE_CREATION` | False |
-| `setSecurityModified` | `FILE_NOTIFY_CHANGE_SECURITY` | False |
-
-`setAllEvents` sets all of these and `setFileNameEvents` and
-`setDirNameEvents`.
-
-`isModified` for the changed file or subdirectory, with the default
-config, and with one option enabled and the other options disabled
-(`setFileNameEvents` stays enabled):
-
-| Operation | Default config | `setAttrsModified` | `setSizeModified` | `setLastWriteTimeModified` | `setLastAccessTimeModified` | `setCreationTimeModified` | `setSecurityModified` |
-|-----------|----------------|--------------------|-------------------|----------------------------|-----------------------------|---------------------------|-----------------------|
-| Make a file read-only | No | Yes | No | No | No | No | No |
-| Set the access and modification times of a file | Yes | No | No | Yes | Yes | No | No |
-| Set the modification time of a file | Yes | No | No | Yes | No | No | No |
-| Set the access time of a file | No | No | No | No | Yes | No | No |
-| Set the creation time of a file | No | No | No | No | No | Yes | No |
-| Truncate a file to zero size, without a write | Yes | No | Yes | Yes | Yes | No | No |
-| Set the hidden attribute of a subdirectory | No | Yes | No | No | No | No | No |
-| Set the access and modification times of a subdirectory | Yes | No | No | Yes | Yes | No | No |
-
-With `setAttrsModified True` added to the default config, making a file
-read-only and setting the times of a file report `isModified` for the
-file. With `setAllEvents True`, setting the hidden attribute and setting
-the times of a subdirectory report `isModified` for the subdirectory.
-
-Creating or deleting a hardlink does not generate any metadata change
-event for the file on any platform.
-
-### File content changes
-
-Events for the content modification of non-directory objects contained
-in the watch root directory.
-
-Linux reports a write to a file that stays open when the write is made.
-macOS and Windows may not report it until the file is closed, they report
-it after the file is closed. On Windows `ReadDirectoryChangesW` detects a
-change of the size or of the last write time of a file when it is written
-to the disk, with caching this can be when the cache is flushed or the
-file is closed.
-
-| Operation | Event | Linux | macOS | Windows |
-|-----------|-------|-------|-------|---------|
-| Write to an open file, before it is closed | `isModified` for the file | Yes | Usually not | No |
-| Write to an open file, after it is closed | `isModified` for the file | Yes | Yes | Yes |
-| Truncate a file to zero size, without a write | `isModified` for the file | Yes | Yes | Yes |
-
-A write to a file changes its modification time on all platforms. The
-converse is not true, the modification time can be set without a write:
+All the events reported for a file or subdirectory by each platform; the
+event is reported for that item:
 
 | Operation | Linux | macOS | Windows |
 |-----------|-------|-------|---------|
-| Write to a file | `isModified` | `isModified` | `isModified` |
-| Set the modification time only | `isModified`, no `isAttrsModified` | `isAttrsModified`, no `isModified` | `isModified` |
-| Set the access and modification times | `isAttrsModified`, no `isModified` | `isAttrsModified`, no `isModified` | `isModified` |
+| Set the modification time only | `isModified` | `isAttrsModified` | `isModified` |
+| Set the access and modification times of an item | `isAttrsModified` | `isAttrsModified` | `isModified` |
+| Change the permissions of an item | `isAttrsModified` | `isSecurityModified` | `isModified` |
+
+A write to a file changes its modification time, which is also a
+metadata change, but on Linux and macOS the write is reported as
+`isModified` without `isAttrsModified`. The library reports the flags
+of the operating system as they are, and does not add `isAttrsModified`
+to a write. An application that needs to know whether the contents or
+the metadata of a file changed must check both `isModified` and
+`isAttrsModified`. On Windows both changes are reported as `isModified`.
 
 On Linux `utimensat` reports setting the modification time only as
 `IN_MODIFY`, the event of a write, and setting both times as `IN_ATTRIB`.
@@ -505,28 +433,48 @@ modification time only as `IN_ATTRIB`, `isAttrsModified` and no
 `isModified`.
 
 On macOS the event of setting the times, or the modification time only,
-sometimes has `isModified` as well. This is the `isModified` of an earlier write to the file, FSEvents
-can report the flags of earlier changes to a path with a later event of the
-same path.
+sometimes has `isModified` as well. This is the `isModified` of an
+earlier write to the file, FSEvents can report the flags of earlier
+changes to a path with a later event of the same path.
 
-Windows does not have a filter for content changes only. A write to a
-file changes its last write time, and its size if the write extends the
-file. The default config reports content changes as `isModified` and does
-not report the other metadata changes:
+On macOS, making a file read-only with `chmod` also reports
+`isAttrsModified` for the file in some runs. macOS reports additional
+metadata changes as `isFinderInfoModified` and `isXAttrsModified`.
 
-| Config option | Default | Reports a change of |
-|---------------|---------|---------------------|
-| `setSizeModified` | True | the size of a file |
-| `setLastWriteTimeModified` | True | the last write time of a file |
-| `setAttrsModified` | False | the attributes of a file, e.g. read-only or hidden |
-| `setLastAccessTimeModified` | False | the last access time of a file |
-| `setCreationTimeModified` | False | the creation time of a file |
-| `setSecurityModified` | False | the security descriptor of a file |
+Windows reports file content modification as well as metadata changes as
+`isModified` event. Which changes trigger this event is controlled by
+config options.
 
-To stop the content change events, set both `setSizeModified` and
-`setLastWriteTimeModified` to `False`. `setLastWriteTimeModified` also
-reports setting the last write time with `SetFileTime` without a write,
-the event does not distinguish the two cases.
+| Operation | Reported by config |
+|-----------|-------------|
+| Make an item read-only | `setAttrsModified` |
+| Set the hidden attribute of an item | `setAttrsModified` |
+| Set the access time of an item | `setLastAccessTimeModified` |
+| Set the modification time of an item | `setLastWriteTimeModified` |
+| Set the creation time of an item | `setCreationTimeModified` |
+| Truncate a file to zero size, without a write | `setSizeModified`, `setLastWriteTimeModified`, `setLastAccessTimeModified` |
+
+Creating or deleting a hardlink does not generate any metadata change
+event for the file on any platform.
+
+### File content changes
+
+Events for the content modification of non-directory objects contained
+in the watch root directory.
+
+All platforms except macOS report an event as soon as data is flushed
+after a write, macOS reports when the file handle is closed after a
+write.  All the events reported for the file by each platform:
+
+| Operation | Linux | macOS | Windows |
+|-----------|-------|-------|---------|
+| Write to an open file, before it is closed | `isModified` | Usually none | `isModified` |
+| Write to an open file, after it is closed | `isModified` | `isModified` | `isModified` |
+| Truncate a file to zero size, without a write | `isModified` | `isModified`, `isAttrsModified` | `isModified` |
+
+On Windows `isModified` indicates a file content modification if only
+`setSizeModified` and `setLastWriteTimeModified` are enabled. With other
+configs enabled it includes other attribute changes as well.
 
 ### Subdirectory content changes
 
