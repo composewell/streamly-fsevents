@@ -1409,7 +1409,7 @@ isModified = getFlag fILE_ACTION_MODIFIED
 --
 -- The watch continues after this event. The application scans the tree
 -- under the watch root to know its current state. See
--- @docs\/robustness.md@ in this package for the recovery.
+-- @docs\/robust-applications.md@ in this package for the recovery.
 --
 -- For this event, 'getRoot' and 'getAbsPath' return the watch root whose
 -- events were lost, and 'getRelPath' returns 'Nothing'.
