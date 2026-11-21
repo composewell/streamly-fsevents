@@ -44,7 +44,8 @@ import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.Maybe (isJust)
 import System.Exit (ExitCode(..), exitFailure)
 import System.Directory
-    ( createDirectory, createDirectoryIfMissing, createDirectoryLink
+    ( canonicalizePath, createDirectory, createDirectoryIfMissing
+    , createDirectoryLink
     , doesDirectoryExist, getPermissions, listDirectory, removeDirectory
     , removeDirectoryLink, removeFile, removePathForcibly, renameDirectory
     , renameFile, renamePath
@@ -53,7 +54,7 @@ import System.Directory
     , setOwnerWritable, setPermissions
 #endif
     )
-import System.FilePath ((</>), takeDirectory, takeFileName)
+import System.FilePath ((</>), makeRelative, takeDirectory, takeFileName)
 import System.IO
     ( Handle, IOMode(AppendMode, ReadWriteMode), hClose, hFlush, hPutStr
     , hSetFileSize, openFile)
@@ -79,7 +80,6 @@ import Foreign.Storable (pokeByteOff)
 #endif
 import System.Timeout (timeout)
 #if defined(CABAL_OS_WINDOWS)
-import System.Directory (canonicalizePath)
 import Data.Char (isDigit)
 import Data.Word (Word32)
 import Data.Bits ((.|.))
@@ -165,6 +165,9 @@ data Behavior = Behavior
     -- | The outcome depends on a race or on the OS version. It is printed but
     -- does not fail the test when it differs from 'expected'.
     , racy :: Bool
+    -- | Print the events of the behavior after the results. False for a
+    -- behavior whose number of events varies between runs.
+    , printEvents :: Bool
     }
 
 -- | The arguments are the outcomes on Linux, macOS and Windows. FreeBSD
@@ -758,6 +761,7 @@ base =
         , steps = []
         , expected = Exception
         , racy = False
+        , printEvents = True
         }
 
 behaviors :: [Behavior]
@@ -966,6 +970,8 @@ behaviors =
         , check = const fileCreatedTwice
         , expected = onPlatform Yes Yes No
         , racy = True
+        -- The files are created until the race is seen.
+        , printEvents = False
         }
     , base
         { title = "file created in a moved in dir before its read is reported"
@@ -2266,10 +2272,37 @@ waitStarted finished control started = go (0 :: Int)
             r <- tryReadMVar started
             maybe (go (n + 1)) return r
 
+-- | One line for an event: the path relative to the first of the
+-- directories that contains it, and the names of the predicates that are true
+-- for the event. The names are the lines after the flags line of
+-- 'Event.showEvent'.
+eventLine :: [FilePath] -> Int -> Event -> String
+eventLine dirs i ev =
+    stepPrefix ++ relPath ++ ": " ++ unwords names
+
+    where
+
+    stepPrefix = if i == 0 then "" else "step " ++ show i ++ ": "
+
+    path = absPath ev
+
+    relPath =
+        case [r | d <- dirs, let r = makeRelative d path, r /= path] of
+            r : _ -> r
+            [] -> path
+
+    names =
+        drop 1
+            $ dropWhile (not . isPrefixOf "Flags ")
+            $ filter (not . null)
+            $ lines (Event.showEvent ev)
+
 -- | Watch the root and the control root, run the operations of the behavior
--- and check the events.
-runWatch :: Behavior -> Paths -> FilePath -> IO Outcome
-runWatch Behavior{..} paths control = do
+-- and check the events. The events, except those of the control root, are
+-- written to the event log as lines relative to the directories.
+runWatch ::
+    IORef [String] -> [FilePath] -> Behavior -> Paths -> FilePath -> IO Outcome
+runWatch eventLog dirs Behavior{..} paths control = do
     let root = watchRoot paths
     started <- newEmptyMVar
     blocked <- newEmptyMVar
@@ -2321,6 +2354,13 @@ runWatch Behavior{..} paths control = do
 
     evs <- timeout 30000000 (takeMVar result)
     mapM_ printException evs
+    let controlDirs = [d </> takeFileName control | d <- dirs]
+        isControl ev = any (`isPrefixOf` absPath ev) controlDirs
+    case evs of
+        Just (Right xs) ->
+            writeIORef eventLog
+                [eventLine dirs i ev | (i, ev) <- xs, not (isControl ev)]
+        _ -> return ()
     return $ case evs of
         Nothing -> error "the stream did not end"
         Just (Left e)
@@ -2352,8 +2392,8 @@ runWatch Behavior{..} paths control = do
     isIOException :: SomeException -> Bool
     isIOException e = isJust (fromException e :: Maybe IOException)
 
-runBehavior :: Behavior -> IO Outcome
-runBehavior b =
+runBehavior :: IORef [String] -> Behavior -> IO Outcome
+runBehavior eventLog b =
     withSystemTempDirectory "fsevent_behavior" $ \dir -> do
         let root = dir </> "root"
             control = dir </> "control"
@@ -2371,7 +2411,11 @@ runBehavior b =
         setup b paths
         flip finally (cleanup b paths >> releaseHeld paths) $ do
             reason <- skip b paths
-            maybe (runWatch b paths control) (return . Skipped) reason
+            -- On macOS the event paths are canonical, the temporary
+            -- directory is not.
+            canonical <- canonicalizePath dir
+            let run = runWatch eventLog [dir, canonical] b paths control
+            maybe run (return . Skipped) reason
 
 -- | Any failure to determine the outcome is an outcome.
 outcomeWithin :: Int -> IO Outcome -> IO Outcome
@@ -2422,19 +2466,30 @@ main = do
 #endif
     resultsRef <- newIORef []
     let spec seconds b runner = it (title b) $ do
-            outcome <- outcomeWithin seconds runner
-            modifyIORef' resultsRef ((b, outcome) :)
+            eventLog <- newIORef []
+            outcome <- outcomeWithin seconds (runner eventLog)
+            evLines <- readIORef eventLog
+            modifyIORef' resultsRef ((b, outcome, evLines) :)
             case outcome of
                 Skipped reason -> pendingWith reason
                 _ -> unless (racy b) $ outcome `shouldBe` expected b
     summary <- hspecResult $ describe moduleName $ do
-        mapM_ (\b -> spec 60 b (runBehavior b)) behaviors
+        mapM_ (\b -> spec 60 b (`runBehavior` b)) behaviors
 
     results <- reverse <$> readIORef resultsRef
     putStrLn ""
     putStrLn $ "Behavior results on " ++ platformName ++ ":"
-    forM_ results $ \(b, outcome) ->
+    forM_ results $ \(b, outcome, _) ->
         putStrLn $ "  " ++ title b ++ ": " ++ show outcome
             ++ expectedNote b outcome
+
+    -- The paths are relative to the temporary directory of the behavior,
+    -- "root" is the watch root.
+    putStrLn ""
+    putStrLn $ "Behavior events on " ++ platformName ++ ":"
+    forM_ results $ \(b, _, evLines) ->
+        when (printEvents b) $ do
+            putStrLn $ "  " ++ title b ++ ":"
+            mapM_ (putStrLn . ("    " ++)) evLines
 
     when (summaryFailures summary > 0) exitFailure
