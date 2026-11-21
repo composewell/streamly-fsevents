@@ -1,38 +1,23 @@
 # Platform Differences
 
-`Streamly.FileSystem.Event` has the same API on Linux, macOS, Windows and
-FreeBSD. The library implements a recursive watch such that Linux reports new
-and moved directories in the same way as macOS and Windows do, with the
-exceptions listed below. The other differences come from the event models of the operating
-systems. The tables at the end list each difference as recorded by the test
-suite `FileSystem.Event.Behavior`.
+`Streamly.FileSystem.Event` has the same API on Linux, macOS,
+Windows and FreeBSD. The library implements a recursive watch such
+that Linux reports new and moved directories in the same way as
+macOS and Windows do, with the exceptions listed below. The other
+differences come from the event models of the operating systems. The
+tables at the end list each difference as recorded by the test suite
+`FileSystem.Event.Behavior`.
 
-## Behavior tests
+Related documents: Lost events and the recovery are described in
+[robustness.md](robustness.md), the limits of each platform in
+[watch-limits.md](watch-limits.md).
 
-Each entry is the result of the test suite `FileSystem.Event.Behavior` on that
-platform, except where noted below the table. The results were recorded on
-Ubuntu 24.04, macOS 26 (arm64) and Windows Server 2025.
+## Architectural Differences
 
-_Operation fails_ means that the file system operation of the test, for
-example a delete or a rename, raises an exception, so there is no event to
-report. _Watch fails_ means that the watch raises an exception.
+Architectural differences across operating systems make it difficult to create
+a library which works the same way across all of them.
 
-## Directory permissions
-
-On POSIX a read permission is needed to list a directory's entries,
-and a search (execute) permission is needed to reach the paths under
-it. The Windows rights that correspond to them are "List folder"
-(`FILE_LIST_DIRECTORY`) and "Traverse folder" (`FILE_TRAVERSE`).  In the
-following discussion we call these permissions as "READ" and "SEARCH"
-for all platforms.
-
-The CI runner on Windows is an administrator, and the test suite disables
-its backup and restore privileges so that a permission removed from a
-directory applies to the test process. The tests of a directory without
-any permission write to a file opened before the permissions are removed,
-and close the file after the write.
-
-## Watch on path vs object
+### Watch on path vs object
 
 On Linux and Windows the watch of a root is attached to its inode, on
 macOS to its path. Therefore, on Linux and Windows, natively, the watch
@@ -50,14 +35,55 @@ complex implementation to do in the library, therefore in the portable
 implementation we try to make macOS behave like Linux rather than the
 opposite.
 
+### Recursive watches
+
+Linux provides primitives to build recursive watches which leaves gaps between
+creation of a directory and adding a watch requiring us to scan it for
+pre-existing entries. macOS and Windows provide a recursive watch natively.
+
+### Event reporting
+
+Which actions collapse into the same event.  On macOS and Linux report
+file modification and attribute changes as separate events. On Windows
+the same events reports everything and what is included in it is
+controlled by flags passed to the kernel.
+
+### Event coalescing
+
+macOS can combine completely different type of events together in the
+same message making it impossible to determine the ordering e.g. an
+event may have a create and delete and we do not know whether it was
+create after delete or vice-versa.
+
+## Behavior tests
+
+Each assertion in this document is tested by the test suite
+`FileSystem.Event.Behavior`, except where noted explicitly.
+The results were recorded on Ubuntu 24.04, macOS 26 (arm64)
+and Windows Server 2025.
+
+_Operation fails_ means that the file system operation of the test, for
+example a delete or a rename, raises an exception, so there is no event to
+report. _Watch fails_ means that the watch raises an exception.
+
+## Directory permissions
+
+On POSIX a read permission is needed to list a directory's entries,
+and a search (execute) permission is needed to reach the paths under
+it. The Windows rights that correspond to them are "List folder"
+(`FILE_LIST_DIRECTORY`) and "Traverse folder" (`FILE_TRAVERSE`).  In
+this document we call these permissions as "READ" and "SEARCH" for all
+platforms.
+
+<!--
+The CI runner on Windows is an administrator, and the test suite disables
+its backup and restore privileges so that a permission removed from a
+directory applies to the test process. The tests of a directory without
+any permission write to a file opened before the permissions are removed,
+and close the file after the write.
+-->
+
 ## Watch roots
-
-On Windows the watch keeps the root open.
-
-### Nested roots
-
-Nested roots in a recursive watch report a change in the inner root once
-for each root, on all platforms.
 
 ### Non directory watch roots
 
@@ -304,11 +330,16 @@ dynamically.
 | A root stops reporting events after the required permission is removed | No | Yes | No |
 | A root starts reporting events after the required permission is enabled | NA | Yes | NA |
 
+### Nested roots
+
+Nested roots in a recursive watch report a change in the inner root once
+for each root, on all platforms.
+
 ## Event reporting (Non recursive)
 
-Events for the objects inside a watch root, not for the root itself.
-
 ### Root Directory metadata changes
+
+Events for the watch root directory metadata, not for objects contained in it.
 
 | Operation | Event | Linux | macOS |
 |-----------|-------|-------|-------|
@@ -326,6 +357,9 @@ On Windows these changes are reported under `isModified`:
 | Set the access and modification times of the directory | `isModified` for the directory | `setAllEvents True` | No |
 
 ### Root Directory content changes
+
+Events for the watch root directory data, due to directory operations e.g.
+creation and deletion of objects in it.
 
 File create/delete events due to directory operations:
 
@@ -370,6 +404,9 @@ reported under `isModified` enabled by appropriate config options:
 | Delete a hard link | `isModified` for the directory | `setAllEvents True` | No |
 
 ### File/subdirectory metadata changes
+
+Events for the metadata modification of objects contained in the watch
+root directory.
 
 Linux and macOS report basic metadata changes as `isAttrsModified`.
 
@@ -431,6 +468,9 @@ Creating or deleting a hardlink does not generate any metadata change
 event for the file on any platform.
 
 ### File content changes
+
+Events for the content modification of non-directory objects contained
+in the watch root directory.
 
 Linux reports a write to a file that stays open when the write is made.
 macOS and Windows may not report it until the file is closed, they report
@@ -555,13 +595,6 @@ one event, for the root only, and does not report the entries in the
 root, in recursive and non-recursive watches. On Windows
 `ReadDirectoryChangesW` does not report the deletion of the watch root,
 the library reports `isDeleted` for the root.
-
-### Related documents
-
-The rows for the end of the stream and for a FIFO root are from the test
-suite `FileSystem.Event`. Lost events and the recovery are described in
-[robustness.md](robustness.md), the limits of each platform in
-[watch-limits.md](watch-limits.md).
 
 ## Event coalescing
 
