@@ -471,12 +471,14 @@ configs enabled it includes other attribute changes as well.
 In non-recursive mode, creation, deletion, modification of files inside a
 subdirectory do not generate any events, neither for the file nor for the
 subdirectory, though the modification time of the subdirectory changes.
+On Windows the deletion of a file in a subdirectory reports `isModified`
+for the subdirectory.
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Create a file in a subdirectory | Any | No | No | No |
 | Modify a file in a subdirectory | Any | No | No | No |
-| Delete a file in a subdirectory | Any | No | No | No |
+| Delete a file in a subdirectory | Any | No | No | Yes |
 
 <!--
 On macOS FSEvents can only watch a tree. The library
@@ -528,7 +530,7 @@ A program cannot count changes by counting events, on any platform.
 
 On macOS two writes to a file are merged into one event only if FSEvents
 reports them in the same batch. The macOS entries of the two rows for writes
-are from several runs in the CI, the test suite does not assert them. The
+are seen in several runs of the CI. The
 coalescing of the events of a directory and its subdirectory into
 `isEventsLost` on macOS is based on the platform documentation.
 
@@ -538,6 +540,7 @@ coalescing of the events of a directory and its subdirectory into
   modify `foo`, all three are reported. Events of different types are never
   merged, so each event has one type, and the order of the events is the
   order of the operations.
+
 * macOS: FSEvents can merge events of different types for a path into one
   event. A file created and deleted can report one event for which both
   `isCreated` and `isDeleted` are true, and the event does not give the order
@@ -545,6 +548,7 @@ coalescing of the events of a directory and its subdirectory into
   the old path for which both `isCreated` and `isMoved` are true. Events in
   a directory and its subdirectory can be coalesced into one event for which
   `isEventsLost` is true, without an overflow.
+
 * Windows: the documentation does not say whether identical changes are
   merged. Each event has one type. One save of a file can report several
   `isModified` events, because the write and the truncate are separate
@@ -638,7 +642,7 @@ Tested behavior common to all platforms:
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
 | Create a file in a subdirectory | `isModified` for the subdirectory | No | No | No |
-| Delete a file from a subdirectory | `isModified` for the subdirectory | No | No | Sometimes |
+| Delete a file from a subdirectory | `isModified` for the subdirectory | No | No | Yes |
 
 ### Subdirectory permissions
 
