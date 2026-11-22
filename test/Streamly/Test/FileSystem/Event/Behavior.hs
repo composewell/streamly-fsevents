@@ -1717,6 +1717,22 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
+    -- Linux reports a change of the size as IN_MODIFY only. On macOS the
+    -- AttrsModified flag can be a flag of the write in the setup.
+    , Test base
+        { title =
+            "Truncating a file to zero size, without a write, reports "
+                ++ "`isAttrsModified`"
+        , config = setAttrs True
+        , darwinSetupDelay = setupFlagsDelay
+        , setup = \p -> do
+            writeFile (watchRoot p </> "file") "old"
+            settle
+        , ops = \p -> truncateFile (watchRoot p </> "file")
+        , check = metadataEvent attrsModified
+        , expected = onPlatform No Yes No
+        , racy = onDarwin
+        }
     -- On FreeBSD the event is generated on the vnode of the file, it is
     -- reported to each watched directory that has a link to the file, for
     -- any link used. Linux reports it to the directory of the link used.
