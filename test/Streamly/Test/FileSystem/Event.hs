@@ -29,7 +29,7 @@ import Control.Exception
     )
 import Control.Monad (forM_, unless, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.List (elemIndex, isPrefixOf, nub, sort, sortOn)
+import Data.List ((\\), elemIndex, isPrefixOf, nub, sort, sortOn)
 import Streamly.Internal.FS.Event (Config, Event)
 import System.Directory
     ( createDirectory
@@ -139,6 +139,31 @@ checkedEvents _ = filter isChange
 isUnder :: FilePath -> FilePath -> Bool
 isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
 
+-- | Like 'shouldBe' for lists of paths. On a failure 'shouldBe' shows both
+-- lists and hspec computes a diff of them, which takes hours for thousands
+-- of paths. This reports the paths missing in the first list, the extra
+-- paths, and the first position at which the lists differ, at most 10 paths
+-- of each.
+shouldBePaths :: [FilePath] -> [FilePath] -> Expectation
+shouldBePaths actual expected =
+    unless (actual == expected) $ expectationFailure $ unlines
+        [ "length " ++ show (length actual) ++ ", expected "
+            ++ show (length expected)
+        , "missing: " ++ showSome (expected \\ actual)
+        , "extra: " ++ showSome (actual \\ expected)
+        , "first difference at " ++ show (length same) ++ ": "
+            ++ showSome (take 1 rest) ++ ", expected "
+            ++ showSome (take 1 restExpected)
+        ]
+
+    where
+
+    same = takeWhile id (zipWith (==) actual expected)
+    rest = drop (length same) actual
+    restExpected = drop (length same) expected
+    showSome xs =
+        show (take 10 xs) ++ if length xs > 10 then " ..." else ""
+
 -- | The 'Event.isCreated' events must be for the given paths, one for each
 -- path. On Linux they must be in the order of the paths, the order in which
 -- the entries were created.
@@ -149,11 +174,11 @@ isUnder dir path = path == dir || (dir ++ [pathSeparator]) `isPrefixOf` path
 shouldCreate :: [Event] -> [FilePath] -> Expectation
 shouldCreate evs paths =
 #if defined(INOTIFY_BACKEND)
-    created `shouldBe` paths
+    created `shouldBePaths` paths
 #elif defined(CABAL_OS_DARWIN)
-    nub (sort (filter (`elem` paths) created)) `shouldBe` nub (sort paths)
+    nub (sort (filter (`elem` paths) created)) `shouldBePaths` nub (sort paths)
 #else
-    sort created `shouldBe` sort paths
+    sort created `shouldBePaths` sort paths
 #endif
 
     where
@@ -165,9 +190,9 @@ shouldCreate evs paths =
 shouldModify :: [Event] -> [FilePath] -> Expectation
 shouldModify evs paths =
 #if defined(INOTIFY_BACKEND)
-    modified `shouldBe` paths
+    modified `shouldBePaths` paths
 #else
-    filter (`notElem` modified) paths `shouldBe` []
+    filter (`notElem` modified) paths `shouldBePaths` []
 #endif
 
     where
