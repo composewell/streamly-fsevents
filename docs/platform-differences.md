@@ -587,8 +587,21 @@ a watch root, the process still receives the events of the whole tree.
 
 On Linux, reads and writes through an open file after it is deleted
 are reported only if `setExcludeUnlinked` is `False`, the default
-is `True`. On all other platforms an open file is not watched after
-deletion.
+is `True`. On macOS a write through an open file after it is deleted is
+reported as `isModified`, in the same event as the `isDeleted` of the file.
+FSEvents coalesces the two, the event does not give their order. On Windows
+and FreeBSD an open file is not watched after deletion.
+
+<!--
+The macOS outcome was checked with a CI run with a 30 second delay after
+the setup of the test: the event had the flags Deleted and Modified, without
+the Created and AttrsModified flags of the setup.
+-->
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| Writing to an open file after its deletion reports `isModified` | No | Yes | No |
+| Writing to an open file after its deletion reports `isModified` with `setExcludeUnlinked False` | Yes | Not applicable | Not applicable |
 
 ### Repeated events
 
