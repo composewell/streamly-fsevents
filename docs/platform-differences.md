@@ -848,6 +848,7 @@ subdirectory added generates such an event.
 | A root with only READ permission reports its events | Yes | Watch fails |
 | A file system can be unmounted while a tree in it is watched | Yes | No, `umount` fails with `Device busy` |
 | Event reported when only the modification time of a file is set | `isModified` | `isAttrsModified` |
+| Truncating a file to zero size, without a write, reports `isAttrsModified` | No | Yes |
 
 Unlike Linux delete is prompt on FreeBSD, instead of following the object it is
 reported as soon as the path is deleted:
