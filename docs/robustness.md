@@ -3,7 +3,9 @@
 The library is designed for long running watches on large trees, in programs
 with many threads and child processes. Each item below is covered by the test
 suite of that platform, unless noted. The limits of the operating systems
-are listed in [watch-limits.md](watch-limits.md).
+are listed in [watch-limits.md](watch-limits.md). How an application handles
+lost events and the other limitations of the watches is described in
+[robust-applications.md](robust-applications.md).
 
 ## Large trees on Linux
 
@@ -21,6 +23,9 @@ are listed in [watch-limits.md](watch-limits.md).
   moved into the tree completes.
 * Moving a large tree into the watch scans it without loading the whole tree
   into memory.
+
+The start of a watch lists every directory of the tree and adds an inotify
+watch to each, so its time and memory grow with the number of directories.
 
 Measurements on Linux 6.12, 2 CPUs, warm caches, on a tree of 28259
 directories, 10 in each directory. This is the largest tree that a
@@ -57,7 +62,6 @@ its current state.
 |-|-------|-------|---------|
 | How the loss is reported | One `isEventsLost` for each watch root | `isEventsLost` for a path, which can be a subdirectory of the root | `isEventsLost` for the watch root |
 | The stream continues after the loss | No, the watch is closed and the stream ends | Yes | Yes |
-| What the program does | Open a new watch on the roots, then scan the tree | Scan the reported path | Scan the watch root |
 | A scan of the tree by the program generates events | Yes, if open, access and close events are enabled | No | No |
 
 On Linux the events read before the overflow are reported, and the events
@@ -78,11 +82,6 @@ for two reasons:
   event does not leave the watch with a wrong state. On Linux the library
   watches each directory of the tree and keeps a map of them, which a lost
   event can make wrong.
-
-A program that runs on all platforms can use one recovery: on an
-`isEventsLost` event, close the watch, open a new watch on the same roots,
-then scan the tree. On macOS and Windows this scans more than needed, the
-tree under the path of the event is enough.
 
 ### What the tests show
 
@@ -124,49 +123,6 @@ at least one in each scenario, and at least four in the scenario with
 repeated overflows. On macOS and Windows an overflow is not certain, and the
 tests pass without one. In one run on macOS the scenarios with a model of
 the tree reported 1, 1 and 12 `isEventsLost` events.
-
-## Handling queue overflow on Linux
-
-If you receive an `isEventsLost`:
-
-* Open a new watch on the same roots, for example by running
-  `watchWith` again, and then scan the tree. Open the watch before the scan,
-  so that a change made during the scan is reported by the watch, by the scan
-  or by both. Opening a watch does not generate any events, on any size of
-  tree. A program can instead exit and let its service manager, such as
-  systemd with `Restart=on-failure`, start it again; the program then scans
-  the tree at its start.
-* Scan the tree in a thread other than the one reading the stream. If a
-  single thread scans the tree and reads the stream, it reads the stream only
-  after the scan, and by then the kernel queue may have overflowed again.
-* With open, access and close events enabled, a scan of the tree
-  generates 8 events per directory. A tree of more than
-  `max_queued_events / 8` directories, 2048 by default, then overflows the
-  queue. Do not enable these events on a recursive watch of a large tree, or
-  raise `max_queued_events`.
-
-Under sustained load a new watch can overflow again. We have a stress
-test which overflows the queue and then changes a tree of 10000
-directories for 10 seconds while the consumer opens a new watch after
-each overflow; one run had 13 overflows. After the changes stopped, a
-file created in every directory was always reported exactly once.
-
-## Handling queue overflow on macOS and Windows
-
-If you receive an `isEventsLost`:
-
-* Do not open a new watch, the watch continues after the event.
-* Scan the tree under the path returned by `getAbsPath` for the event. On
-  Windows this is the watch root, on macOS it can be a subdirectory of the
-  root. A change made during the scan is reported by the watch, by the scan
-  or by both.
-* Scan the tree in a thread other than the one reading the stream. If a
-  single thread scans the tree and reads the stream, it reads the stream only
-  after the scan, and by then the system buffer may have overflowed again.
-* Under sustained load an overflow can follow another, and each one is
-  reported by its own `isEventsLost` event. If an `isEventsLost` event is
-  read while a scan of the same tree is running, start one more scan after
-  the running scan ends, instead of a scan for each event.
 
 ## Symlink safety on Linux
 
@@ -233,12 +189,59 @@ tree during the sequence. CI runs 2157 sequences. 51436 sequences of up
 to three operations, and of up to four on fewer paths, are run manually
 after a change in the handling of moves or scans.
 
+## Renamed roots and moved directories on Linux
+
+An inotify watch is attached to a directory, not to its path. After a
+watch root is renamed, or a directory is moved out of the tree, the
+kernel still reports the events of the directory, with the old path. The
+old path no longer exists, or refers to another object.
+
+* The events of a moved directory are not reported with the old path.
+  After the `isMoved` event of a renamed root, or the `isMovedFrom` event
+  of a directory moved out of the tree, the only events reported for the
+  directory and the directories under it are their `isRootUnwatched`
+  events.
+* A directory root renamed and renamed back before the rename event is
+  read is unwatched, the same as a root that is renamed only once.
+* A bind mount gives a directory a second path. A rename of the directory
+  at one path reports a rename event for the roots at both paths. The
+  root at the renamed path is unwatched, the root at the mount point
+  stays watched. On Linux before 5.8 the library cannot detect a mount
+  point, and the root at the mount point is unwatched as well.
+* A file with several hard links has several paths. A rename of any of
+  its links reports a rename event for a file root. The root is
+  unwatched only if its path no longer refers to the file when the event
+  is read, so a file root renamed and renamed back before that stays
+  watched.
+* The rename of a parent directory of a root is not reported. The root
+  stays watched and its events report the old path, which no longer
+  exists or refers to another object. A directory at the old path is
+  never watched in place of a directory in the tree.
+* The library may find later that the root path no longer refers to the
+  root, and then ends the watch of the root with `isRootUnwatched`. In
+  recursive mode it checks the root path before it adds a directory
+  created in the tree or moved into it. The check is best effort, a root
+  in which no directory is created or moved in stays watched under the
+  old path.
+* `staleRoots` returns the roots whose path no longer refers to the root,
+  it does not change the watch.
+* A watch does not keep a file of the watched file system open. The file
+  system of a watched tree can be unmounted, the watch then reports
+  `isRootUnmounted` and `isRootUnwatched`.
+* A mount or an unmount at the path of a root, or of a parent directory,
+  is not reported unless the file system of the root itself is
+  unmounted. After a bind mount at a root is unmounted, the root stays
+  watched and its events report the root path, which now refers to the
+  directory under the former mount point.
+
+The bind mount and unmount tests run in an unprivileged user and mount
+namespace, with `test/bind-mount.sh`.
+
 ## Overlapping roots on Linux
 
-* A root listed twice reports each event once.
-* Two roots that reach the same directory, for example a recursive root
-  and a root inside it, report each event once for each root.
-* Removing one of the two roots keeps the other one watching.
+Two roots that reach the same directory, for example a recursive root and
+a root inside it, share the inotify watch of the directory. Removing one
+of the two roots keeps the other one watching the directory.
 
 ## Exceptions and resource cleanup
 
@@ -260,11 +263,15 @@ All platforms:
   nothing.
 * Handle API: a stream returned by `eventStream` does not close the
   watch when it ends. After a read is interrupted by a timeout, the next
-  read continues with the remaining events. On Linux and macOS an event
-  is lost if the timeout arrives after the read has taken the event from
-  the watch and before the program has received it. In a test on macOS,
-  2000 reads interrupted after 1 to 200 microseconds lost 3 to 18 of the
-  events of 300 files. This is not measured on Windows.
+  read continues with the remaining events. A read that is interrupted
+  does not take an event out of the watch. An event is lost only if the
+  timeout arrives after the read has returned the event and before the
+  program has recorded it. A program that masks async exceptions around
+  `readEvent`, or around the fold of `eventStream`, and the code that
+  records the event does not lose any event: the read can still be
+  interrupted, while it waits for an event and before it takes one. In a
+  test on Linux, 2000 such reads interrupted after 1 to 200 microseconds
+  lost none of the events of 2000 files.
 
 Linux:
 
@@ -276,14 +283,17 @@ Linux:
 * Handle API: with the non-threaded RTS, and no free fd or no `/proc`,
   the stream of a thread reading the watch ends when the next event
   arrives after `closeWatch`.
-* Handle API: after `removeRoot`, the events queued for the root before
-  the removal are reported, up to its `isRootUnwatched` event. For a
-  directory that the root shares with another root, this requires `/proc`
-  and a free fd. If `/proc` is not mounted or access to it is denied, the
-  root stops reporting that directory at once, and its `isRootUnwatched`
-  event is reported before the next event. If no fd is free, `removeRoot`
-  throws an exception, the directory stays watched for the root, and the
-  call can be retried.
+* Handle API: `removeRoot` removes the root at once and does not fail for
+  lack of a free fd or of `/proc`. The events of the root already read
+  from the kernel are reported, then its `isRootUnwatched` event, and no
+  other event of the root follows. The events of the root still in the
+  kernel queue are not reported.
+* A deleted root is removed from the watch, an `isRootUnwatched` event
+  follows its `isDeleted` event. Some events of the root may arrive
+  (rarely though) between `isDeleted` and `isRootUnwatched`.
+* Handle API: with the non-threaded RTS, and no free fd or no `/proc`, a
+  thread reading the watch reports the `isRootUnwatched` event of a
+  removed root when the next event arrives.
 * Handle API: after an `IOException` from adding or reading a
   directory, for example when no fd is free, the next stream on the
   watch continues with the remaining events. The directory that failed
@@ -307,9 +317,12 @@ macOS:
   system events, e.g. a read-only or a network volume, the events of the
   other roots that occur during the call may be lost, an `isEventsLost`
   event may be reported in their place.
-* Handle API: after `removeRoot`, the events of the root can be reported
-  for a short time after the call returns, usually a few milliseconds.
-  There is no `isRootUnwatched` event.
+* Handle API: after `removeRoot`, the events of the root that occurred
+  before the call are reported, then its `isRootUnwatched` event, usually
+  within a few milliseconds of the call. The events of the root that occur
+  after the call are not reported. If the root is added again before its
+  `isRootUnwatched` event, the event precedes the events of the root
+  reported after the add.
 * Handle API: with the non-threaded RTS, `closeWatch` does not wake up a
   thread waiting in `readEvent` while a child process created by `fork`
   without `exec` is running, unless the child has closed the file
@@ -322,7 +335,11 @@ Windows:
 * Handle API: `removeRoot` closes the directory handle of the root. No
   event of the root is reported for a change made after the call returns.
   The changes of the root that the watch has not yet read from the system
-  are not reported. There is no `isRootUnwatched` event.
+  are not reported. An `isRootUnwatched` event follows the events of the
+  root already in the event queue of the watch.
+* A deleted root, or a root whose changes the system fails to report, is
+  removed from the watch, an `isRootUnwatched` event follows its
+  `isDeleted` event or the exception.
 * Handle API: `addRoot` and `removeRoot` do not lose or duplicate the
   events of the other roots. Each root has its own directory handle and its
   own event buffer.
