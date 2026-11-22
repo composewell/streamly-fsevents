@@ -98,7 +98,8 @@ dirTouchEvents dir =
     , (dir, dirEvent Event.isNonWriteClosed)
     ]
 
--- | The link count change of a deleted directory. FreeBSD does not report it.
+-- | removePathForcibly sets the permissions of a directory before deleting
+-- it, without changing them. Linux reports the chmod, FreeBSD does not.
 dirDelAttrsEvents :: String -> [([Char], Event -> Bool)]
 #if defined(FILESYSTEM_EVENT_FREEBSD)
 dirDelAttrsEvents _ = []

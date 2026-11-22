@@ -17,13 +17,10 @@
 --
 -- The FreeBSD inotify API is compatible with the Linux inotify API. This
 -- module exports the same functions as "Streamly.FileSystem.Event.Linux",
--- with the same defaults. The differences from Linux are:
+-- with the same defaults, except @setExcludeUnlinked@. The differences from
+-- Linux are:
 --
--- * The events of a file are never reported after it is unlinked,
--- 'setExcludeUnlinked' 'False' has no effect.
--- * A link count change, by unlink(2), link(2) or a rename over an existing
--- file, reports 'isAttrsModified' only to a watch on the file itself, not to
--- a watch on its directory. rmdir(2) does not report 'isAttrsModified'.
+-- * The events of a file are never reported after it is unlinked.
 -- * An access to a file through any of its hard links generates an event
 -- in a watched directory that has a link to the file. A watched directory
 -- that has two links to the same file reports each event once for each
@@ -33,17 +30,13 @@
 -- read generates an 'isAccessed' event for the directory. A directory that
 -- is readable but not searchable cannot be watched, the watch fails with
 -- @EACCES@.
--- * On FreeBSD 15.0, the kernel reports the 'isMovedFrom' event of a
--- directory with cookie 0 if any inotify watch watches the directory itself,
--- as a recursive watch does for each subdirectory. The library gives such an
--- event the cookie of the 'isMovedTo' event that follows it. The
--- 'isMovedFrom' event of a directory moved out of the tree keeps cookie 0.
 -- * devfs does not report events. File systems that do not use the kernel
 -- name cache, for example tmpfs mounted with @nonc@, may not report all the
 -- events.
 --
 -- The limits are the sysctl variables @vfs.inotify.max_user_instances@,
--- @vfs.inotify.max_user_watches@ and @vfs.inotify.max_queued_events@.
+-- @vfs.inotify.max_user_watches@, @vfs.inotify.max_watches@ and
+-- @vfs.inotify.max_queued_events@.
 --
 -- For reference documentation see:
 --
@@ -62,7 +55,6 @@ module Streamly.FileSystem.Event.FreeBSD
     , setRecursiveMode
     , setScanNewDirs
     , setFollowRootSymLinks
-    , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
 

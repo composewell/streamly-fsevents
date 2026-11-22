@@ -4162,9 +4162,6 @@ isRootPathEvent = getFlag (iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT)
 -- Linux 2.6.25; e.g., for the target of link(2) and for unlink(2)), and
 -- user/group ID (e.g., chown(2)).
 --
--- On FreeBSD, a link count change is reported only by a watch on the object
--- itself, not by a watch on its directory, and rmdir(2) does not report it.
---
 -- /Can occur for watched path or a file inside it/
 isAttrsModified :: Event -> Bool
 isAttrsModified = getFlag iN_ATTRIB

@@ -1780,12 +1780,11 @@ behaviors =
         -- of deletedOpenFile, after the check.
         , darwinSetupDelay = 30
         }
-#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
-    -- FreeBSD never reports the events of an unlinked file.
+#if defined(CABAL_OS_LINUX)
     , deletedOpenFile
         { title = "write to a deleted file, setExcludeUnlinked False"
         , config = Inotify.setExcludeUnlinked False
-        , expected = onFreeBSD No Yes
+        , expected = Yes
         }
 #endif
     -- The metadata change events are enabled. On macOS chmod reports
