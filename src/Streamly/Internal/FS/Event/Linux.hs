@@ -1799,6 +1799,17 @@ data AddedDir =
 -- open @.@. A watch of a directory without the search permission would report
 -- the events of its entries, but its subdirectories could not be added.
 --
+-- Design rationale: such a directory is not watched with 'setScanNewDirs'
+-- 'False' either, although the watch could be added with the read permission
+-- alone and the scan does not need the listing. Every directory in the tree
+-- is either watched with all its subdirectories, or not watched and reported
+-- as 'isAccessDenied'. A watched directory that cannot be listed would break
+-- this: it must not be reported as 'isAccessDenied' because it is watched,
+-- and its subdirectories cannot be reported as 'isAccessDenied' because they
+-- cannot be listed, so they would not be watched without any event saying so.
+-- The alternative, not reporting 'isAccessDenied' for any directory and
+-- skipping it silently, is not used.
+--
 -- A root is added by its path, see 'addWatchFor'.
 withAddedDir ::
        Word32
