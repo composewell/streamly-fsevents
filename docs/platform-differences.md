@@ -389,6 +389,16 @@ checking" privilege.
 Nested roots in a recursive watch report a change in the inner root once
 for each root, on all platforms.
 
+<!--
+Tested, without a claim above:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A root listed twice reports a file created in it once | Yes | Yes | Yes |
+| A root and a symbolic link to it report a file created in it for both | Yes | Yes | Yes |
+| A root and its path in upper case report a file created in it for both | Not applicable, case sensitive | Yes | Yes |
+-->
+
 ## Event reporting (Non recursive)
 
 ### Root Directory metadata changes
@@ -463,6 +473,14 @@ reported under `isModified` enabled by appropriate config options:
 | Delete a subdirectory | `isModified` for the directory | `setAllEvents True` | No |
 | Create a hard link | `isModified` for the directory | `setAllEvents True` | No |
 | Delete a hard link | `isModified` for the directory | `setAllEvents True` | No |
+
+<!--
+Tested, without a claim above:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A file deleted and created again is reported | Yes | Yes | Yes |
+-->
 
 ### File/subdirectory metadata changes
 
@@ -549,6 +567,15 @@ subdirectory in some runs.
 | Delete a file in a subdirectory | Any | No | No | Sometimes |
 | Modify a file two levels below the root | Any | No | No | Sometimes |
 | Delete a file two levels below the root | Any | No | No | No |
+
+<!--
+Tested, without a claim above. It checks whether the Windows events in the
+table are late events of the setup, which creates the file:
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A file created in a subdirectory before the watch reports an event | No | No | Sometimes |
+-->
 
 <!--
 On macOS FSEvents can only watch a tree. The library
