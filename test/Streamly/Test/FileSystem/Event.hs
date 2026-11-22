@@ -47,6 +47,7 @@ import System.FilePath ((</>), normalise, pathSeparator, takeDirectory)
 import System.FilePath (takeFileName)
 #endif
 import System.IO.Temp (withSystemTempDirectory)
+import System.Environment (lookupEnv)
 import System.Mem (performGC)
 import System.Timeout (timeout)
 #if defined(CABAL_OS_LINUX)
@@ -74,6 +75,8 @@ import qualified Streamly.Internal.FS.Event.Linux as Inotify
 #elif defined(CABAL_OS_FREEBSD)
 import Foreign.C.Types (CInt(..))
 import qualified Streamly.Internal.FS.Event.FreeBSD as Inotify
+#elif defined(CABAL_OS_DARWIN)
+import qualified Streamly.Internal.FS.Event.Darwin as Darwin
 #elif defined(CABAL_OS_WINDOWS)
 import GHC.IO.Exception (IOErrorType(InappropriateType))
 import System.IO.Error (ioeGetErrorType)
@@ -279,6 +282,22 @@ readUntil p w = do
             Just ev
                 | p ev -> return (reverse (ev : acc))
                 | otherwise -> go (ev : acc)
+
+-- | The events read in the given number of microseconds, or until the
+-- watch is closed.
+readFor :: Int -> Event.Watch -> IO [Event]
+readFor us w = do
+    ref <- newIORef []
+    _ <- timeout us (go ref)
+    reverse <$> readIORef ref
+
+    where
+
+    go ref = do
+        r <- Event.readEvent w
+        case r of
+            Nothing -> return ()
+            Just ev -> atomicModifyIORef' ref (\xs -> (ev : xs, ())) >> go ref
 
 -- | Read the events up to the @isRootUnwatched@ event of the path for the
 -- root. On macOS and Windows nothing is read if the path is not the root.
@@ -1284,6 +1303,8 @@ keepEventsWhileAdding :: Spec
 keepEventsWhileAdding =
     it "a root reports all its events while other roots are added, removed"
         $ withRootHandle id $ \root w -> do
+            n <- envInt "FSEVENT_TEST_ROOT_FILES" 2000
+            adds <- envInt "FSEVENT_TEST_ROOT_CHANGES" 20
             let base = takeDirectory root
                 files = [root </> ("file" ++ show i) | i <- [1 .. n]]
                 end = root </> "end"
@@ -1302,15 +1323,73 @@ keepEventsWhileAdding =
                     $ \_ -> do
                         mapM_ changeRoots (zip [1 :: Int ..] dirs)
                         takeMVar done
+            -- The events read after "end", to tell an event reported after
+            -- "end" from an event that is not reported.
+            late <- readFor 2000000 w
             let ofRoot = filter ((== root) . rootPath) evs
-            if any Event.isEventsLost evs
+                lateOfRoot = filter ((== root) . rootPath) late
+            if any Event.isEventsLost (evs ++ late)
             then pendingWith "events were lost, reported by isEventsLost"
-            else ofRoot `shouldCreate` (files ++ [end])
+            else do
+                let expected = files ++ [end]
+                    missing =
+                        filter (`notElem` pathsOf Event.isCreated ofRoot)
+                            expected
+                unless (null missing)
+                    $ expectationFailure
+                    $ missingReport end expected missing ofRoot lateOfRoot
+                ofRoot `shouldCreate` expected
 
     where
 
-    n = 2000 :: Int
-    adds = 20 :: Int
+    -- The CI repeats this test with larger values to reproduce a failure.
+    envInt :: String -> Int -> IO Int
+    envInt name def = maybe def read <$> lookupEnv name
+
+    -- The paths missing when "end" was read, their positions in the order
+    -- of creation, and those reported later. On macOS also the event ids.
+    missingReport end expected missing ofRoot lateOfRoot =
+        let createdLate = pathsOf Event.isCreated lateOfRoot
+            arrived = filter (`elem` createdLate) missing
+            never = filter (`notElem` createdLate) missing
+            positions =
+                [i | (i, f) <- zip [1 :: Int ..] expected, f `elem` missing]
+         in unlines $
+            [ "missing when end was read: " ++ show (length missing)
+                ++ " of " ++ show (length expected)
+            , "positions: " ++ showRanges positions
+            , "reported after end: " ++ show (length arrived)
+            , "never reported: " ++ show (length never) ++ " "
+                ++ show (take 10 never)
+            ]
+            ++ eventIds end ofRoot
+                (filter (\ev -> absPath ev `elem` missing) lateOfRoot)
+
+    -- Consecutive positions as ranges, e.g. "3-7 12".
+    showRanges = unwords . map showRange . ranges
+
+    ranges [] = []
+    ranges (x : xs) =
+        let run = x : map snd (takeWhile (uncurry (==)) (zip [x + 1 ..] xs))
+         in (x, last run) : ranges (drop (length run - 1) xs)
+
+    showRange (a, b) = if a == b then show a else show a ++ "-" ++ show b
+
+#if defined(CABAL_OS_DARWIN)
+    -- The highest id read before "end", the id of "end", and the ids of
+    -- the late events of the missing paths. A missing path with an id
+    -- lower than the id of "end" was reported out of order.
+    eventIds end ofRoot lateMissing =
+        [ "max id before end: "
+            ++ show (maximum (0 : map Darwin.getEventId ofRoot))
+        , "id of end: "
+            ++ show (map Darwin.getEventId (filter (isCreatedAt end) ofRoot))
+        , "ids of the late events of the missing paths: "
+            ++ show (take 20 (map Darwin.getEventId lateMissing))
+        ]
+#else
+    eventIds _ _ _ = []
+#endif
 
 -- A change made in the removed root after removeRoot returns is not
 -- reported, before or after the isRootUnwatched event of the root.
