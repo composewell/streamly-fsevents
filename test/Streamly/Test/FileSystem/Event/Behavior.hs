@@ -1315,8 +1315,8 @@ behaviors =
         , check = const (modifiedNamed "file")
         , expected = onPlatform No No No
         }
-    -- On Linux the watch of the subdirectory is added, its listing fails, it
-    -- is reported as isAccessDenied. On FreeBSD adding the watch looks up the
+    -- On Linux the subdirectory cannot be listed, it is not watched and is
+    -- reported as isAccessDenied. On FreeBSD adding the watch looks up the
     -- entries, it fails without SEARCH.
     , withoutBypass $ base
         { title = "A subdirectory with READ, without SEARCH reports its events"
@@ -1330,7 +1330,7 @@ behaviors =
         , skip = stillSearchable . deniedDir
         , ops = writeHeldFiles
         , check = const (modifiedNamed "file")
-        , expected = onFreeBSD No (onPlatform Yes No No)
+        , expected = No
         }
     , base
         { title =

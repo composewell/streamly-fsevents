@@ -1780,24 +1780,24 @@ data AddedDir =
       -- | A root that is not a directory, or a directory symbolic link that
       -- is not followed.
       NotDir
-      -- | A subdirectory added but not listed because of a permission error
-    | DirDenied
     | DirOpened (CInt, ReadDir.DirStream) -- ^ The fd and the directory stream
-
--- | The denied subdirectory of an 'AddedDir'.
-deniedOf :: PathRep -> AddedDir -> [PathRep]
-deniedOf pRep DirDenied = [pRep]
-deniedOf _ _ = []
 
 -- | Add the watch of a directory and run an action with the result of
 -- 'addPathWith' and the fd and the directory stream of the directory, see
--- 'openDirStream'. The directory is opened with @O_PATH@, which does not
--- generate any events, the watch is added with the given flags through this
--- fd, and the directory is then opened for reading relative to it. The fds are
--- closed when the action ends, the subdirectories are opened relative to the
--- fd while it is open. A walk holds two fds for each level of the tree that
--- it keeps open, see 'maxOpenLevels'. The caller restores 'watchFlags' after
--- this returns, after the close.
+-- 'openDirStream'. A subdirectory is opened with @O_PATH@, which does not
+-- generate any events, and then opened for reading relative to it. The watch
+-- is added with the given flags through the @O_PATH@ fd after the open, and
+-- before the directory is read. The fds are closed when the action ends, the
+-- subdirectories are opened relative to the fd while it is open. A walk holds
+-- two fds for each level of the tree that it keeps open, see
+-- 'maxOpenLevels'. The caller restores 'watchFlags' after this returns, after
+-- the close.
+--
+-- A subdirectory that cannot be opened for reading because of a permission
+-- error is not watched, and 'Nothing' is returned. Opening it for reading
+-- needs the read and the search permissions on it, the search permission to
+-- open @.@. A watch of a directory without the search permission would report
+-- the events of its entries, but its subdirectories could not be added.
 --
 -- A root is added by its path, see 'addWatchFor'.
 withAddedDir ::
@@ -1806,16 +1806,19 @@ withAddedDir ::
     -> Maybe ParentDir
     -> PathRep
     -> ((Int, Bool) -> AddedDir -> IO a)
-    -> IO a
+    -> IO (Maybe a)
 withAddedDir flags wtch parent pRep action =
     case pRep of
         (_, Nothing) -> do
             r <- addPathWith flags wtch pRep
-            bracket openRoot close (action r)
+            Just <$> bracket openRoot close (action r)
         (_, Just _) ->
-            bracket (openDirAt o_PATH flags parent pRep) c_close $ \pfd -> do
-                r <- addPathAt flags wtch pRep pfd
-                bracket (openSub pfd) close (action r)
+            bracket (openDirAt o_PATH flags parent pRep) c_close $ \pfd ->
+                bracket (openSub pfd) (mapM_ (close . DirOpened)) $ \case
+                    Nothing -> return Nothing
+                    Just d -> do
+                        r <- addPathAt flags wtch pRep pfd
+                        Just <$> action r (DirOpened d)
 
     where
 
@@ -1826,9 +1829,9 @@ withAddedDir flags wtch parent pRep action =
         r <- try (openDirStream pRep (openDot pRep pfd))
         case r of
             Left e
-                | isAccessError e -> return DirDenied
+                | isAccessError e -> return Nothing
                 | otherwise -> ioError e
-            Right dir -> return (DirOpened dir)
+            Right dir -> return (Just dir)
 
     openRoot = do
         r <- try (openDirStreamAt flags Nothing pRep)
@@ -2054,7 +2057,7 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
     -- raises the exception. A subdirectory is skipped and reported as
     -- 'isAccessDenied', see 'ignoreInvalidOrInaccessible'.
     --
-    (wd, subdirs) <- withAddedDir (scanFlags cfg) watch0 parent pRep
+    added <- withAddedDir (scanFlags cfg) watch0 parent pRep
         $ \(wd, isNew) dir -> do
             case (pRep, dir) of
                 ((_, Nothing), DirOpened _) ->
@@ -2066,16 +2069,20 @@ addToWatchAt cfg@Config{..} watch0 level parent pRep = do
             case dir of
                 DirOpened d | isNew && watchRec ->
                     (,) wd <$> walkSubdirs level pRep d addSubdir
-                _ -> return (wd, Right (deniedOf pRep dir))
-    denied <- walkCollected addSubdir subdirs
+                _ -> return (wd, Right [])
+    case added of
+        Nothing -> return [pRep]
+        Just (wd, subdirs) -> do
+            denied <- walkCollected addSubdir subdirs
 
-    -- The directory has been listed and closed. The watch of its parent still
-    -- has 'scanFlags' until the scan of the parent ends, the directories are
-    -- changed in the reverse order of adding them. An already watched path is
-    -- changed too, to add the flags of this config.
-    when (scanFlags cfg /= watchFlags cfg)
-        $ void $ updateWatch (watchFlags cfg) watch0 wd pRep
-    return denied
+            -- The directory has been listed and closed. The watch of its
+            -- parent still has 'scanFlags' until the scan of the parent ends,
+            -- the directories are changed in the reverse order of adding
+            -- them. An already watched path is changed too, to add the flags
+            -- of this config.
+            when (scanFlags cfg /= watchFlags cfg)
+                $ void $ updateWatch (watchFlags cfg) watch0 wd pRep
+            return denied
 
     where
 
