@@ -357,10 +357,7 @@ getAbsPath = Event.getAbsPath
 
 -- | Determine whether the event indicates creation of an object within the
 -- monitored path. This event is generated when any file system object is
--- created.
---
--- Creating a hard link does not generate this event on all platforms. See
--- @docs\/platform-differences.md@ in this package.
+-- created, including a hard link.
 --
 -- In a recursive watch on Linux and FreeBSD, this event is also generated for
 -- the entries of a directory moved into the tree, which may not be new. See
