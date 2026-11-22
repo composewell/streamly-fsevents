@@ -1217,6 +1217,145 @@ behaviors =
             any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
         , expected = onPlatform Yes No Exception
         }
+    , Subsection "Resolution of the root path"
+    -- On macOS the event paths have the symbolic links resolved, the library
+    -- matches them against the root path resolved when the root is added.
+    -- These behaviors change the resolution of a root path after the watch
+    -- starts. An event that matches a root reports the root path as
+    -- supplied, an event that does not match any root reports the resolved
+    -- path, so the check compares the absolute path.
+    , Test base
+        { title =
+            "A missing root created as a symbolic link to a directory "
+                ++ "reports its events"
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (linkTarget p)
+        , ops = \p -> do
+            createDirectoryLink (linkTarget p) (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = \p -> createdAt (watchRoot p </> "file")
+        , expected = onPlatform WatchException No WatchException
+        , racy = onDarwin
+        }
+    , Test base
+        { title =
+            "A root whose missing parent is created as a symbolic link to a "
+                ++ "directory reports its events"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = \p -> createDirectoryIfMissing True (linkTarget p </> "root")
+        , ops = \p -> do
+            createDirectoryLink (linkTarget p) (nestedParent p)
+            settle
+            createFile (nestedRoot p </> "file")
+        , check = \p -> createdAt (nestedRoot p </> "file")
+        , expected = onPlatform WatchException No WatchException
+        , racy = onDarwin
+        }
+    -- On a case-insensitive file system "Missing" and "missing" are the
+    -- same path.
+    , Test base
+        { title =
+            "A missing root created with a different case reports its events"
+        , extraRoots = \p -> [missingRoot p]
+        , ops = \p -> do
+            createDirectory (createdMissingRoot p)
+            settle
+            createFile (createdMissingRoot p </> "file")
+        , check = \p -> createdAt (missingRoot p </> "file")
+        , expected = onPlatform WatchException No WatchException
+        , racy = onDarwin
+        }
+    -- The watch follows a symbolic link root when it starts. On Linux and
+    -- Windows the watch is on the directory the link pointed to.
+    , Test base
+        { title =
+            "A symbolic link root changed to another directory reports the "
+                ++ "events of the new directory"
+        , setup = withLinkRoot
+        , ops = \p -> do
+            retargetLinkRoot p
+            createFile (otherTarget p </> "file")
+        , check = \p -> createdAt (watchRoot p </> "file")
+        , expected = onPlatform No No No
+        , racy = onDarwin || onWindows
+        }
+    , Test base
+        { title =
+            "A symbolic link root changed to another directory reports the "
+                ++ "events of the old directory"
+        , setup = withLinkRoot
+        , ops = \p -> do
+            retargetLinkRoot p
+            createFile (linkTarget p </> "file")
+        , check = \p -> createdAt (watchRoot p </> "file")
+        , expected = onPlatform Yes Yes Yes
+        , racy = onDarwin || onWindows
+        }
+#if defined(CABAL_OS_DARWIN)
+    -- FSEvents reports a root path event when a path component of a root is
+    -- created, deleted or renamed. These check whether the changes of the
+    -- resolution above report it.
+    , Test base
+        { title =
+            "A missing root created as a symbolic link to a directory "
+                ++ "reports `isRootPathEvent`"
+        , config = Darwin.setRootPathEvents True
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (linkTarget p)
+        , ops = \p -> createDirectoryLink (linkTarget p) (watchRoot p)
+        , check = const (any Darwin.isRootPathEvent)
+        , expected = Yes
+        , racy = True
+        }
+    , Test base
+        { title =
+            "A root whose missing parent is created as a symbolic link to a "
+                ++ "directory reports `isRootPathEvent`"
+        , config = Darwin.setRootPathEvents True
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = \p -> createDirectoryIfMissing True (linkTarget p </> "root")
+        , ops = \p -> createDirectoryLink (linkTarget p) (nestedParent p)
+        , check = const (any Darwin.isRootPathEvent)
+        , expected = Yes
+        , racy = True
+        }
+    , Test base
+        { title =
+            "A missing root created with a different case reports "
+                ++ "`isRootPathEvent`"
+        , config = Darwin.setRootPathEvents True
+        , extraRoots = \p -> [missingRoot p]
+        , ops = createDirectory . createdMissingRoot
+        , check = const (any Darwin.isRootPathEvent)
+        , expected = Yes
+        , racy = True
+        }
+    , Test base
+        { title =
+            "A symbolic link root changed to another directory reports "
+                ++ "`isRootPathEvent`"
+        , config = Darwin.setRootPathEvents True
+        , setup = withLinkRoot
+        , ops = retargetLinkRoot
+        , check = const (any Darwin.isRootPathEvent)
+        , expected = Yes
+        , racy = True
+        }
+    -- /Users is a firmlink to /System/Volumes/Data/Users.
+    , Test base
+        { title = "A root under /Users reports its events"
+        , extraRoots = \p -> [usersRoot p]
+        , setup = createDirectory . usersRoot
+        , cleanup = removePathForcibly . usersRoot
+        , ops = \p -> createFile (usersRoot p </> "file")
+        , check = \p -> createdAt (usersRoot p </> "file")
+        , expected = Yes
+        , racy = True
+        }
+#endif
     , Subsection "Unmount of the file system of a root"
     -- A new file system is mounted at the watch root. On Windows the
     -- watch keeps a handle on the volume open, the lock of the volume
@@ -2347,6 +2486,42 @@ behaviors =
 
     movedNestedRoot p = takeDirectory (watchRoot p) </> "moved" </> "root"
 
+    -- Whether the file at the absolute path is reported as created.
+    createdAt path = any (\ev -> absPath ev == path && Event.isCreated ev)
+
+    -- The directories that a symbolic link root points to, next to the
+    -- watch root.
+    linkTarget p = takeDirectory (watchRoot p) </> "target"
+
+    otherTarget p = takeDirectory (watchRoot p) </> "other"
+
+    -- Replace the watch root by a symbolic link to 'linkTarget'.
+    withLinkRoot p = do
+        removeDirectory (watchRoot p)
+        createDirectory (linkTarget p)
+        createDirectory (otherTarget p)
+        createDirectoryLink (linkTarget p) (watchRoot p)
+        settle
+
+    -- Point the symbolic link root to 'otherTarget'.
+    retargetLinkRoot p = do
+        removeDirectoryLink (watchRoot p)
+        createDirectoryLink (otherTarget p) (watchRoot p)
+        settle
+
+    -- A root that does not exist, next to the watch root, and the same path
+    -- in a different case.
+    missingRoot p = takeDirectory (watchRoot p) </> "Missing"
+
+    createdMissingRoot p = takeDirectory (watchRoot p) </> "missing"
+
+#if defined(CABAL_OS_DARWIN)
+    -- A root in /Users/Shared, named after the temporary directory of the
+    -- behavior.
+    usersRoot p =
+        "/Users/Shared" </> takeFileName (takeDirectory (watchRoot p))
+
+#endif
     volumeDir = takeDirectory . watchRoot
 
     unmount =
