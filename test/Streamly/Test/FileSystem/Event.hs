@@ -38,6 +38,7 @@ import System.Directory
     , createFileLink
     , getCurrentDirectory
     , removeDirectory
+    , removeDirectoryLink
     , removePathForcibly
     , renameDirectory
     , setCurrentDirectory
@@ -1523,6 +1524,46 @@ staleRootReAdded =
     expected r = [r]
 #endif
 
+-- The root link is a symbolic link to a, the watch follows it to a. After
+-- link is changed to point to b, the root path refers to b. On Linux and
+-- FreeBSD the root is stale, its device and inode differ from those of b.
+-- On Windows a root is stale only when it is renamed. On macOS a root is
+-- never stale. removeRoot and addRoot watch b.
+staleLinkRootReAdded :: Spec
+staleLinkRootReAdded =
+    it "a symbolic link root changed to another directory is stale"
+        $ withRootHandle id $ \root w -> do
+            let dir = takeDirectory root
+                a = dir </> "a"
+                b = dir </> "b"
+                link = dir </> "link"
+                file = link </> "file"
+            createDirectory a
+            createDirectory b
+            createDirectoryLink a link
+            p <- Path.fromString link
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            removeDirectoryLink link
+            createDirectoryLink b link
+            stale w `shouldReturn` expected link
+            Event.removeRoot w p
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            createFile (b </> "file")
+            evs <- readUntil (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [link]
+
+    where
+
+    stale w = map Path.toString <$> Event.staleRoots w
+
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+    expected r = [r]
+#else
+    expected _ = []
+#endif
+
 closedWatchOps :: Spec
 closedWatchOps =
     it "addRoot raises an exception, removeRoot does nothing on a closed watch"
@@ -1708,6 +1749,7 @@ handleTests = do
     removeWhileReading
     removeAddAgain
     staleRootReAdded
+    staleLinkRootReAdded
     closedWatchOps
 #if defined(CABAL_OS_WINDOWS)
     fileRootRaises
