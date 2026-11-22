@@ -787,8 +787,12 @@ Subdirectory permissions required to start the watch:
 |----------|-------|-------|---------|
 | A subdirectory with READ and SEARCH reports its events | Yes | Yes | Yes |
 | A subdirectory without READ and without SEARCH reports its events | No | No | No |
-| A subdirectory with READ, without SEARCH reports its events | if scan disabled | No | No |
+| A subdirectory with READ, without SEARCH reports its events | No | No | No |
 | A subdirectory without READ, with SEARCH reports its events | No | Yes | Yes |
+
+On Linux a subdirectory is listed when its watch is added, with
+`setScanNewDirs False` as well. A subdirectory without SEARCH cannot be
+listed, it is reported as `isAccessDenied` and is not watched.
 
 Skipping permission errors:
 
