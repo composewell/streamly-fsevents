@@ -11,8 +11,11 @@
 -- including when an assertion fails. The tables in
 -- docs/platform-differences.md record the results printed on each platform in
 -- the CI logs. The behaviors are grouped under the section and subsection
--- headings of the document. A behavior that belongs to a section but is
--- tested in another test suite has a placeholder comment in the section.
+-- headings of the document. The title of a behavior is the text of its table
+-- row, the operation and the event in an operation and event table. A
+-- behavior stated in the text of the document has a title in the same
+-- style. A behavior that belongs to a section but is tested in another test
+-- suite has a placeholder comment in the section.
 --
 -- A racy outcome, one that depends on a race or on the OS version, is not
 -- asserted, it is recorded from the CI logs.
@@ -878,7 +881,7 @@ behaviors =
     -- opening it", which also checks that FreeBSD does not report a write
     -- to the FIFO.
     , Test base
-        { title = "regular file as a root is watched"
+        { title = "A regular file can be watched"
         , setup = \p -> do
             removeDirectory (watchRoot p)
             createFile (watchRoot p)
@@ -890,7 +893,7 @@ behaviors =
         }
     , Subsection "Watching non-existing paths"
     , Test base
-        { title = "root created after the start of the watch is watched"
+        { title = "A non-existing object path is watched"
         , setup = removeDirectory . watchRoot
         , ops = \p -> do
             createDirectory (watchRoot p)
@@ -900,7 +903,7 @@ behaviors =
         , expected = onPlatform WatchException Yes WatchException
         }
     , Test base
-        { title = "root deleted and created again is watched"
+        { title = "A watch root deleted and created again is watched"
         , ops = \p -> do
             removePathForcibly (watchRoot p)
             settle
@@ -987,8 +990,8 @@ behaviors =
     -- Without following, the watch is on the symbolic link itself.
     , Test base
         { title =
-            "A deleted symbolic link to a directory root watched in "
-                ++ "no-follow mode reports `isDeleted` for the root"
+            "A deleted symbolic link root with `setFollowRootSymLinks False` "
+                ++ "reports `isDeleted` for the root"
         , config = Inotify.setFollowRootSymLinks False
         , setup = \p -> do
             removeDirectory (watchRoot p)
@@ -1034,14 +1037,14 @@ behaviors =
         }
 #endif
     , Test base
-        { title = "renamed root is watched"
+        { title = "A renamed watch root remains watched"
         , ops = renameRootAndCreate
         , check = const (createdNamed "file")
         , expected = onPlatform No No Yes
         }
     -- On Windows the rename of a root is not reported, the watch continues.
     , Test base
-        { title = "renamed root reports isMoved for the root"
+        { title = "A renamed watch root reports `isMoved`"
         , ops = \p -> renameDirectory (watchRoot p) (renamedRoot p)
         , check = \p ->
             let isRoot ev = absPath ev `elem` [watchRoot p, renamedRoot p]
@@ -1050,15 +1053,14 @@ behaviors =
         }
     -- On Windows the rename of a root is not reported, the watch continues.
     , Test base
-        { title =
-            "A renamed watch root reports `isRootUnwatched` for the root"
+        { title = "A renamed watch root reports `isRootUnwatched`"
         , ops = renameRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
         , expected = onPlatform Yes No No
         }
     , Test base
-        { title = "root renamed back after the event is read is watched"
+        { title = "A root renamed back to its original path is watched"
         , ops = \p -> do
             renameDirectory (watchRoot p) (renamedRoot p)
             settle
@@ -1069,7 +1071,8 @@ behaviors =
         }
     -- On Linux the rename event of a directory root removes the root.
     , Test base
-        { title = "root renamed back before the event is read is watched"
+        { title =
+            "A root renamed back before the rename event is read is watched"
         , paused = True
         , ops = \p -> do
             renameDirectory (watchRoot p) (renamedRoot p)
@@ -1107,8 +1110,8 @@ behaviors =
 #if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
     , Test base
         { title =
-            "A renamed symbolic link to a directory root watched in "
-                ++ "no-follow mode reports `isMoved` for the root"
+            "A renamed symbolic link root with `setFollowRootSymLinks False` "
+                ++ "reports `isMoved` for the root"
         , config = Inotify.setFollowRootSymLinks False
         , setup = \p -> do
             removeDirectory (watchRoot p)
@@ -1372,23 +1375,23 @@ behaviors =
     -- created flag, it has a different event id. A copy of one event for
     -- each root has the same event id.
     , Test base
-        { title = "root listed twice reports a file created in it twice"
+        { title = "A root listed twice reports a file created in it once"
         , extraRoots = \p -> [watchRoot p]
         , ops = \p -> createFile (watchRoot p </> "file")
         , check = \_ evs ->
             let created ev = isNamed "file" ev && Event.isCreated ev
 #if defined(CABAL_OS_DARWIN)
                 ids = sort (map Darwin.getEventId (filter created evs))
-             in any ((> 1) . length) (group ids)
+             in not (null ids) && all ((== 1) . length) (group ids)
 #else
-             in length (filter created evs) == 2
+             in length (filter created evs) == 1
 #endif
-        , expected = No
+        , expected = Yes
         }
     , Test base
         { title =
-            "root and a symbolic link to it report a file created in it "
-                ++ "for both"
+            "A root and a symbolic link to it report a file created in it for "
+                ++ "both"
         , setup = \p -> do
             createDirectoryLink (watchRoot p) (linkRoot p)
             settle
@@ -1400,7 +1403,7 @@ behaviors =
     -- The upper case path exists only on a case-insensitive file system.
     , Test base
         { title =
-            "root and its path in upper case report a file created in it "
+            "A root and its path in upper case report a file created in it "
                 ++ "for both"
         , extraRoots = \p -> [upperRoot p]
         , skip = \p -> do
@@ -1414,7 +1417,8 @@ behaviors =
         , expected = Yes
         }
     , Test base
-        { title = "nested roots report a file in the inner root for both"
+        { title =
+            "Nested roots report a file created in the inner root for both"
         , config = Event.setRecursiveMode True
         , setup = withDir
         , extraRoots = \p -> [watchRoot p </> "dir"]
@@ -1426,23 +1430,23 @@ behaviors =
     , Subsection "Root Directory metadata changes"
     , Test dirAttrsChange
         { title =
-            "changing the permissions of the directory reports "
-                ++ "isAttrsModified for the directory"
+            "Changing the permissions of the directory reports "
+                ++ "`isAttrsModified` for the directory"
         , ops = changeDirMode . watchRoot
         , expected = onPlatform Yes No No
         }
     , Test dirAttrsChange
         { title =
-            "setting the times of the directory reports isAttrsModified for "
-                ++ "the directory"
+            "Setting the access and modification times of the directory "
+                ++ "reports `isAttrsModified` for the directory"
         , ops = setTimes . watchRoot
         , expected = onPlatform Yes Yes No
         }
 #if defined(CABAL_OS_DARWIN)
     , Test base
         { title =
-            "changing the permissions of the directory reports "
-                ++ "isSecurityModified for the directory"
+            "Changing the permissions of the directory reports "
+                ++ "`isSecurityModified` for the directory"
         , ops = changeDirMode . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && securityModified ev)
@@ -1458,7 +1462,7 @@ behaviors =
     -- problem: the watch of the directory reports the events of the file
     -- after it is deleted and created again.
     , Test base
-        { title = "file deleted and created again in a watched dir is reported"
+        { title = "A file deleted and created again is reported"
         , ops = \p -> do
             let file = watchRoot p </> "file"
             createFile file
@@ -1472,8 +1476,8 @@ behaviors =
         }
     , Test hardLinkSteps
         { title =
-            "creating, then deleting a hard link reports isCreated, then "
-                ++ "isDeleted for the link"
+            "Creating, then deleting a hard link reports `isCreated`, then "
+                ++ "`isDeleted` for the link"
         , steps =
             [ (createLink, const (createdNamed "link"))
             , (deleteLink, \_ -> any (\ev -> isNamed "link" ev
@@ -1483,7 +1487,7 @@ behaviors =
         }
     -- On macOS the copy is a clone, on APFS it reports 'Darwin.isCloned'.
     , Test base
-        { title = "copy of a file reports isCreated for the copy"
+        { title = "Copying a file reports `isCreated` for the copy"
         , setup = withFile
         , ops = \p ->
             copyFile (watchRoot p </> "file") (watchRoot p </> "copy")
@@ -1492,7 +1496,8 @@ behaviors =
         }
 #if defined(CABAL_OS_DARWIN)
     , Test base
-        { title = "clone reports isCloned for the source and the clone"
+        { title =
+            "Cloning a file reports `isCloned` for the source and the clone"
         , setup = withFile
         , ops = \p ->
             copyFile (watchRoot p </> "file") (watchRoot p </> "copy")
@@ -1505,8 +1510,8 @@ behaviors =
 #endif
     , Test base
         { title =
-            "A move reports the source and the destination as separate "
-                ++ "predicates"
+            "Renaming a file reports `isMovedFrom` for the source, "
+                ++ "`isMovedTo` for the destination"
         , setup = withFile
         , ops = \p ->
             renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
@@ -1518,7 +1523,9 @@ behaviors =
         , expected = onPlatform Yes No Yes
         }
     , Test base
-        { title = "rename reports isMoved for the source and the destination"
+        { title =
+            "Renaming a file reports `isMoved` for the source and the "
+                ++ "destination"
         , setup = withFile
         , ops = \p ->
             renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
@@ -1528,35 +1535,37 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , Test dirAttrsChange
-        { title = "creating a file reports isAttrsModified for the directory"
+        { title = "Creating a file reports `isAttrsModified` for the directory"
         , ops = \p -> createFile (watchRoot p </> "file")
         }
     , Test dirAttrsChange
-        { title = "deleting a file reports isAttrsModified for the directory"
+        { title = "Deleting a file reports `isAttrsModified` for the directory"
         , setup = withFile
         , ops = \p -> removeFile (watchRoot p </> "file")
         }
     , Test dirAttrsChange
-        { title = "renaming a file reports isAttrsModified for the directory"
+        { title = "Renaming a file reports `isAttrsModified` for the directory"
         , setup = withFile
         , ops = \p ->
             renameFile (watchRoot p </> "file") (watchRoot p </> "renamed")
         }
     , Test dirAttrsChange
         { title =
-            "creating a subdirectory reports isAttrsModified for the directory"
+            "Creating a subdirectory reports `isAttrsModified` for the "
+                ++ "directory"
         , ops = \p -> createDirectory (watchRoot p </> "dir")
         }
     , Test dirAttrsChange
         { title =
-            "deleting a subdirectory reports isAttrsModified for the directory"
+            "Deleting a subdirectory reports `isAttrsModified` for the "
+                ++ "directory"
         , setup = withDir
         , ops = \p -> removeDirectory (watchRoot p </> "dir")
         }
 #if !defined(CABAL_OS_WINDOWS)
     , Test dirAttrsChange
         { title =
-            "creating a symbolic link reports isAttrsModified for the "
+            "Creating a symbolic link reports `isAttrsModified` for the "
                 ++ "directory"
         , setup = withFile
         , ops = \p -> Posix.createSymbolicLink "file" (watchRoot p </> "link")
@@ -1564,8 +1573,8 @@ behaviors =
 #endif
     , Test hardLinkSteps
         { title =
-            "creating, then deleting a hard link reports isAttrsModified for "
-                ++ "the directory"
+            "Creating, then deleting a hard link reports `isAttrsModified` "
+                ++ "for the directory"
         , config = dirMetadataConfig
         , steps = [(createLink, dirMetadata), (deleteLink, dirMetadata)]
         , expected =
@@ -1573,12 +1582,16 @@ behaviors =
         }
     , Subsection "File/subdirectory metadata changes"
     , Test setTimesChange
-        { title = "setting the file times reports isAttrsModified"
+        { title =
+            "Setting the access and modification times of a file reports "
+                ++ "`isAttrsModified`"
         , check = metadataEvent attrsModified
         , expected = onPlatform Yes Yes No
         }
     , Test setTimesChange
-        { title = "setting the file times reports isModified"
+        { title =
+            "Setting the access and modification times of a file reports "
+                ++ "`isModified`"
         , check = metadataEvent Event.isModified
         , expected = onPlatform No No Yes
         , racy = onDarwin
@@ -1587,7 +1600,9 @@ behaviors =
     -- Windows sets the modification time only in the tests of each config
     -- option. Linux reports it as IN_MODIFY, FreeBSD as IN_ATTRIB.
     , Test setTimesChange
-        { title = "setting only the file modification time reports isModified"
+        { title =
+            "Setting only the modification time of a file reports "
+                ++ "`isModified`"
         , ops = \p -> setModTime (watchRoot p </> "file")
         , check = metadataEvent Event.isModified
         , expected = onPlatform (onFreeBSD No Yes) No No
@@ -1595,7 +1610,8 @@ behaviors =
         }
     , Test setTimesChange
         { title =
-            "setting only the file modification time reports isAttrsModified"
+            "Setting only the modification time of a file reports "
+                ++ "`isAttrsModified`"
         , ops = \p -> setModTime (watchRoot p </> "file")
         , check = metadataEvent attrsModified
         , expected = onPlatform (onFreeBSD Yes No) Yes No
@@ -1606,34 +1622,34 @@ behaviors =
     -- some runs. Whether these are the flags of the create in the setup, or
     -- the change of an attribute by chmod, e.g. its ctime, is not known.
     , Test metadataChange
-        { title = "making a file read-only reports isAttrsModified"
+        { title = "Making a file read-only reports `isAttrsModified`"
         , check = metadataEvent attrsModified
         , expected = onPlatform Yes No No
         , racy = onDarwin
         }
     , Test metadataChange
-        { title = "making a file read-only reports isSecurityModified"
+        { title = "Making a file read-only reports `isSecurityModified`"
         , check = metadataEvent securityModified
         , expected = onPlatform No Yes No
         }
     , Test metadataChange
-        { title = "making a file read-only reports isModified"
+        { title = "Making a file read-only reports `isModified`"
         , check = metadataEvent Event.isModified
         , expected = onPlatform No No Yes
         , racy = onDarwin
         }
     , Test subdirAttrsChange
         { title =
-            "changing the permissions of a subdirectory reports "
-                ++ "isAttrsModified for the subdirectory"
+            "Changing the permissions of a subdirectory reports "
+                ++ "`isAttrsModified` for the subdirectory"
         , ops = \p -> changeDirMode (watchRoot p </> "dir")
         , expected = onPlatform Yes No Yes
         }
 #if defined(CABAL_OS_DARWIN)
     , Test base
         { title =
-            "changing the permissions of a subdirectory reports "
-                ++ "isSecurityModified for the subdirectory"
+            "Changing the permissions of a subdirectory reports "
+                ++ "`isSecurityModified` for the subdirectory"
         , setup = withDir
         , ops = \p -> changeDirMode (watchRoot p </> "dir")
         , check =
@@ -1643,14 +1659,14 @@ behaviors =
 #endif
     , Test subdirAttrsChange
         { title =
-            "setting the times of a subdirectory reports isAttrsModified for "
-                ++ "the subdirectory"
+            "Setting the access and modification times of a subdirectory "
+                ++ "reports `isAttrsModified` for the subdirectory"
         , ops = \p -> setTimes (watchRoot p </> "dir")
         }
     , Test hardLinkSteps
         { title =
-            "creating, then deleting a hard link reports isAttrsModified for "
-                ++ "the file"
+            "Creating, then deleting a hard link reports `isAttrsModified` "
+                ++ "for the file"
         , steps = [(createLink, linkFileAttrs), (deleteLink, linkFileAttrs)]
         , expected = Steps [No, No]
         }
@@ -1665,7 +1681,9 @@ behaviors =
     -- are removed, and close it after the write. On macOS the write to a file
     -- kept open was reported in one run and not in others.
     , Test base
-        { title = "write is reported before the file is closed"
+        { title =
+            "Writing to an open file reports `isModified` before the file is "
+                ++ "closed"
         , darwinSetupDelay = setupFlagsDelay
         , setup = \p -> createFile (watchRoot p </> "file")
         , ops = \p -> do
@@ -1676,7 +1694,9 @@ behaviors =
         , racy = onDarwin
         }
     , Test base
-        { title = "write is reported after the file is closed"
+        { title =
+            "Writing to an open file reports `isModified` after the file is "
+                ++ "closed"
         , darwinSetupDelay = setupFlagsDelay
         , setup = \p -> createFile (watchRoot p </> "file")
         , ops = \p -> do
@@ -1686,7 +1706,9 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , Test base
-        { title = "truncating a file without a write reports isModified"
+        { title =
+            "Truncating a file to zero size, without a write, reports "
+                ++ "`isModified`"
         , darwinSetupDelay = setupFlagsDelay
         , setup = \p -> do
             writeFile (watchRoot p </> "file") "old"
@@ -1701,8 +1723,8 @@ behaviors =
     -- The outcomes on macOS and Windows have not been observed yet.
     , Test base
         { title =
-            "a write through a hard link in an unwatched directory reports "
-                ++ "isModified for the file in the root"
+            "Writing through a hard link in an unwatched directory reports "
+                ++ "`isModified` for the file"
         , setup = \p -> do
             let outside = takeDirectory (watchRoot p) </> "outside"
             createFile (watchRoot p </> "file")
@@ -1718,8 +1740,8 @@ behaviors =
         }
     , Test base
         { title =
-            "a write to a file with two links in the root reports "
-                ++ "isModified for both names"
+            "Writing to a file with two links in the root reports "
+                ++ "`isModified` for both names"
         , setup = \p -> do
             createFile (watchRoot p </> "a")
             hardLink (watchRoot p </> "a") (watchRoot p </> "b")
@@ -1732,9 +1754,7 @@ behaviors =
         }
     , Subsection "Subdirectory content changes"
     , Test base
-        { title =
-            "non-recursive watch reports an event when a file is created in"
-                ++ " a subdir"
+        { title = "Creating a file in a subdirectory reports an event"
         , setup = withDir
         , ops = \p -> createFile (watchRoot p </> "dir/file")
         , check = const (any notControl)
@@ -1746,9 +1766,7 @@ behaviors =
     -- the creation of the file in the setup, the behavior without an
     -- operation checks this.
     , Test base
-        { title =
-            "non-recursive watch reports an event when a file in a subdir is"
-                ++ " written"
+        { title = "Modifying a file in a subdirectory reports an event"
         , setup = withDirFile
         , ops = \p -> appendFile (watchRoot p </> "dir/file") "x"
         , check = const (any notControl)
@@ -1756,9 +1774,7 @@ behaviors =
         , racy = onWindows
         }
     , Test base
-        { title =
-            "non-recursive watch reports an event when a file in a subdir is"
-                ++ " deleted"
+        { title = "Deleting a file in a subdirectory reports an event"
         , setup = withDirFile
         , ops = \p -> removeFile (watchRoot p </> "dir/file")
         , check = const (any notControl)
@@ -1766,9 +1782,7 @@ behaviors =
         , racy = onWindows
         }
     , Test base
-        { title =
-            "non-recursive watch reports an event when a file two levels down"
-                ++ " is written"
+        { title = "Modifying a file two levels below the root reports an event"
         , setup = withSubdirFile
         , ops = \p -> appendFile (watchRoot p </> "dir/sub/file") "x"
         , check = const (any notControl)
@@ -1776,9 +1790,7 @@ behaviors =
         , racy = onWindows
         }
     , Test base
-        { title =
-            "non-recursive watch reports an event when a file two levels down"
-                ++ " is deleted"
+        { title = "Deleting a file two levels below the root reports an event"
         , setup = withSubdirFile
         , ops = \p -> removeFile (watchRoot p </> "dir/sub/file")
         , check = const (any notControl)
@@ -1787,8 +1799,8 @@ behaviors =
         }
     , Test base
         { title =
-            "non-recursive watch reports an event without an operation after"
-                ++ " a file is created in a subdir"
+            "A file created in a subdirectory before the watch reports an "
+                ++ "event"
         , setup = withDirFile
         , ops = const (return ())
         , check = const (any notControl)
@@ -1797,7 +1809,8 @@ behaviors =
         }
     , Subsection "Writes to a deleted open file"
     , Test deletedOpenFile
-        { title = "write to an open file after its deletion is reported"
+        { title =
+            "Writing to an open file after its deletion reports `isModified`"
         , expected = onPlatform No Yes No
         -- TODO: a temporary delay, to check whether the macOS Yes is the
         -- Modified flag of the setup. Undo it, back to the setupFlagsDelay
@@ -1806,7 +1819,9 @@ behaviors =
         }
 #if defined(CABAL_OS_LINUX)
     , Test deletedOpenFile
-        { title = "write to a deleted file, setExcludeUnlinked False"
+        { title =
+            "Writing to an open file after its deletion reports `isModified` "
+                ++ "with `setExcludeUnlinked False`"
         , config = Inotify.setExcludeUnlinked False
         , expected = Yes
         }
@@ -1814,7 +1829,7 @@ behaviors =
     , Subsection "Repeated events"
     -- Overwriting truncates the file and then writes it.
     , Test base
-        { title = "one overwrite of a file reports several isModified"
+        { title = "Overwriting a file once reports more than one `isModified`"
         , darwinSetupDelay = setupFlagsDelay
         , setup = \p -> do
             writeFile (watchRoot p </> "file") "old"
@@ -1830,7 +1845,9 @@ behaviors =
     -- with a later event of the path. Whether the delete, one second after
     -- the create, reports isCreated varies between runs.
     , Test base
-        { title = "file deleted after its create is read reports isCreated"
+        { title =
+            "Deleting a file after the consumer reads its create reports "
+                ++ "`isCreated` again"
         , ops = \p -> do
             let file = watchRoot p </> "file"
             createFile file
@@ -1845,7 +1862,9 @@ behaviors =
     -- first is the last event in the queue and it has not been read. On macOS
     -- FSEvents merges the writes only if they are reported in the same batch.
     , Test base
-        { title = "two writes to a file before the read report one isModified"
+        { title =
+            "Writing a file twice before the consumer reads the first write "
+                ++ "reports one `isModified`"
         , darwinSetupDelay = setupFlagsDelay
         , setup = withFile
         , paused = True
@@ -1862,7 +1881,9 @@ behaviors =
     -- On Linux only adjacent identical events are merged. On macOS FSEvents
     -- merges the writes to "file" only if they are reported in the same batch.
     , Test base
-        { title = "interleaved writes to two files report each isModified"
+        { title =
+            "Writing `file`, `other`, then `file` again before the consumer "
+                ++ "reads them reports two `isModified` for `file`"
         , darwinSetupDelay = setupFlagsDelay
         , setup = \p -> do
             createFile (watchRoot p </> "file")
@@ -1880,7 +1901,9 @@ behaviors =
         , racy = onDarwin
         }
     , Test base
-        { title = "one event reports isCreated and isDeleted for a file"
+        { title =
+            "Creating and deleting a file before the consumer reads the "
+                ++ "create reports one event with `isCreated` and `isDeleted`"
         , paused = True
         , ops = \p -> do
             let file = watchRoot p </> "file"
@@ -1892,7 +1915,9 @@ behaviors =
         , expected = onPlatform No Yes No
         }
     , Test base
-        { title = "one event reports isCreated and isMoved for a file"
+        { title =
+            "Creating and renaming a file before the consumer reads the "
+                ++ "create reports one event with `isCreated` and `isMoved`"
         , paused = True
         , ops = \p -> do
             createFile (watchRoot p </> "file")
@@ -1906,15 +1931,15 @@ behaviors =
     , Subsection "New directories"
     , Test newDir
         { title =
-            "file created immediately after creating its parent dir"
-                ++ " is reported"
+            "A file created immediately after creating its parent directory "
+                ++ "is reported"
         , check = const (createdNamed "file")
         , expected = onPlatform Yes Yes Yes
         }
     , Test newDir
         { title =
-            "subdir created immediately after creating its parent dir"
-                ++ " is watched"
+            "A subdirectory created immediately after creating its parent "
+                ++ "directory is watched"
         , laterOps = \p -> createFile (watchRoot p </> "dir/sub/later")
         , check = const (createdNamed "later")
         , expected = onPlatform Yes Yes Yes
@@ -1923,8 +1948,8 @@ behaviors =
     -- the watch of the directory is added.
     , Test newDir
         { title =
-            "file modified immediately after creating its parent dir"
-                ++ " is reported"
+            "A file written immediately after creating its parent directory "
+                ++ "reports `isModified`"
         , ops = \p -> do
             let file = watchRoot p </> "dir/file"
             createDirectory (watchRoot p </> "dir")
@@ -1936,8 +1961,8 @@ behaviors =
         }
     , Test newDir
         { title =
-            "file created and deleted immediately after creating its parent"
-                ++ " dir is reported"
+            "A file created and deleted immediately after creating its parent "
+                ++ "directory is reported"
         , ops = \p -> do
             let file = watchRoot p </> "dir/file"
             createDirectory (watchRoot p </> "dir")
@@ -1949,8 +1974,8 @@ behaviors =
     , Subsection "Moved directories"
     , Test base
         { title =
-            "file created immediately after moving in its parent dir"
-                ++ " is reported"
+            "A file created immediately after moving its parent directory "
+                ++ "into the tree is reported"
         , config = Event.setRecursiveMode True
         , paused = True
         , ops = \p -> do
@@ -1961,7 +1986,7 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
     , Test base
-        { title = "file in a dir moved out of the tree is reported"
+        { title = "A file in a directory moved out of the tree is reported"
         , config = Event.setRecursiveMode True
         , setup = withDirFile
         , ops = \p -> renameDirectory (watchRoot p </> "dir") (renamedRoot p)
@@ -1969,7 +1994,8 @@ behaviors =
         , expected = onPlatform No No No
         }
     , Test base
-        { title = "file already in a moved in dir is reported"
+        { title =
+            "A file already in a directory moved into the tree is reported"
         , config = Event.setRecursiveMode True
         , paused = True
         , ops = \p -> do
@@ -1981,7 +2007,7 @@ behaviors =
         }
     -- On Linux the scan of the directory at its new path reports the file.
     , Test base
-        { title = "file in a dir renamed within the tree is reported"
+        { title = "A file in a directory renamed within the tree is reported"
         , config = Event.setRecursiveMode True
         , setup = withDirFile
         , ops = \p ->
@@ -1995,7 +2021,8 @@ behaviors =
     -- dev/design.linux.md.
     , Test base
         { title =
-            "write in a dir renamed twice, middle path reused, is reported"
+            "A write in a directory renamed twice, with the intermediate path "
+                ++ "reused, is reported"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (watchRoot p </> "dir1")
@@ -2017,15 +2044,15 @@ behaviors =
     , Subsection "Subdirectory content changes"
     , Test dirChange
         { title =
-            "recursive watch reports isModified for a dir when a file is"
-                ++ " created in it"
+            "Creating a file in a subdirectory reports `isModified` for the "
+                ++ "subdirectory"
         , config = Event.setRecursiveMode True
         , expected = onPlatform No No No
         }
     , Test dirChange
         { title =
-            "recursive watch reports isModified for a dir when a file in it is"
-                ++ " written"
+            "Modifying a file in a subdirectory reports `isModified` for the "
+                ++ "subdirectory"
         , config = Event.setRecursiveMode True
         , setup = withDirFile
         , ops = \p -> appendFile (watchRoot p </> "dir/file") "x"
@@ -2034,8 +2061,8 @@ behaviors =
         }
     , Test dirChange
         { title =
-            "recursive watch reports isModified for a dir when a file is"
-                ++ " deleted from it"
+            "Deleting a file from a subdirectory reports `isModified` for the "
+                ++ "subdirectory"
         , config = Event.setRecursiveMode True
         , setup = withDirFile
         , ops = \p -> removeFile (watchRoot p </> "dir/file")
@@ -2045,8 +2072,8 @@ behaviors =
     , Subsection "Deletion of a subdirectory"
     , Test base
         { title =
-            "Deleting a directory in a recursive watch reports `isDeleted` "
-                ++ "for each file in it"
+            "Deleting a directory recursively reports `isDeleted` for each "
+                ++ "file"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             createDirectory (watchRoot p </> "dir")
@@ -2062,7 +2089,9 @@ behaviors =
     -- some of the files are created after the watch of a directory is added
     -- and before the scan of the directory reads them.
     , Test base
-        { title = "file created in a new dir can report isCreated twice"
+        { title =
+            "Creating 20 directories with 200 files in each reports "
+                ++ "`isCreated` twice for a file"
         , config = Event.setRecursiveMode True
         , ops = \p -> forM_ [1 .. 20 :: Int] $ \i -> do
             let dir = watchRoot p </> ("dir" ++ show i)
@@ -2086,9 +2115,8 @@ behaviors =
     -- writes to "mid/dir/deepfile", the root and "mid" do not have SEARCH.
     , Test base
         { title =
-            "A subdirectory reports its events when the directories above"
-                ++ " it have READ but not SEARCH: the root as its parent,"
-                ++ " its parent and the root"
+            "A subdirectory reports its events when the root (step 1), or its "
+                ++ "parent and the root (step 2), have READ but not SEARCH"
         , config = Event.setRecursiveMode True
         , setup = \p -> do
             let root = watchRoot p
@@ -2340,42 +2368,46 @@ behaviors =
 
     windowsConfigs =
         [ ("the default config", id)
-        , ("only setAttrsModified", only Windows.setAttrsModified)
-        , ("only setSizeModified", only Windows.setSizeModified)
-        , ( "only setLastWriteTimeModified"
+        , ("only `setAttrsModified`", only Windows.setAttrsModified)
+        , ("only `setSizeModified`", only Windows.setSizeModified)
+        , ( "only `setLastWriteTimeModified`"
           , only Windows.setLastWriteTimeModified)
-        , ( "only setLastAccessTimeModified"
+        , ( "only `setLastAccessTimeModified`"
           , only Windows.setLastAccessTimeModified)
-        , ( "only setCreationTimeModified"
+        , ( "only `setCreationTimeModified`"
           , only Windows.setCreationTimeModified)
-        , ("only setSecurityModified", only Windows.setSecurityModified)
+        , ("only `setSecurityModified`", only Windows.setSecurityModified)
         ]
 
     -- The items an operation is applied to, a file or a subdirectory of the
-    -- watch root.
-    fileItem = ("file", withFile)
-    dirItem = ("dir", withDir)
+    -- watch root: the path and the name of the item in the title.
+    fileItem = ("file", "a file", withFile)
+    dirItem = ("dir", "a subdirectory", withDir)
 
+    -- The name of an operation in the title, for the name of the item.
     windowsMetadataOps =
-        [ ("making the item read-only", makeReadOnly, [fileItem, dirItem]
-          , ["only setAttrsModified"])
-        , ("setting the item times", setTimes, [fileItem, dirItem]
-          , [ "the default config", "only setLastWriteTimeModified"
-            , "only setLastAccessTimeModified"])
-        , ( "setting the item modification time"
+        [ ( \i -> "Making " ++ i ++ " read-only", makeReadOnly
+          , [fileItem, dirItem], ["only `setAttrsModified`"])
+        , ( \i -> "Setting the access and modification times of " ++ i
+          , setTimes, [fileItem, dirItem]
+          , [ "the default config", "only `setLastWriteTimeModified`"
+            , "only `setLastAccessTimeModified`"])
+        , ( \i -> "Setting only the modification time of " ++ i
           , setFileTimes False False True, [fileItem, dirItem]
-          , ["the default config", "only setLastWriteTimeModified"])
-        , ( "setting the item access time", setFileTimes False True False
-          , [fileItem, dirItem], ["only setLastAccessTimeModified"])
-        , ( "setting the item creation time", setFileTimes True False False
-          , [fileItem, dirItem], ["only setCreationTimeModified"])
-        , ( "truncating the item", truncateFile
-          , [("file", withFileContents)]
-          , [ "the default config", "only setSizeModified"
-            , "only setLastWriteTimeModified"
-            , "only setLastAccessTimeModified"])
-        , ( "setting the hidden attribute of the item", makeHidden
-          , [fileItem, dirItem], ["only setAttrsModified"])
+          , ["the default config", "only `setLastWriteTimeModified`"])
+        , ( \i -> "Setting the access time of " ++ i
+          , setFileTimes False True False, [fileItem, dirItem]
+          , ["only `setLastAccessTimeModified`"])
+        , ( \i -> "Setting the creation time of " ++ i
+          , setFileTimes True False False, [fileItem, dirItem]
+          , ["only `setCreationTimeModified`"])
+        , ( \i -> "Truncating " ++ i ++ " to zero size, without a write"
+          , truncateFile, [("file", "a file", withFileContents)]
+          , [ "the default config", "only `setSizeModified`"
+            , "only `setLastWriteTimeModified`"
+            , "only `setLastAccessTimeModified`"])
+        , ( \i -> "Setting the hidden attribute of " ++ i, makeHidden
+          , [fileItem, dirItem], ["only `setAttrsModified`"])
         ]
 
     -- Each metadata change with the default config, and with one config
@@ -2385,7 +2417,7 @@ behaviors =
     windowsConfigBehaviors =
         [ base
             { title =
-                opName ++ " reports isModified for the " ++ name ++ " with "
+                opName item ++ " reports `isModified` with "
                     ++ cfgName
             , config = cfg
             , setup = setupOp
@@ -2395,7 +2427,7 @@ behaviors =
             , expected = if cfgName `elem` yes then Yes else No
             }
         | (opName, op, items, yes) <- windowsMetadataOps
-        , (name, setupOp) <- items
+        , (name, item, setupOp) <- items
         , (cfgName, cfg) <- windowsConfigs
         ]
 #endif
