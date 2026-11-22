@@ -12,6 +12,22 @@ Related documents: Lost events and the recovery are described in
 [robust-applications.md](robust-applications.md), the limits of each platform in
 [watch-limits.md](watch-limits.md).
 
+<!--
+This document is kept in sync with the test suite FileSystem.Event.Behavior
+(test/Streamly/Test/FileSystem/Event/Behavior.hs):
+
+* The Section and Subsection entries of the test suite are the headings of
+  this document.
+* The title of a behavior is the text of its table row. In a table of
+  operations and events, the title is the operation and the event, e.g.
+  "Copying a file reports `isCreated` for the copy".
+* A row tested in another test suite has a placeholder comment under its
+  heading in the test suite.
+
+When a row is added, changed or removed here, change the test suite too, and
+the converse.
+-->
+
 ## Architectural Differences
 
 Architectural differences across operating systems make it difficult to create
@@ -36,7 +52,7 @@ try to make macOS behave like Linux rather than the opposite.
 
 ### Permissions Checks
 
-On macOS the permission checking is dynamic i.e. if the permsissions of a path
+On macOS the permission checking is dynamic i.e. if the permissions of a path
 change the events can stop or start under that path. On Windows the permission
 checks happen only at the start of watch. In our Linux implementation as well
 the permission checks are static, though it is possible to implement dynamic
@@ -214,12 +230,12 @@ Directory roots:
 | A renamed watch root remains watched | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
 | A renamed watch root reports `isRootUnwatched` | Yes | No | No |
-| A root renamed back to original is watched | No | Yes | Yes |
+| A root renamed back to its original path is watched | No | Yes | Yes |
 | A renamed directory root reports `isMoved` for each file in it | No | No | No |
 | A renamed symbolic link to a directory root reports `isMoved` for the root | No | No | No |
 
 <!--
-| A root renamed back quickly (before the rename event is read) is watched | No | Yes | Yes |
+| A root renamed back before the rename event is read is watched | No | Yes | Yes |
 -->
 
 ### Renaming or deleting in-use objects
@@ -297,6 +313,7 @@ volume. A forced dismount, for example with `fsutil volume dismount`,
 does not lock the volume, the volume is dismounted and the open handles
 on it become invalid.
 
+<!--
 The tests mount a new file system at the watch root: a tmpfs on Linux and
 FreeBSD, mounted as root or with `sudo -n`, a disk image attached with
 `hdiutil` on macOS, and a virtual disk created with `diskpart` on
@@ -305,6 +322,7 @@ system cannot be mounted, or on Windows if the volume cannot be locked
 before the watch is started. On Windows the unmount test locks the volume
 and then dismounts it, the event tests dismount the volume forcibly,
 without the lock.
+-->
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -557,7 +575,10 @@ because the write and the truncate are separate changes.
 
 On macOS FSEvents can report the flags of earlier changes of a path with a
 later event of the path, even after the consumer has read the events of the
-earlier changes. In the test suite, a file is created, the consumer reads
+earlier changes.
+
+<!--
+In the test suite, a file is created, the consumer reads
 its `isCreated` event, and the file is deleted one second later. The event
 of the delete has `isCreated` true in most CI runs but not in all of them,
 so the test suite does not assert the macOS entry of this row.
@@ -567,6 +588,7 @@ getting combined with the one being tested.  Therefore, for macOS tests
 we use a delay of 30 second or more to be sure, and watch the results
 over many runs. If an event is reported sometimes, it is likely that
 this is a repeated event from earlier operations.
+-->
 
 ## Event coalescing
 
@@ -602,8 +624,9 @@ different types:
 * A file created and renamed reports one event for the old path for which
   both `isCreated` and `isMoved` are true.
 * Two writes to a file are merged into one event only if FSEvents reports
-  them in the same batch. The macOS entries of the two rows for writes are
-  seen in several runs of the CI.
+  them in the same batch.
+  <!-- The macOS entries of the two rows for writes are seen in several runs
+  of the CI. -->
 * Events in a directory and its subdirectory can be coalesced into one
   event for which `isEventsLost` is true, without an overflow. This is
   based on the platform documentation.
@@ -645,8 +668,8 @@ event of the parent directory.
 |----------|-------|-------|---------|
 | A file created immediately after creating its parent directory is reported | Yes | Yes | Yes |
 | A subdirectory created immediately after creating its parent directory is watched | Yes | Yes | Yes |
-| Writes to a scanned file before its `isCreated` event are missed | Yes | No | No |
-| A file created and deleted before the scan of its new parent directory is missed | Yes | No | No |
+| A file written immediately after creating its parent directory reports `isModified` | No | Yes | Yes |
+| A file created and deleted immediately after creating its parent directory is reported | No | Yes | Yes |
 
 On Linux these writes and deletes happen before the watch of the new
 directory is added. The scan of the directory then reports the file with
@@ -778,7 +801,7 @@ subdirectory added generates such an event.
 | Behavior | Linux | FreeBSD |
 |----------|-------|---------|
 | A FIFO as a root reports a write to the FIFO | Yes | No |
-| A root with only READ premission reports its events | Yes | Watch fails |
+| A root with only READ permission reports its events | Yes | Watch fails |
 | A file system can be unmounted while a tree in it is watched | Yes | No, `umount` fails with `Device busy` |
 | Event reported when only the modification time of a file is set | `isModified` | `isAttrsModified` |
 
