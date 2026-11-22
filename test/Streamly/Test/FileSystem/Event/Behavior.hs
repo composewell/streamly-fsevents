@@ -1824,14 +1824,15 @@ behaviors =
         , racy = onWindows
         }
     , Subsection "Writes to a deleted open file"
+    -- On macOS the event of the file has the flags Deleted and Modified.
+    -- Without a delay after the setup it also has Created and
+    -- AttrsModified, the flags of the setup. A CI run with a 30 second setup
+    -- delay reported Deleted and Modified only: Modified is the flag of the
+    -- write, not of the setup.
     , Test deletedOpenFile
         { title =
             "Writing to an open file after its deletion reports `isModified`"
         , expected = onPlatform No Yes No
-        -- TODO: a temporary delay, to check whether the macOS Yes is the
-        -- Modified flag of the setup. Undo it, back to the setupFlagsDelay
-        -- of deletedOpenFile, after the check.
-        , darwinSetupDelay = 30
         }
 #if defined(CABAL_OS_LINUX)
     , Test deletedOpenFile
