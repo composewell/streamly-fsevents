@@ -1422,7 +1422,7 @@ removedNotStale =
             Event.removeRoot w p
             evs <- readUnwatched w root1 root1
             pathsOf Event.isRootStale evs `shouldBe` []
-            removeDirectory root2
+            removePathForcibly root2
             evs1 <- readUnwatched w root2 root2
             pathsOf Event.isRootStale evs1 `shouldBe` [root2]
 
