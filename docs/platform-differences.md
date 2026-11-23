@@ -207,7 +207,8 @@ renamed root, and the events continue reporting the old path.
 
 On macOS the watch is on the path and not on the object, so the renamed
 root is not watched, and a root renamed back to the original path is
-watched again.
+watched again. FSEvents does not report any events under the new path of
+the renamed root.
 
 File roots, Windows does not support file roots:
 
