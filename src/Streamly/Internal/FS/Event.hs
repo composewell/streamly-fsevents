@@ -298,8 +298,10 @@ removeRoot = Event.removeRoot
 -- returns.
 --
 -- On Linux and FreeBSD a root becomes stale when a parent directory is
--- renamed, and on Windows when the root is renamed. The root is still
--- watched, its events report the old path. A root is stale if its path does
+-- renamed, and on Windows when the root is renamed. On all three it also
+-- becomes stale when a symbolic link in the root path is changed to point to
+-- another directory. The root is still watched, its events report the old
+-- path. A root is stale if its path does
 -- not exist or refers to another file. On macOS a root is watched by its path
 -- and is never stale, the list is empty.
 --

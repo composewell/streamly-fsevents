@@ -1094,7 +1094,9 @@ removeRoot w@Watch{..} root =
 
 -- | The roots of a watch whose path no longer refers to the directory
 -- watched via the root, as supplied to 'addRoot'. A root becomes stale when
--- it is renamed. The root is still watched, its events report the old path.
+-- it is renamed, or when a symbolic link in the root path is changed to point
+-- to another directory. The root is still watched, its events report the old
+-- path.
 -- A parent directory of a watched root cannot be renamed, the rename raises
 -- an exception.
 --

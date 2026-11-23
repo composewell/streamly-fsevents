@@ -1525,10 +1525,10 @@ staleRootReAdded =
 #endif
 
 -- The root link is a symbolic link to a, the watch follows it to a. After
--- link is changed to point to b, the root path refers to b. On Linux and
--- FreeBSD the root is stale, its device and inode differ from those of b.
--- On Windows a root is stale only when it is renamed. On macOS a root is
--- never stale. removeRoot and addRoot watch b.
+-- link is changed to point to b, the root path refers to b. On Linux,
+-- FreeBSD and Windows the root is stale, the file identity of b differs from
+-- the one recorded when the root was added. On macOS a root is never stale.
+-- removeRoot and addRoot watch b.
 staleLinkRootReAdded :: Spec
 staleLinkRootReAdded =
     it "a symbolic link root changed to another directory is stale"
@@ -1558,10 +1558,10 @@ staleLinkRootReAdded =
 
     stale w = map Path.toString <$> Event.staleRoots w
 
-#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
-    expected r = [r]
-#else
+#if defined(CABAL_OS_DARWIN)
     expected _ = []
+#else
+    expected r = [r]
 #endif
 
 -- The root link/root is under the symbolic link link to a, the watch is on
@@ -1597,10 +1597,10 @@ staleLinkParentReAdded =
 
     stale w = map Path.toString <$> Event.staleRoots w
 
-#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
-    expected r = [r]
-#else
+#if defined(CABAL_OS_DARWIN)
     expected _ = []
+#else
+    expected r = [r]
 #endif
 
 closedWatchOps :: Spec

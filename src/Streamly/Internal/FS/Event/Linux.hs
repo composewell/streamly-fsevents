@@ -2692,8 +2692,9 @@ removeRoot wtch@Watch {watchFd = fd} root = do
 
 -- | The roots of a watch whose path no longer refers to the directory or file
 -- watched via the root, as supplied to 'addRoot'. A root becomes stale when
--- a parent directory is renamed, the rename does not generate any event.
--- The root is still watched under its old path.
+-- a parent directory is renamed, the rename does not generate any event, or
+-- when a symbolic link in the root path is changed to point to another
+-- directory. The root is still watched under its old path.
 --
 -- A root is stale if its path does not exist, or refers to another file,
 -- compared by the device and inode numbers recorded when the root was added.
