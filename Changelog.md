@@ -53,6 +53,24 @@
   relative path. Earlier it returned the relative path. The root is taken
   relative to the working directory at the time the watch is started. Use
   `getRoot` and `getRelPath` to get the relative path.
+- A watch root is bound to the object that its path refers to when the
+  root is added. When the path no longer refers to that object, the watch
+  of the root ends with `isRootUnwatched` and `isRootStale`. The stale root
+  check, `enableStaleRootCheck`, on by default, checks the root path when
+  the events of a root are read. The events read after the path changed
+  are not returned, for example, after a parent directory of the root is
+  renamed, after a symbolic link in the root path is changed to point to
+  another directory, or the deletions of the files of a deleted root that
+  are read after the root is deleted. Use `enableStaleRootCheck False` to
+  report the events under the old path, as earlier.
+- macOS: a watch root that does not exist raises an exception, the same as
+  on Linux and Windows. A deleted or renamed root ends with
+  `isRootUnwatched` and `isRootStale`, the object created at its path
+  later is not watched. Use `allowMissingRootPath True` for the earlier
+  behavior.
+- Windows: a renamed watch root ends with `isRootUnwatched` and
+  `isRootStale` at its next change. Earlier it reported the events under
+  the old path.
 - Users of the `Streamly.Internal.FS.Event.*` modules should move to the new
   public platform specific modules. In these, the Linux `setUnwatchMoved` is
   renamed to `setExcludeUnlinked`, the Linux `setFollowSymLinks` is renamed
@@ -78,6 +96,13 @@
   `setScanNewDirs` and `isScanEvent`.
 - Windows: use one thread per watch instead of one thread per root, do not
   depend on the `streamly` package.
+- `isRootStale` reports the end of the watch of a root whose path no
+  longer refers to the watched object.
+- macOS: `staleRoots` reports the roots whose path no longer refers to the
+  watched object, the same as on Linux and Windows.
+- Linux: the identity of a root includes its file handle where the file
+  system supports it, a new file that reuses the inode number of the root
+  is found to be another file.
 
 ### Bug Fixes
 
