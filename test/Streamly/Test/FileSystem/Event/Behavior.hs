@@ -1288,6 +1288,32 @@ behaviors =
         , check = \p -> createdAt (watchRoot p </> "file")
         , expected = onPlatform Yes Yes Yes
         }
+    , Test base
+        { title =
+            "A root whose symbolic link parent is changed to another "
+                ++ "directory reports the events of the new directory"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = withLinkParent
+        , ops = \p -> do
+            retargetLinkParent p
+            createFile (otherTarget p </> "root" </> "file")
+        , check = \p -> createdAt (nestedRoot p </> "file")
+        , expected = onPlatform No No No
+        , racy = onDarwin || onWindows
+        }
+    , Test base
+        { title =
+            "A root whose symbolic link parent is changed to another "
+                ++ "directory reports the events of the old directory"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = withLinkParent
+        , ops = \p -> do
+            retargetLinkParent p
+            createFile (linkTarget p </> "root" </> "file")
+        , check = \p -> createdAt (nestedRoot p </> "file")
+        , expected = onPlatform Yes Yes Yes
+        , racy = onDarwin || onWindows
+        }
 #if defined(CABAL_OS_DARWIN)
     -- FSEvents reports a root path event when a path component of a root is
     -- created, deleted or renamed. These check whether the changes of the
@@ -1334,6 +1360,18 @@ behaviors =
         , ops = retargetLinkRoot
         , check = const (any Darwin.isRootPathEvent)
         , expected = No
+        }
+    , Test base
+        { title =
+            "A root whose symbolic link parent is changed to another "
+                ++ "directory reports `isRootPathEvent`"
+        , config = Darwin.setRootPathEvents True
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = withLinkParent
+        , ops = retargetLinkParent
+        , check = const (any Darwin.isRootPathEvent)
+        , expected = No
+        , racy = True
         }
     -- /Users is a firmlink to /System/Volumes/Data/Users.
     , Test base
@@ -2497,6 +2535,20 @@ behaviors =
     retargetLinkRoot p = do
         removeDirectoryLink (watchRoot p)
         createDirectoryLink (otherTarget p) (watchRoot p)
+        settle
+
+    -- Create 'nestedParent' as a symbolic link to 'linkTarget', both
+    -- 'linkTarget' and 'otherTarget' have a "root" directory.
+    withLinkParent p = do
+        createDirectoryIfMissing True (linkTarget p </> "root")
+        createDirectoryIfMissing True (otherTarget p </> "root")
+        createDirectoryLink (linkTarget p) (nestedParent p)
+        settle
+
+    -- Point the symbolic link 'nestedParent' to 'otherTarget'.
+    retargetLinkParent p = do
+        removeDirectoryLink (nestedParent p)
+        createDirectoryLink (otherTarget p) (nestedParent p)
         settle
 
     -- A root that does not exist, next to the watch root, and the same path
