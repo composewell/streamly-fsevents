@@ -1230,10 +1230,14 @@ behaviors =
         , expected = onFreeBSD Yes (onPlatform No Yes Exception)
         }
 #if defined(CABAL_OS_LINUX)
+    -- The unlink reports IN_ATTRIB for the root before the file is closed,
+    -- the stale root check would end the root at that event, before the
+    -- IN_DELETE_SELF of the close.
     , Test base
         { title =
             "A deleted open regular file root reports `isDeleted` for the "
                 ++ "root after the file is closed"
+        , config = Event.enableStaleRootCheck False
         , setup = \p -> withFileRoot p >> holdFile p (watchRoot p)
         , ops = \p -> removeFile (watchRoot p) >> releaseHeld p
         , check = rootDeleted
