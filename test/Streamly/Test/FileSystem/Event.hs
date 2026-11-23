@@ -534,7 +534,7 @@ normalizedRoots = do
 deletedRootsEnd :: String -> [FilePath] -> Spec
 deletedRootsEnd title names =
     it title
-        $ notOnDarwin "the watch of a deleted root continues"
+        $ notOnDarwin "the stream of watchWith does not end on macOS"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
             let roots = nub (map (normalise . (fp </>)) names)
             mapM_ createDirectory roots
@@ -1412,6 +1412,20 @@ removeStops =
             filter (isUnder root2) (pathsOf isChange (evs ++ evs1))
                 `shouldBe` []
 
+-- The isRootUnwatched event of a removed root does not report isRootStale.
+-- The isRootUnwatched event of a deleted root does.
+removedNotStale :: Spec
+removedNotStale =
+    it "a removed root does not report isRootStale, a deleted root does"
+        $ withTwoRoots $ \root1 root2 w -> do
+            p <- Path.fromString root1
+            Event.removeRoot w p
+            evs <- readUnwatched w root1 root1
+            pathsOf Event.isRootStale evs `shouldBe` []
+            removeDirectory root2
+            evs1 <- readUnwatched w root2 root2
+            pathsOf Event.isRootStale evs1 `shouldBe` [root2]
+
 -- On Linux the second removeRoot runs before the isRootUnwatched event is
 -- read.
 removeTwice :: Spec
@@ -1482,8 +1496,7 @@ removeAddAgain =
 -- The root parent/root2 is stale after it is moved away from its path, and
 -- after a new parent/root2 is created at its path. removeRoot and addRoot
 -- watch the new directory. Windows does not rename a parent of a watched
--- root, the root itself is renamed. On macOS a root is watched by its path
--- and is never stale.
+-- root, the root itself is renamed.
 staleRootReAdded :: Spec
 staleRootReAdded =
     it "a root moved away from its path is stale until it is added again"
@@ -1518,17 +1531,12 @@ staleRootReAdded =
         renameDirectory parent (takeDirectory parent </> "moved")
 #endif
 
-#if defined(CABAL_OS_DARWIN)
-    expected _ = []
-#else
     expected r = [r]
-#endif
 
 -- The root link is a symbolic link to a, the watch follows it to a. After
--- link is changed to point to b, the root path refers to b. On Linux,
--- FreeBSD and Windows the root is stale, the file identity of b differs from
--- the one recorded when the root was added. On macOS a root is never stale.
--- removeRoot and addRoot watch b.
+-- link is changed to point to b, the root path refers to b. The root is
+-- stale, the file identity of b differs from the one recorded when the root
+-- was added. removeRoot and addRoot watch b.
 staleLinkRootReAdded :: Spec
 staleLinkRootReAdded =
     it "a symbolic link root changed to another directory is stale"
@@ -1558,11 +1566,7 @@ staleLinkRootReAdded =
 
     stale w = map Path.toString <$> Event.staleRoots w
 
-#if defined(CABAL_OS_DARWIN)
-    expected _ = []
-#else
     expected r = [r]
-#endif
 
 -- The root link/root is under the symbolic link link to a, the watch is on
 -- a/root. After link is changed to point to b, the root path refers to
@@ -1597,11 +1601,7 @@ staleLinkParentReAdded =
 
     stale w = map Path.toString <$> Event.staleRoots w
 
-#if defined(CABAL_OS_DARWIN)
-    expected _ = []
-#else
     expected r = [r]
-#endif
 
 closedWatchOps :: Spec
 closedWatchOps =
@@ -1784,6 +1784,7 @@ handleTests = do
     addRecursive
     keepEventsWhileAdding
     removeStops
+    removedNotStale
     removeTwice
     removeWhileReading
     removeAddAgain

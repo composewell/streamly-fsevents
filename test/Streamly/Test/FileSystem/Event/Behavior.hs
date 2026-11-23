@@ -900,7 +900,7 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform WatchException Yes WatchException
+        , expected = WatchException
         }
     , Test base
         { title = "A watch root deleted and created again is watched"
@@ -911,8 +911,37 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes No
+        , expected = No
         }
+#if defined(CABAL_OS_DARWIN)
+    , Test base
+        { title =
+            "A non-existing object path is watched with "
+                ++ "`allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , setup = removeDirectory . watchRoot
+        , ops = \p -> do
+            createDirectory (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = Yes
+        }
+    , Test base
+        { title =
+            "A watch root deleted and created again is watched with "
+                ++ "`allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , ops = \p -> do
+            removePathForcibly (watchRoot p)
+            settle
+            createDirectory (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = Yes
+        }
+#endif
     , Subsection "Deletion of watch root"
     , Test base
         { title =
@@ -953,15 +982,38 @@ behaviors =
             any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
         , expected = Yes
         }
-    -- On macOS the watch is on the path, a deleted root stays watched.
     , Test base
         { title =
             "A deleted watch root reports `isRootUnwatched` for the root"
         , ops = removePathForcibly . watchRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
-        , expected = onPlatform Yes No Yes
+        , expected = Yes
         }
+    , Test base
+        { title =
+            "A deleted watch root reports `isRootStale` for the root"
+        , ops = removePathForcibly . watchRoot
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isRootStale ev)
+        , expected = Yes
+        }
+#if defined(CABAL_OS_DARWIN)
+    -- The watch is on the path, a deleted root stays watched.
+    , Test base
+        { title =
+            "A deleted watch root reports `isRootUnwatched` for the root with "
+                ++ "`allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , ops = removePathForcibly . watchRoot
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
+        , expected = No
+        }
+#endif
+    -- The events of the files read after the root is deleted are not
+    -- reported, the path of the root no longer refers to the root. The
+    -- consumer is paused to read the events after the deletion.
     , Test base
         { title =
             "A deleted directory root reports `isDeleted` for each file in it"
@@ -969,6 +1021,21 @@ behaviors =
             createFile (watchRoot p </> "file")
             createFile (watchRoot p </> "file2")
             settle
+        , paused = True
+        , ops = removePathForcibly . watchRoot
+        , check = const (deletedNamed ["file", "file2"])
+        , expected = onPlatform No No Yes
+        }
+    , Test base
+        { title =
+            "A deleted directory root reports `isDeleted` for each file in it "
+                ++ "without the stale root check"
+        , config = Event.enableStaleRootCheck False
+        , setup = \p -> do
+            createFile (watchRoot p </> "file")
+            createFile (watchRoot p </> "file2")
+            settle
+        , paused = True
         , ops = removePathForcibly . watchRoot
         , check = const (deletedNamed ["file", "file2"])
         , expected = onPlatform Yes No Yes
@@ -1036,8 +1103,25 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
 #endif
+    -- On Windows the rename of a root is not reported, the stale root check
+    -- ends the root at the create event.
     , Test base
         { title = "A renamed watch root remains watched"
+        , ops = renameRootAndCreate
+        , check = const (createdNamed "file")
+        , expected = No
+        }
+    , Test base
+        { title = "A renamed watch root reports `isRootStale` at its next event"
+        , ops = renameRootAndCreate
+        , check = \p ->
+            any (\ev -> absPath ev == watchRoot p && Event.isRootStale ev)
+        , expected = Yes
+        }
+    , Test base
+        { title =
+            "A renamed watch root remains watched without the stale root check"
+        , config = Event.enableStaleRootCheck False
         , ops = renameRootAndCreate
         , check = const (createdNamed "file")
         , expected = onPlatform No No Yes
@@ -1051,13 +1135,14 @@ behaviors =
              in any (\ev -> isRoot ev && Event.isMoved ev)
         , expected = onPlatform Yes Yes No
         }
-    -- On Windows the rename of a root is not reported, the watch continues.
+    -- On Windows the rename of a root is not reported, the root is not
+    -- checked without an event of the root.
     , Test base
         { title = "A renamed watch root reports `isRootUnwatched`"
         , ops = renameRoot
         , check = \p ->
             any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
-        , expected = onPlatform Yes No No
+        , expected = onPlatform Yes Yes No
         }
     , Test base
         { title = "A root renamed back to its original path is watched"
@@ -1067,7 +1152,7 @@ behaviors =
             renameDirectory (renamedRoot p) (watchRoot p)
         , laterOps = \p -> createFile (watchRoot p </> "file")
         , check = const (createdNamed "file")
-        , expected = onPlatform No Yes Yes
+        , expected = onPlatform No No Yes
         }
     -- On Linux the rename event of a directory root removes the root.
     , Test base
@@ -1199,6 +1284,34 @@ behaviors =
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p </> "file"
                     && Event.isCreated ev)
+        , expected = onPlatform No No Exception
+        }
+    , Test base
+        { title =
+            "A root whose parent is renamed reports `isRootStale` at its next "
+                ++ "event"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = createDirectoryIfMissing True . nestedRoot
+        , ops = \p -> do
+            renameNestedParent p
+            createFile (movedNestedRoot p </> "file")
+        , check = \p ->
+            any (\ev -> absPath ev == nestedRoot p && Event.isRootStale ev)
+        , expected = onPlatform Yes No Exception
+        }
+    , Test base
+        { title =
+            "A root whose parent is renamed remains watched under the old path "
+                ++ "without the stale root check"
+        , config = Event.enableStaleRootCheck False
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = createDirectoryIfMissing True . nestedRoot
+        , ops = \p -> do
+            renameNestedParent p
+            createFile (movedNestedRoot p </> "file")
+        , check = \p ->
+            any (\ev -> absPath ev == nestedRoot p </> "file"
+                    && Event.isCreated ev)
         , expected = onPlatform Yes No Exception
         }
     -- On Linux the directory created after the rename cannot be reached by
@@ -1236,7 +1349,7 @@ behaviors =
             settle
             createFile (watchRoot p </> "file")
         , check = \p -> createdAt (watchRoot p </> "file")
-        , expected = onPlatform WatchException No WatchException
+        , expected = WatchException
         }
     , Test base
         { title =
@@ -1249,7 +1362,7 @@ behaviors =
             settle
             createFile (nestedRoot p </> "file")
         , check = \p -> createdAt (nestedRoot p </> "file")
-        , expected = onPlatform WatchException No WatchException
+        , expected = WatchException
         }
     -- On a case-insensitive file system "Missing" and "missing" are the
     -- same path.
@@ -1262,7 +1375,7 @@ behaviors =
             settle
             createFile (createdMissingRoot p </> "file")
         , check = \p -> createdAt (missingRoot p </> "file")
-        , expected = onPlatform WatchException No WatchException
+        , expected = WatchException
         }
     -- The watch follows a symbolic link root when it starts and stays on the
     -- directory the link pointed to.
@@ -1286,7 +1399,19 @@ behaviors =
             retargetLinkRoot p
             createFile (linkTarget p </> "file")
         , check = \p -> createdAt (watchRoot p </> "file")
-        , expected = onPlatform Yes Yes Yes
+        , expected = No
+        }
+    , Test base
+        { title =
+            "A symbolic link root changed to another directory reports the "
+                ++ "events of the old directory without the stale root check"
+        , config = Event.enableStaleRootCheck False
+        , setup = withLinkRoot
+        , ops = \p -> do
+            retargetLinkRoot p
+            createFile (linkTarget p </> "file")
+        , check = \p -> createdAt (watchRoot p </> "file")
+        , expected = Yes
         }
     , Test base
         { title =
@@ -1310,9 +1435,81 @@ behaviors =
             retargetLinkParent p
             createFile (linkTarget p </> "root" </> "file")
         , check = \p -> createdAt (nestedRoot p </> "file")
-        , expected = onPlatform Yes Yes Yes
+        , expected = No
+        }
+    , Test base
+        { title =
+            "A root whose symbolic link parent is changed to another "
+                ++ "directory reports the events of the old directory without "
+                ++ "the stale root check"
+        , config = Event.enableStaleRootCheck False
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = withLinkParent
+        , ops = \p -> do
+            retargetLinkParent p
+            createFile (linkTarget p </> "root" </> "file")
+        , check = \p -> createdAt (nestedRoot p </> "file")
+        , expected = Yes
+        }
+    , Test base
+        { title =
+            "A root whose symbolic link parent is changed to another "
+                ++ "directory reports `isRootStale` at its next event"
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = withLinkParent
+        , ops = \p -> do
+            retargetLinkParent p
+            createFile (linkTarget p </> "root" </> "file")
+        , check = \p ->
+            any (\ev -> absPath ev == nestedRoot p && Event.isRootStale ev)
+        , expected = Yes
         }
 #if defined(CABAL_OS_DARWIN)
+    -- With `allowMissingRootPath True` a missing root is watched, FSEvents
+    -- does not report any events for the new resolution of its path.
+    , Test base
+        { title =
+            "A missing root created as a symbolic link to a directory "
+                ++ "reports its events with `allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , setup = \p -> do
+            removeDirectory (watchRoot p)
+            createDirectory (linkTarget p)
+        , ops = \p -> do
+            createDirectoryLink (linkTarget p) (watchRoot p)
+            settle
+            createFile (watchRoot p </> "file")
+        , check = \p -> createdAt (watchRoot p </> "file")
+        , expected = No
+        }
+    , Test base
+        { title =
+            "A root whose missing parent is created as a symbolic link to a "
+                ++ "directory reports its events with "
+                ++ "`allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , extraRoots = \p -> [nestedRoot p]
+        , setup = \p -> createDirectoryIfMissing True (linkTarget p </> "root")
+        , ops = \p -> do
+            createDirectoryLink (linkTarget p) (nestedParent p)
+            settle
+            createFile (nestedRoot p </> "file")
+        , check = \p -> createdAt (nestedRoot p </> "file")
+        , expected = No
+        }
+    , Test base
+        { title =
+            "A missing root created with a different case reports its events "
+                ++ "with `allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , extraRoots = \p -> [missingRoot p]
+        , ops = \p -> do
+            createDirectory (createdMissingRoot p)
+            settle
+            createFile (createdMissingRoot p </> "file")
+        , check = \p -> createdAt (missingRoot p </> "file")
+        , expected = No
+        }
     -- FSEvents reports a root path event when a path component of a root is
     -- created, deleted or renamed. These check whether the changes of the
     -- resolution above report it.
@@ -1320,7 +1517,8 @@ behaviors =
         { title =
             "A missing root created as a symbolic link to a directory "
                 ++ "reports `isRootPathEvent`"
-        , config = Darwin.setRootPathEvents True
+        , config =
+            Darwin.setRootPathEvents True . Darwin.allowMissingRootPath True
         , setup = \p -> do
             removeDirectory (watchRoot p)
             createDirectory (linkTarget p)
@@ -1332,7 +1530,8 @@ behaviors =
         { title =
             "A root whose missing parent is created as a symbolic link to a "
                 ++ "directory reports `isRootPathEvent`"
-        , config = Darwin.setRootPathEvents True
+        , config =
+            Darwin.setRootPathEvents True . Darwin.allowMissingRootPath True
         , extraRoots = \p -> [nestedRoot p]
         , setup = \p -> createDirectoryIfMissing True (linkTarget p </> "root")
         , ops = \p -> createDirectoryLink (linkTarget p) (nestedParent p)
@@ -1343,7 +1542,8 @@ behaviors =
         { title =
             "A missing root created with a different case reports "
                 ++ "`isRootPathEvent`"
-        , config = Darwin.setRootPathEvents True
+        , config =
+            Darwin.setRootPathEvents True . Darwin.allowMissingRootPath True
         , extraRoots = \p -> [missingRoot p]
         , ops = createDirectory . createdMissingRoot
         , check = const (any Darwin.isRootPathEvent)
@@ -1530,8 +1730,32 @@ behaviors =
             settle
             writeHeldFiles p
         , check = const (modifiedNamed "file")
-        , expected = onPlatform WatchException Yes WatchException
+        , expected = WatchException
         }
+#if defined(CABAL_OS_DARWIN)
+    , Test base
+        { title =
+            "A root starts reporting events after SEARCH is restored on its"
+                ++ " parent with `allowMissingRootPath True`"
+        , config = Darwin.allowMissingRootPath True
+        , extraRoots = \p -> [parentRoot p]
+        , setup = \p -> do
+            createDirectoryIfMissing True (parentRoot p)
+            createFile (parentRoot p </> "file")
+            holdFile p (parentRoot p </> "file")
+            denySearch (parentDir p)
+            bypassTraverse False
+        , cleanup = \p ->
+            allowAll (parentDir p) `finally` bypassTraverse True
+        , skip = stillSearchable . parentRoot
+        , ops = \p -> do
+            allowAll (parentDir p)
+            settle
+            writeHeldFiles p
+        , check = const (modifiedNamed "file")
+        , expected = Yes
+        }
+#endif
     , Subsection "Nested roots"
     -- A path listed twice is one root.
     --
