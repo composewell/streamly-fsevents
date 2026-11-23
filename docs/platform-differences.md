@@ -50,6 +50,19 @@ To watch non-existing paths like macOS would be a significantly complex
 to implement in the library, therefore in the portable implementation we
 try to make macOS behave like Linux rather than the opposite.
 
+On all platforms a root is bound to the object that its path refers to
+when the root is added. When the path no longer refers to that object,
+because the root or a parent directory is renamed, the root is deleted, or
+a symbolic link in the path is changed, the watch of the root ends with
+`isRootUnwatched` and `isRootStale`. The stale root check,
+`enableStaleRootCheck`, on by default, checks the root path when the events
+of a root are read. A root whose path changes without any event of the root,
+e.g. after a parent rename on Linux or a symbolic link change, ends at its
+next event. With the check off the root reports the events of the watched
+object under the old path. On macOS `allowMissingRootPath True` gives the
+behavior of FSEvents instead: the path is watched, whatever object is at
+the path.
+
 ### Permissions Checks
 
 On macOS the permission checking is dynamic i.e. if the permissions of a path
@@ -133,26 +146,34 @@ On FreeBSD a FIFO root is watched, but a write to the FIFO is not reported.
 
 ### Watching non-existing paths
 
-macOS watches the path of a root, Linux and Windows watch the object at
-the path and not the path itself. The following tests are a direct
-consequence of that difference. macOS can watch a missing root,
-therefore, it also reports the creation of the root, which is an event
-that occurs even before the watch of that root started. This is in fact
-an event on the the parent directory of the missing path component.
+A root that does not exist raises an exception on all platforms, a
+deleted root is not watched again.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A non-existing object path is watched | No, the watch raises an exception | Yes | No, the watch raises an exception |
-| A watch root deleted and created again is watched | No | Yes | No |
+| A non-existing object path is watched | No, the watch raises an exception | No, the watch raises an exception | No, the watch raises an exception |
+| A watch root deleted and created again is watched | No | No | No |
+
+macOS watches the path of a root, Linux and Windows watch the object at
+the path and not the path itself. With `allowMissingRootPath True` from
+`Streamly.FileSystem.Event.Darwin` a missing root is watched. It also
+reports the creation of the root, which is an event that occurs even
+before the watch of that root started. This is in fact an event on the
+the parent directory of the missing path component.
+
+| Behavior | macOS |
+|----------|-------|
+| A non-existing object path is watched with `allowMissingRootPath True` | Yes |
+| A watch root deleted and created again is watched with `allowMissingRootPath True` | Yes |
 
 ### Deletion of watch root
 
-On Linux and Windows the watch of a deleted root is removed. The watch
-ends with the `isRootUnwatched` event that follows the `isDeleted` event
-of the root. macOS watches the path not the object, after the
-`isDeleted` event the path is still watched and events start if a new
-object is created on that path. Therefore, on macOS there is no
-`isRootUnwatched` event generated on deletion of a root.
+On all platforms the watch of a deleted root is removed. The watch ends
+with the `isRootUnwatched` and `isRootStale` event that follows the
+`isDeleted` event of the root. With `allowMissingRootPath True` macOS
+watches the path not the object, after the `isDeleted` event the path is
+still watched and events start if a new object is created on that path,
+there is no `isRootUnwatched` event.
 
 File roots, Windows does not support file roots:
 
@@ -170,8 +191,20 @@ Directory roots:
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A deleted directory root reports `isDeleted` for the root | Yes | Yes | Yes |
-| A deleted directory root reports `isDeleted` for each file in it | Yes | No | Yes |
+| A deleted watch root reports `isRootUnwatched` for the root | Yes | Yes | Yes |
+| A deleted watch root reports `isRootStale` for the root | Yes | Yes | Yes |
+| A deleted directory root reports `isDeleted` for each file in it | No | No | Yes |
+| A deleted directory root reports `isDeleted` for each file in it without the stale root check | Yes | No | Yes |
 | A deleted symbolic link to a directory root reports `isDeleted` for the root | No | No | No |
+
+| Behavior | macOS |
+|----------|-------|
+| A deleted watch root reports `isRootUnwatched` for the root with `allowMissingRootPath True` | No |
+
+On Linux the stale root check drops the deletions of the files that are
+read after the root is deleted, the test reads them after the deletion.
+On Windows the read of the changes of the root completes before the root
+is deleted.
 
 Linux reports the deletion of a root when its inode is freed, after the
 last link to it is removed and the last open reference to it is closed.
@@ -199,16 +232,13 @@ maps the object to the old path for the kernel events generated for the
 renamed object. The old path may no longer exist or may refer to another
 object.
 
-On Linux, the library detects a rename and ends the watch with
-`isRootUnwatched`.
+On Linux and macOS, the library detects a rename and ends the watch with
+`isRootUnwatched` and `isRootStale`.
 
-On Windows the rename is not detected and the watch continues on the
-renamed root, and the events continue reporting the old path.
-
-On macOS the watch is on the path and not on the object, so the renamed
-root is not watched, and a root renamed back to the original path is
-watched again. FSEvents does not report any events under the new path of
-the renamed root.
+On Windows the rename does not generate any event. The stale root check
+ends the watch of the root at its next change. Without the check the
+watch continues on the renamed root, and the events continue reporting the
+old path.
 
 File roots, Windows does not support file roots:
 
@@ -228,10 +258,12 @@ Directory roots:
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A renamed watch root remains watched | No | No | Yes |
+| A renamed watch root remains watched | No | No | No |
+| A renamed watch root reports `isRootStale` at its next event | Yes | Yes | Yes |
+| A renamed watch root remains watched without the stale root check | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
-| A renamed watch root reports `isRootUnwatched` | Yes | No | No |
-| A root renamed back to its original path is watched | No | Yes | Yes |
+| A renamed watch root reports `isRootUnwatched` | Yes | Yes | No |
+| A root renamed back to its original path is watched | No | No | Yes |
 | A renamed directory root reports `isMoved` for each file in it | No | No | No |
 | A renamed symbolic link to a directory root reports `isMoved` for the root | No | No | No |
 
@@ -275,15 +307,15 @@ Renaming has same behavior on Linux and macOS:
 ### Rename of a parent of a root
 
 On Linux the rename of a parent directory of a root does not generate
-any event for the root. The root stays watched, and its events report
-the old path. The library may find later that the root path no longer
-refers to the root, for example, when it adds a directory created in a
-recursive root. It then ends the watch of the root with
-`isRootUnwatched`. This check is best effort: a root in which no
-directory is created or moved in stays watched under the old path.
+any event for the root. The stale root check ends the watch of the root
+with `isRootUnwatched` and `isRootStale` at its next event. Without the
+check the root stays watched, and its events report the old path, until
+the library finds that the root path no longer refers to the root, for
+example, when it adds a directory created in a recursive root.
 
-On macOS the watch is on the path, the events of the root at the new path
-of the parent are not reported.
+On macOS the events of the root at the new path of the parent are not
+reported, the root ends only when `staleRoots` or a change of the roots of
+the watch finds the change.
 
 On Windows, the watch keeps an open handle to the root, and Windows does
 not rename a directory while a file or a directory under it is open. The
@@ -294,7 +326,9 @@ the handle only, not to its parent directories.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A root whose parent is renamed remains watched under the old path | Yes | No | Operation fails |
+| A root whose parent is renamed remains watched under the old path | No | No | Operation fails |
+| A root whose parent is renamed reports `isRootStale` at its next event | Yes | No | Operation fails |
+| A root whose parent is renamed remains watched under the old path without the stale root check | Yes | No | Operation fails |
 | A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Operation fails |
 
 ### Resolution of the root path
@@ -303,29 +337,42 @@ These tests change the resolution of a root path after the watch
 starts, by creating a missing path component or by changing the target
 of a symbolic link root.
 
-On macOS FSEvents resolves the symbolic links in the root paths when the
-stream starts, and reports events only under the paths resolved then. A
-missing root, or a missing parent of a root, created later as a
-symbolic link to a directory, does not report any events in that
-directory. On a case-insensitive file system a missing root `Missing`
-created later as `missing` does not report any events in it either. With
-`setRootPathEvents True` from `Streamly.FileSystem.Event.Darwin`, each of
-these three changes reports `isRootPathEvent`.
+A missing root raises an exception on all platforms. On macOS with
+`allowMissingRootPath True`, FSEvents reports events only under the path
+resolved when the root is added. A missing root, or a missing parent of a
+root, created later as a symbolic link to a directory, does not report
+any events in that directory. On a case-insensitive file system a missing
+root `Missing` created later as `missing` does not report any events in it
+either. With `setRootPathEvents True` from
+`Streamly.FileSystem.Event.Darwin`, each of these three changes reports
+`isRootPathEvent`.
 
 On all platforms a symbolic link root, or a root under a symbolic link
 parent, stays watched on the directory the link pointed to when the
 watch started, after the link is changed to point to another directory.
-On macOS this change does not report `isRootPathEvent`.
+No event reports the change, on macOS it does not report
+`isRootPathEvent`. The stale root check ends the watch of the root at its
+next event, without the check the events of the old directory are
+reported under the root path.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| A missing root created as a symbolic link to a directory reports its events | Watch fails | No | Watch fails |
-| A root whose missing parent is created as a symbolic link to a directory reports its events | Watch fails | No | Watch fails |
-| A missing root created with a different case reports its events | Watch fails | No | Watch fails |
+| A missing root created as a symbolic link to a directory reports its events | Watch fails | Watch fails | Watch fails |
+| A root whose missing parent is created as a symbolic link to a directory reports its events | Watch fails | Watch fails | Watch fails |
+| A missing root created with a different case reports its events | Watch fails | Watch fails | Watch fails |
 | A symbolic link root changed to another directory reports the events of the new directory | No | No | No |
-| A symbolic link root changed to another directory reports the events of the old directory | Yes | Yes | Yes |
+| A symbolic link root changed to another directory reports the events of the old directory | No | No | No |
+| A symbolic link root changed to another directory reports the events of the old directory without the stale root check | Yes | Yes | Yes |
 | A root whose symbolic link parent is changed to another directory reports the events of the new directory | No | No | No |
-| A root whose symbolic link parent is changed to another directory reports the events of the old directory | Yes | Yes | Yes |
+| A root whose symbolic link parent is changed to another directory reports the events of the old directory | No | No | No |
+| A root whose symbolic link parent is changed to another directory reports the events of the old directory without the stale root check | Yes | Yes | Yes |
+| A root whose symbolic link parent is changed to another directory reports `isRootStale` at its next event | Yes | Yes | Yes |
+
+| Behavior | macOS |
+|----------|-------|
+| A missing root created as a symbolic link to a directory reports its events with `allowMissingRootPath True` | No |
+| A root whose missing parent is created as a symbolic link to a directory reports its events with `allowMissingRootPath True` | No |
+| A missing root created with a different case reports its events with `allowMissingRootPath True` | No |
 
 On macOS `/Users` is a firmlink to `/System/Volumes/Data/Users`. A root
 under `/Users` reports its events with the root path as supplied.
@@ -361,7 +408,7 @@ without the lock.
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
 | A file system can be unmounted while a tree in it is watched | Yes | Yes | No, a dismount that locks the volume raises an exception |
-| Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | No | No |
+| Unmount of a watched file system reports `isRootUnwatched` for the root | Yes | Yes | No |
 | Unmount of a watched file system reports an unmount event | Yes | Yes | No |
 
 On FreeBSD a file system cannot be unmounted while a tree in it is
@@ -369,12 +416,10 @@ watched, `umount` fails with `Device busy`.
 
 ### End of watch stream
 
-On macOS a watch stream never ends even if you delete all the watched
-paths because new objects on those paths can be created and watched. On
-Linux a deleted or renamed root is gone forever therefore the watch
-stream ends when all the roots are deleted or renamed. On Windows a
-renamed root remains watched, but deleted root is gone forever, if all
-the roots are deleted then the watch stream ends.
+On macOS a watch stream does not end when the watch of all the roots has
+ended. On Linux and Windows a deleted or renamed root is gone forever
+therefore the watch stream ends when all the roots are deleted or renamed.
+On Windows a renamed root ends at its next change.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -413,7 +458,15 @@ dynamically.
 | A root stops reporting events after the required permission is removed | No | Yes | No |
 | A root starts reporting events after the required permission is enabled | NA | Yes | NA |
 | A root stops reporting events after SEARCH is removed from its parent | No | Yes | No |
-| A root starts reporting events after SEARCH is restored on its parent | NA | Yes | NA |
+| A root starts reporting events after SEARCH is restored on its parent | NA | Watch fails | NA |
+
+On macOS a root whose parent has no SEARCH permission cannot be resolved,
+the watch raises an exception. With `allowMissingRootPath True` it is
+watched:
+
+| Behavior | macOS |
+|----------|-------|
+| A root starts reporting events after SEARCH is restored on its parent with `allowMissingRootPath True` | Yes |
 
 On Windows the tests of the parent also disable the "Bypass traverse
 checking" privilege.
