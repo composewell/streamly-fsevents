@@ -863,6 +863,12 @@ each event.
 On Linux a subdirectory reported as `isAccessDenied` stays unwatched until
 it is moved.
 
+Permission error notifications: On Linux any permission errors are notified as
+`isAccessDenied` events. On Windows and macOS you just don't receive events if
+there are permission errors, the paths are not watched and there is no way to
+know which paths are not watched. The applications can scan the tree for
+permissions themselves.
+
 ## FreeBSD
 
 FreeBSD 14.5, 15.0 and later releases have an inotify API compatible with
