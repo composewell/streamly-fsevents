@@ -42,12 +42,15 @@ the operating systems in [watch-limits.md](watch-limits.md).
   use the Linux recovery on every platform.
 * On Linux, a subdirectory reported as `isAccessDenied` is not watched. It
   is added when it is moved, or when the program opens a new watch.
-* On Linux, FreeBSD and Windows, call `staleRoots` periodically. For each
-  root it returns, call `removeRoot` and then `addRoot` to watch the
-  directory now at the root path, and then scan the tree at the root path.
-  `addRoot` does not report the entries already in the directory. Until
-  the scan, the state the application keeps may have entries from the
-  events of the old directory, reported under the root path.
+* A root whose path no longer refers to the watched directory ends with
+  `isRootUnwatched` and `isRootStale`, at its next event, see
+  `enableStaleRootCheck`. To watch the directory now at the root path, call
+  `addRoot` and then scan the tree at the root path. `addRoot` does not
+  report the entries already in the directory. A root that has no events
+  is found by `staleRoots`, call it periodically and call `removeRoot`
+  before `addRoot` for each root it returns. With the check off, until the
+  scan, the state the application keeps may have entries from the events
+  of the old directory, reported under the root path.
 
 ## Handling queue overflow
 
@@ -197,10 +200,10 @@ and Windows, are:
   with both `isCreated` and `isMoved` true.
 * macOS: a watch root, or a directory under the root of a recursive watch,
   deleted and created again can report one event for its path with both
-  `isDeleted` and `isCreated` true. macOS watches the path, so the root
-  path then reports the events of the new object, and the event does not
-  tell which change belongs to the deleted object and which to the new
-  one.
+  `isDeleted` and `isCreated` true. With `allowMissingRootPath True`
+  macOS watches the path, so the root path then reports the events of the
+  new object, and the event does not tell which change belongs to the
+  deleted object and which to the new one.
 * macOS: a later event of a path can repeat the flags of earlier changes of
   the path, even after the consumer has read the events of the earlier
   changes. A file created, with its `isCreated` event read, and deleted one
