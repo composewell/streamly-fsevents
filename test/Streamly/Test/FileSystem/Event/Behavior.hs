@@ -1299,7 +1299,6 @@ behaviors =
             createFile (otherTarget p </> "root" </> "file")
         , check = \p -> createdAt (nestedRoot p </> "file")
         , expected = onPlatform No No No
-        , racy = onDarwin || onWindows
         }
     , Test base
         { title =
@@ -1312,7 +1311,6 @@ behaviors =
             createFile (linkTarget p </> "root" </> "file")
         , check = \p -> createdAt (nestedRoot p </> "file")
         , expected = onPlatform Yes Yes Yes
-        , racy = onDarwin || onWindows
         }
 #if defined(CABAL_OS_DARWIN)
     -- FSEvents reports a root path event when a path component of a root is
@@ -1371,7 +1369,6 @@ behaviors =
         , ops = retargetLinkParent
         , check = const (any Darwin.isRootPathEvent)
         , expected = No
-        , racy = True
         }
     -- /Users is a firmlink to /System/Volumes/Data/Users.
     , Test base
