@@ -21,6 +21,7 @@ module Streamly.Internal.FS.Event.Linux
     , setScanNewDirs
     , setFollowRootSymLinks
     , setFollowSymLinks
+    , enableStaleRootCheck
     , setExcludeUnlinked
     , setUnwatchMoved
     , setOneShot
@@ -78,6 +79,7 @@ module Streamly.Internal.FS.Event.Linux
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
+    , isRootStale
     , isRootDeleted
     , isRootMoved
     , isRootUnmounted
@@ -210,6 +212,7 @@ import qualified Streamly.Internal.Data.StreamK as StreamK
 data Config = Config
     { watchRec :: Bool
     , scanNewDirs :: Bool
+    , staleRootCheck :: Bool
     , createFlags :: Word32
     }
 
@@ -398,6 +401,32 @@ setFollowRootSymLinks s = setFlag iN_DONT_FOLLOW (not s)
 {-# DEPRECATED setFollowSymLinks "Use setFollowRootSymLinks" #-}
 setFollowSymLinks :: Bool -> Config -> Config
 setFollowSymLinks = setFollowRootSymLinks
+
+-- | Check that the root path still refers to the watched object before the
+-- events of the root are returned. When the check fails, the events of the
+-- root are not returned, and the watch of the root ends with
+-- 'isRootUnwatched' and 'isRootStale'. Then no event is reported under a
+-- root path that now refers to another object, for example, after a parent
+-- directory of the root is renamed, or after a symbolic link in the root path
+-- is changed to point to another directory. Neither of these generates any
+-- event of the root.
+--
+-- The check is made once for each root that has events in a read of the
+-- kernel event queue, after the changes of the events read. It opens the
+-- root path, as 'staleRoots' does, and compares the file identity with the
+-- one recorded when the root was added. An event of a change made before the
+-- path changed, but read after it, is not returned either. The
+-- 'isRootDeleted', 'isRootMoved' and 'isRootUnmounted' events of the root are
+-- returned.
+--
+-- With 'False' the check is not made. A root whose path changes reports the
+-- events of the watched object under the old path, until the change is found
+-- by 'staleRoots', or by the check made before a directory is added to a
+-- recursive root.
+--
+-- /default: True/
+enableStaleRootCheck :: Bool -> Config -> Config
+enableStaleRootCheck s cfg = cfg {staleRootCheck = s}
 
 #if HAVE_DECL_IN_EXCL_UNLINK
 foreign import capi
@@ -656,6 +685,7 @@ setAllEvents s =
 --
 -- * 'setScanNewDirs' 'True'
 -- * 'setFollowRootSymLinks' 'True'
+-- * 'enableStaleRootCheck' 'True'
 -- * 'setExcludeUnlinked' 'True'
 -- * 'setOneShot' 'False'
 -- * 'setOnlyDir' 'False'
@@ -687,6 +717,7 @@ defaultConfig =
     $ Config
         { watchRec = False
         , scanNewDirs = True
+        , staleRootCheck = True
         , createFlags = 0
         }
 
@@ -789,15 +820,51 @@ scanFlags cfg@Config{..} =
 -- Path representation for events
 -------------------------------------------------------------------------------
 
--- | The device and inode numbers of a file.
-data FileId = FileId !CDev !CIno deriving Eq
+-- | The device and inode numbers of a file, and its file handle, see
+-- 'fdFileHandle'.
+data FileId = FileId !CDev !CIno !(Maybe (Array Word8)) deriving Eq
+
+-- | Whether two 'FileId's identify the same file. The file handles are
+-- compared only if both are known.
+isSameFile :: FileId -> FileId -> Bool
+isSameFile (FileId d1 i1 h1) (FileId d2 i2 h2) =
+    d1 == d2 && i1 == i2 && and ((==) <$> h1 <*> h2)
+
+#if defined(CABAL_OS_FREEBSD)
+fdFileHandle :: CInt -> IO (Maybe (Array Word8))
+fdFileHandle _ = return Nothing
+#else
+foreign import ccall unsafe "streamly_fsevents_file_handle"
+    c_fileHandle :: CInt -> Ptr Word8 -> CInt -> IO CInt
+
+-- | The file handle of the file of an fd, from name_to_handle_at(2),
+-- 'Nothing' if the file system does not support file handles. A file handle
+-- contains the inode generation number on most file systems, e.g. ext4,
+-- btrfs and tmpfs. The generation number changes when the inode number of a
+-- deleted file is used for a new file.
+fdFileHandle :: CInt -> IO (Maybe (Array Word8))
+fdFileHandle fd = do
+    arr <-
+        unsafeFreezeWithShrink
+            <$> MArray.unsafeCreateWithPtr' size
+                    (\p -> max 0 . fromIntegral
+                        <$> c_fileHandle fd p (fromIntegral size))
+    return $ if A.length arr == 0 then Nothing else Just arr
+
+    where
+
+    -- MAX_HANDLE_SZ and the handle type.
+    size = 128 + 4
+#endif
 
 -- | The 'FileId' of the file of an fd.
 fdFileId :: CInt -> IO FileId
-fdFileId fd =
-    allocaBytes sizeof_stat $ \p -> do
-        throwErrnoIfMinus1_ "fstat" $ c_fstat fd p
-        FileId <$> st_dev p <*> st_ino p
+fdFileId fd = do
+    (dev, ino) <-
+        allocaBytes sizeof_stat $ \p -> do
+            throwErrnoIfMinus1_ "fstat" $ c_fstat fd p
+            (,) <$> st_dev p <*> st_ino p
+    FileId dev ino <$> fdFileHandle fd
 
 -- | A watch root. 'rootPath' is the path supplied by the user, normalized by
 -- 'normalizeRoot', 'getRoot' reports it. 'rootAbs' is the absolute path of
@@ -810,7 +877,7 @@ fdFileId fd =
 -- could not be determined. The rename of a parent of the root does not
 -- generate any event, 'rootAbs' then refers to another file or to none. A
 -- directory opened via 'rootAbs' is checked against 'rootId', see
--- 'openSubdir' and 'unwatchMovedRoots'.
+-- 'openSubdir', 'unwatchMovedRoots' and 'RootChecks'.
 data Root = Root
     { rootPath :: !Path
     , rootAbs :: !Path
@@ -994,11 +1061,16 @@ data WdMap = WdMap
       -- | The watch descriptors of the roots that are directories, see
       -- 'unwatchGoneRoots'.
     , wmDirRoots :: !IntSet
+      -- | The watch descriptors that reported IN_DELETE_SELF or IN_UNMOUNT,
+      -- their IN_IGNORED event reports 'isRootStale' for the roots.
+    , wmGone :: !IntSet
     }
 
 emptyWdMap :: WdMap
 emptyWdMap =
-    WdMap Map.empty OrdMap.empty IntSet.empty IntSet.empty IntSet.empty
+    WdMap
+        Map.empty OrdMap.empty IntSet.empty IntSet.empty IntSet.empty
+        IntSet.empty
 
 lookupWd :: Int -> WdMap -> Maybe WdEntry
 lookupWd wd = Map.lookup wd . wmEntries
@@ -1064,6 +1136,7 @@ insertWdUser wd wps m =
             , wmMoved = member (any (isJust . wpMoveCookie) wps) (wmMoved m)
             , wmPending = member (any wpPending wps) (wmPending m)
             , wmDirRoots = wmDirRoots m
+            , wmGone = wmGone m
             }
 
     where
@@ -1079,11 +1152,18 @@ deleteWd wd m =
         , wmMoved = IntSet.delete wd (wmMoved m)
         , wmPending = IntSet.delete wd (wmPending m)
         , wmDirRoots = IntSet.delete wd (wmDirRoots m)
+        , wmGone = IntSet.delete wd (wmGone m)
         }
 
 -- | Record that the watch descriptor is of a root that is a directory.
 markDirRoot :: Int -> WdMap -> WdMap
 markDirRoot wd m = m {wmDirRoots = IntSet.insert wd (wmDirRoots m)}
+
+-- | Record that the watch descriptor reported IN_DELETE_SELF or IN_UNMOUNT.
+markGone :: Int -> WdMap -> WdMap
+markGone wd m
+    | Map.member wd (wmEntries m) = m {wmGone = IntSet.insert wd (wmGone m)}
+    | otherwise = m
 
 -- | Change the paths of the given user watch descriptors. The function
 -- returns 'Nothing' if the paths of a watch descriptor do not change.
@@ -1439,7 +1519,7 @@ openSubdir root sub = do
     isRootFd fd =
         case rootId root of
             Nothing -> return True
-            Just i -> (== i) <$> fdFileId fd
+            Just i -> isSameFile i <$> fdFileId fd
 
     dirFlags = o_PATH .|. o_DIRECTORY
     subFlags = dirFlags .|. o_NOFOLLOW .|. o_CLOEXEC
@@ -2190,7 +2270,7 @@ isRootAtPath cfg root =
         Just i -> do
             r <- try (pathFileId (followsRootLink cfg) (rootAbs root))
             return $ case r of
-                Right j -> j == i
+                Right j -> isSameFile i j
                 Left e -> not (isNotSubdirError e)
 
 -- | @addRoot watch root@ adds the path @root@ as a root of the watch
@@ -2694,10 +2774,13 @@ removeRoot wtch@Watch {watchFd = fd} root = do
 -- watched via the root, as supplied to 'addRoot'. A root becomes stale when
 -- a parent directory is renamed, the rename does not generate any event, or
 -- when a symbolic link in the root path is changed to point to another
--- directory. The root is still watched under its old path.
+-- directory. The root is still watched until its next event, see
+-- 'enableStaleRootCheck', a root that has no events is found only by this
+-- call.
 --
 -- A root is stale if its path does not exist, or refers to another file,
--- compared by the device and inode numbers recorded when the root was added.
+-- compared by the device and inode numbers, and the file handle where the
+-- file system supports it, recorded when the root was added.
 -- A root whose path cannot be opened because of another error, for example,
 -- a permission error, is not stale.
 --
@@ -2819,10 +2902,18 @@ foreign import capi
 foreign import capi
     "sys/inotify.h value IN_IGNORED" iN_IGNORED :: Word32
 
+foreign import capi
+    "sys/inotify.h value IN_UNMOUNT" iN_UNMOUNT :: Word32
+
 -- | The flag of an 'isAccessDenied' event. It is not an inotify flag, the
 -- inotify events do not use the bits from 0x00010000 to 0x00800000.
 accessDeniedFlag :: Word32
 accessDeniedFlag = 0x00100000
+
+-- | The flag of an 'isRootStale' event, set along with IN_IGNORED. See
+-- 'accessDeniedFlag'.
+rootStaleFlag :: Word32
+rootStaleFlag = 0x00200000
 
 #if !defined(CABAL_OS_FREEBSD)
 foreign import ccall unsafe "streamly_fsevents_is_mount_root"
@@ -3232,6 +3323,62 @@ synthEvent (SynthDenied pRep) =
 synthEvent (SynthUnwatched wd pRep) =
     mkSynth (fromIntegral wd) iN_IGNORED pRep
 
+-- | The 'isRootUnwatched' event of a path removed because its root path no
+-- longer refers to the root. The event of the root path reports
+-- 'isRootStale'.
+staleUnwatchedEvent :: WdUnwatched -> Event
+staleUnwatchedEvent (wd, pRep) =
+    mkSynth (fromIntegral wd) (iN_IGNORED .|. staleFlag) pRep
+
+    where
+
+    staleFlag = if isNothing (getRepSub pRep) then rootStaleFlag else 0
+
+-- | A root as the key of a map.
+newtype RootKey = RootKey Root
+
+instance Eq RootKey where
+    RootKey a == RootKey b = eqRoot a b
+
+instance Ord RootKey where
+    compare (RootKey a) (RootKey b) = compareRoot a b
+
+-- | The results of the checks of the roots that have events in one read of
+-- the fd, 'True' for a stale root, see 'enableStaleRootCheck'. Each root is
+-- checked once.
+type RootChecks = IORef (OrdMap.Map RootKey Bool)
+
+-- | Whether the root path no longer refers to the root, see 'RootChecks'.
+isStaleRoot :: Config -> RootChecks -> Root -> IO Bool
+isStaleRoot cfg ref root = do
+    checked <- readIORef ref
+    case OrdMap.lookup (RootKey root) checked of
+        Just stale -> return stale
+        Nothing -> do
+            stale <- not <$> isRootAtPath cfg root
+            modifyIORef' ref (OrdMap.insert (RootKey root) stale)
+            return stale
+
+-- | The paths of a kernel event that are reported, the paths of a stale root
+-- are dropped, see 'enableStaleRootCheck'. The IN_IGNORED event of a path,
+-- and the IN_DELETE_SELF, IN_MOVE_SELF and IN_UNMOUNT events of a root path
+-- are kept, they end the path.
+freshPaths ::
+    Config -> RootChecks -> Word32 -> [WatchPath] -> IO [WatchPath]
+freshPaths cfg ref flags wps =
+    if staleRootCheck cfg
+    then filterM isFresh wps
+    else return wps
+
+    where
+
+    selfFlags = iN_DELETE_SELF .|. iN_MOVE_SELF .|. iN_UNMOUNT
+
+    isFresh WatchPath{wpRep = (root, sub)}
+        | flags .&. iN_IGNORED /= 0 = return True
+        | flags .&. selfFlags /= 0 && isNothing sub = return True
+        | otherwise = not <$> isStaleRoot cfg ref root
+
 -- | A kernel event read from the fd of a watch: the watch descriptor, the
 -- flags, the cookie and the name.
 data RawEvent = RawEvent CInt Word32 Word32 (Maybe Path)
@@ -3458,6 +3605,24 @@ isDrained :: Int -> Bool
 isDrained n = n + 16 + 256 <= readBufSize
 #endif
 
+-- | Remove the roots found stale by the checks of a read, and the paths under
+-- them, see 'RootChecks'. A root added again after the check, with another
+-- 'rootId', is not removed. Returns the removed paths as 'isRootUnwatched'
+-- events, see 'staleUnwatchedEvent'.
+unwatchStaleRoots :: Watch -> RootChecks -> IO (Stream IO StreamItem)
+unwatchStaleRoots wtch ref =
+    withEffects [] $ do
+        checked <- readIORef ref
+        let stale = [root | (RootKey root, True) <- OrdMap.toList checked]
+            isChecked r root = eqRoot r root && rootId r == rootId root
+            isStale p = any (isChecked (getRepRoot p)) stale
+        if null stale
+        then return S.nil
+        else do
+            removed <- unwatchPaths wtch "unwatchStaleRoots" allWds isStale
+            return
+                $ S.fromList (map (ItemEvent . staleUnwatchedEvent) removed)
+
 -- | Handle a kernel event: change the watches and the map, and return the
 -- events to report.
 --
@@ -3473,8 +3638,11 @@ isDrained n = n + 16 + 256 <= readBufSize
 -- An 'IOException' raised while handling the event is returned as an
 -- 'ItemFailed' after the events of the kernel event, see 'withEffects'. The
 -- rest of the handling of that kernel event is skipped.
-handleEvent :: Config -> Watch -> RawEvent -> IO (Stream IO StreamItem)
-handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
+--
+-- The paths of a stale root are dropped, see 'freshPaths'.
+handleEvent ::
+    Config -> Watch -> RootChecks -> RawEvent -> IO (Stream IO StreamItem)
+handleEvent cfg wtch checks (RawEvent ewd eflags cookie mpth) = do
     let wdMapRef = watchWdMap wtch
     wdm <- readIORef wdMapRef
     let mkEvent wd (root, rel) =
@@ -3521,7 +3689,8 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
     else
         case lookupWd (fromIntegral ewd) wdm of
             Nothing -> return S.nil
-            Just (WdUser wps) -> do
+            Just (WdUser wps0) -> do
+                wps <- freshPaths cfg checks eflags wps0
                 let addName wp =
                         wp {wpRep = maybe id (flip addSub) mpth (wpRep wp)}
                     wps1 = map addName wps
@@ -3554,9 +3723,21 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                     isReported wp =
                         not isMoveSelf
                             && (not isSelfEvent || isRootPath wp)
+                    -- The IN_IGNORED event of a root that reported
+                    -- IN_DELETE_SELF or IN_UNMOUNT.
+                    isGone = isIgnored && IntSet.member wdKey (wmGone wdm)
+                    withStale wp ev =
+                        if isGone && isRootPath wp
+                        then ev {eventFlags = eflags .|. rootStaleFlag}
+                        else ev
                     reported =
-                        [mkEvent ewd (wpRep wp) | wp <- wps1, isReported wp]
+                        [ withStale wp (mkEvent ewd (wpRep wp))
+                        | wp <- wps1, isReported wp
+                        ]
                 withEffects (if isUnrequested then [] else reported) $ do
+                    when (eflags .&. (iN_DELETE_SELF .|. iN_UNMOUNT) /= 0)
+                        $ atomicModifyIORef' wdMapRef
+                        $ \m -> (markGone wdKey m, ())
                     -- See the NOTE above 'markPending'.
                     removedPending <-
                         effectIf
@@ -3624,15 +3805,19 @@ handleEvent cfg wtch (RawEvent ewd eflags cookie mpth) = do
                     when isIgnored
                         $ atomicModifyIORef' wdMapRef
                         $ \m -> (deleteWd (fromIntegral ewd) m, ())
-                    let removed =
-                            removedPending ++ removedMoved ++ removedRoots
-                                ++ removedGone ++ removedOut
+                    let unwatched =
+                            map mkUnwatched (removedPending ++ removedMoved)
+                                ++ map staleUnwatchedEvent
+                                    (removedRoots ++ removedGone)
+                                ++ map mkUnwatched removedOut
                     return
                         $ events moved
                         `S.append` fmap scanItem scanned
-                        `S.append` events (map mkUnwatched removed)
+                        `S.append` events unwatched
 
     where
+
+    wdKey = fromIntegral ewd
 
     isFound (ScanFound _) = True
     isFound _ = False
@@ -3650,36 +3835,11 @@ foreign import ccall unsafe "unistd.h read"
 readBufSize :: Int
 readBufSize = 32 * 1024
 
--- | Read the events available on the fd of a watch, and take the events
--- recorded by 'recordSynthEvents'. The array is empty if no event is
--- available on the fd. If there are none of either, returns an action that
--- waits for an event. Returns 'Nothing' if the watch is closed, or if there
--- are none of either, no path is watched and 'watchEndsUnwatched' is set.
---
--- The wait is registered, or counted, before the action is returned. The
--- caller must mask async exceptions and must run the action. The action can
--- be interrupted by an async exception.
-readEvents ::
-    Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], [Array Word8])))
-readEvents
-    wtch@Watch {watchFd = fd, watchLock = lock, watchSynthEvents = synthVar} =
-    modifyMVar lock $ \st ->
-        if fsWatchClosed st
-        then return (st, Nothing)
-        else do
-            arrs <- readArrays
-            synth <- takeSynthEvents wtch
-            if not (null arrs) || not (null synth)
-            then return (st, Just $ Right (synth, arrs))
-            else do
-                -- A watch descriptor stays in the map until its
-                -- IN_IGNORED event is handled or its paths are removed.
-                -- With an empty map and an empty queue no event of a
-                -- watched path can arrive.
-                m <- readIORef (watchWdMap wtch)
-                if watchEndsUnwatched wtch && Map.null (wmEntries m)
-                then return (st, Nothing)
-                else fmap (Just . Left) <$> register st
+-- | Read the events available on an inotify fd, without waiting. The list is
+-- empty if no event is available. Must be called with the lock of the watch
+-- held.
+readFdArrays :: CInt -> IO [Array Word8]
+readFdArrays fd = readArrays
 
     where
 
@@ -3719,6 +3879,54 @@ readEvents
             if errno == eAGAIN || errno == eWOULDBLOCK || errno == eINTR
             then return 0
             else throwErrno "readEvent"
+
+-- | Read the events available on the fd of a watch, without waiting, and
+-- take the events recorded by 'recordSynthEvents'. Both lists are empty if
+-- the watch is closed.
+readAvailable :: Watch -> IO ([SynthEvent], [Array Word8])
+readAvailable wtch@Watch {watchFd = fd, watchLock = lock} =
+    withMVar lock $ \st ->
+        if fsWatchClosed st
+        then return ([], [])
+        else do
+            arrs <- readFdArrays fd
+            synth <- takeSynthEvents wtch
+            return (synth, arrs)
+
+-- | Read the events available on the fd of a watch, and take the events
+-- recorded by 'recordSynthEvents'. The array is empty if no event is
+-- available on the fd. If there are none of either, returns an action that
+-- waits for an event. Returns 'Nothing' if the watch is closed, or if there
+-- are none of either, no path is watched and 'watchEndsUnwatched' is set.
+--
+-- The wait is registered, or counted, before the action is returned. The
+-- caller must mask async exceptions and must run the action. The action can
+-- be interrupted by an async exception.
+readEvents ::
+    Watch -> IO (Maybe (Either (IO ()) ([SynthEvent], [Array Word8])))
+readEvents
+    wtch@Watch {watchFd = fd, watchLock = lock, watchSynthEvents = synthVar} =
+    modifyMVar lock $ \st ->
+        if fsWatchClosed st
+        then return (st, Nothing)
+        else do
+            arrs <- readArrays
+            synth <- takeSynthEvents wtch
+            if not (null arrs) || not (null synth)
+            then return (st, Just $ Right (synth, arrs))
+            else do
+                -- A watch descriptor stays in the map until its
+                -- IN_IGNORED event is handled or its paths are removed.
+                -- With an empty map and an empty queue no event of a
+                -- watched path can arrive.
+                m <- readIORef (watchWdMap wtch)
+                if watchEndsUnwatched wtch && Map.null (wmEntries m)
+                then return (st, Nothing)
+                else fmap (Just . Left) <$> register st
+
+    where
+
+    readArrays = readFdArrays fd
 
     -- In the threaded RTS, the wait is registered with the IO manager with
     -- the lock held, if 'closeWatch' closes the fd after that, the wait
@@ -3807,23 +4015,27 @@ readEvent
 
     fdReads = S.unfoldrM (\() -> fmap (, ()) <$> readEvents wtch) ()
 
+    readOne (Left wait) = S.fromPure (ItemWait wait)
+    readOne (Right (synth, arrs)) =
+        S.concatEffect $ do
+            checks <- newIORef OrdMap.empty
+            return
+                $ readEvents1 checks synth arrs
+                `S.append` S.concatEffect (endStaleRoots checks 0)
+
     -- The synthetic events recorded by 'openWatch', 'addRoot' or
     -- 'removeRoot' are reported before the kernel events of the same
     -- read. A read returns whole events, the events of a read are parsed on
     -- their own.
-    readOne (Left wait) = S.fromPure (ItemWait wait)
-    readOne (Right (synth, arrs)) =
-        S.append synthEvents kernelEvents
+    --
+    -- 'handleEvent' returns a stream for each kernel event: the event for
+    -- each of its paths, followed by the entries found by its scan.
+    readEvents1 checks synth arrs =
+        S.fromList (map (ItemEvent . synthEvent) synth)
+            `S.append` S.concatMapM (handleEvent cfg wtch checks) rawEvents
+            `S.append` movedOut
 
         where
-
-        synthEvents = S.fromList (map (ItemEvent . synthEvent) synth)
-
-        -- 'handleEvent' returns a stream for each kernel event: the event
-        -- for each of its paths, followed by the entries found by its scan.
-        kernelEvents =
-            S.concatMapM (handleEvent cfg wtch) rawEvents
-                `S.append` movedOut
 
 #if defined(CABAL_OS_FREEBSD)
         -- See the NOTE above 'orderMoves'.
@@ -3843,6 +4055,28 @@ readEvent
 
         movedOut = S.nil
 #endif
+
+    -- The roots found stale while the events of a read are handled are
+    -- removed after the events, see 'RootChecks'. The IN_DELETE_SELF or
+    -- IN_MOVE_SELF event of a root deleted or renamed is queued when the
+    -- root is deleted or renamed, the check can find the root stale before
+    -- the event is read. The events available are read again, and handled
+    -- with the same checks, until a read finds no new stale root. Then the
+    -- stale roots are removed. @n@ is the number of stale roots before the
+    -- last read.
+    endStaleRoots checks n = do
+        checked <- readIORef checks
+        let stale = length (filter id (OrdMap.elems checked))
+        if stale == n
+        then
+            if stale == 0
+            then return S.nil
+            else unwatchStaleRoots wtch checks
+        else do
+            (synth, arrs) <- readAvailable wtch
+            return
+                $ readEvents1 checks synth arrs
+                `S.append` S.concatEffect (endStaleRoots checks stale)
 
     items = S.concatMap readOne fdReads
 
@@ -4090,8 +4324,9 @@ isAccessDenied = getFlag accessDeniedFlag
 --
 -- The rename of a parent of a root does not generate any event. A root is
 -- also removed when the library finds that its path no longer refers to it,
--- before it adds a directory created or moved into a recursive root. This
--- check is best effort, a root may stay watched under its old path.
+-- at the next event of the root, see 'enableStaleRootCheck', and before it
+-- adds a directory created or moved into a recursive root. 'isRootStale' is
+-- reported with this event in these cases.
 --
 -- Note that in recursive watch mode all the subdirectories are watch roots,
 -- therefore, they will all generate this event.
@@ -4108,6 +4343,25 @@ isAccessDenied = getFlag accessDeniedFlag
 -- /Occurs only for a watched path/
 isRootUnwatched :: Event -> Bool
 isRootUnwatched = getFlag iN_IGNORED
+
+-- | The watch of the root ended because the root path no longer refers to the
+-- watched object. It is reported along with 'isRootUnwatched', for the root
+-- path only, when:
+--
+-- * the root is deleted or renamed,
+-- * the file system of the root is unmounted,
+-- * the library finds that the root path refers to another object or to
+--   none, for example, after a parent directory of the root is renamed, or a
+--   symbolic link in the root path is changed to point to another directory.
+--   See 'enableStaleRootCheck'.
+--
+-- It is not reported after 'removeRoot', in the one shot mode, or for a
+-- subdirectory of a recursive root. To watch the object now at the path, add
+-- the root again with 'addRoot'.
+--
+-- /Occurs only for a watched path/
+isRootStale :: Event -> Bool
+isRootStale = getFlag rootStaleFlag
 
 -- | Watched file/directory was itself deleted.  (This event also occurs if an
 -- object is moved to another filesystem, since mv(1) in effect copies the file
@@ -4149,9 +4403,6 @@ isRootDeleted = getFlag iN_DELETE_SELF
 -- /Occurs only for a watched path/
 isRootMoved :: Event -> Bool
 isRootMoved = getFlag iN_MOVE_SELF
-
-foreign import capi
-    "sys/inotify.h value IN_UNMOUNT" iN_UNMOUNT :: Word32
 
 -- | Filesystem containing watched object was unmounted.  In addition, an
 -- 'isRootUnwatched' event will subsequently be generated for the watch
@@ -4345,6 +4596,7 @@ showEvent ev@Event{..} =
     ++ showev isAccessDenied "AccessDenied"
 
     ++ showev isRootUnwatched "RootUnwatched"
+    ++ showev isRootStale "RootStale"
     ++ showev isRootDeleted "RootDeleted"
     ++ showev isRootMoved "RootMoved"
     ++ showev isRootUnmounted "RootUnmounted"

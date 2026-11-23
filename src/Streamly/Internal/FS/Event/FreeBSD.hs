@@ -36,6 +36,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     , setRecursiveMode
     , setScanNewDirs
     , setFollowRootSymLinks
+    , enableStaleRootCheck
     , setFollowSymLinks
     , setOneShot
     , setOnlyDir
@@ -92,6 +93,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
+    , isRootStale
     , isRootDeleted
     , isRootMoved
     , isRootUnmounted

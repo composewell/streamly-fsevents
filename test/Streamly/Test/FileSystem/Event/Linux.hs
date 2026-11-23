@@ -14,7 +14,7 @@ import Control.Concurrent
     )
 import Control.Exception
     (IOException, SomeException, bracket, finally, throwIO, try)
-import Control.Monad (filterM, unless, void, when)
+import Control.Monad (filterM, forM_, unless, void, when)
 import Data.List (isPrefixOf, nub, sort)
 #if defined(FILESYSTEM_EVENT_FREEBSD)
 import Foreign.C.Error (throwErrnoIfMinus1_)
@@ -36,6 +36,7 @@ import System.Environment (lookupEnv)
 #endif
 import System.Directory
     ( createDirectory
+    , createDirectoryIfMissing
     , createDirectoryLink
     , createFileLink
     , doesDirectoryExist
@@ -45,6 +46,7 @@ import System.Directory
 #endif
     , listDirectory
     , removeDirectory
+    , removeDirectoryLink
     , removeFile
     , removePathForcibly
     , renameDirectory
@@ -309,6 +311,9 @@ createdRoots file = map getRoot . filter (isCreatedAt file)
 unwatched :: [Event] -> [(FilePath, FilePath)]
 unwatched evs =
     [(getRoot ev, getAbsPath ev) | ev <- evs, Event.isRootUnwatched ev]
+
+isUnwatchedAt :: FilePath -> Event -> Bool
+isUnwatchedAt path ev = Event.isRootUnwatched ev && getAbsPath ev == path
 
 -- The roots are reported in the order in which they were added.
 overlapFanOut :: Spec
@@ -736,27 +741,156 @@ rootRenamedBack =
             otherThanRename evs `shouldBe` []
             unwatched evs `shouldBe` [(root, root)]
 
--- The rename of a parent of a root generates no event for the root. The root
--- stays watched, its events report the old path.
+-- | Open a watch on the directory @parent/root@ in a temporary directory
+-- using @cfg@, rename @parent@ to @moved@, and run the action with the path
+-- of the root, its path after the rename, and the watch.
+withParentRenamed ::
+    Event.Config -> (FilePath -> FilePath -> Event.Watch -> IO a) -> IO a
+withParentRenamed cfg action =
+    withSystemTempDirectory "fsevent_dir" $ \fp -> do
+        let parent = fp </> "parent"
+            root = parent </> "root"
+            moved = fp </> "moved"
+        createDirectory parent
+        createDirectory root
+        r <- Path.fromString root
+        bracket
+            (Event.openWatch (const cfg) (r NonEmpty.:| []))
+            Event.closeWatch
+            $ \w -> do
+                renameDirectory parent moved
+                action root (moved </> "root") w
+
+-- The rename of a parent of a root generates no event for the root. Without
+-- the stale root check the root stays watched, its events report the old
+-- path.
 rootParentRenamed :: Spec
 rootParentRenamed =
-    it "a root whose parent is renamed stays watched under the old path"
+    it ("a root whose parent is renamed stays watched under the old path "
+            ++ "without the stale root check")
+        $ withParentRenamed (Event.enableStaleRootCheck False watchCfg)
+        $ \root new w -> do
+            createFile (new </> "file")
+            evs <- readUntil Event.isCreated w
+            unwatched evs `shouldBe` []
+            pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
+
+-- The paths of the 'Event.isRootStale' events.
+stalePaths :: [Event] -> [FilePath]
+stalePaths = pathsOf Event.isRootStale
+
+-- The event of the file created after the rename is not reported under the
+-- old path of the root.
+rootParentRenamedStale :: Spec
+rootParentRenamedStale =
+    it "a root whose parent is renamed ends at its next event"
+        $ withParentRenamed watchCfg $ \root new w -> do
+            createFile (new </> "file")
+            evs <- readUntilUnwatched w
+            pathsOf Event.isCreated evs `shouldBe` []
+            unwatched evs `shouldBe` [(root, root)]
+            stalePaths evs `shouldBe` [root]
+
+-- The root link/root is under the symbolic link link to a, the watch is on
+-- a/root. After link is changed to point to b, the event of a file created in
+-- a/root is not reported as link/root/file.
+linkParentRetargetedStale :: Spec
+linkParentRetargetedStale =
+    it "a root whose symbolic link parent is changed ends at its next event"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let a = fp </> "a"
+                b = fp </> "b"
+                link = fp </> "link"
+                root = link </> "root"
+            createDirectoryIfMissing True (a </> "root")
+            createDirectoryIfMissing True (b </> "root")
+            createDirectoryLink a link
+            r <- Path.fromString root
+            bracket
+                (Event.openWatch (const watchCfg) (r NonEmpty.:| []))
+                Event.closeWatch
+                $ \w -> do
+                    removeDirectoryLink link
+                    createDirectoryLink b link
+                    createFile (a </> "root" </> "file")
+                    evs <- readUntilUnwatched w
+                    pathsOf Event.isCreated evs `shouldBe` []
+                    unwatched evs `shouldBe` [(root, root)]
+                    stalePaths evs `shouldBe` [root]
+
+staleRootDeleted :: Spec
+staleRootDeleted =
+    it "a deleted root reports isRootStale with isRootUnwatched"
+        $ withRoot watchCfg $ \root w -> do
+            removeDirectory root
+            evs <- readUntilUnwatched w
+            pathsOf Event.isRootDeleted evs `shouldBe` [root]
+            unwatched evs `shouldBe` [(root, root)]
+            stalePaths evs `shouldBe` [root]
+
+-- The entries are deleted before the root, the events of the entries read
+-- after the root is deleted are not reported. The isRootDeleted event is
+-- reported.
+staleRootDeletedTree :: Spec
+staleRootDeletedTree =
+    it "a root deleted with its entries reports isRootDeleted"
+        $ withRoot watchCfg $ \root w -> do
+            forM_ [1 .. 20 :: Int] $ \i ->
+                createFile (root </> ("file" ++ show i))
+            removePathForcibly root
+            evs <- readUntilUnwatched w
+            pathsOf Event.isRootDeleted evs `shouldBe` [root]
+            stalePaths evs `shouldBe` [root]
+
+staleRootRenamed :: Spec
+staleRootRenamed =
+    it "a renamed root reports isRootStale with isRootUnwatched"
+        $ withRoot watchCfg $ \root w -> do
+            renameDirectory root (root ++ "-moved")
+            evs <- readUntilUnwatched w
+            pathsOf Event.isRootMoved evs `shouldBe` [root]
+            unwatched evs `shouldBe` [(root, root)]
+            stalePaths evs `shouldBe` [root]
+
+staleRootRemoved :: Spec
+staleRootRemoved =
+    it "a removed root does not report isRootStale"
+        $ withRoot watchCfg $ \root w -> do
+            Event.removeRoot w =<< Path.fromString root
+            evs <- readUntilUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+            stalePaths evs `shouldBe` []
+
+staleOneShot :: Spec
+staleOneShot =
+    it "a one shot root does not report isRootStale"
+        $ withRoot (Event.setOneShot True watchCfg) $ \root w -> do
+            createFile (root </> "file")
+            evs <- readUntilUnwatched w
+            unwatched evs `shouldBe` [(root, root)]
+            stalePaths evs `shouldBe` []
+
+-- The subdirectories of a stale recursive root report isRootUnwatched
+-- without isRootStale.
+staleRecSubdirs :: Spec
+staleRecSubdirs =
+    it "the subdirectories of a stale recursive root do not report it"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
             let parent = fp </> "parent"
                 root = parent </> "root"
                 moved = fp </> "moved"
-            createDirectory parent
-            createDirectory root
+            createDirectoryIfMissing True (root </> "sub")
             r <- Path.fromString root
             bracket
-                (Event.openWatch id (r NonEmpty.:| []))
+                (Event.openWatch (const recCfg) (r NonEmpty.:| []))
                 Event.closeWatch
                 $ \w -> do
                     renameDirectory parent moved
-                    createFile (moved </> "root" </> "file")
-                    evs <- readUntil Event.isCreated w
-                    unwatched evs `shouldBe` []
-                    pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
+                    createFile (moved </> "root" </> "sub" </> "file")
+                    evs <- readUntil (isUnwatchedAt root) w
+                    evs1 <- readUntil (isUnwatchedAt (root </> "sub")) w
+                    pathsOf Event.isCreated (evs ++ evs1) `shouldBe` []
+                    stalePaths (evs ++ evs1) `shouldBe` [root]
 
 -- | Open a recursive watch on the directory @parent/root@ in a temporary
 -- directory, rename @parent@ to @moved@, and run the action with the path of
@@ -981,9 +1115,6 @@ recSubdirSelfEvents =
             pathsOf isSelfEvent evs `shouldBe` []
             pathsOf Event.isMovedFrom evs `shouldBe` [dir1]
             pathsOf Event.isDeleted evs `shouldBe` [dir2]
-
-isUnwatchedAt :: FilePath -> Event -> Bool
-isUnwatchedAt path ev = Event.isRootUnwatched ev && getAbsPath ev == path
 
 -- | @dir@ or a path under it.
 isUnder :: FilePath -> FilePath -> Bool
@@ -2673,10 +2804,12 @@ shouldHaveRootPaths evs =
 
     rootEvs = filter ((== Nothing) . getRelPath) evs
 
+-- The stale root check would drop the events of the file read after the root
+-- is deleted.
 rootEventPaths :: Spec
 rootEventPaths =
     it "getRelPath is Nothing and getAbsPath is getRoot for the root"
-        $ withRoot watchCfg $ \root w -> do
+        $ withRoot (Event.enableStaleRootCheck False watchCfg) $ \root w -> do
             let file = root </> "file"
             createFile file
             removeFile file
@@ -2722,6 +2855,15 @@ watchTests =
                 overlapRemoveBoth
                 overlapMoveOutInner
                 duplicateRoot
+            describe "stale roots" $ do
+                rootParentRenamedStale
+                linkParentRetargetedStale
+                staleRootDeleted
+                staleRootDeletedTree
+                staleRootRenamed
+                staleRootRemoved
+                staleOneShot
+                staleRecSubdirs
             describe "renamed roots" $ do
                 rootRenamed
                 rootRenamedUnrequested

@@ -111,6 +111,7 @@ module Streamly.FileSystem.Event.Linux
     , setRecursiveMode
     , setScanNewDirs
     , setFollowRootSymLinks
+    , enableStaleRootCheck
     , setExcludeUnlinked
     , setOneShot
     , setOnlyDir
@@ -154,6 +155,7 @@ module Streamly.FileSystem.Event.Linux
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
+    , isRootStale
     , isRootUnmounted
 
     -- ** Item Level Metadata change
