@@ -890,13 +890,19 @@ isStaleRoot r = do
         Left e -> isDoesNotExistError e
 
 -- | The outcome of a read after the check of the root, see
--- 'enableStaleRootCheck'.
+-- 'enableStaleRootCheck'. A stale root whose directory is delete pending is
+-- deleted: with POSIX delete semantics its path is removed while the handle
+-- of the watch is open.
 checkRoot :: Config -> Root -> Outcome -> IO Outcome
 checkRoot cfg root outcome =
     if staleRootCheck cfg && isChanges outcome
     then do
         stale <- isStaleRoot root
-        return (if stale then RootStale else outcome)
+        if stale
+        then do
+            deleted <- isDeletePending (rootHandle root)
+            return (if deleted then RootDeleted else RootStale)
+        else return outcome
     else return outcome
 
     where
