@@ -312,9 +312,10 @@ created later as `missing` does not report any events in it either. With
 `setRootPathEvents True` from `Streamly.FileSystem.Event.Darwin`, each of
 these three changes reports `isRootPathEvent`.
 
-On all platforms a symbolic link root changed to point to another
-directory stays watched on the directory it pointed to when the watch
-started. On macOS this change does not report `isRootPathEvent`.
+On all platforms a symbolic link root, or a root under a symbolic link
+parent, stays watched on the directory the link pointed to when the
+watch started, after the link is changed to point to another directory.
+On macOS this change does not report `isRootPathEvent`.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
@@ -323,6 +324,8 @@ started. On macOS this change does not report `isRootPathEvent`.
 | A missing root created with a different case reports its events | Watch fails | No | Watch fails |
 | A symbolic link root changed to another directory reports the events of the new directory | No | No | No |
 | A symbolic link root changed to another directory reports the events of the old directory | Yes | Yes | Yes |
+| A root whose symbolic link parent is changed to another directory reports the events of the new directory | No | No | No |
+| A root whose symbolic link parent is changed to another directory reports the events of the old directory | Yes | Yes | Yes |
 
 On macOS `/Users` is a firmlink to `/System/Volumes/Data/Users`. A root
 under `/Users` reports its events with the root path as supplied.
