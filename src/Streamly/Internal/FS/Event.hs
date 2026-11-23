@@ -18,6 +18,7 @@ module Streamly.Internal.FS.Event
     -- ** Configuration
       Config
     , setRecursiveMode
+    , enableStaleRootCheck
 
     -- ** Watch APIs
     , watch
@@ -26,8 +27,7 @@ module Streamly.Internal.FS.Event
 
     -- ** Handle APIs
     -- TODO: When these are exported from Streamly.FileSystem.Event, add a
-    -- "Handle API" section to docs/platform-differences.md: on macOS
-    -- isRootUnwatched is reported only after removeRoot; no FSEvents
+    -- "Handle API" section to docs/platform-differences.md: no FSEvents
     -- history on read-only and network volumes, a root change may report
     -- isEventsLost; on Windows removeRoot drops the changes of the
     -- root not yet read from the system, and a deleted root is removed from
@@ -55,6 +55,7 @@ module Streamly.Internal.FS.Event
 
     -- ** Root events
     , isRootUnwatched
+    , isRootStale
 
     -- ** Exception Conditions
     , isEventsLost
@@ -117,6 +118,28 @@ import qualified Streamly.Internal.FS.Event.FreeBSD as Event
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode = Event.setRecursiveMode
 
+-- | Check that the root path still refers to the watched object before the
+-- events of the root are returned. When the check fails, the events of the
+-- root are not returned, and the watch of the root ends with
+-- 'isRootUnwatched' and 'isRootStale'. Then no event is reported under a
+-- root path that now refers to another object, for example, after a parent
+-- directory of the root is renamed, or after a symbolic link in the root path
+-- is changed to point to another directory. Neither of these generates any
+-- event of the root.
+--
+-- The check is made once for each root that has events in a read of the
+-- events from the system, after the changes of the events read. An event of
+-- a change made before the path changed, but read after it, is not returned
+-- either. A root that has no events is found by 'staleRoots'.
+--
+-- With 'False' the check costs nothing, a root whose path changes reports
+-- the events of the watched object under the old path until the change is
+-- found otherwise, see the platform specific modules.
+--
+-- /default: True/
+enableStaleRootCheck :: Bool -> Config -> Config
+enableStaleRootCheck = Event.enableStaleRootCheck
+
 -------------------------------------------------------------------------------
 -- Creating a watch
 -------------------------------------------------------------------------------
@@ -142,14 +165,9 @@ setRecursiveMode = Event.setRecursiveMode
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith = Event.watchWith
 
--- macOS and Windows seem to do a path level watch i.e. they watch the path
--- rather than the underlying inode. Linux watches the inode, the library
--- removes a root on its IN_MOVE_SELF event, so a renamed root is not watched
--- on Linux and macOS. A new object created at the path of a deleted or renamed
--- root is watched on macOS but not on Linux.
---
--- Also, to make the behavior of Linux same as macOS we need to set
--- setFollowRootSymLinks on Linux.
+-- A root is bound to the object its supplied path refers to when the root is
+-- added, on all platforms. The watch of the root ends when the path no longer
+-- refers to that object, see dev/design-issues/root-path-binding.md.
 
 -- XXX Verify all the cases mentioned below using test cases.
 -- XXX Make it fail if the watch root is a file. It works on macOS and Linux
@@ -175,11 +193,19 @@ watchWith = Event.watchWith
 -- affect the watch. 'getRoot' returns the relative path, 'getAbsPath'
 -- returns an absolute path.
 --
+-- A watch root is bound to the object that its path refers to when the watch
+-- starts. When the path no longer refers to that object, the watch of the
+-- root ends with 'isRootUnwatched' and 'isRootStale'. This happens when the
+-- root is deleted or renamed, when a parent directory is renamed, or when a
+-- symbolic link in the path is changed to point to another directory, see
+-- 'enableStaleRootCheck'. To keep watching a directory whose path has a
+-- symbolic link that may be changed, supply the path with the symbolic links
+-- resolved. To follow a symbolic link that is changed, watch the directory
+-- that contains the link.
+--
 -- When a watch root is deleted, an 'isDeleted' event is reported for the
--- root. On Linux, FreeBSD and Windows a deleted root is not watched again,
--- and the stream ends when none of the roots is watched any more. On macOS
--- the watch continues, an object created at the path of the root later is
--- watched.
+-- root. On Linux, FreeBSD and Windows the stream ends when none of the roots
+-- is watched any more.
 --
 -- Do not rename, or delete and create again, a watch root in a portable
 -- program, the result depends on the platform. See
@@ -297,13 +323,12 @@ removeRoot = Event.removeRoot
 -- 'addRoot' with the path. The result can be out of date when the call
 -- returns.
 --
--- On Linux and FreeBSD a root becomes stale when a parent directory is
--- renamed, and on Windows when the root is renamed. On all three it also
--- becomes stale when a symbolic link in the root path is changed to point to
--- another directory. The root is still watched, its events report the old
--- path. A root is stale if its path does
--- not exist or refers to another file. On macOS a root is watched by its path
--- and is never stale, the list is empty.
+-- A root becomes stale when a parent directory is renamed, when a symbolic
+-- link in the root path is changed to point to another directory, and on
+-- Windows and macOS when the root is renamed. A root is stale if its path
+-- does not exist or refers to another file. The root is still watched until
+-- its next event, see 'enableStaleRootCheck', a stale root that has no
+-- events is found only by this call.
 --
 staleRoots :: Watch -> IO [Path]
 staleRoots = Event.staleRoots
@@ -421,21 +446,25 @@ isEventsLost :: Event -> Bool
 isEventsLost = Event.isEventsLost
 
 -- | The root returned by 'getRoot' is no longer watched, no more events of
--- the root follow. It is reported after 'removeRoot' on all platforms. On
--- Linux, FreeBSD and Windows it is also reported when the watch of a root
--- ends because the root is deleted, and on Linux and FreeBSD when a root is
--- renamed. On macOS a deleted or renamed root stays watched.
---
--- The rename of a parent of a root is not reported. On Linux and FreeBSD the
--- root stays watched under the old path, but this event may be reported for
--- the root later, when the library finds that the root path no longer refers
--- to the root, for example, before it adds a directory created in a
--- recursive root.
+-- the root follow. It is reported after 'removeRoot', and with
+-- 'isRootStale' when the root path no longer refers to the watched object.
 --
 -- On Linux and FreeBSD it is also reported for a directory of a recursive
 -- watch that is no longer watched, 'getAbsPath' returns the directory.
 isRootUnwatched :: Event -> Bool
 isRootUnwatched = Event.isRootUnwatched
+
+-- | The watch of the root ended because the root path no longer refers to the
+-- watched object. It is reported along with 'isRootUnwatched' when the root
+-- is deleted or renamed, and when the library finds that the root path
+-- refers to another object or to none, for example, after a parent directory
+-- of the root is renamed, or a symbolic link in the root path is changed to
+-- point to another directory, see 'enableStaleRootCheck'.
+--
+-- It is not reported after 'removeRoot'. To watch the object now at the
+-- path, add the root again with 'addRoot' and scan the tree at the path.
+isRootStale :: Event -> Bool
+isRootStale = Event.isRootStale
 
 -------------------------------------------------------------------------------
 -- Debugging

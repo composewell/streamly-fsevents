@@ -103,6 +103,7 @@ module Streamly.FileSystem.Event
     -- ** Configuration
       Config
     , setRecursiveMode
+    , enableStaleRootCheck
 
     -- ** Watch APIs
     , watch
@@ -121,6 +122,10 @@ module Streamly.FileSystem.Event
     , isDeleted
     , isMoved
     , isModified
+
+    -- ** Root events
+    , isRootUnwatched
+    , isRootStale
 
     -- ** Exception Conditions
     , isEventsLost
