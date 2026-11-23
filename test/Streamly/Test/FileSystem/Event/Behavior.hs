@@ -1218,12 +1218,12 @@ behaviors =
         , expected = onPlatform Yes No Exception
         }
     , Subsection "Resolution of the root path"
-    -- On macOS the event paths have the symbolic links resolved, the library
-    -- matches them against the root path resolved when the root is added.
     -- These behaviors change the resolution of a root path after the watch
-    -- starts. An event that matches a root reports the root path as
+    -- starts. On macOS an event that matches a root reports the root path as
     -- supplied, an event that does not match any root reports the resolved
-    -- path, so the check compares the absolute path.
+    -- path, so the check compares the absolute path. FSEvents resolves the
+    -- root paths when the stream starts and does not report any events for
+    -- the new resolution.
     , Test base
         { title =
             "A missing root created as a symbolic link to a directory "
@@ -1237,7 +1237,6 @@ behaviors =
             createFile (watchRoot p </> "file")
         , check = \p -> createdAt (watchRoot p </> "file")
         , expected = onPlatform WatchException No WatchException
-        , racy = onDarwin
         }
     , Test base
         { title =
@@ -1251,7 +1250,6 @@ behaviors =
             createFile (nestedRoot p </> "file")
         , check = \p -> createdAt (nestedRoot p </> "file")
         , expected = onPlatform WatchException No WatchException
-        , racy = onDarwin
         }
     -- On a case-insensitive file system "Missing" and "missing" are the
     -- same path.
@@ -1265,10 +1263,9 @@ behaviors =
             createFile (createdMissingRoot p </> "file")
         , check = \p -> createdAt (missingRoot p </> "file")
         , expected = onPlatform WatchException No WatchException
-        , racy = onDarwin
         }
-    -- The watch follows a symbolic link root when it starts. On Linux and
-    -- Windows the watch is on the directory the link pointed to.
+    -- The watch follows a symbolic link root when it starts and stays on the
+    -- directory the link pointed to.
     , Test base
         { title =
             "A symbolic link root changed to another directory reports the "
@@ -1279,7 +1276,6 @@ behaviors =
             createFile (otherTarget p </> "file")
         , check = \p -> createdAt (watchRoot p </> "file")
         , expected = onPlatform No No No
-        , racy = onDarwin || onWindows
         }
     , Test base
         { title =
@@ -1291,7 +1287,6 @@ behaviors =
             createFile (linkTarget p </> "file")
         , check = \p -> createdAt (watchRoot p </> "file")
         , expected = onPlatform Yes Yes Yes
-        , racy = onDarwin || onWindows
         }
 #if defined(CABAL_OS_DARWIN)
     -- FSEvents reports a root path event when a path component of a root is
@@ -1308,7 +1303,6 @@ behaviors =
         , ops = \p -> createDirectoryLink (linkTarget p) (watchRoot p)
         , check = const (any Darwin.isRootPathEvent)
         , expected = Yes
-        , racy = True
         }
     , Test base
         { title =
@@ -1320,7 +1314,6 @@ behaviors =
         , ops = \p -> createDirectoryLink (linkTarget p) (nestedParent p)
         , check = const (any Darwin.isRootPathEvent)
         , expected = Yes
-        , racy = True
         }
     , Test base
         { title =
@@ -1331,7 +1324,6 @@ behaviors =
         , ops = createDirectory . createdMissingRoot
         , check = const (any Darwin.isRootPathEvent)
         , expected = Yes
-        , racy = True
         }
     , Test base
         { title =
@@ -1341,8 +1333,7 @@ behaviors =
         , setup = withLinkRoot
         , ops = retargetLinkRoot
         , check = const (any Darwin.isRootPathEvent)
-        , expected = Yes
-        , racy = True
+        , expected = No
         }
     -- /Users is a firmlink to /System/Volumes/Data/Users.
     , Test base
@@ -1353,7 +1344,6 @@ behaviors =
         , ops = \p -> createFile (usersRoot p </> "file")
         , check = \p -> createdAt (usersRoot p </> "file")
         , expected = Yes
-        , racy = True
         }
 #endif
     , Subsection "Unmount of the file system of a root"
