@@ -1564,6 +1564,45 @@ staleLinkRootReAdded =
     expected _ = []
 #endif
 
+-- The root link/root is under the symbolic link link to a, the watch is on
+-- a/root. After link is changed to point to b, the root path refers to
+-- b/root. The expected results are those of 'staleLinkRootReAdded'.
+staleLinkParentReAdded :: Spec
+staleLinkParentReAdded =
+    it "a root whose symbolic link parent is changed is stale"
+        $ withRootHandle id $ \root w -> do
+            let dir = takeDirectory root
+                a = dir </> "a"
+                b = dir </> "b"
+                link = dir </> "link"
+                root2 = link </> "root"
+                file = root2 </> "file"
+            createDirectoryIfMissing True (a </> "root")
+            createDirectoryIfMissing True (b </> "root")
+            createDirectoryLink a link
+            p <- Path.fromString root2
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            removeDirectoryLink link
+            createDirectoryLink b link
+            stale w `shouldReturn` expected root2
+            Event.removeRoot w p
+            Event.addRoot w p
+            stale w `shouldReturn` []
+            createFile (b </> "root" </> "file")
+            evs <- readUntil (isCreatedAt file) w
+            createdRoots file evs `shouldBe` [root2]
+
+    where
+
+    stale w = map Path.toString <$> Event.staleRoots w
+
+#if defined(CABAL_OS_LINUX) || defined(CABAL_OS_FREEBSD)
+    expected r = [r]
+#else
+    expected _ = []
+#endif
+
 closedWatchOps :: Spec
 closedWatchOps =
     it "addRoot raises an exception, removeRoot does nothing on a closed watch"
@@ -1750,6 +1789,7 @@ handleTests = do
     removeAddAgain
     staleRootReAdded
     staleLinkRootReAdded
+    staleLinkParentReAdded
     closedWatchOps
 #if defined(CABAL_OS_WINDOWS)
     fileRootRaises
