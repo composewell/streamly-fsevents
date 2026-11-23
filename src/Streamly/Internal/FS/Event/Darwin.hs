@@ -333,6 +333,10 @@ foreign import ccall safe
 -- Note: We have observed that an 'isDeleted' event occurs for the root path
 -- (when it is a regular dir and not symlink) even when this option is off.
 --
+-- The setting has no effect while a root of the watch is neither a directory
+-- nor a regular file, e.g. a FIFO: FSEvents does not return from the start of
+-- the stream of such a root with this flag.
+--
 -- /default: False/
 --
 -- /macOS 10.5+/
@@ -427,14 +431,24 @@ defaultConfig = setFileEvents True $ Config
     , createFlags = 0
     }
 
--- | The create flags of the FSEvents streams of a watch. The
+-- | The create flags of the FSEvents stream of the roots. The
 -- 'isRootPathEvent' events are used for the check of the binding of the
 -- roots, see 'allowMissingRootPath', and are returned only with
 -- 'setRootPathEvents'.
-streamFlags :: Config -> Word32
-streamFlags cfg
-    | missingRoots cfg = createFlags cfg
-    | otherwise = createFlags cfg .|. kFSEventStreamCreateFlagWatchRoot
+--
+-- With 'kFSEventStreamCreateFlagWatchRoot' the start of a stream with a FIFO
+-- root does not return. The flag is not set, even with 'setRootPathEvents',
+-- if a root is neither a directory nor a regular file, see 'rootSpecial'.
+streamFlags :: Config -> [Root] -> Word32
+streamFlags cfg roots
+    | any rootSpecial roots = flags .&. complement watchRoot
+    | missingRoots cfg = flags
+    | otherwise = flags .|. watchRoot
+
+    where
+
+    flags = createFlags cfg
+    watchRoot = kFSEventStreamCreateFlagWatchRoot
 
 -------------------------------------------------------------------------------
 -- C FFI
@@ -491,7 +505,8 @@ foreign import ccall safe "FS/Event/Darwin.h destroyWatch" c_destroyWatch
     :: Ptr CWatch -> IO ()
 
 foreign import ccall unsafe "FS/Event/Darwin.h fileId" c_fileId
-    :: CString -> Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> IO CInt
+    :: CString -> Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Ptr CInt
+    -> IO CInt
 
 foreign import ccall unsafe "unistd.h read"
     c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
@@ -522,17 +537,22 @@ data Event = Event
 -- number is 0 unless the process runs as root.
 data FileId = FileId !Word64 !Word64 !Word64 deriving Eq
 
--- | The 'FileId' of the file at a path, following the symbolic links. Raise
--- an exception if the path cannot be accessed.
-pathFileId :: Path -> IO FileId
-pathFileId path =
+-- | The 'FileId' of the file at a path, following the symbolic links, and
+-- whether the file is neither a directory nor a regular file. Raise an
+-- exception if the path cannot be accessed.
+pathStat :: Path -> IO (FileId, Bool)
+pathStat path =
     A.asCStringUnsafe (Path.toArray path) $ \cpath ->
     alloca $ \pDev ->
     alloca $ \pIno ->
-    alloca $ \pGen -> do
-        r <- c_fileId cpath pDev pIno pGen
+    alloca $ \pGen ->
+    alloca $ \pSpecial -> do
+        r <- c_fileId cpath pDev pIno pGen pSpecial
         if r == 0
-        then FileId <$> peek pDev <*> peek pIno <*> peek pGen
+        then do
+            fid <- FileId <$> peek pDev <*> peek pIno <*> peek pGen
+            special <- peek pSpecial
+            return (fid, special /= 0)
         else do
             errno <- getErrno
             ioError
@@ -557,6 +577,9 @@ data Root = Root
       -- | The 'FileId' of the root when it was added, 'Nothing' if the
       -- root does not exist and 'allowMissingRootPath' is set.
     , rootId :: Maybe FileId
+      -- | The root is neither a directory nor a regular file, e.g. a FIFO,
+      -- see 'streamFlags'.
+    , rootSpecial :: Bool
     }
 
 dropTrailingSeparators :: String -> String
@@ -590,23 +613,24 @@ toRoot cfg p0 = do
     resolve absPath n = do
         canonical <- canonicalizePath (Path.toString absPath)
         resolved <- Path.fromString canonical
-        let root fid =
+        let root fid special =
                 Root
                     { rootPath = p
                     , rootAbs = absPath
                     , rootResolved = resolved
                     , rootCanonical = dropTrailingSeparators canonical
                     , rootId = fid
+                    , rootSpecial = special
                     }
-        r <- try (pathFileId resolved)
+        r <- try (pathStat resolved)
         case r of
             Left (e :: IOException)
-                | missingRoots cfg -> return (root Nothing)
+                | missingRoots cfg -> return (root Nothing False)
                 | otherwise -> ioError e
-            Right fid -> do
-                fid1 <- pathFileId absPath
+            Right (fid, special) -> do
+                (fid1, _) <- pathStat absPath
                 if fid1 == fid
-                then return (root (Just fid))
+                then return (root (Just fid) special)
                 else if n > 1
                 then resolve absPath (n - 1)
                 else
@@ -634,9 +658,9 @@ isRootAtPath root =
     case rootId root of
         Nothing -> return True
         Just i -> do
-            r <- try (pathFileId (rootAbs root))
+            r <- try (pathStat (rootAbs root))
             return $ case r of
-                Right j -> j == i
+                Right (j, _) -> j == i
                 Left e -> fmap Errno (ioe_errno e) `notElem` gone
 
     where
@@ -863,8 +887,9 @@ data Removed = Removed
       -- | The root path no longer refers to the root, the 'isRootUnwatched'
       -- event reports 'isRootStale'.
     , rmStale :: !Bool
-      -- | The current event id of the system when the root was removed, 0
-      -- for a stale root: its events are not reported after the removal.
+      -- | The current event id of the system when the root was removed. The
+      -- events of a stale root up to the cutoff are dropped by
+      -- 'checkRoots', except the deletion and the rename of the root.
     , rmCutoff :: !Word64
       -- | The generations of the streams that watched the root when it
       -- was removed.
@@ -998,7 +1023,7 @@ setRoots name Watch{..} gen roots removed stale =
                     { ssRemoved =
                         ssRemoved ss0
                             ++ map (toRemoved ss0 False now) removed
-                            ++ map (toRemoved ss0 True 0) stale
+                            ++ map (toRemoved ss0 True now) stale
                     , ssCurrent = roots
                     -- A root added again is reported by the old streams
                     -- again, the new stream does not report the events
@@ -1015,7 +1040,7 @@ setRoots name Watch{..} gen roots removed stale =
             return ss1 {ssReplace = rs}
         else do
             let (since, stops, rs) = Replace.replace gen now (ssReplace ss)
-                flags = streamFlags watchConfig
+                flags = streamFlags watchConfig roots
             (sinceId, flags1) <-
                 case since of
                     SinceNow -> (, flags) <$> c_eventIdSinceNow

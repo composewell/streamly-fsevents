@@ -489,10 +489,12 @@ void destroyWatch(struct watch* w) {
 
 /*
  * The device, inode and generation numbers of the file at the path,
- * following the symbolic links. st_gen is 0 unless the process runs as
- * root. Returns 0 on success, -1 with errno set on failure.
+ * following the symbolic links, and whether it is neither a directory nor a
+ * regular file. st_gen is 0 unless the process runs as root. Returns 0 on
+ * success, -1 with errno set on failure.
  */
-int fileId(const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen)
+int fileId
+    (const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen, int *special)
 {
     struct stat st;
 
@@ -502,6 +504,7 @@ int fileId(const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen)
     *dev = (UInt64)st.st_dev;
     *ino = (UInt64)st.st_ino;
     *gen = (UInt64)st.st_gen;
+    *special = !(S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
     return 0;
 }
 

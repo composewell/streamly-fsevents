@@ -30,7 +30,8 @@ void destroyWatch(struct watch* w);
 UInt64 currentEventId(void);
 UInt64 eventIdSinceNow(void);
 
-int fileId(const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen);
+int fileId
+    (const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen, int *special);
 
 /******************************************************************************
  * Create Flags
