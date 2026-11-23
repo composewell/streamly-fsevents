@@ -495,6 +495,7 @@ isSameRoot r1 r2 = Path.eqPathBytes (rootPath r1) (rootPath r2)
 -- event under those roots only is not returned.
 setRoot :: [Root] -> (Root -> Bool) -> Event -> IO [Event]
 setRoot roots isEnded ev = do
+    -- XXX Use streamly Path
     let path = dropTrailingSeparators (Path.toString (eventPath ev))
         allMatches =
             [ (root, rel)
@@ -504,6 +505,8 @@ setRoot roots isEnded ev = do
         matches = filter (not . isEnded . fst) allMatches
         withRoot (root, rel) = do
             relPath <-
+                -- XXX if it is not relative to any root, there is a problem
+                -- which we need to report or correct.
                 if null rel
                 then return Nothing
                 else Just <$> Path.fromString rel
@@ -517,6 +520,7 @@ setRoot roots isEnded ev = do
 
     where
 
+    -- XXX Use streamly Path
     relativeTo canonical path
         | path == canonical = Just ""
         | otherwise = stripPrefix (canonical ++ "/") path
