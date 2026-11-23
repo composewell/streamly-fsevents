@@ -1270,9 +1270,9 @@ behaviors =
         }
     , Subsection "Rename of a parent of a root"
     -- The root is parent/root, the rename of parent generates no event for
-    -- the root on Linux. macOS watches the path, the root is not watched
-    -- after the rename. Windows does not rename a directory that has a
-    -- watched root under it.
+    -- the root on Linux, the stale root check ends the root at its next
+    -- event. On macOS the root ends after the rename. Windows does not
+    -- rename a directory that has a watched root under it.
     , Test base
         { title =
             "A root whose parent is renamed remains watched under the old path"
@@ -1297,7 +1297,7 @@ behaviors =
             createFile (movedNestedRoot p </> "file")
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p && Event.isRootStale ev)
-        , expected = onPlatform Yes No Exception
+        , expected = onPlatform Yes Yes Exception
         }
     , Test base
         { title =
@@ -1328,7 +1328,7 @@ behaviors =
             createDirectory (movedNestedRoot p </> "dir")
         , check = \p ->
             any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
-        , expected = onPlatform Yes No Exception
+        , expected = onPlatform Yes Yes Exception
         }
     , Subsection "Resolution of the root path"
     -- These behaviors change the resolution of a root path after the watch
