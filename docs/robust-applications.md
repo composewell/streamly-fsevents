@@ -20,6 +20,11 @@ the operating systems in [watch-limits.md](watch-limits.md).
 * An event reports what changed, not the state of the path after the
   change. When the state matters, for example whether a path reported with
   both `isCreated` and `isDeleted` exists, call `stat` on the path.
+* There is no guarantee that the path of an event, or the root of the
+  event, is available when the application processes the event. The path
+  or a parent directory can be deleted or renamed after the event is
+  reported. An operation on the path, for example `stat`, can then fail or
+  refer to another file.
 * When a directory is reported deleted or moved out of the tree, remove the
   directory and every path under it from the state. On macOS the deletion
   of a watch root does not report the files in it, and on all platforms a
@@ -37,9 +42,12 @@ the operating systems in [watch-limits.md](watch-limits.md).
   use the Linux recovery on every platform.
 * On Linux, a subdirectory reported as `isAccessDenied` is not watched. It
   is added when it is moved, or when the program opens a new watch.
-* On Linux, call `staleRoots` periodically, and call `removeRoot` and then
-  `addRoot` for each root it returns, to watch the directory now at the
-  root path after the rename of a parent directory.
+* On Linux, FreeBSD and Windows, call `staleRoots` periodically. For each
+  root it returns, call `removeRoot` and then `addRoot` to watch the
+  directory now at the root path, and then scan the tree at the root path.
+  `addRoot` does not report the entries already in the directory. Until
+  the scan, the state the application keeps may have entries from the
+  events of the old directory, reported under the root path.
 
 ## Handling queue overflow
 
