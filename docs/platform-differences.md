@@ -296,6 +296,36 @@ the handle only, not to its parent directories.
 | A root whose parent is renamed remains watched under the old path | Yes | No | Operation fails |
 | A recursive root whose parent is renamed is unwatched on a directory create | Yes | No | Operation fails |
 
+### Resolution of the root path
+
+These tests change the resolution of a root path after the watch
+starts, by creating a missing path component or by changing the target
+of a symbolic link root.
+
+On macOS FSEvents resolves the symbolic links in the root paths when the
+stream starts, and reports events only under the paths resolved then. A
+missing root, or a missing parent of a root, created later as a
+symbolic link to a directory, does not report any events in that
+directory. On a case-insensitive file system a missing root `Missing`
+created later as `missing` does not report any events in it either. With
+`setRootPathEvents True` from `Streamly.FileSystem.Event.Darwin`, each of
+these three changes reports `isRootPathEvent`.
+
+On all platforms a symbolic link root changed to point to another
+directory stays watched on the directory it pointed to when the watch
+started. On macOS this change does not report `isRootPathEvent`.
+
+| Behavior | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| A missing root created as a symbolic link to a directory reports its events | Watch fails | No | Watch fails |
+| A root whose missing parent is created as a symbolic link to a directory reports its events | Watch fails | No | Watch fails |
+| A missing root created with a different case reports its events | Watch fails | No | Watch fails |
+| A symbolic link root changed to another directory reports the events of the new directory | No | No | No |
+| A symbolic link root changed to another directory reports the events of the old directory | Yes | Yes | Yes |
+
+On macOS `/Users` is a firmlink to `/System/Volumes/Data/Users`. A root
+under `/Users` reports its events with the root path as supplied.
+
 ### Unmount of the file system of a root
 
 On Linux a watch does not keep a file of the watched file system open,
