@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <FS/Event/Darwin.h>
 
@@ -481,4 +482,27 @@ void destroyWatch(struct watch* w) {
     close(w->writefd);
     free(w);
 }
+
+/******************************************************************************
+ * File identity
+ *****************************************************************************/
+
+/*
+ * The device, inode and generation numbers of the file at the path,
+ * following the symbolic links. st_gen is 0 unless the process runs as
+ * root. Returns 0 on success, -1 with errno set on failure.
+ */
+int fileId(const char *path, UInt64 *dev, UInt64 *ino, UInt64 *gen)
+{
+    struct stat st;
+
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+    *dev = (UInt64)st.st_dev;
+    *ino = (UInt64)st.st_ino;
+    *gen = (UInt64)st.st_gen;
+    return 0;
+}
+
 #endif

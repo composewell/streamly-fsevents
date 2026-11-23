@@ -26,6 +26,8 @@ module Streamly.Internal.FS.Event.Darwin
     , setRecursiveMode
     , BatchInfo (..)
     , setEventBatching
+    , allowMissingRootPath
+    , enableStaleRootCheck
 
     -- ** Events of Interest
     , setRootPathEvents
@@ -64,6 +66,7 @@ module Streamly.Internal.FS.Event.Darwin
     , isHistoryDone
     , isRootPathEvent
     , isRootUnwatched
+    , isRootStale
 
     -- ** Item Level Metadata change
     , isAttrsModified
@@ -98,18 +101,23 @@ where
 
 import Control.Concurrent (rtsSupportsBoundThreads, threadWaitRead)
 import Control.Concurrent.MVar
-    (MVar, modifyMVar, modifyMVar_, newMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, finally, onException, throwIO, try)
-import Control.Monad (void, when)
+    (MVar, modifyMVar, modifyMVar_, newMVar, putMVar, takeMVar, withMVar)
+import Control.Exception
+    (IOException, SomeException, finally, onException, throwIO, try)
+import Control.Monad (filterM, void, when)
 import Data.List (partition)
 import Control.Monad.Cont (runCont, cont)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (dropWhileEnd, nubBy, stripPrefix)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word8, Word32, Word64)
-import Foreign.C.Error (eAGAIN, eINTR, eWOULDBLOCK, getErrno, throwErrno)
+import Foreign.C.Error
+    ( Errno(..), eAGAIN, eINTR, eNOENT, eNOTDIR, eWOULDBLOCK, errnoToIOError
+    , getErrno, throwErrno
+    )
+import Foreign.C.String (CString)
 import Foreign.C.Types (CInt(..), CDouble(..), CSize(..), CUChar(..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (withArray)
@@ -123,6 +131,7 @@ import Streamly.Internal.FS.Event.Darwin.Replace (Gen, Since(..))
 import Streamly.Internal.FileSystem.Path (Path)
 import Streamly.Internal.FS.Event.RootPath (isDotPath, normalizeRoot)
 import System.Directory (canonicalizePath, getCurrentDirectory)
+import GHC.IO.Exception (IOException(ioe_errno))
 import System.IO.Error (catchIOError)
 import System.Posix.Types (CSsize(..), Fd(..))
 
@@ -132,7 +141,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Array as A (createOf, read)
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Internal.Data.Array as A
-    (byteLength, unsafePinnedAsPtr, unsafeSliceOffLen)
+    (asCStringUnsafe, byteLength, unsafePinnedAsPtr, unsafeSliceOffLen)
 import qualified Streamly.Internal.Data.MutArray as MArray
     (unsafeCreateWithPtr')
 import qualified Streamly.Internal.FileSystem.Path as Path
@@ -174,6 +183,8 @@ contListMap f g xs final =
 data Config = Config
     { watchRec :: Bool
     , latency :: Double
+    , missingRoots :: Bool
+    , staleRootCheck :: Bool
     , createFlags   :: Word32
     }
 
@@ -206,6 +217,61 @@ data Config = Config
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
+
+-------------------------------------------------------------------------------
+-- Root path binding
+-------------------------------------------------------------------------------
+
+-- | When 'False', a root is bound to the object that its path refers to when
+-- the root is added. 'openWatch' and 'addRoot' raise an exception if the
+-- root path does not exist, or cannot be resolved, e.g. because a parent
+-- directory has no search permission. The watch of the root ends with
+-- 'isRootUnwatched' and 'isRootStale' when the library finds that the root
+-- path no longer refers to that object: when the root is deleted or renamed,
+-- when a parent directory is renamed, or when a symbolic link in the root
+-- path is changed to point to another directory. The root is then removed
+-- from the watch, as by 'removeRoot'. 'addRoot' with the same path watches
+-- the object now at the path.
+--
+-- The library finds the change at the next 'isRootPathEvent' of the root,
+-- before the stream of the watch is replaced by 'addRoot' or 'removeRoot',
+-- at the next event of the root, see 'enableStaleRootCheck', and in
+-- 'staleRoots'. FSEvents does not report an 'isRootPathEvent' when a symbolic
+-- link in the root path is changed.
+--
+-- When 'True', a missing root is watched. The watch is on the path of the
+-- root, with the symbolic links in the existing part of the path resolved
+-- when the root is added. A deleted or renamed root stays watched, an object
+-- created at that path later is watched. A missing component of the path
+-- created later as a symbolic link, or in another case, is not followed.
+-- 'staleRoots' returns an empty list.
+--
+-- /default: False/
+allowMissingRootPath :: Bool -> Config -> Config
+allowMissingRootPath allow cfg = cfg {missingRoots = allow}
+
+-- | Check that the root path still refers to the watched object before the
+-- events of the root are returned. When the check fails, the events of the
+-- root are not returned, and the watch of the root ends with
+-- 'isRootUnwatched' and 'isRootStale', see 'allowMissingRootPath'. Then no
+-- event is reported under a root path that now refers to another object.
+--
+-- The check is made once for each root that has events in a read of the
+-- events of the watch, after the changes of the events read. It compares the
+-- file identity of the root path with the one recorded when the root was
+-- added. An event of a change made before the path changed, but read after
+-- it, is not returned either. The deletion and the rename of the root itself
+-- are returned.
+--
+-- With 'False' the check is made only at an 'isRootPathEvent' of the root,
+-- and before the stream of the watch is replaced. A root whose symbolic link
+-- parent is changed reports the events of the watched object under the old
+-- path until then. The setting has no effect with 'allowMissingRootPath'
+-- 'True'.
+--
+-- /default: True/
+enableStaleRootCheck :: Bool -> Config -> Config
+enableStaleRootCheck check cfg = cfg {staleRootCheck = check}
 
 -------------------------------------------------------------------------------
 -- Batching Events
@@ -347,6 +413,8 @@ setAllEvents s =
 -- * 'setRootPathEvents' 'False'
 -- * 'setIgnoreSelf' 'False'
 -- * 'setFullHistory' 'False'
+-- * 'allowMissingRootPath' 'False'
+-- * 'enableStaleRootCheck' 'True'
 --
 -- /Pre-release/
 --
@@ -354,8 +422,19 @@ defaultConfig :: Config
 defaultConfig = setFileEvents True $ Config
     { watchRec = False
     , latency = 0.0
+    , missingRoots = False
+    , staleRootCheck = True
     , createFlags = 0
     }
+
+-- | The create flags of the FSEvents streams of a watch. The
+-- 'isRootPathEvent' events are used for the check of the binding of the
+-- roots, see 'allowMissingRootPath', and are returned only with
+-- 'setRootPathEvents'.
+streamFlags :: Config -> Word32
+streamFlags cfg
+    | missingRoots cfg = createFlags cfg
+    | otherwise = createFlags cfg .|. kFSEventStreamCreateFlagWatchRoot
 
 -------------------------------------------------------------------------------
 -- C FFI
@@ -411,6 +490,9 @@ foreign import ccall unsafe "FS/Event/Darwin.h eventIdSinceNow"
 foreign import ccall safe "FS/Event/Darwin.h destroyWatch" c_destroyWatch
     :: Ptr CWatch -> IO ()
 
+foreign import ccall unsafe "FS/Event/Darwin.h fileId" c_fileId
+    :: CString -> Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> IO CInt
+
 foreign import ccall unsafe "unistd.h read"
     c_read :: CInt -> Ptr Word8 -> CSize -> IO CSsize
 
@@ -436,19 +518,45 @@ data Event = Event
 -- Watch roots
 -------------------------------------------------------------------------------
 
+-- | The device, inode and generation numbers of a file. The generation
+-- number is 0 unless the process runs as root.
+data FileId = FileId !Word64 !Word64 !Word64 deriving Eq
+
+-- | The 'FileId' of the file at a path, following the symbolic links. Raise
+-- an exception if the path cannot be accessed.
+pathFileId :: Path -> IO FileId
+pathFileId path =
+    A.asCStringUnsafe (Path.toArray path) $ \cpath ->
+    alloca $ \pDev ->
+    alloca $ \pIno ->
+    alloca $ \pGen -> do
+        r <- c_fileId cpath pDev pIno pGen
+        if r == 0
+        then FileId <$> peek pDev <*> peek pIno <*> peek pGen
+        else do
+            errno <- getErrno
+            ioError
+                $ errnoToIOError
+                    "addRoot" errno Nothing (Just (Path.toString path))
+
 -- | A watch root.
 data Root = Root
     { rootPath :: Path -- ^ As supplied by the user, see 'normalizeRoot'
       -- | The absolute path of the root: a relative 'rootPath' joined to
       -- the working directory at the time the root was added. Symbolic
-      -- links are not resolved. The FSEvents streams are created with this
-      -- path, a stream created after a change of the working directory
-      -- watches the same directory.
+      -- links are not resolved. The binding of the root is checked with
+      -- this path, see 'isRootAtPath'.
     , rootAbs :: Path
+      -- | The canonical path, the FSEvents streams are created with it, see
+      -- 'setRoots'.
+    , rootResolved :: Path
       -- | The canonical path without trailing separators. The OS reports
       -- the event paths with symbolic links resolved, we compare them
       -- against the canonical path.
     , rootCanonical :: String
+      -- | The 'FileId' of the root when it was added, 'Nothing' if the
+      -- root does not exist and 'allowMissingRootPath' is set.
+    , rootId :: Maybe FileId
     }
 
 dropTrailingSeparators :: String -> String
@@ -459,31 +567,92 @@ dropTrailingSeparators = dropWhileEnd (== '/')
 -- @.@ is the working directory. A path starting with @.\/@ is not rooted
 -- after 'normalizeRoot'.
 --
+-- The 'FileId' of the canonical path is compared with that of the absolute
+-- path, if they differ the path changed while it was resolved and it is
+-- resolved again. Raise an exception if the root does not exist and
+-- 'allowMissingRootPath' is not set, or if the path keeps changing.
+--
 -- XXX Use OsPath or streamly's canonicalize
-toRoot :: Path -> IO Root
-toRoot p0 = do
+toRoot :: Config -> Path -> IO Root
+toRoot cfg p0 = do
     absPath <-
         if Path.isRooted p && not (isDotPath p)
         then return p
         else do
             cwd <- getCurrentDirectory >>= Path.fromString
             return (if isDotPath p then cwd else Path.join cwd p)
-    canonical <- canonicalizePath (Path.toString absPath)
-    return
-        Root
-            { rootPath = p
-            , rootAbs = absPath
-            , rootCanonical = dropTrailingSeparators canonical
-            }
+    resolve absPath (3 :: Int)
 
     where
 
     p = normalizeRoot p0
 
+    resolve absPath n = do
+        canonical <- canonicalizePath (Path.toString absPath)
+        resolved <- Path.fromString canonical
+        let root fid =
+                Root
+                    { rootPath = p
+                    , rootAbs = absPath
+                    , rootResolved = resolved
+                    , rootCanonical = dropTrailingSeparators canonical
+                    , rootId = fid
+                    }
+        r <- try (pathFileId resolved)
+        case r of
+            Left (e :: IOException)
+                | missingRoots cfg -> return (root Nothing)
+                | otherwise -> ioError e
+            Right fid -> do
+                fid1 <- pathFileId absPath
+                if fid1 == fid
+                then return (root (Just fid))
+                else if n > 1
+                then resolve absPath (n - 1)
+                else
+                    ioError
+                        $ userError
+                        $ "addRoot: the path keeps changing: "
+                            ++ Path.toString absPath
+
 -- | Whether the two roots were supplied as the same path, after
 -- normalization.
 isSameRoot :: Root -> Root -> Bool
 isSameRoot r1 r2 = Path.eqPathBytes (rootPath r1) (rootPath r2)
+
+-- | Whether the two roots were supplied as the same path and refer to the
+-- same object. A root removed and added again with the same path may refer
+-- to another object.
+isSameBinding :: Root -> Root -> Bool
+isSameBinding r1 r2 = isSameRoot r1 r2 && rootId r1 == rootId r2
+
+-- | Whether 'rootAbs' still refers to the object of 'rootId'. 'True' if
+-- 'rootId' is 'Nothing', or if the path cannot be accessed because of an
+-- error other than the path not existing, for example, a permission error.
+isRootAtPath :: Root -> IO Bool
+isRootAtPath root =
+    case rootId root of
+        Nothing -> return True
+        Just i -> do
+            r <- try (pathFileId (rootAbs root))
+            return $ case r of
+                Right j -> j == i
+                Left e -> fmap Errno (ioe_errno e) `notElem` gone
+
+    where
+
+    gone = [Just eNOENT, Just eNOTDIR]
+
+-- | Split the roots into the roots whose path still refers to the root and
+-- the stale roots, see 'isRootAtPath'. No root is stale with
+-- 'allowMissingRootPath'.
+partitionStale :: Config -> [Root] -> IO ([Root], [Root])
+partitionStale cfg roots
+    | missingRoots cfg = return (roots, [])
+    | otherwise = do
+        fresh <- filterM isRootAtPath roots
+        let stale = filter (\r -> not (any (isSameBinding r) fresh)) roots
+        return (fresh, stale)
 
 -- | The event with its watch root and the path relative to the root set. If
 -- the event path is under more than one root, for example, a root and a
@@ -492,8 +661,9 @@ isSameRoot r1 r2 = Path.eqPathBytes (rootPath r1) (rootPath r2)
 -- is returned without a root.
 --
 -- The events of the roots that satisfy the predicate are not returned. An
--- event under those roots only is not returned.
-setRoot :: [Root] -> (Root -> Bool) -> Event -> IO [Event]
+-- event under those roots only is not returned. Each event is returned with
+-- its root.
+setRoot :: [Root] -> (Root -> Bool) -> Event -> IO [(Event, Maybe Root)]
 setRoot roots isEnded ev = do
     -- XXX Use streamly Path
     let path = dropTrailingSeparators (Path.toString (eventPath ev))
@@ -511,12 +681,16 @@ setRoot roots isEnded ev = do
                 then return Nothing
                 else Just <$> Path.fromString rel
             return
-                ev
+                ( ev
                     { eventRoot = Just (rootPath root)
                     , eventAbsRoot = Just (rootAbs root)
                     , eventRelPath = relPath
                     }
-    if null allMatches then return [ev] else mapM withRoot matches
+                , Just root
+                )
+    if null allMatches
+    then return [(ev, Nothing)]
+    else mapM withRoot matches
 
     where
 
@@ -686,7 +860,11 @@ data RootState = RootState
 -- reported yet.
 data Removed = Removed
     { rmRoot :: Root
-      -- | The current event id of the system when the root was removed
+      -- | The root path no longer refers to the root, the 'isRootUnwatched'
+      -- event reports 'isRootStale'.
+    , rmStale :: !Bool
+      -- | The current event id of the system when the root was removed, 0
+      -- for a stale root: its events are not reported after the removal.
     , rmCutoff :: !Word64
       -- | The generations of the streams that watched the root when it
       -- was removed.
@@ -727,6 +905,9 @@ data ReadState = ReadState
       -- event is also kept here by a read that was interrupted by an async
       -- exception before it could return the event.
     , rdUndelivered :: [Event]
+      -- | The roots checked since the last read of the pipe, 'True' for a
+      -- stale root, see 'checkRoots'.
+    , rdChecks :: [(Root, Bool)]
     }
 
 -- | A handle for a watch.
@@ -777,6 +958,7 @@ createWatch cfg@Config{..} =
                     { rdBuffer = mempty
                     , rdEnded = False
                     , rdUndelivered = []
+                    , rdChecks = []
                     }
         return
             Watch
@@ -798,17 +980,25 @@ stopStreams gens ss = do
 
 -- | Replace the stream of the watch by a stream on @roots@ with the
 -- generation @gen@. @removed@ are the roots removed from the watch by the
--- change, see 'Removed'. Must be called with the root lock held. Raise an
+-- change, see 'Removed', and @stale@ the roots removed because their path no
+-- longer refers to them. Must be called with the root lock held. Raise an
 -- exception if the stream cannot be started, the watch keeps its stream.
-setRoots :: String -> Watch -> Gen -> [Root] -> [Root] -> IO ()
-setRoots name Watch{..} gen roots removed =
+--
+-- The stream is created from the resolved paths of the roots, 'rootResolved'.
+-- FSEvents then watches the objects that the event paths are matched
+-- against, see 'setRoot', even if a symbolic link in a root path has changed
+-- since the root was added.
+setRoots :: String -> Watch -> Gen -> [Root] -> [Root] -> [Root] -> IO ()
+setRoots name Watch{..} gen roots removed stale =
     modifyMVar_ watchStreamState $ \ss0 -> do
         now <- c_currentEventId
         let isCurrent (r, _) = any (isSameRoot r) roots
             ss =
                 ss0
                     { ssRemoved =
-                        ssRemoved ss0 ++ map (toRemoved ss0 now) removed
+                        ssRemoved ss0
+                            ++ map (toRemoved ss0 False now) removed
+                            ++ map (toRemoved ss0 True 0) stale
                     , ssCurrent = roots
                     -- A root added again is reported by the old streams
                     -- again, the new stream does not report the events
@@ -825,7 +1015,7 @@ setRoots name Watch{..} gen roots removed =
             return ss1 {ssReplace = rs}
         else do
             let (since, stops, rs) = Replace.replace gen now (ssReplace ss)
-                flags = createFlags watchConfig
+                flags = streamFlags watchConfig
             (sinceId, flags1) <-
                 case since of
                     SinceNow -> (, flags) <$> c_eventIdSinceNow
@@ -835,7 +1025,7 @@ setRoots name Watch{..} gen roots removed =
                     SinceId eid ->
                         let full = kFSEventStreamCreateFlagFullHistory
                         in return (eid, flags .|. full)
-            h <- withPathNames (map rootAbs roots) $ \arraysPtr ->
+            h <- withPathNames (map rootResolved roots) $ \arraysPtr ->
                     c_startStream
                         watchPtr arraysPtr (fromIntegral (length roots))
                         gen sinceId flags1
@@ -853,10 +1043,15 @@ setRoots name Watch{..} gen roots removed =
 
     where
 
-    toRemoved ss now r =
+    toRemoved ss isStale cutoff r =
         let gens = [g | (g, rs) <- ssRoots ss, any (isSameRoot r) rs]
          in Removed
-                {rmRoot = r, rmCutoff = now, rmOld = gens, rmGens = gens}
+                { rmRoot = r
+                , rmStale = isStale
+                , rmCutoff = cutoff
+                , rmOld = gens
+                , rmGens = gens
+                }
 
     withPathName :: Path -> (PathName -> IO a) -> IO a
     withPathName path act =
@@ -868,12 +1063,13 @@ setRoots name Watch{..} gen roots removed =
 deleteGen :: Gen -> [(Gen, a)] -> [(Gen, a)]
 deleteGen gen = filter ((/= gen) . fst)
 
--- | The 'isRootUnwatched' event of the root.
-rootUnwatchedEvent :: Root -> Event
-rootUnwatchedEvent Root{..} =
+-- | The 'isRootUnwatched' event of a removed root.
+rootUnwatchedEvent :: Removed -> Event
+rootUnwatchedEvent Removed{rmRoot = Root{..}, ..} =
     Event
         { eventId = 0
-        , eventFlags = rootUnwatchedFlag
+        , eventFlags =
+            rootUnwatchedFlag .|. (if rmStale then rootStaleFlag else 0)
         , eventPath = rootAbs
         , eventRoot = Just rootPath
         , eventAbsRoot = Just rootAbs
@@ -888,7 +1084,7 @@ rootUnwatchedEvent Root{..} =
 endRemoved :: (Removed -> [Gen]) -> StreamState -> (StreamState, [Event])
 endRemoved gensOf ss =
     ( ss {ssRemoved = pending, ssEnded = foldr addEnded (ssEnded ss) ends}
-    , map (rootUnwatchedEvent . rmRoot) unwatched
+    , map rootUnwatchedEvent unwatched
     )
 
     where
@@ -936,6 +1132,11 @@ isEndedEvent ended ev root =
 -- on a case-insensitive file system: @\/tmp\/Foo@ and @\/tmp\/foo@ are two
 -- roots, and so are a symbolic link and its target.
 --
+-- The root is bound to the object that the path refers to, see
+-- 'allowMissingRootPath'. To keep watching a directory whose path has a
+-- symbolic link that may be changed, supply the path with the symbolic links
+-- resolved.
+--
 -- The events of @root@ that occur before 'addRoot' returns may not be
 -- reported. The events of the other roots of the watch are not lost or
 -- duplicated by the call, except on a volume that does not keep a history
@@ -945,26 +1146,26 @@ isEndedEvent ended ev root =
 --
 -- Can be called from any thread, including while another thread reads the
 -- events of the watch using 'eventStream'. The call does not wait for an
--- event. Raise an exception if the watch is closed, or if the new stream
--- cannot be started, e.g. when the watch would have more than 4096 roots.
+-- event. Raise an exception if the watch is closed, if @root@ does not exist
+-- and 'allowMissingRootPath' is not set, or if the new stream cannot be
+-- started, e.g. when the watch would have more than 4096 roots.
 --
 -- /Pre-release/
 --
 addRoot :: Watch -> Path -> IO ()
 addRoot wtch@Watch{..} root = do
-    -- Canonicalize before starting the stream, the OS resolves the symbolic
-    -- links in the roots when the stream is started.
-    r <- toRoot root
+    r <- toRoot watchConfig root
     modifyMVar_ watchRootLock $ \st -> do
         when (rsClosed st)
             $ ioError (userError "addRoot: the watch is closed.")
-        let roots = rsRoots st ++ [r]
-            gen = rsGen st + 1
         -- A path that is already a root is watched once
         if any (isSameRoot r) (rsRoots st)
         then return st
         else do
-            setRoots "addRoot" wtch gen roots []
+            (fresh, stale) <- partitionStale watchConfig (rsRoots st)
+            let roots = fresh ++ [r]
+                gen = rsGen st + 1
+            setRoots "addRoot" wtch gen roots [] stale
             return st {rsRoots = roots, rsGen = gen}
 
 -- | Remove a root path from a 'Watch'. The path must be the same as the
@@ -1001,18 +1202,55 @@ removeRoot wtch@Watch{..} root =
         if rsClosed st || null removed
         then return st
         else do
-            setRoots "removeRoot" wtch gen roots removed
-            return st {rsRoots = roots, rsGen = gen}
+            (fresh, stale) <- partitionStale watchConfig roots
+            setRoots "removeRoot" wtch gen fresh removed stale
+            return st {rsRoots = fresh, rsGen = gen}
 
--- | The roots of a watch whose path no longer refers to the directory
--- watched via the root. FSEvents watches a root by its path, a root is never
--- stale, returns an empty list. When a root or a parent directory is renamed
--- the watch reports the events of the directory at the path.
+-- | Remove the stale roots from the watch, they report 'isRootUnwatched'
+-- and 'isRootStale'. The other roots found stale when the stream is
+-- replaced are removed too. A root removed and added again after it was
+-- found stale is not removed, see 'isSameBinding'.
+removeStaleRoots :: Watch -> [Root] -> IO ()
+removeStaleRoots wtch@Watch{..} stale =
+    modifyMVar_ watchRootLock $ \st -> do
+        let isStale r = any (isSameBinding r) stale
+            (gone, kept) = partition isStale (rsRoots st)
+            gen = rsGen st + 1
+        if rsClosed st || null gone
+        then return st
+        else do
+            (fresh, stale1) <- partitionStale watchConfig kept
+            setRoots "readEvent" wtch gen fresh [] (gone ++ stale1)
+            return st {rsRoots = fresh, rsGen = gen}
+
+-- | The roots of a watch whose path no longer refers to the object watched
+-- via the root, as supplied to 'addRoot'. A root becomes stale when it is
+-- deleted or renamed, when a parent directory is renamed, or when a symbolic
+-- link in the root path is changed to point to another directory. The root
+-- is still watched until the library finds the change, see
+-- 'allowMissingRootPath'.
+--
+-- A root is stale if its path does not exist, or refers to another file,
+-- compared by the device, inode and generation numbers recorded when the root
+-- was added. A root whose path cannot be accessed because of another error,
+-- for example, a permission error, is not stale.
+--
+-- The watch is not changed. To watch the object now at the path, call
+-- 'removeRoot' and then 'addRoot' with the path. The result can be out of
+-- date when the call returns.
+--
+-- Returns an empty list if the watch is closed, or with
+-- 'allowMissingRootPath' 'True'.
 --
 -- /Pre-release/
 --
 staleRoots :: Watch -> IO [Path]
-staleRoots _ = return []
+staleRoots Watch{..} = do
+    roots <-
+        withMVar watchRootLock $ \st ->
+            return $ if rsClosed st then [] else rsRoots st
+    (_, stale) <- partitionStale watchConfig roots
+    return (map rootPath stale)
 
 -- | Close the read end of the pipe. closeFdWith wakes up the threads
 -- waiting for the fd to become readable, in the threaded RTS.
@@ -1085,15 +1323,16 @@ openWatch f paths = do
     -- inadvertently provide a path for which the user may not have permission
     -- and then later wonder why events are not being reported.
     -- A path listed more than once is watched once
-    roots <- nubBy isSameRoot <$> mapM toRoot (NonEmpty.toList paths)
+    let cfg = f defaultConfig
+    roots <- nubBy isSameRoot <$> mapM (toRoot cfg) (NonEmpty.toList paths)
     -- The handle is not returned to the caller if starting the stream
     -- fails, the caller cannot close it. 'mask' ensures that an async
     -- exception cannot arrive between creating the watch and installing the
     -- handler.
     Exception.mask $ \restore -> do
-        w <- createWatch (f defaultConfig)
+        w <- createWatch cfg
         let start st = do
-                setRoots "openWatch" w 1 roots []
+                setRoots "openWatch" w 1 roots [] []
                 return st {rsRoots = roots, rsGen = 1}
         restore (modifyMVar_ (watchRootLock w) start)
             `onException` closeWatch w
@@ -1184,8 +1423,8 @@ readPipe Watch{watchFd = fd, watchFdLock = lock} =
 -- 'Removed', followed by the event for each of its roots, see 'setRoot'.
 -- Returns no event for a retired stream, for an event not reported while
 -- the streams are replaced, and for an event not reported in the
--- non-recursive mode.
-processRecord :: Watch -> Record -> IO [Event]
+-- non-recursive mode. Each event is returned with its root.
+processRecord :: Watch -> Record -> IO [(Event, Maybe Root)]
 processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
     modifyMVar streams $ \ss -> go ss rec
 
@@ -1194,7 +1433,8 @@ processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
     fileEvents = createFlags cfg .&. kFSEventStreamCreateFlagFileEvents /= 0
 
     -- No 'isRootUnwatched' event is reported after 'closeWatch'
-    unwatchedOf ss evs = if ssClosed ss then [] else evs
+    unwatchedOf ss evs =
+        if ssClosed ss then [] else map (\ev -> (ev, Nothing)) evs
 
     go ss (RecordRetired gen) = do
         let (ss1, unwatched) = endRemoved (const [gen]) ss
@@ -1239,8 +1479,56 @@ processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
                 return
                     ( ss1
                     , unwatched1
-                        ++ filter (isNonRecursiveEvent fileEvents) evs
+                        ++ filter (isNonRecursiveEvent fileEvents . fst) evs
                     )
+
+-- | Check the binding of the roots of the events of a record, see
+-- 'enableStaleRootCheck'. A root is checked at its 'isRootPathEvent', and at
+-- every event with the check enabled, once for each read of the pipe, the
+-- results are kept in the list of checks. The events of a stale root are
+-- dropped, except the deletion and the rename of the root itself and its
+-- 'isRootPathEvent'. The 'isRootPathEvent' events are dropped unless
+-- 'setRootPathEvents' is set, see 'streamFlags'.
+--
+-- Returns the events to report, the checks, and the roots found stale that
+-- were not stale in the checks given.
+checkRoots ::
+       Config
+    -> [(Root, Bool)]
+    -> [(Event, Maybe Root)]
+    -> IO ([Event], [(Root, Bool)], [Root])
+checkRoots cfg checks0 evs0
+    | missingRoots cfg = return (map fst evs0, checks0, [])
+    | otherwise = go checks0 [] [] evs0
+
+    where
+
+    rootPathEvents =
+        createFlags cfg .&. kFSEventStreamCreateFlagWatchRoot /= 0
+
+    isRequested ev = rootPathEvents || not (isRootPathEvent ev)
+
+    isEnd ev =
+        isNothing (eventRelPath ev)
+            && (isRootPathEvent ev || isDeleted ev || isMoved ev)
+
+    go checks evs stale [] = return (reverse evs, checks, reverse stale)
+    go checks evs stale ((ev, Nothing) : rest) =
+        go checks (if isRequested ev then ev : evs else evs) stale rest
+    go checks evs stale ((ev, Just root) : rest)
+        | staleRootCheck cfg || isRootPathEvent ev = do
+            (checks1, isStale, new) <-
+                case [b | (r, b) <- checks, isSameBinding r root] of
+                    b : _ -> return (checks, b, False)
+                    [] -> do
+                        b <- not <$> isRootAtPath root
+                        return ((root, b) : checks, b, b)
+            let keep = isRequested ev && (not isStale || isEnd ev)
+                evs1 = if keep then ev : evs else evs
+                stale1 = if new then root : stale else stale
+            go checks1 evs1 stale1 rest
+        | otherwise =
+            go checks (if isRequested ev then ev : evs else evs) stale rest
 
 -- | The result of a step of 'readEvent'.
 data ReadStep =
@@ -1277,7 +1565,7 @@ data ReadStep =
 -- /Pre-release/
 --
 readEvent :: Watch -> IO (Maybe Event)
-readEvent wtch@Watch{watchReadState = stRef} =
+readEvent wtch@Watch{watchConfig = cfg, watchReadState = stRef} =
     Exception.mask_ $ takeMVar stRef >>= loop
 
     where
@@ -1319,10 +1607,22 @@ readEvent wtch@Watch{watchReadState = stRef} =
         r <- parseRecord (rdBuffer st)
         case r of
             Just (rec, rest) -> do
-                evs <- processRecord wtch rec
+                evs0 <- processRecord wtch rec
+                (evs, checks, stale) <- checkRoots cfg (rdChecks st) evs0
+                -- If the stream cannot be replaced the roots stay in the
+                -- watch, their events are dropped and the removal is
+                -- tried again after the next read of the pipe.
+                when (not (null stale))
+                    $ void (try (removeStaleRoots wtch stale)
+                        :: IO (Either IOException ()))
                 -- The next step returns the first event
                 return
-                    $ StepContinue st {rdBuffer = rest, rdUndelivered = evs}
+                    $ StepContinue
+                        st
+                            { rdBuffer = rest
+                            , rdUndelivered = evs
+                            , rdChecks = checks
+                            }
             Nothing | rdEnded st -> return StepEnd
             Nothing -> do
                 res <- readPipe wtch
@@ -1337,7 +1637,11 @@ readEvent wtch@Watch{watchReadState = stRef} =
                     ReadWait wait -> return (StepWait wait)
                     ReadData chunk ->
                         return
-                            $ StepContinue st {rdBuffer = rdBuffer st <> chunk}
+                            $ StepContinue
+                                st
+                                    { rdBuffer = rdBuffer st <> chunk
+                                    , rdChecks = []
+                                    }
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
 -- stream does not close the watch, use 'closeWatch' to close it. The stream
@@ -1376,11 +1680,11 @@ eventStream wtch = S.unfoldrM step ()
 --      [Path.fromString "path"]
 -- @
 --
--- The stream does not end when a root is deleted or renamed, or when a root
--- does not exist. The watch is on the path of the root, an object created
--- at that path later is watched. On Linux and Windows a root that does not
--- exist raises an exception, and the stream ends when none of the roots is
--- watched any more.
+-- A root that does not exist raises an exception when the stream starts. The
+-- watch of a deleted or renamed root ends with 'isRootUnwatched' and
+-- 'isRootStale', see 'allowMissingRootPath'. The stream does not end when the
+-- watch of all the roots ends. On Linux and Windows the stream ends when none
+-- of the roots is watched any more.
 --
 -- Each run of the stream opens a new watch and closes it when the stream
 -- ends. The handle of the watch is not exposed, so the roots of the watch
@@ -1568,13 +1872,31 @@ rootUnwatchedFlag = 0x80000000
 
 -- | The root is no longer watched, no more events of the root follow. It
 -- is reported after 'removeRoot', it follows the events of the root that
--- occurred before the call. A deleted or renamed root stays watched, the
+-- occurred before the call. It is also reported, with 'isRootStale', when the
+-- root path no longer refers to the root, see 'allowMissingRootPath'. With
+-- 'allowMissingRootPath' 'True' a deleted or renamed root stays watched, the
 -- watch is on the path of the root.
 --
 -- For this event, 'getRoot' and 'getAbsPath' return the watch root,
 -- 'getRelPath' returns 'Nothing', and 'getEventId' returns 0.
 isRootUnwatched :: Event -> Bool
 isRootUnwatched = getFlag rootUnwatchedFlag
+
+-- | The flag of the 'isRootStale' event, set along with 'rootUnwatchedFlag'.
+-- FSEvents does not use this bit.
+rootStaleFlag :: Word32
+rootStaleFlag = 0x40000000
+
+-- | The watch of the root ended because the root path no longer refers to
+-- the watched object, see 'allowMissingRootPath'. It is reported along with
+-- 'isRootUnwatched' when the root is deleted or renamed, when a parent
+-- directory is renamed, or when a symbolic link in the root path is changed
+-- to point to another directory.
+--
+-- It is not reported after 'removeRoot'. To watch the object now at the
+-- path, add the root again with 'addRoot'.
+isRootStale :: Event -> Bool
+isRootStale = getFlag rootStaleFlag
 
 -------------------------------------------------------------------------------
 -- Global events under the watched path
@@ -1855,6 +2177,7 @@ showEvent ev@Event{..} =
 
         ++ showev isRootPathEvent "RootPathEvent"
         ++ showev isRootUnwatched "RootUnwatched"
+        ++ showev isRootStale "RootStale"
         ++ showev isMounted "Mounted"
         ++ showev isUnmounted "Unmounted"
         ++ showev isHistoryDone "HistoryDone"
