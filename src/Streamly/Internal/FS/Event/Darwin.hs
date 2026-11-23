@@ -233,11 +233,11 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- from the watch, as by 'removeRoot'. 'addRoot' with the same path watches
 -- the object now at the path.
 --
--- The library finds the change at the next 'isRootPathEvent' of the root,
+-- The library finds the change at the deletion or rename event of the root,
 -- before the stream of the watch is replaced by 'addRoot' or 'removeRoot',
 -- at the next event of the root, see 'enableStaleRootCheck', and in
--- 'staleRoots'. FSEvents does not report an 'isRootPathEvent' when a symbolic
--- link in the root path is changed.
+-- 'staleRoots'. FSEvents does not report any event of the root when a
+-- symbolic link in the root path is changed.
 --
 -- When 'True', a missing root is watched. The watch is on the path of the
 -- root, with the symbolic links in the existing part of the path resolved
@@ -263,11 +263,11 @@ allowMissingRootPath allow cfg = cfg {missingRoots = allow}
 -- it, is not returned either. The deletion and the rename of the root itself
 -- are returned.
 --
--- With 'False' the check is made only at an 'isRootPathEvent' of the root,
--- and before the stream of the watch is replaced. A root whose symbolic link
--- parent is changed reports the events of the watched object under the old
--- path until then. The setting has no effect with 'allowMissingRootPath'
--- 'True'.
+-- With 'False' the check is made only at the deletion or rename event of the
+-- root, and before the stream of the watch is replaced. A root whose
+-- symbolic link parent is changed reports the events of the watched object
+-- under the old path until then. The setting has no effect with
+-- 'allowMissingRootPath' 'True'.
 --
 -- /default: True/
 enableStaleRootCheck :: Bool -> Config -> Config
@@ -431,24 +431,18 @@ defaultConfig = setFileEvents True $ Config
     , createFlags = 0
     }
 
--- | The create flags of the FSEvents stream of the roots. The
--- 'isRootPathEvent' events are used for the check of the binding of the
--- roots, see 'allowMissingRootPath', and are returned only with
--- 'setRootPathEvents'.
+-- | The create flags of the FSEvents stream of the roots.
 --
--- With 'kFSEventStreamCreateFlagWatchRoot' the start of a stream with a FIFO
--- root does not return. The flag is not set, even with 'setRootPathEvents',
--- if a root is neither a directory nor a regular file, see 'rootSpecial'.
+-- With 'kFSEventStreamCreateFlagWatchRoot' the start of a stream with a
+-- FIFO root does not return (macOS 26 CI). The flag is not set, even with
+-- 'setRootPathEvents', if a root is neither a directory nor a regular file,
+-- see 'rootSpecial'. The library does not set the flag for its own checks,
+-- the deletion and rename events of a root trigger them, see 'checkRoots'.
 streamFlags :: Config -> [Root] -> Word32
 streamFlags cfg roots
-    | any rootSpecial roots = flags .&. complement watchRoot
-    | missingRoots cfg = flags
-    | otherwise = flags .|. watchRoot
-
-    where
-
-    flags = createFlags cfg
-    watchRoot = kFSEventStreamCreateFlagWatchRoot
+    | any rootSpecial roots =
+        createFlags cfg .&. complement kFSEventStreamCreateFlagWatchRoot
+    | otherwise = createFlags cfg
 
 -------------------------------------------------------------------------------
 -- C FFI
@@ -1508,12 +1502,15 @@ processRecord Watch{watchConfig = cfg, watchStreamState = streams} rec =
                     )
 
 -- | Check the binding of the roots of the events of a record, see
--- 'enableStaleRootCheck'. A root is checked at its 'isRootPathEvent', and at
--- every event with the check enabled, once for each read of the pipe, the
--- results are kept in the list of checks. The events of a stale root are
+-- 'enableStaleRootCheck'. A root is checked at its deletion or rename event,
+-- and at every event with the check enabled, once for each read of the pipe,
+-- the results are kept in the list of checks. The events of a stale root are
 -- dropped, except the deletion and the rename of the root itself and its
--- 'isRootPathEvent'. The 'isRootPathEvent' events are dropped unless
--- 'setRootPathEvents' is set, see 'streamFlags'.
+-- 'isRootPathEvent'.
+--
+-- An 'isRootPathEvent' does not trigger the check. FSEvents reports it before
+-- the 'isDeleted' event of a deleted root, a root ended at the
+-- 'isRootPathEvent' would not report its deletion.
 --
 -- Returns the events to report, the checks, and the roots found stale that
 -- were not stale in the checks given.
@@ -1528,32 +1525,34 @@ checkRoots cfg checks0 evs0
 
     where
 
-    rootPathEvents =
-        createFlags cfg .&. kFSEventStreamCreateFlagWatchRoot /= 0
+    isRootEnd ev = isNothing (eventRelPath ev) && (isDeleted ev || isMoved ev)
 
-    isRequested ev = rootPathEvents || not (isRootPathEvent ev)
+    isEnd ev = isRootEnd ev || isRootPathEvent ev
 
-    isEnd ev =
-        isNothing (eventRelPath ev)
-            && (isRootPathEvent ev || isDeleted ev || isMoved ev)
+    needsCheck ev =
+        isRootEnd ev || (staleRootCheck cfg && not (isRootPathEvent ev))
 
     go checks evs stale [] = return (reverse evs, checks, reverse stale)
     go checks evs stale ((ev, Nothing) : rest) =
-        go checks (if isRequested ev then ev : evs else evs) stale rest
+        go checks (ev : evs) stale rest
     go checks evs stale ((ev, Just root) : rest)
-        | staleRootCheck cfg || isRootPathEvent ev = do
+        | needsCheck ev = do
             (checks1, isStale, new) <-
                 case [b | (r, b) <- checks, isSameBinding r root] of
                     b : _ -> return (checks, b, False)
                     [] -> do
                         b <- not <$> isRootAtPath root
                         return ((root, b) : checks, b, b)
-            let keep = isRequested ev && (not isStale || isEnd ev)
+            let keep = not isStale || isEnd ev
                 evs1 = if keep then ev : evs else evs
                 stale1 = if new then root : stale else stale
             go checks1 evs1 stale1 rest
-        | otherwise =
-            go checks (if isRequested ev then ev : evs else evs) stale rest
+        | otherwise = do
+            -- A root found stale in this read does not report other events
+            let isStale =
+                    or [b | (r, b) <- checks, isSameBinding r root]
+                keep = not isStale || isEnd ev
+            go checks (if keep then ev : evs else evs) stale rest
 
 -- | The result of a step of 'readEvent'.
 data ReadStep =
