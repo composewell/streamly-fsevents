@@ -32,11 +32,11 @@
 -- = Watch Behavior
 --
 -- A watch keeps its watch root open. The watch root can be renamed or
--- deleted while it is watched. After a rename, the watch continues and the
--- events report paths under the original root path. On Linux and macOS a
--- renamed watch root is no longer watched. When a watch root is deleted,
+-- deleted while it is watched. The rename does not generate any event, the
+-- watch of the root ends with 'isRootUnwatched' and 'isRootStale' at its
+-- next change, see 'enableStaleRootCheck'. When a watch root is deleted,
 -- 'isDeleted' is reported for the root and the watch of the root ends with
--- an 'isRootUnwatched' event.
+-- 'isRootUnwatched' and 'isRootStale'.
 --
 -- When recursive mode is True, the whole directory tree under the path is
 -- watched recursively.  When recursive mode is False, only the files and
@@ -80,6 +80,7 @@ module Streamly.FileSystem.Event.Windows
     -- ** Configuration
       Config
     , setRecursiveMode
+    , enableStaleRootCheck
 
     -- ** Events of Interest
     , setFileNameEvents
@@ -114,6 +115,7 @@ module Streamly.FileSystem.Event.Windows
 
     -- ** Root Level Events
     , isRootUnwatched
+    , isRootStale
 
     -- ** Exception Conditions
     , isEventsLost

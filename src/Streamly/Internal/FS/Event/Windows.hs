@@ -20,6 +20,7 @@ module Streamly.Internal.FS.Event.Windows
 
     -- ** Watch Behavior
     , setRecursiveMode
+    , enableStaleRootCheck
 
     -- ** Events of Interest
     , setFileNameEvents
@@ -64,6 +65,7 @@ module Streamly.Internal.FS.Event.Windows
     -- ** Exception Conditions
     , isEventsLost
     , isRootUnwatched
+    , isRootStale
 
     -- * Debugging
     , showEvent
@@ -140,6 +142,7 @@ import qualified Streamly.Internal.FileSystem.Path as Path
 -- behavior of the watch.
 data Config = Config
     { watchRec :: BOOL
+    , staleRootCheck :: Bool
     , createFlags :: DWORD
     }
 
@@ -163,6 +166,29 @@ setFlag mask status cfg@Config{..} =
 -- /default: False/
 setRecursiveMode :: Bool -> Config -> Config
 setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
+
+-- | Check that the root path still refers to the watched directory before
+-- the events of a read of the root are returned. When the check fails, the
+-- events of the read are not returned, and the watch of the root ends with
+-- 'isRootUnwatched' and 'isRootStale'. Then no event is reported under a
+-- root path that now refers to another directory, for example, after the
+-- root is renamed, or after a symbolic link in the root path is changed to
+-- point to another directory. Neither of these generates any event of the
+-- root.
+--
+-- The check is made once for each read of the changes of a root, after the
+-- changes of the read. It opens the root path, as 'staleRoots' does, and
+-- compares the file identity with the one recorded when the root was added.
+-- A change made before the path changed, but read after it, is not reported
+-- either.
+--
+-- With 'False' the check is not made. A root whose path changes reports the
+-- events of the watched directory under the old path, until the change is
+-- found by 'staleRoots'.
+--
+-- /default: True/
+enableStaleRootCheck :: Bool -> Config -> Config
+enableStaleRootCheck s cfg = cfg {staleRootCheck = s}
 
 -- | Generate notify events on file create, rename or delete.
 --
@@ -280,6 +306,8 @@ setAllEvents s =
 -- * setSizeModified True
 -- * setLastWriteTimeModified True
 --
+-- The stale root check is enabled, see 'enableStaleRootCheck'.
+--
 -- /Pre-release/
 --
 defaultConfig :: Config
@@ -288,7 +316,7 @@ defaultConfig =
     $ setDirNameEvents True
     $ setSizeModified True
     $ setLastWriteTimeModified True
-    $ Config {watchRec = False, createFlags = 0}
+    $ Config {watchRec = False, staleRootCheck = True, createFlags = 0}
 
 getConfigFlag :: Config -> DWORD
 getConfigFlag Config{..} = createFlags
@@ -538,13 +566,18 @@ eventsLostEvent root absRoot =
 rootUnwatchedAction :: FileAction
 rootUnwatchedAction = 0x80000000
 
+-- | The flag of the 'isRootStale' event, set along with
+-- 'rootUnwatchedAction'.
+rootStaleFlag :: FileAction
+rootStaleFlag = 0x40000000
+
 -- | The event reported when the root is no longer watched. 'totalBytes' 0
--- and 'eventFlags' 'rootUnwatchedAction' identify it. 'eventRelPath' is a
--- placeholder, 'getRelPath' returns 'Nothing'.
-rootUnwatchedEvent :: Path -> Path -> Event
-rootUnwatchedEvent root absRoot =
+-- and 'rootUnwatchedAction' in 'eventFlags' identify it, the flags are
+-- given. 'eventRelPath' is a placeholder, 'getRelPath' returns 'Nothing'.
+rootUnwatchedEvent :: FileAction -> Path -> Path -> Event
+rootUnwatchedEvent flags root absRoot =
     Event
-        { eventFlags = rootUnwatchedAction
+        { eventFlags = flags
         , eventRelPath = root
         , eventRootPath = root
         , eventAbsRootPath = absRoot
@@ -680,6 +713,9 @@ data Outcome =
       Changes DWORD -- ^ The buffer holds this many bytes of records
     | ChangesLost
     | RootDeleted
+      -- | The root path no longer refers to the root, see
+      -- 'enableStaleRootCheck'.
+    | RootStale
     | ReadFailed IOException
 
 -- | Classify the result of a read: the error code, or the number of bytes
@@ -704,11 +740,21 @@ isTerminal :: Outcome -> Bool
 isTerminal (Changes _) = False
 isTerminal ChangesLost = False
 isTerminal RootDeleted = True
+isTerminal RootStale = True
 isTerminal (ReadFailed _) = True
 
 -- | The 'isRootUnwatched' item of the root.
 unwatchedItem :: Root -> Item
-unwatchedItem Root{..} = ItemEvent (rootUnwatchedEvent rootPath rootAbsPath)
+unwatchedItem Root{..} =
+    ItemEvent (rootUnwatchedEvent rootUnwatchedAction rootPath rootAbsPath)
+
+-- | The 'isRootUnwatched' item of a root whose path no longer refers to it,
+-- it reports 'isRootStale'.
+staleUnwatchedItem :: Root -> Item
+staleUnwatchedItem Root{..} =
+    ItemEvent
+        $ rootUnwatchedEvent
+            (rootUnwatchedAction .|. rootStaleFlag) rootPath rootAbsPath
 
 -- | The queue items for the outcome of a read. The read must be complete,
 -- and the memory of the root must not be freed during the call. A terminal
@@ -725,8 +771,9 @@ outcomeItems root@Root{..} outcome =
         RootDeleted ->
             return
                 [ ItemEvent (rootDeletedEvent rootPath rootAbsPath)
-                , unwatchedItem root
+                , staleUnwatchedItem root
                 ]
+        RootStale -> return [staleUnwatchedItem root]
         ReadFailed e -> return [ItemFailed e, unwatchedItem root]
 
 -- | Add the items to the event queue of the watch. Wait while the queue
@@ -826,6 +873,38 @@ getCompletion port =
             then Completed key . Right <$> peek pBytes
             else return (Completed key (Left err))
 
+-- | Whether the path of the root does not exist, or refers to another file
+-- than 'rootId'. 'False' if the path cannot be opened because of another
+-- error, for example, a permission error, or because the directory is delete
+-- pending.
+isStaleRoot :: Root -> IO Bool
+isStaleRoot r = do
+    res <-
+        try
+            $ bracket
+                (openDirHandle (rootAbsPath r))
+                closeQuietly
+                handleFileId
+    return $ case res of
+        Right fid -> fid /= rootId r
+        Left e -> isDoesNotExistError e
+
+-- | The outcome of a read after the check of the root, see
+-- 'enableStaleRootCheck'.
+checkRoot :: Config -> Root -> Outcome -> IO Outcome
+checkRoot cfg root outcome =
+    if staleRootCheck cfg && isChanges outcome
+    then do
+        stale <- isStaleRoot root
+        return (if stale then RootStale else outcome)
+    else return outcome
+
+    where
+
+    isChanges (Changes _) = True
+    isChanges ChangesLost = True
+    isChanges _ = False
+
 -- | The thread of a watch. Processes the completion packets of the port
 -- until the watch is closed and the reads of all its roots are complete,
 -- then closes the port.
@@ -881,7 +960,8 @@ pumpEvents w@Watch{..} = loop
                     outcome1 <- classify (rootHandle root) (Left err)
                     return (rs, Just outcome1)
 
-    process key root outcome = do
+    process key root outcome0 = do
+        outcome <- checkRoot watchConfig root outcome0
         items <- outcomeItems root outcome
         enqueue w items
         r <- modifyMVar watchRoots (releaseRoot key root outcome)
@@ -1095,9 +1175,9 @@ removeRoot w@Watch{..} root =
 -- | The roots of a watch whose path no longer refers to the directory
 -- watched via the root, as supplied to 'addRoot'. A root becomes stale when
 -- it is renamed, or when a symbolic link in the root path is changed to point
--- to another directory. The root is still watched, its events report the old
--- path.
--- A parent directory of a watched root cannot be renamed, the rename raises
+-- to another directory. The root is still watched until its next change, see
+-- 'enableStaleRootCheck', a root that has no changes is found only by this
+-- call. A parent directory of a watched root cannot be renamed, the rename raises
 -- an exception.
 --
 -- A root is stale if its path does not exist, or refers to another file,
@@ -1121,20 +1201,7 @@ staleRoots Watch{..} = do
         withMVar watchRoots $ \rs ->
             return
                 $ if rsClosed rs then [] else Map.elems (rsActive rs)
-    map rootPath <$> filterM isStale roots
-
-    where
-
-    isStale r = do
-        res <-
-            try
-                $ bracket
-                    (openDirHandle (rootAbsPath r))
-                    closeQuietly
-                    handleFileId
-        return $ case res of
-            Right fid -> fid /= rootId r
-            Left e -> isDoesNotExistError e
+    map rootPath <$> filterM isStaleRoot roots
 
 -- | Open a watch on the paths with the given 'Config', see
 -- 'watchEndsUnwatched' for the 'Bool'.
@@ -1282,12 +1349,12 @@ eventStream wtch = S.unfoldrM (\() -> fmap (, ()) <$> readEvent wtch) ()
 --
 -- Each run of the stream opens a new watch and closes it when the stream ends.
 -- The stream ends after the 'isRootUnwatched' event of the last root when
--- all the roots are deleted. A renamed root stays watched and does not end the
--- stream, its events are reported under the original root path and the
--- rename itself is not reported. The roots of the watch are fixed as long
--- as the stream runs. To add or remove roots while reading the events, open
--- the watch using 'openWatch', read it using 'eventStream' and change the
--- roots using 'addRoot' and 'removeRoot'.
+-- all the roots are deleted or renamed. The rename of a root is not
+-- reported, the root ends at its next change, see 'enableStaleRootCheck'.
+-- The roots of the watch are fixed as long as the stream runs. To add or
+-- remove roots while reading the events, open the watch using 'openWatch',
+-- read it using 'eventStream' and change the roots using 'addRoot' and
+-- 'removeRoot'.
 watchWith :: (Config -> Config) -> NonEmpty Path -> Stream IO Event
 watchWith f paths = S.bracketIO before closeWatch eventStream
 
@@ -1420,13 +1487,27 @@ isEventsLost Event{..} = totalBytes == 0 && eventFlags == 0
 
 -- | The root is no longer watched, no more events of the root follow. It
 -- is reported after the 'isDeleted' event of a deleted root, after the
--- exception of a root whose changes the system fails to report, and after
--- 'removeRoot'. It is not reported when the watch is closed.
+-- exception of a root whose changes the system fails to report, after
+-- 'removeRoot', and when the root path no longer refers to the root, see
+-- 'enableStaleRootCheck'. It is not reported when the watch is closed.
 --
 -- For this event, 'getRoot' and 'getAbsPath' return the watch root, and
 -- 'getRelPath' returns 'Nothing'.
 isRootUnwatched :: Event -> Bool
-isRootUnwatched = getFlag rootUnwatchedAction
+isRootUnwatched Event{..} = eventFlags .&. rootUnwatchedAction /= 0
+
+-- | The watch of the root ended because the root path no longer refers to
+-- the watched directory. It is reported along with 'isRootUnwatched' when the
+-- root is deleted, and when the library finds that the root path refers to
+-- another directory or to none, for example, after the root is renamed, or a
+-- symbolic link in the root path is changed to point to another directory.
+-- See 'enableStaleRootCheck'.
+--
+-- It is not reported after 'removeRoot', or after the exception of a root
+-- whose changes the system fails to report. To watch the directory now at
+-- the path, add the root again with 'addRoot'.
+isRootStale :: Event -> Bool
+isRootStale Event{..} = eventFlags .&. rootStaleFlag /= 0
 
 -------------------------------------------------------------------------------
 -- Debugging
@@ -1453,6 +1534,7 @@ showEvent ev@Event{..} =
     ++ showev isMovedFrom "MovedFrom"
     ++ showev isMovedTo "MovedTo"
     ++ showev isRootUnwatched "RootUnwatched"
+    ++ showev isRootStale "RootStale"
     ++ "\n"
 
     where showev f str = if f ev then "\n" ++ str else ""
