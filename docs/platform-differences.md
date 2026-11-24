@@ -198,6 +198,12 @@ Directory roots:
 | A deleted directory root reports `isDeleted` for each file in it without the stale root check | Yes | No | Yes |
 | A deleted symbolic link to a directory root reports `isDeleted` for the root | No | No | No |
 
+<!--
+The rows "A deleted directory root reports `isDeleted` for the root" and "A
+deleted watch root reports `isRootUnwatched` for the root" are tested by
+`FileSystem.Event`.
+-->
+
 | Behavior | macOS |
 |----------|-------|
 | A deleted watch root reports `isRootUnwatched` for the root with `allowMissingRootPath True` | No |
@@ -537,6 +543,10 @@ File move events due to directory operations:
 |-----------|-------|-------|-------|---------|
 | Rename a file | `isMovedFrom` for the source, `isMovedTo` for the destination | Yes | No | Yes |
 | Rename a file | `isMoved` for the source and the destination | Yes | Yes | Yes |
+
+<!--
+The `isMoved` row is tested by `FileSystem.Event`.
+-->
 
 Directory metadata events due to directory operations on Linux/macOS:
 
