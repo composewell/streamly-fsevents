@@ -84,8 +84,9 @@ import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.FileSystem.Event as Event
 import qualified Streamly.FileSystem.Path as Path
-import qualified Streamly.Internal.FS.Event as Handle
-    (closeWatch, eventStream, openWatch)
+import qualified Streamly.Internal.FS.Event as Handle (closeWatch, openWatch)
+-- Every event read is checked for a watch root
+import qualified Streamly.Test.FileSystem.Event.Rooted as Handle (eventStream)
 #if defined(CABAL_OS_LINUX)
 import qualified Streamly.FileSystem.Event.Linux as Linux
 #endif

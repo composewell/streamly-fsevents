@@ -120,6 +120,7 @@ import qualified Streamly.Internal.FS.Event.Darwin as Darwin
 import qualified Streamly.Internal.FS.Event.Windows as Windows
 #endif
 import qualified Streamly.Internal.FileSystem.Path as Path
+import qualified Streamly.Test.FileSystem.Event.Rooted as Rooted (hasNoRoot)
 
 import Test.Hspec
 import Test.Hspec.Runner (hspecResult, summaryFailures)
@@ -1338,9 +1339,16 @@ behaviors =
     -- These behaviors change the resolution of a root path after the watch
     -- starts. On macOS an event that matches a root reports the root path as
     -- supplied, an event that does not match any root reports the resolved
-    -- path, so the check compares the absolute path. FSEvents resolves the
-    -- root paths when the stream starts and does not report any events for
-    -- the new resolution.
+    -- path, so the check compares the absolute path.
+    --
+    -- FSEvents delivers the events under the paths that the stream was
+    -- created with, compared with the real path of each change. It does not
+    -- deliver any event of the new resolution, matched or not, e.g. of a file
+    -- created in the target of a symbolic link created at a missing
+    -- component. A missing root created as a symbolic link reports the
+    -- create event of the link, at the root path, a missing parent created as
+    -- a symbolic link and a missing root created in another case report no
+    -- event without 'Darwin.setRootPathEvents' (macOS 26 CI event log).
     , Test base
         { title =
             "A missing root created as a symbolic link to a directory "
@@ -1470,7 +1478,8 @@ behaviors =
         }
 #if defined(CABAL_OS_DARWIN)
     -- With `allowMissingRootPath True` a missing root is watched, FSEvents
-    -- does not report any events for the new resolution of its path.
+    -- does not deliver any events of the new resolution of its path, see
+    -- above.
     , Test base
         { title =
             "A missing root created as a symbolic link to a directory "
@@ -3133,16 +3142,18 @@ waitStarted finished control started = go (0 :: Int)
             maybe (go (n + 1)) return r
 
 -- | One line for an event: the path relative to the first of the
--- directories that contains it, and the names of the predicates that are true
--- for the event. The names are the lines after the flags line of
--- 'Event.showEvent'.
+-- directories that contains it, @(no root)@ if the event is not under any
+-- watch root, and the names of the predicates that are true for the event.
+-- The names are the lines after the flags line of 'Event.showEvent'.
 eventLine :: [FilePath] -> Int -> Event -> String
 eventLine dirs i ev =
-    stepPrefix ++ relPath ++ ": " ++ unwords names
+    stepPrefix ++ relPath ++ noRoot ++ ": " ++ unwords names
 
     where
 
     stepPrefix = if i == 0 then "" else "step " ++ show i ++ ": "
+
+    noRoot = if Rooted.hasNoRoot ev then " (no root)" else ""
 
     path = absPath ev
 
