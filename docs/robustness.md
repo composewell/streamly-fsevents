@@ -319,10 +319,20 @@ macOS:
   event may be reported in their place.
 * Handle API: after `removeRoot`, the events of the root that occurred
   before the call are reported, then its `isRootUnwatched` event, usually
-  within a few milliseconds of the call. The events of the root that occur
+  within a few milliseconds of the call. An event that occurred shortly
+  before the call may not be reported. The events of the root that occur
   after the call are not reported. If the root is added again before its
   `isRootUnwatched` event, the event precedes the events of the root
   reported after the add.
+  <!--
+  Tested by FileSystem.Event, by the --match path of each test:
+  - events before the call, then isRootUnwatched:
+    "/FS.Event/handle API/isRootUnwatched is the last event of a root removed with a change/"
+  - events after the call:
+    "/FS.Event/handle API/a removed root stops reporting its events/"
+  - added again:
+    "/FS.Event/handle API/a root removed and added again reports the events after the add/"
+  -->
 * Handle API: with the non-threaded RTS, `closeWatch` does not wake up a
   thread waiting in `readEvent` while a child process created by `fork`
   without `exec` is running, unless the child has closed the file

@@ -178,6 +178,12 @@ macOS:
   example a read-only or a network volume, `addRoot` and `removeRoot` can
   lose the events of the other roots that occur during the call. An
   `isEventsLost` event may be reported in their place.
+* After `removeRoot`, an event of the root that occurred shortly before
+  the call may not be reported.
+  <!--
+  Tested by FileSystem.Event, by the --match path of the test:
+  "/FS.Event/handle API/isRootUnwatched is the last event of a root removed with a change/"
+  -->
 
 Windows:
 
