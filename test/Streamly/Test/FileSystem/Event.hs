@@ -571,6 +571,65 @@ deletedRootsEndStream = do
         "the stream ends when a root listed via two equal paths is deleted"
         ["root1", "." </> "root1"]
 
+-- When the start of one root fails, the watch closes the other roots, whose
+-- reads are in progress with no changes occurring. The exception must be
+-- raised without waiting for a change in the other roots.
+missingRootIdle :: Spec
+missingRootIdle =
+    it "raises an exception for a missing root while the others are idle"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let dirs = [fp </> ("dir" ++ show i) | i <- [1 .. 3 :: Int]]
+            mapM_ createDirectory dirs
+            paths <- mapM Path.fromString (dirs ++ [fp </> "missing"])
+            -- try must be outside timeout, it would catch the exception that
+            -- timeout throws.
+            r <- try $ timeout 10000000
+                $ Stream.fold Fold.drain
+                $ Event.watch (NonEmpty.fromList paths)
+            case r of
+                Left (_ :: SomeException) -> return ()
+                Right Nothing -> expectationFailure "timed out"
+                Right (Just ()) -> expectationFailure "the stream ended"
+
+-- | Read the events of the watch up to the @isRootUnwatched@ event of
+-- @path@, and then the events that follow within 500 ms of each other.
+readPastUnwatched :: FilePath -> Event.Watch -> IO [Event]
+readPastUnwatched path w = do
+    evs <- readUntil (\ev -> isUnwatched ev && absPath ev == path) w
+    (evs ++) <$> more
+
+    where
+
+    more = do
+        r <- timeout 500000 (Event.readEvent w)
+        case r of
+            Just (Just ev) -> (ev :) <$> more
+            _ -> return []
+
+-- | The events after the 'Event.isDeleted' event of the root @root@.
+afterRootDeleted :: FilePath -> [Event] -> [Event]
+afterRootDeleted root = drop 1 . dropWhile (not . isRootDelete)
+
+    where
+
+    isRootDelete ev =
+        Event.isDeleted ev && relPath ev == Nothing && rootPath ev == root
+
+-- The tree is deleted before the events are read. On Linux the kernel
+-- queues the deletion of the entries before the deletion of the root.
+rootDeletedLast :: Spec
+rootDeletedLast =
+    it "only isRootUnwatched follows the isDeleted event of a root"
+        $ withRootCfg recursive $ \root w -> do
+            let sub = root </> "sub"
+            createDirectory sub
+            createFile (sub </> "file")
+            _ <- syncOn root "sentinel" w
+            removePathForcibly root
+            evs <- afterRootDeleted root <$> readPastUnwatched root w
+            pathsOf (not . isUnwatched) evs `shouldBe` []
+            pathsOf isUnwatched evs `shouldSatisfy` elem root
+
 -------------------------------------------------------------------------------
 -- Recursive mode
 -------------------------------------------------------------------------------
@@ -658,6 +717,44 @@ recDirMovedOutRecreatedRenamed =
             filter (isUnder (outside root))
                 (map absPath (checkedEvents False (evs1 ++ evs2)))
                 `shouldBe` []
+
+-- The subdirectory is moved out and the root is deleted before the events
+-- are read. On Linux the subdirectory stays watched until the library
+-- processes its move, a change in it before that would report the old
+-- path, it is dropped. Linux and FreeBSD also report isRootUnwatched for
+-- the subdirectory.
+movedOutAfterRootDeleted :: Spec
+movedOutAfterRootDeleted =
+    it "no change in a moved out subdirectory follows the root's isDeleted"
+        $ withRootCfg recursive $ \root w -> do
+            let sub = root </> "sub"
+            createDirectory sub
+            _ <- syncOn root "sentinel" w
+            renameDirectory sub (outside root)
+            removePathForcibly root
+            createFile (outside root </> "file")
+            let lastUnwatched = if onInotify then sub else root
+            evs <-
+                afterRootDeleted root <$> readPastUnwatched lastUnwatched w
+            pathsOf (not . isUnwatched) evs `shouldBe` []
+
+-- The tree exists before the watch is opened. On Linux the watch scans the
+-- tree to add the watches of the subdirectories, the scan does not report
+-- any events. On macOS the events of the changes before the start are
+-- skipped by 'skipEarlier', its marker can be reported again.
+recStartSilent :: Spec
+recStartSilent =
+    it "the start of a recursive watch reports no events of the tree"
+        $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
+            let root = fp </> "root"
+                sentinel = root </> "sentinel"
+            createDirectory root
+            createDirectory (root </> "sub")
+            withWatch recursive [root] $ \w -> do
+                createFile sentinel
+                evs <- readUntil (isCreatedAt sentinel) w
+                filter (/= root </> "ready") (map absPath evs)
+                    `shouldBe` [sentinel]
 
 -- A directory of the tree is moved out of the inner root and stays in the
 -- outer root. On Linux the inner root reports it as no longer watched.
@@ -1402,6 +1499,34 @@ removeStops =
             filter (isUnder root2) (pathsOf isChange (evs ++ evs1))
                 `shouldBe` []
 
+-- The file is created before removeRoot, the watch has not read its event.
+-- On Linux the event is not reported, on macOS it is. On Windows it is
+-- reported if the watch has read it from the system before the call, see
+-- 'Event.removeRoot'.
+removeQueued :: Spec
+removeQueued =
+    it "isRootUnwatched is the last event of a root removed with a change"
+        $ withTwoRoots $ \root1 root2 w -> do
+            let file = root1 </> "file"
+                end = root2 </> "end"
+            createFile file
+            Event.removeRoot w =<< Path.fromString root1
+            evs <- readUnwatched w root1 root1
+            createFile end
+            evs1 <- readUntil (isCreatedAt end) w
+            let ofRoot1 = filter ((== root1) . rootPath) (evs ++ evs1)
+                changed = nub (pathsOf isChange ofRoot1)
+            map isUnwatched (drop (length ofRoot1 - 1) ofRoot1)
+                `shouldBe` [True]
+            length (filter isUnwatched ofRoot1) `shouldBe` 1
+#if defined(INOTIFY_BACKEND)
+            changed `shouldBe` []
+#elif defined(CABAL_OS_DARWIN)
+            changed `shouldBe` [file]
+#else
+            changed `shouldSatisfy` (`elem` [[], [file]])
+#endif
+
 -- The isRootUnwatched event of a removed root does not report isRootStale.
 -- A deleted root reports isRootStale: tested in FileSystem.Event.Behavior, "A
 -- deleted watch root reports `isRootStale` for the root".
@@ -1466,6 +1591,23 @@ overlapRemoveInner =
             createdRoots file1 evs1 `shouldBe` [root]
             filter (== sub) (map rootPath evs1) `shouldBe` []
 
+-- After the outer root is removed, the inner root reports the changes in
+-- @sub@. On Linux the outer root also reports isRootUnwatched for @sub@,
+-- the watch of @sub@ is kept for the inner root.
+overlapRemoveOuter :: Spec
+overlapRemoveOuter =
+    it "removing the outer root keeps the inner root watching"
+        $ withNestedRoots $ \root sub w -> do
+            Event.removeRoot w =<< Path.fromString root
+            evs <- readUnwatched w root root
+            evs1 <- readUnwatched w root sub
+            (evs ++ evs1) `shouldUnwatch` [(root, root), (root, sub)]
+            let file = sub </> "file"
+            createFile file
+            evs2 <- readUntil (isCreatedAt file) w
+            createdRoots file evs2 `shouldBe` [sub]
+            filter (== root) (map rootPath evs2) `shouldBe` []
+
 -- The events of the root after it is added again are reported. On Linux the
 -- root is added again before its isRootUnwatched event is read.
 removeAddAgain :: Spec
@@ -1480,6 +1622,58 @@ removeAddAgain =
             evs <- readUntil (isCreatedAt file) w
             evs `shouldUnwatch` [(root, root)]
             createdRoots file evs `shouldBe` [root]
+
+-- Each thread adds its root, creates a file in it and removes the root, a
+-- number of times. A change made before the removal can be not reported,
+-- see 'Event.removeRoot', the others are reported once. Each removal reports
+-- isRootUnwatched.
+addRemoveThreads :: Spec
+addRemoveThreads =
+    it "roots added and removed by several threads report each removal"
+        $ withRootHandle id $ \root w -> do
+            let base = takeDirectory root
+                dirs = [base </> ("dir" ++ show i) | i <- [1 .. threads]]
+                fileOf dir j = dir </> ("file" ++ show j)
+                worker dir = do
+                    p <- Path.fromString dir
+                    mapM_
+                        (\j -> do
+                            Event.addRoot w p
+                            createFile (fileOf dir j)
+                            Event.removeRoot w p
+                        )
+                        [1 .. cycles]
+                done evs =
+                    length (filter isUnwatched evs) == threads * cycles
+            mapM_ createDirectory dirs
+            readerMv <- newEmptyMVar
+            bracket
+                (forkIO (try (readEventsUntil done w) >>= putMVar readerMv))
+                killThread
+                $ \_ -> do
+                    workerMvs <- mapM (const newEmptyMVar) dirs
+                    mapM_
+                        (\(dir, mv) ->
+                            forkIO (try (worker dir) >>= putMVar mv))
+                        (zip dirs workerMvs)
+                    mapM_ (\mv -> takeMVar mv >>= either rethrow return)
+                        workerMvs
+                    evs <- takeMVar readerMv >>= either rethrow return
+                    mapM_ (checkDir evs fileOf) dirs
+
+    where
+
+    threads = 4 :: Int
+    cycles = 10 :: Int
+    rethrow (e :: SomeException) = throwIO e
+
+    checkDir evs fileOf dir = do
+        let ofDir = filter ((== dir) . rootPath) evs
+            created = pathsOf Event.isCreated ofDir
+        created `shouldSatisfy` all (`elem` map (fileOf dir) [1 .. cycles])
+        length (nub created) `shouldBe` length created
+        pathsOf isUnwatched ofDir `shouldBe` replicate cycles dir
+        map isUnwatched (drop (length ofDir - 1) ofDir) `shouldBe` [True]
 
 -- The root parent/root2 is stale after it is moved away from its path, and
 -- after a new parent/root2 is created at its path. removeRoot and addRoot
@@ -1772,10 +1966,12 @@ handleTests = do
     addRecursive
     keepEventsWhileAdding
     removeStops
+    removeQueued
     removedNotStale
     removeTwice
     removeWhileReading
     removeAddAgain
+    addRemoveThreads
     staleRootReAdded
     staleLinkRootReAdded
     staleLinkParentReAdded
@@ -2185,14 +2381,19 @@ watchTests =
                 fifoRoot
 #endif
                 deletedRootsEndStream
+                missingRootIdle
+                rootDeletedLast
             describe "overlapping roots" $ do
                 overlapRemoveInner
+                overlapRemoveOuter
                 renameOutOfInnerRoot
             describe "recursive mode" $ do
                 recSubdirMovedDeleted
                 recManyNewDirs
                 recDirReplacedByFile
                 recDirMovedOutRecreatedRenamed
+                movedOutAfterRootDeleted
+                recStartSilent
                 recStartSymlinkCycles
             describe "recursive mode changes to the tree"
                 $ mapM_ runTreeChange treeChanges

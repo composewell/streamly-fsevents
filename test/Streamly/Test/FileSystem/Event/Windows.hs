@@ -10,7 +10,7 @@ module Streamly.Test.FileSystem.Event.Windows (main) where
 
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (evaluate)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
 import System.Directory (createDirectory, makeAbsolute)
@@ -88,28 +88,6 @@ reservedName =
     , [("aux.c", Event.isCreated)]
     )
 
--- | When the open of one root fails, the watch closes the other roots, whose
--- reads are in progress with no changes occurring. The exception must be
--- raised without waiting for a change in the other roots.
-missingRoot :: Spec
-missingRoot =
-    it "raises an exception for a missing root while the others are idle" $
-        withRoot $ \root -> do
-            let dirs = fmap (\i -> root </> ("dir" ++ show i)) [1 .. 3 :: Int]
-            mapM_ createDirectory dirs
-            paths <- mapM Path.fromString (dirs ++ [root </> "missing"])
-            let watcher =
-                    case paths of
-                        p : ps -> Event.watch (p :| ps)
-                        [] -> error "missingRoot: no paths"
-            -- try must be outside timeout, it would catch the exception that
-            -- timeout throws.
-            r <- try $ timeout 10000000 $ Stream.drain watcher
-            case r of
-                Left (_ :: SomeException) -> return ()
-                Right Nothing -> expectationFailure "timed out"
-                Right (Just ()) -> expectationFailure "the stream ended"
-
 -- | NTFS does not validate the UTF-16 in names. showEvent must not raise an
 -- exception for a name with an unpaired surrogate.
 unpairedSurrogate :: Spec
@@ -131,7 +109,8 @@ robustnessTests :: Spec
 robustnessTests =
     describe moduleName $ describe "robustness" $ do
         eventsLost
-        missingRoot
+        -- "raises an exception for a missing root while the others are
+        -- idle": tested in FileSystem.Event with the same title.
         unpairedSurrogate
         -- "a renamed root ends with isRootStale at its next change": tested
         -- in FileSystem.Event.Behavior, "A renamed watch root remains

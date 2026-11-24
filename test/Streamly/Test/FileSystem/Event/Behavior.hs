@@ -1134,6 +1134,19 @@ behaviors =
             any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
         , expected = onPlatform Yes Yes No
         }
+    -- On Linux and Windows the watch follows the renamed directory, the
+    -- change is read with the old path of the root and it is dropped.
+    , Test base
+        { title =
+            "A change in a renamed watch root before the rename event is "
+                ++ "read is reported"
+        , paused = True
+        , ops = \p -> do
+            renameDirectory (watchRoot p) (renamedRoot p)
+            createFile (renamedRoot p </> "file")
+        , check = const (createdNamed "file")
+        , expected = No
+        }
     , Test base
         { title = "A root renamed back to its original path is watched"
         , ops = \p -> do
