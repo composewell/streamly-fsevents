@@ -1666,11 +1666,15 @@ addRemoveThreads =
 
     -- On macOS the FSEvents history replayed by addRoot can include the
     -- create of the root itself, and the create of the file of the previous
-    -- cycle, which is then reported twice.
+    -- cycle, which is then reported twice. On the other platforms each
+    -- create is reported once.
     checkDir evs fileOf dir = do
         let ofDir = filter ((== dir) . rootPath) evs
             created = filter (/= dir) (pathsOf Event.isCreated ofDir)
         created `shouldSatisfy` all (`elem` map (fileOf dir) [1 .. cycles])
+#if !defined(CABAL_OS_DARWIN)
+        length (nub created) `shouldBe` length created
+#endif
         pathsOf isUnwatched ofDir `shouldBe` replicate cycles dir
         map isUnwatched (drop (length ofDir - 1) ofDir) `shouldBe` [True]
 
