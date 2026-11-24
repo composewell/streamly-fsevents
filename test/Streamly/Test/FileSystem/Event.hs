@@ -1500,9 +1500,9 @@ removeStops =
                 `shouldBe` []
 
 -- The file is created before removeRoot, the watch has not read its event.
--- On Linux the event is not reported, on macOS it is. On Windows it is
--- reported if the watch has read it from the system before the call, see
--- 'Event.removeRoot'.
+-- On Linux the event is not reported. On macOS it may be reported, see
+-- 'Event.removeRoot'. On Windows it is reported if the watch has read it
+-- from the system before the call.
 removeQueued :: Spec
 removeQueued =
     it "isRootUnwatched is the last event of a root removed with a change"
@@ -1521,8 +1521,6 @@ removeQueued =
             length (filter isUnwatched ofRoot1) `shouldBe` 1
 #if defined(INOTIFY_BACKEND)
             changed `shouldBe` []
-#elif defined(CABAL_OS_DARWIN)
-            changed `shouldBe` [file]
 #else
             changed `shouldSatisfy` (`elem` [[], [file]])
 #endif
@@ -1667,9 +1665,11 @@ addRemoveThreads =
     cycles = 10 :: Int
     rethrow (e :: SomeException) = throwIO e
 
+    -- On macOS the create of the root itself may be reported, the
+    -- FSEvents history replayed by addRoot can include it.
     checkDir evs fileOf dir = do
         let ofDir = filter ((== dir) . rootPath) evs
-            created = pathsOf Event.isCreated ofDir
+            created = filter (/= dir) (pathsOf Event.isCreated ofDir)
         created `shouldSatisfy` all (`elem` map (fileOf dir) [1 .. cycles])
         length (nub created) `shouldBe` length created
         pathsOf isUnwatched ofDir `shouldBe` replicate cycles dir

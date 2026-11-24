@@ -313,7 +313,8 @@ addRoot = Event.addRoot
 -- An 'isRootUnwatched' event for the root follows the events of the root.
 -- On Linux and Windows the changes of the root that the watch has not yet
 -- read from the system are not reported. On macOS the events of the root
--- that occur before the call are reported, and the 'isRootUnwatched' event
+-- that occur before the call are reported, except that an event that occurs
+-- shortly before the call may not be reported. The 'isRootUnwatched' event
 -- follows them, usually within a few milliseconds of the call.
 --
 -- The events of the other roots of the watch are not lost or duplicated by

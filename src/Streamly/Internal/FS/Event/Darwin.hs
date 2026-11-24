@@ -860,6 +860,12 @@ parseRecord arr
 -- reporting the events of the root with an id up to the cutoff. The events
 -- with a greater id are not reported for the root.
 --
+-- An event of the root that occurs shortly before 'removeRoot' may not be
+-- reported. fseventsd assigns the event ids asynchronously, a change made
+-- just before the call may get an id greater than the cutoff. An old stream
+-- cut at the end of the replay of its replacement may not have reported all
+-- its events up to the cutoff.
+--
 -- A stream reports its events in the order of their ids. A stream is done
 -- with the root when it reports an event with an id greater than the
 -- cutoff, when the reader cuts it at the end of the replay, or when it is
@@ -1212,12 +1218,14 @@ addRoot wtch@Watch{..} root = do
 -- one used to add the root, with the same case, ignoring redundant
 -- separators and @.@ components.
 --
--- The events of the root that occur before the call are reported, the
--- events that occur after it are not. An 'isRootUnwatched' event for the
--- root follows the events of the root, usually within a few milliseconds of
--- the call. If the root is added again before that, the event precedes the
--- events of the root reported after the add. A directory that is also
--- watched via another root remains watched for that root.
+-- The events of the root that occur after the call are not reported. The
+-- events that occur before the call are reported, except that an event
+-- that occurs shortly before the call may not be reported. An
+-- 'isRootUnwatched' event for the root follows the events of the root,
+-- usually within a few milliseconds of the call. If the root is added
+-- again before that, the event precedes the events of the root reported
+-- after the add. A directory that is also watched via another root remains
+-- watched for that root.
 --
 -- The events of the other roots of the watch are not lost or duplicated by
 -- the call, except on a volume that does not keep a history of file system
@@ -1946,7 +1954,7 @@ rootUnwatchedFlag = 0x80000000
 
 -- | The root is no longer watched, no more events of the root follow. It
 -- is reported after 'removeRoot', it follows the events of the root that
--- occurred before the call. It is also reported, with 'isRootStale', when the
+-- are reported, see 'removeRoot'. It is also reported, with 'isRootStale', when the
 -- root path no longer refers to the root, see 'allowMissingRootPath'. With
 -- 'allowMissingRootPath' 'True' a deleted or renamed root stays watched, the
 -- watch is on the path of the root.
