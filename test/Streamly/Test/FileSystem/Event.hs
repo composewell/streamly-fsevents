@@ -1403,18 +1403,16 @@ removeStops =
                 `shouldBe` []
 
 -- The isRootUnwatched event of a removed root does not report isRootStale.
--- The isRootUnwatched event of a deleted root does.
+-- A deleted root reports isRootStale: tested in FileSystem.Event.Behavior, "A
+-- deleted watch root reports `isRootStale` for the root".
 removedNotStale :: Spec
 removedNotStale =
-    it "a removed root does not report isRootStale, a deleted root does"
-        $ withTwoRoots $ \root1 root2 w -> do
+    it "a removed root does not report isRootStale"
+        $ withTwoRoots $ \root1 _ w -> do
             p <- Path.fromString root1
             Event.removeRoot w p
             evs <- readUnwatched w root1 root1
             pathsOf Event.isRootStale evs `shouldBe` []
-            removePathForcibly root2
-            evs1 <- readUnwatched w root2 root2
-            pathsOf Event.isRootStale evs1 `shouldBe` [root2]
 
 -- On Linux the second removeRoot runs before the isRootUnwatched event is
 -- read.

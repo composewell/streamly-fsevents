@@ -10,10 +10,10 @@ module Streamly.Test.FileSystem.Event.Windows (main) where
 
 import Control.Concurrent
     (forkIO, killThread, newEmptyMVar, putMVar, readMVar, threadDelay)
-import Control.Exception (SomeException, bracket, evaluate, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty(..))
-import System.Directory (createDirectory, makeAbsolute, renameDirectory)
+import System.Directory (createDirectory, makeAbsolute)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
@@ -39,49 +39,6 @@ withRoot act =
         let root = fp </> "watch-root"
         createDirectory root
         act root
-
--- | Open a watch on the root using the config, rename the root, then create
--- a file in it. Returns the events up to and including the first event that
--- satisfies the predicate.
-renameAndCreate ::
-    (Event.Config -> Event.Config) -> (Event.Event -> Bool) -> FilePath
-    -> IO [Event.Event]
-renameAndCreate f p root = do
-    path <- Path.fromString root
-    bracket (Event.openWatch f (path :| [])) Event.closeWatch $ \w -> do
-        renameDirectory root (root ++ "-moved")
-        writeFile (root ++ "-moved" </> "file") ""
-        r <- timeout 10000000
-            $ Stream.toList
-            $ Stream.takeEndBy p
-            $ Stream.trace (putStrLn . Event.showEvent)
-            $ Event.eventStream w
-        maybe (error "renameAndCreate: timed out") return r
-
-pathsOf :: (Event.Event -> Bool) -> [Event.Event] -> [FilePath]
-pathsOf p = map (Path.toString . Event.getAbsPath) . filter p
-
--- | The rename of the root does not generate any event. The event of the
--- file created after the rename ends the root.
-rootRenamed :: Spec
-rootRenamed =
-    it "a renamed root ends with isRootStale at its next change" $
-        withRoot $ \root -> do
-            evs <- renameAndCreate id Event.isRootUnwatched root
-            pathsOf Event.isCreated evs `shouldBe` []
-            pathsOf Event.isRootStale evs `shouldBe` [root]
-
--- | Without the stale root check the watch reports the event with the
--- original root path.
-rootRenamedNoCheck :: Spec
-rootRenamedNoCheck =
-    it "a renamed root stays watched without the stale root check" $
-        withRoot $ \root -> do
-            evs <-
-                renameAndCreate
-                    (Event.enableStaleRootCheck False) Event.isCreated root
-            pathsOf Event.isCreated evs `shouldBe` [root </> "file"]
-            pathsOf Event.isRootUnwatched evs `shouldBe` []
 
 -- | Block the consumer at the first event while creating enough files to
 -- overflow both the event queue of the watch (1024 events) and the event
@@ -176,8 +133,14 @@ robustnessTests =
         eventsLost
         missingRoot
         unpairedSurrogate
-        rootRenamed
-        rootRenamedNoCheck
+        -- "a renamed root ends with isRootStale at its next change": tested
+        -- in FileSystem.Event.Behavior, "A renamed watch root remains
+        -- watched" and "A renamed watch root reports `isRootStale` at its
+        -- next event".
+        --
+        -- "a renamed root stays watched without the stale root check":
+        -- tested in FileSystem.Event.Behavior, "A renamed watch root remains
+        -- watched without the stale root check".
 
 -- TODO Test isModified event for parent directories when a file is created or
 -- deleted.

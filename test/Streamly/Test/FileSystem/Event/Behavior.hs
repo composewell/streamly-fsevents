@@ -975,27 +975,15 @@ behaviors =
         , expected = onPlatform Yes Yes Yes
         }
 #endif
-    , Test base
-        { title = "A deleted directory root reports `isDeleted` for the root"
-        , ops = removePathForcibly . watchRoot
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && Event.isDeleted ev)
-        , expected = Yes
-        }
-    , Test base
-        { title =
-            "A deleted watch root reports `isRootUnwatched` for the root"
-        , ops = removePathForcibly . watchRoot
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && Event.isRootUnwatched ev)
-        , expected = Yes
-        }
+    -- "A deleted directory root reports `isDeleted` for the root" and "A
+    -- deleted watch root reports `isRootUnwatched` for the root": tested in
+    -- FileSystem.Event, "the stream ends when all its roots are deleted",
+    -- which also checks a root listed twice.
     , Test base
         { title =
             "A deleted watch root reports `isRootStale` for the root"
         , ops = removePathForcibly . watchRoot
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && Event.isRootStale ev)
+        , check = \p -> rootEnded (watchRoot p)
         , expected = Yes
         }
 #if defined(CABAL_OS_DARWIN)
@@ -1114,16 +1102,18 @@ behaviors =
     , Test base
         { title = "A renamed watch root reports `isRootStale` at its next event"
         , ops = renameRootAndCreate
-        , check = \p ->
-            any (\ev -> absPath ev == watchRoot p && Event.isRootStale ev)
+        , check = \p -> rootEnded (watchRoot p)
         , expected = Yes
         }
+    -- The event is reported under the old path of the root.
     , Test base
         { title =
             "A renamed watch root remains watched without the stale root check"
         , config = Event.enableStaleRootCheck False
         , ops = renameRootAndCreate
-        , check = const (createdNamed "file")
+        , check = \p evs ->
+            rootPaths Event.isCreated evs == [watchRoot p </> "file"]
+                && null (rootPaths Event.isRootUnwatched evs)
         , expected = onPlatform No No Yes
         }
     -- On Windows the rename of a root is not reported, the watch continues.
@@ -1299,8 +1289,7 @@ behaviors =
         , ops = \p -> do
             renameNestedParent p
             createFile (movedNestedRoot p </> "file")
-        , check = \p ->
-            any (\ev -> absPath ev == nestedRoot p && Event.isRootStale ev)
+        , check = \p -> rootEnded (nestedRoot p)
         , expected = onPlatform Yes No Exception
         }
     , Test base
@@ -1313,9 +1302,9 @@ behaviors =
         , ops = \p -> do
             renameNestedParent p
             createFile (movedNestedRoot p </> "file")
-        , check = \p ->
-            any (\ev -> absPath ev == nestedRoot p </> "file"
-                    && Event.isCreated ev)
+        , check = \p evs ->
+            rootPaths Event.isCreated evs == [nestedRoot p </> "file"]
+                && null (rootPaths Event.isRootUnwatched evs)
         , expected = onPlatform Yes No Exception
         }
     -- On Linux the directory created after the rename cannot be reached by
@@ -1330,8 +1319,8 @@ behaviors =
         , ops = \p -> do
             renameNestedParent p
             createDirectory (movedNestedRoot p </> "dir")
-        , check = \p ->
-            any (\ev -> absPath ev == nestedRoot p && Event.isRootUnwatched ev)
+        , check = \p evs ->
+            rootPaths Event.isRootUnwatched evs == [nestedRoot p]
         , expected = onPlatform Yes No Exception
         }
     , Subsection "Resolution of the root path"
@@ -1471,8 +1460,7 @@ behaviors =
         , ops = \p -> do
             retargetLinkParent p
             createFile (linkTarget p </> "root" </> "file")
-        , check = \p ->
-            any (\ev -> absPath ev == nestedRoot p && Event.isRootStale ev)
+        , check = \p -> rootEnded (nestedRoot p)
         , expected = Yes
         }
 #if defined(CABAL_OS_DARWIN)
@@ -1922,18 +1910,9 @@ behaviors =
                     && reported "moved" movedTo movedFrom
         , expected = onPlatform Yes No Yes
         }
-    , Test base
-        { title =
-            "Renaming a file reports `isMoved` for the source and the "
-                ++ "destination"
-        , setup = withFile
-        , ops = \p ->
-            renameFile (watchRoot p </> "file") (watchRoot p </> "moved")
-        , check = \_ evs ->
-            let moved name = any (\ev -> isNamed name ev && Event.isMoved ev)
-             in moved "file" evs && moved "moved" evs
-        , expected = onPlatform Yes Yes Yes
-        }
+    -- "Renaming a file reports `isMoved` for the source and the
+    -- destination": tested in FileSystem.Event, "File moved (file1 file2)",
+    -- which also checks a recursive watch and a symbolic link root.
     , Test dirAttrsChange
         { title = "Creating a file reports `isAttrsModified` for the directory"
         , ops = \p -> createFile (watchRoot p </> "file")
@@ -2749,6 +2728,16 @@ behaviors =
 
     -- Whether the file at the absolute path is reported as created.
     createdAt path = any (\ev -> absPath ev == path && Event.isCreated ev)
+
+    -- The paths of the events outside the control root that satisfy the
+    -- predicate.
+    rootPaths f = map absPath . filter (\ev -> notControl ev && f ev)
+
+    -- The watch of the root ended with one 'isRootUnwatched' and one
+    -- 'isRootStale' event, and no other root ended.
+    rootEnded root evs =
+        rootPaths Event.isRootStale evs == [root]
+            && rootPaths Event.isRootUnwatched evs == [root]
 
     -- The directories that a symbolic link root points to, next to the
     -- watch root.
