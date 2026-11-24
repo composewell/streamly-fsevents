@@ -56,10 +56,11 @@ because the root or a parent directory is renamed, the root is deleted, or
 a symbolic link in the path is changed, the watch of the root ends with
 `isRootUnwatched` and `isRootStale`. The stale root check,
 `enableStaleRootCheck`, on by default, checks the root path when the events
-of a root are read. A root whose path changes without any event of the root,
-e.g. after a parent rename on Linux or a symbolic link change, ends at its
-next event. With the check off the root reports the events of the watched
-object under the old path. On macOS `allowMissingRootPath True` gives the
+of a root are read. A deleted root, and on Linux and macOS a renamed root,
+ends at its deletion or rename event. A root whose path changes without
+any event of the root, e.g. after a parent rename on Linux or a symbolic
+link change, ends at its next event. With the check off the root reports
+the events of the watched object under the old path. On macOS `allowMissingRootPath True` gives the
 behavior of FSEvents instead: the path is watched, whatever object is at
 the path.
 
@@ -416,14 +417,15 @@ watched, `umount` fails with `Device busy`.
 
 ### End of watch stream
 
-On macOS a watch stream does not end when the watch of all the roots has
-ended. On Linux and Windows a deleted or renamed root is gone forever
-therefore the watch stream ends when all the roots are deleted or renamed.
-On Windows a renamed root ends at its next change.
+The stream of `watchWith` ends after the `isRootUnwatched` event of the
+last root, when all the roots are deleted or renamed. On Windows a renamed
+root ends at its next change. On macOS with `allowMissingRootPath True`
+the paths stay watched and the stream does not end. A stream read from a
+watch opened with `openWatch` ends only when the watch is closed.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
-| The stream ends when all the watch roots are deleted | Yes | No | Yes |
+| The stream ends when all the watch roots are deleted | Yes | Yes | Yes |
 
 ### Watch root permissions
 
