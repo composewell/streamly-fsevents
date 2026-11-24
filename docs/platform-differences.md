@@ -498,7 +498,7 @@ Tested, without a claim above:
 
 ## Event reporting (Non recursive)
 
-### Root Directory metadata changes
+### Root directory metadata changes
 
 Events for the watch root directory metadata, not for objects contained in it.
 
@@ -517,12 +517,12 @@ On Windows these changes are reported under `isModified`:
 | Set the hidden attribute of the directory | `isModified` for the directory | `setAllEvents True` | No |
 | Set the access and modification times of the directory | `isModified` for the directory | `setAllEvents True` | No |
 
-### Root Directory content changes
+### Root directory content changes
 
-Events for the watch root directory data, due to directory operations e.g.
-creation and deletion of objects in it.
+Operations that change a directory contents are child create, delete, rename.
+These operations generate events on the child itself and not on the directory.
 
-File create/delete events due to directory operations:
+Child create/delete events:
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
@@ -538,7 +538,7 @@ the clone also reports `isCreated`. `isCloned` is in
 `Streamly.FileSystem.Event.Darwin` only, the portable module does not have
 a predicate for the clone flag of the source.
 
-File move events due to directory operations:
+Child move events:
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
@@ -549,31 +549,22 @@ File move events due to directory operations:
 The `isMoved` row is tested by `FileSystem.Event`.
 -->
 
-Directory metadata events due to directory operations on Linux/macOS:
+Create, delete rename operations generate events on the child and not on the
+parent directory. Even though the directory's modification time is changed by
+these operations, these operations do not generate any directory metadata
+(`isAttrsModified`) or data modification events (`isModified`) except in one
+case on macOS:
 
-| Operation | Event | Linux | macOS |
-|-----------|-------|-------|-------|
-| Create a file | `isAttrsModified` for the directory | No | No |
-| Delete a file | `isAttrsModified` for the directory | No | No |
-| Rename a file | `isAttrsModified` for the directory | No | No |
-| Create a subdirectory | `isAttrsModified` for the directory | No | No |
-| Delete a subdirectory | `isAttrsModified` for the directory | No | No |
-| Create a symbolic link | `isAttrsModified` for the directory | No | No |
-| Create a hard link | `isAttrsModified` for the directory | No | Yes |
-| Delete a hard link | `isAttrsModified` for the directory | No | No |
-
-Directory metadata events due to directory operations on Windows are
-reported under `isModified` enabled by appropriate config options:
-
-| Operation | Event | Config | Status |
-|-----------|-------|--------|--------|
-| Create a file | `isModified` for the directory | `setAllEvents True` | No |
-| Delete a file | `isModified` for the directory | `setAllEvents True` | No |
-| Rename a file | `isModified` for the directory | `setAllEvents True` | No |
-| Create a subdirectory | `isModified` for the directory | `setAllEvents True` | No |
-| Delete a subdirectory | `isModified` for the directory | `setAllEvents True` | No |
-| Create a hard link | `isModified` for the directory | `setAllEvents True` | No |
-| Delete a hard link | `isModified` for the directory | `setAllEvents True` | No |
+| Operation | Linux | macOS | Windows |
+|-----------|-------|-------|---------|
+| Create a file | No | No | No |
+| Delete a file | No | No | No |
+| Rename a file | No | No | No |
+| Create a subdirectory | No | No | No |
+| Delete a subdirectory | No | No | No |
+| Create a symbolic link | No | No | No |
+| Create a hard link | No | `isAttrsModified` | No |
+| Delete a hard link | No | No | No |
 
 <!--
 Tested, without a claim above:
@@ -583,10 +574,10 @@ Tested, without a claim above:
 | A file deleted and created again is reported | Yes | Yes | Yes |
 -->
 
-### File/subdirectory metadata changes
+### Child metadata changes
 
-Events for the metadata modification of objects contained in the watch
-root directory.
+Events for the metadata modification of objects (files and directories)
+contained in the watch root directory.
 
 All the events reported for a file or subdirectory by each platform; the
 event is reported for that item:
@@ -615,7 +606,7 @@ Windows reports file content modification as well as metadata changes as
 `isModified` event. Which actions trigger this event is controlled by
 config options.
 
-| Operation | Reported by config |
+| Operation | Enabled by config |
 |-----------|-------------|
 | Make an item read-only | `setAttrsModified` |
 | Set the hidden attribute of an item | `setAttrsModified` |
@@ -653,13 +644,14 @@ links to one file reports each event twice, once for each name.
 
 ### Subdirectory content changes
 
-In non-recursive mode, creation, deletion, modification of files inside a
-subdirectory do not generate any events, neither for the file nor for the
-subdirectory, though the modification time of the subdirectory changes.
-On Windows the modification or deletion of a file in a subdirectory
-reports `isModified` for the subdirectory in some runs. The modification
-of a file two levels below the root also reports `isModified` for the
-subdirectory in some runs.
+On all platforms except Windows, in non-recursive mode, creation, deletion,
+modification of files inside a subdirectory do not generate any events.
+
+On Windows the modification or deletion of a file in a subdirectory of the root
+reports `isModified` for the subdirectory in some runs. The modification of a
+file two levels below the root also reports `isModified` for the subdirectory
+in some runs. This may be a bug or the event may be due to some metadata
+modification of the directory.
 
 | Operation | Event | Linux | macOS | Windows |
 |-----------|-------|-------|-------|---------|
