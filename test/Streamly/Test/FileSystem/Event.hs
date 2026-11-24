@@ -70,10 +70,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Internal.FS.Event as Event
-    hiding (watch, watchWith, watchRecursive, eventStream, readEvent)
 import qualified Streamly.Internal.FileSystem.Path as Path
--- Every event read is checked for a watch root
-import qualified Streamly.Test.FileSystem.Event.Rooted as Event
 #if defined(CABAL_OS_LINUX)
 import qualified Streamly.Internal.FS.Event.Linux as Inotify
 #elif defined(CABAL_OS_FREEBSD)

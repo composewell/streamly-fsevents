@@ -37,10 +37,6 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Streamly.Internal.Data.Stream as Stream
 import qualified Streamly.Internal.FileSystem.Path as Path
 import qualified Streamly.Internal.FS.Event.Darwin as Event
-    hiding (watch, watchWith)
--- Every event read is checked for a watch root
-import qualified Streamly.Test.FileSystem.Event.Rooted as Event
-    (watch, watchWith)
 
 import Streamly.Test.FileSystem.Event.Common
 

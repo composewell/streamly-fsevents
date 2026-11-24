@@ -120,7 +120,6 @@ import qualified Streamly.Internal.FS.Event.Darwin as Darwin
 import qualified Streamly.Internal.FS.Event.Windows as Windows
 #endif
 import qualified Streamly.Internal.FileSystem.Path as Path
-import qualified Streamly.Test.FileSystem.Event.Rooted as Rooted (hasNoRoot)
 
 import Test.Hspec
 import Test.Hspec.Runner (hspecResult, summaryFailures)
@@ -3141,6 +3140,15 @@ waitStarted finished control started = go (0 :: Int)
             r <- tryReadMVar started
             maybe (go (n + 1)) return r
 
+-- | Whether the event is not under any watch root. 'False' on Linux, FreeBSD
+-- and Windows, every event has a root.
+hasNoRoot :: Event -> Bool
+#if defined(CABAL_OS_DARWIN)
+hasNoRoot = not . Darwin.hasRoot
+#else
+hasNoRoot _ = False
+#endif
+
 -- | One line for an event: the path relative to the first of the
 -- directories that contains it, @(no root)@ if the event is not under any
 -- watch root, and the names of the predicates that are true for the event.
@@ -3153,7 +3161,7 @@ eventLine dirs i ev =
 
     stepPrefix = if i == 0 then "" else "step " ++ show i ++ ": "
 
-    noRoot = if Rooted.hasNoRoot ev then " (no root)" else ""
+    noRoot = if hasNoRoot ev then " (no root)" else ""
 
     path = absPath ev
 
