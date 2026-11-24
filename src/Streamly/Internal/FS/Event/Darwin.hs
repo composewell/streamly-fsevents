@@ -932,6 +932,11 @@ data ReadState = ReadState
 -- | A handle for a watch.
 data Watch = Watch
     { watchConfig :: Config -- ^ The config used to open the watch
+      -- | End the event stream when no root is watched and no event is left
+      -- to report. 'True' for the watch of 'watchWith', whose roots cannot
+      -- be changed: when all of them are removed as stale, the watch cannot
+      -- report another event.
+    , watchEndsUnwatched :: Bool
     , watchFd :: CInt -- ^ The read end of the pipe, non-blocking
     , watchPtr :: Ptr CWatch
       -- | Held during a system call on the fd, 'closeWatch' cannot close the
@@ -944,9 +949,9 @@ data Watch = Watch
     , watchReadState :: MVar ReadState
     }
 
--- | Create a watch with no root.
-createWatch :: Config -> IO Watch
-createWatch cfg@Config{..} =
+-- | Create a watch with no root, see 'watchEndsUnwatched' for the 'Bool'.
+createWatch :: Bool -> Config -> IO Watch
+createWatch endsUnwatched cfg@Config{..} =
     alloca $ \fdPtr ->
     alloca $ \watchPPtr -> do
         r <- c_createWatch (realToFrac latency) fdPtr watchPPtr
@@ -982,6 +987,7 @@ createWatch cfg@Config{..} =
         return
             Watch
                 { watchConfig = cfg
+                , watchEndsUnwatched = endsUnwatched
                 , watchFd = fd
                 , watchPtr = ptr
                 , watchFdLock = fdLock
@@ -1315,6 +1321,25 @@ closeWatch Watch{..} =
                 else return fs {fsWatchClosed = True}
             return st {rsClosed = True}
 
+-- | Open a watch on the paths with the given 'Config', see
+-- 'watchEndsUnwatched' for the 'Bool'.
+openWatchWith :: Bool -> Config -> NonEmpty Path -> IO Watch
+openWatchWith endsUnwatched cfg paths = do
+    -- A path listed more than once is watched once
+    roots <- nubBy isSameRoot <$> mapM (toRoot cfg) (NonEmpty.toList paths)
+    -- The handle is not returned to the caller if starting the stream
+    -- fails, the caller cannot close it. 'mask' ensures that an async
+    -- exception cannot arrive between creating the watch and installing the
+    -- handler.
+    Exception.mask $ \restore -> do
+        w <- createWatch endsUnwatched cfg
+        let start st = do
+                setRoots "openWatch" w 1 roots [] []
+                return st {rsRoots = roots, rsGen = 1}
+        restore (modifyMVar_ (watchRootLock w) start)
+            `onException` closeWatch w
+        return w
+
 -- The FSEvents callbacks of a watch run on a dispatch queue and write the
 -- events to a POSIX pipe. 'readEvent' reads the events from the read end of
 -- the pipe.
@@ -1341,21 +1366,7 @@ openWatch f paths = do
     -- is created later it cannot be properly monitored. Also a user may
     -- inadvertently provide a path for which the user may not have permission
     -- and then later wonder why events are not being reported.
-    -- A path listed more than once is watched once
-    let cfg = f defaultConfig
-    roots <- nubBy isSameRoot <$> mapM (toRoot cfg) (NonEmpty.toList paths)
-    -- The handle is not returned to the caller if starting the stream
-    -- fails, the caller cannot close it. 'mask' ensures that an async
-    -- exception cannot arrive between creating the watch and installing the
-    -- handler.
-    Exception.mask $ \restore -> do
-        w <- createWatch cfg
-        let start st = do
-                setRoots "openWatch" w 1 roots [] []
-                return st {rsRoots = roots, rsGen = 1}
-        restore (modifyMVar_ (watchRootLock w) start)
-            `onException` closeWatch w
-        return w
+    openWatchWith False (f defaultConfig) paths
 
 -------------------------------------------------------------------------------
 -- Reading events
@@ -1649,23 +1660,41 @@ readEvent wtch@Watch{watchConfig = cfg, watchReadState = stRef} =
                             }
             Nothing | rdEnded st -> return StepEnd
             Nothing -> do
-                res <- readPipe wtch
-                case res of
-                    -- We do not use StepEnd here because it does not carry the
-                    -- state, the next step returns StepEnd after this state is
-                    -- passed on and updated.
-                    ReadClosed ->
-                        return
-                            $ StepContinue
-                                st {rdBuffer = mempty, rdEnded = True}
-                    ReadWait wait -> return (StepWait wait)
-                    ReadData chunk ->
-                        return
-                            $ StepContinue
-                                st
-                                    { rdBuffer = rdBuffer st <> chunk
-                                    , rdChecks = []
-                                    }
+                unwatched <- isUnwatched
+                if unwatched
+                then return StepEnd
+                else readStep st
+
+    -- No root is watched and the events of the removed roots, including
+    -- their 'isRootUnwatched' events, are processed: the streams of all the
+    -- generations are retired, they do not write any more records.
+    isUnwatched
+        | watchEndsUnwatched wtch =
+            withMVar (watchStreamState wtch) $ \ss ->
+                return
+                    $ null (ssCurrent ss)
+                        && null (ssRoots ss)
+                        && null (ssRemoved ss)
+        | otherwise = return False
+
+    readStep st = do
+        res <- readPipe wtch
+        case res of
+            -- We do not use StepEnd here because it does not carry the
+            -- state, the next step returns StepEnd after this state is
+            -- passed on and updated.
+            ReadClosed ->
+                return
+                    $ StepContinue
+                        st {rdBuffer = mempty, rdEnded = True}
+            ReadWait wait -> return (StepWait wait)
+            ReadData chunk ->
+                return
+                    $ StepContinue
+                        st
+                            { rdBuffer = rdBuffer st <> chunk
+                            , rdChecks = []
+                            }
 
 -- | Read the events from a 'Watch' as a stream, using 'readEvent'. The
 -- stream does not close the watch, use 'closeWatch' to close it. The stream
@@ -1706,9 +1735,9 @@ eventStream wtch = S.unfoldrM step ()
 --
 -- A root that does not exist raises an exception when the stream starts. The
 -- watch of a deleted or renamed root ends with 'isRootUnwatched' and
--- 'isRootStale', see 'allowMissingRootPath'. The stream does not end when the
--- watch of all the roots ends. On Linux and Windows the stream ends when none
--- of the roots is watched any more.
+-- 'isRootStale', see 'allowMissingRootPath'. The stream ends after the
+-- 'isRootUnwatched' event of the last root. With 'allowMissingRootPath'
+-- 'True' the paths stay watched and the stream does not end.
 --
 -- Each run of the stream opens a new watch and closes it when the stream
 -- ends. The handle of the watch is not exposed, so the roots of the watch
@@ -1722,7 +1751,7 @@ watchWith f paths = S.bracketIO before closeWatch eventStream
 
     where
 
-    before = openWatch f paths
+    before = openWatchWith True (f defaultConfig) paths
 
 -- | Same as 'watchWith' using 'defaultConfig' and recursive mode.
 --

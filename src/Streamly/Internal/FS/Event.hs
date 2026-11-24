@@ -204,8 +204,7 @@ watchWith = Event.watchWith
 -- that contains the link.
 --
 -- When a watch root is deleted, an 'isDeleted' event is reported for the
--- root. On Linux, FreeBSD and Windows the stream ends when none of the roots
--- is watched any more.
+-- root. The stream ends when none of the roots is watched any more.
 --
 -- Do not rename, or delete and create again, a watch root in a portable
 -- program, the result depends on the platform. See
