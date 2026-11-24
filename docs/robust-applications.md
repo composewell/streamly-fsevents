@@ -184,6 +184,12 @@ macOS:
   Tested by FileSystem.Event, by the --match path of the test:
   "/FS.Event/handle API/isRootUnwatched is the last event of a root removed with a change/"
   -->
+* After `addRoot`, an event of the root that occurred shortly before the
+  call may be reported.
+  <!--
+  Accepted by FileSystem.Event, by the --match path of the test:
+  "/FS.Event/handle API/roots added and removed by several threads report each removal/"
+  -->
 
 Windows:
 
