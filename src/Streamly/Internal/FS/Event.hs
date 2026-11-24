@@ -289,8 +289,9 @@ eventStream = Event.eventStream
 
 -- | Add a root to a watch. Can be called from any thread, including while
 -- another thread reads the watch. The events of the root that occur before
--- the call returns may not be reported. Raise an exception if the watch is
--- closed.
+-- the call returns may not be reported. On macOS an event of the root that
+-- occurred shortly before the call may be reported. Raise an exception if
+-- the watch is closed.
 --
 -- The path is interpreted as in 'watch', a relative path is relative to the
 -- working directory at the time of the call. A path that is already a root

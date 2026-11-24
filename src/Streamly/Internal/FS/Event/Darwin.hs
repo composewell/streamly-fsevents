@@ -1184,6 +1184,7 @@ isEndedEvent ended ev root =
 -- resolved.
 --
 -- The events of @root@ that occur before 'addRoot' returns may not be
+-- reported. An event of @root@ that occurred shortly before the call may be
 -- reported. The events of the other roots of the watch are not lost or
 -- duplicated by the call, except on a volume that does not keep a history
 -- of file system events, e.g. a read-only or a network volume. On such a
