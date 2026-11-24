@@ -55,6 +55,7 @@ module Streamly.Internal.FS.Event.Darwin
     , Event
     , getEventId
     , getRoot
+    , hasRoot
     , getRelPath
     , getAbsPath
 
@@ -111,7 +112,7 @@ import Data.Bits ((.|.), (.&.), complement)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (dropWhileEnd, nubBy, stripPrefix)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Word (Word8, Word32, Word64)
 import Foreign.C.Error
     ( Errno(..), eAGAIN, eINTR, eNOENT, eNOTDIR, eWOULDBLOCK, errnoToIOError
@@ -1804,6 +1805,12 @@ isEventIdWrapped = getFlag kFSEventStreamEventFlagEventIdsWrapped
 -- watch root that is created later reports the parent directory of the root.
 getRoot :: Event -> Path
 getRoot Event{..} = fromMaybe eventPath eventRoot
+
+-- | Whether the event path is under a watch root, see 'getRoot'.
+--
+-- /Internal/
+hasRoot :: Event -> Bool
+hasRoot = isJust . eventRoot
 
 -- getRelPath returns 'Nothing' rather than "." for the watch root because
 -- the watch root may be a file, see the comment on getRelPath in
