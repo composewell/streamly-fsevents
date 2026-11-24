@@ -243,9 +243,14 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- When 'True', a missing root is watched. The watch is on the path of the
 -- root, with the symbolic links in the existing part of the path resolved
 -- when the root is added. A deleted or renamed root stays watched, an object
--- created at that path later is watched. A missing component of the path
--- created later as a symbolic link, or in another case, is not followed.
--- 'staleRoots' returns an empty list.
+-- created at that path later is watched. 'staleRoots' returns an empty list.
+--
+-- A missing component of the path, the root or a parent directory, created
+-- later as a symbolic link, or with another case on a case-insensitive file
+-- system, is not followed: the events under it are not reported. FSEvents
+-- reports the events under the path resolved when the root is added. To
+-- watch the path after such a change, call 'removeRoot' and then 'addRoot'
+-- with the path.
 --
 -- An object created at the root path, for example a directory moved there,
 -- reports an event for the root only, the entries already in it are not
