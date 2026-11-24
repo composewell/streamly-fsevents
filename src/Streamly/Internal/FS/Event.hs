@@ -415,18 +415,19 @@ isDeleted = Event.isDeleted
 -- | Determine whether the event is for the old path or the new path of a
 -- rename, when that path is under the watch root. A rename within the watched
 -- tree reports two events, one for each path. A move out of the tree reports
--- one event, for the old path, and a move into the tree reports one event, for
--- the new path. Moving hard links is no different than other types of objects.
+-- only one event, for the old path, and a move into the tree also reports only
+-- one event, for the new path. Moving hard links is no different than other
+-- types of objects.
 --
--- When a watch root itself is renamed, this event is reported for the root
--- on Linux, FreeBSD and macOS, 'getRelPath' returns 'Nothing' for it, and
--- the watch of the root ends with 'isRootUnwatched' and 'isRootStale'. On
--- Windows the rename of a watch root is not reported, the watch of the root
--- ends at the next change in the root, see 'enableStaleRootCheck'.
+-- On all platforms except Windows, a rename of a root is reported by this
+-- event, and the watch of the root ends with 'isRootUnwatched' and
+-- 'isRootStale'. On Windows the rename of a watch root is not reported, the
+-- move is detected and the watch is ended at the next event in the root, see
+-- 'enableStaleRootCheck'.
 --
--- This event is reported for the moved directory, not for the entries in it.
--- In a recursive watch, see 'setRecursiveMode' for the entries of a directory
--- moved into the tree.
+-- When a directory is moved, this event is reported for the directory, not for
+-- the entries in it. In a recursive watch, see 'setRecursiveMode' for the
+-- entries of a directory moved into the tree.
 isMoved :: Event -> Bool
 isMoved = Event.isMoved
 
