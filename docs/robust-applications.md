@@ -43,8 +43,12 @@ the operating systems in [watch-limits.md](watch-limits.md).
 * On Linux, a subdirectory reported as `isAccessDenied` is not watched. It
   is added when it is moved, or when the program opens a new watch.
 * A root whose path no longer refers to the watched directory ends with
-  `isRootUnwatched` and `isRootStale`, at its next event, see
-  `enableStaleRootCheck`. To watch the directory now at the root path, call
+  `isRootUnwatched` and `isRootStale`, see `enableStaleRootCheck`. A
+  deleted root, and on Linux and macOS a renamed root, ends at its
+  deletion or rename event. A root whose path changes without an event of
+  the root, e.g. after the rename of a parent directory on Linux, a change
+  of a symbolic link in the path, or a rename of the root on Windows, ends
+  at its next event. To watch the directory now at the root path, call
   `addRoot` and then scan the tree at the root path. `addRoot` does not
   report the entries already in the directory. A root that has no events
   is found by `staleRoots`, call it periodically and call `removeRoot`
