@@ -240,17 +240,19 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- 'staleRoots'. FSEvents does not report any event of the root when a
 -- symbolic link in the root path is changed.
 --
--- When 'True', a missing root is watched. The watch is on the path of the
--- root, with the symbolic links in the existing part of the path resolved
--- when the root is added. A deleted or renamed root stays watched, an object
--- created at that path later is watched. 'staleRoots' returns an empty list.
+-- When 'True', a missing root is watched. A deleted or renamed root stays
+-- watched, an object created at that path later is watched. 'staleRoots'
+-- returns an empty list.
 --
--- A missing component of the path, the root or a parent directory, created
--- later as a symbolic link, or with another case on a case-insensitive file
--- system, is not followed: the events under it are not reported. FSEvents
--- reports the events under the path resolved when the root is added. To
--- watch the path after such a change, call 'removeRoot' and then 'addRoot'
--- with the path.
+-- The watch is on the path as resolved when the root is added, FSEvents
+-- reports the events under that path only. Symbolic links in the path are
+-- not followed after that: a missing component, the root or a parent
+-- directory, created later as a symbolic link does not report the events
+-- under it, and after a symbolic link in the path is changed the root
+-- reports the events of the directory the link pointed to. A missing
+-- component created with another case on a case-insensitive file system
+-- does not report the events under it either. To watch the path after such
+-- a change, call 'removeRoot' and then 'addRoot' with the path.
 --
 -- An object created at the root path, for example a directory moved there,
 -- reports an event for the root only, the entries already in it are not
