@@ -132,9 +132,19 @@ setRecursiveMode = Event.setRecursiveMode
 -- a change made before the path changed, but read after it, is not returned
 -- either. A root that has no events is found by 'staleRoots'.
 --
--- With 'False' the check costs nothing, a root whose path changes reports
--- the events of the watched object under the old path until the change is
--- found otherwise, see the platform specific modules.
+-- With 'False' the cost of the check is avoided, but the watch of a root does
+-- not end, and the events of the watched object are reported under the old
+-- path, in the following cases:
+--
+-- * On Windows, when the root is renamed. Windows does not report a root
+-- rename.
+-- * The path leading up to the root changes via a rename or a symbolic link
+-- change.
+--
+-- See 'staleRoots' for finding roots whose name to inode binding has changed.
+-- On Linux, FreeBSD and macOS, even without this option, the library ends the
+-- watch of a stale root but only when it finds the change, which may not be
+-- prompt, see the platform specific modules.
 --
 -- /default: True/
 enableStaleRootCheck :: Bool -> Config -> Config
@@ -197,15 +207,9 @@ watchWith = Event.watchWith
 -- starts, and none of the roots is watched.
 --
 -- A watch root is bound to the object that its path refers to when the watch
--- starts. When the path no longer refers to that object, the watch of the
--- root ends with 'isRootUnwatched' and 'isRootStale', see
--- 'enableStaleRootCheck'. This happens when the root is deleted or renamed,
--- when a parent directory is renamed, or when a symbolic link in the path is
--- changed to point to another directory. A deleted root reports 'isDeleted'
--- first, and is not watched again when it is created again. A renamed root
--- reports 'isMoved' first on some platforms; on others the rename is not
--- reported, and the watch of the root ends at the next change in the root.
--- The stream ends when none of the roots is watched any more.
+-- starts. When the path no longer refers to that object, for example, when
+-- the root is deleted or renamed, the watch of the root ends, see
+-- 'isRootStale'. The stream ends when none of the roots is watched any more.
 --
 -- To keep the watch of a root from ending when a symbolic link in its path
 -- is changed, supply the path with the symbolic links resolved. To be
@@ -401,9 +405,10 @@ isCreated = Event.isCreated
 --
 -- When a watch root itself is deleted, this event is reported for the root,
 -- 'getRelPath' returns 'Nothing' for it. It is not reported when the root is
--- a symbolic link and the link is deleted. See
--- @docs\/platform-differences.md@ in this package for the events of the
--- entries in a deleted root, and for the watch after the root is deleted.
+-- a symbolic link and the link is deleted. The watch of a deleted root ends
+-- with 'isRootUnwatched' and 'isRootStale', a root created again at the path
+-- is not watched. See @docs\/platform-differences.md@ in this package for the
+-- events of the entries in a deleted root.
 isDeleted :: Event -> Bool
 isDeleted = Event.isDeleted
 
@@ -414,10 +419,10 @@ isDeleted = Event.isDeleted
 -- the new path. Moving hard links is no different than other types of objects.
 --
 -- When a watch root itself is renamed, this event is reported for the root
--- on Linux, FreeBSD and macOS, 'getRelPath' returns 'Nothing' for it. On
--- Windows the rename of a watch root is not reported. See
--- @docs\/platform-differences.md@ in this package for the watch after the
--- root is renamed.
+-- on Linux, FreeBSD and macOS, 'getRelPath' returns 'Nothing' for it, and
+-- the watch of the root ends with 'isRootUnwatched' and 'isRootStale'. On
+-- Windows the rename of a watch root is not reported, the watch of the root
+-- ends at the next change in the root, see 'enableStaleRootCheck'.
 --
 -- This event is reported for the moved directory, not for the entries in it.
 -- In a recursive watch, see 'setRecursiveMode' for the entries of a directory
