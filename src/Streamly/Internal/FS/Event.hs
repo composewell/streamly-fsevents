@@ -198,21 +198,23 @@ watchWith = Event.watchWith
 --
 -- A watch root is bound to the object that its path refers to when the watch
 -- starts. When the path no longer refers to that object, the watch of the
--- root ends with 'isRootUnwatched' and 'isRootStale'. This happens when the
--- root is deleted or renamed, when a parent directory is renamed, or when a
--- symbolic link in the path is changed to point to another directory, see
--- 'enableStaleRootCheck'. To keep watching a directory whose path has a
--- symbolic link that may be changed, supply the path with the symbolic links
--- resolved. To follow a symbolic link that is changed, watch the directory
--- that contains the link.
+-- root ends with 'isRootUnwatched' and 'isRootStale', see
+-- 'enableStaleRootCheck'. This happens when the root is deleted or renamed,
+-- when a parent directory is renamed, or when a symbolic link in the path is
+-- changed to point to another directory. A deleted root reports 'isDeleted'
+-- first, and is not watched again when it is created again. A renamed root
+-- reports 'isMoved' first on some platforms; on others the rename is not
+-- reported, and the watch of the root ends at the next change in the root.
+-- The stream ends when none of the roots is watched any more.
 --
--- When a watch root is deleted, an 'isDeleted' event is reported for the
--- root. The stream ends when none of the roots is watched any more.
+-- To keep the watch of a root from ending when a symbolic link in its path
+-- is changed, supply the path with the symbolic links resolved. To be
+-- notified of a change of the link, watch the directory that contains the
+-- link.
 --
--- Do not rename, or delete and create again, a watch root in a portable
--- program, the result depends on the platform. See
--- @docs\/platform-differences.md@ in this package, which also describes
--- watching a path that does not exist or a path without permissions.
+-- The permissions needed to watch a root, and whether a later change of the
+-- permissions affects the watch, depend on the platform. See
+-- @docs\/platform-differences.md@ in this package for the differences.
 --
 -- This API watches for changes in the watch root directory only, any changes
 -- in the subdirectories of the watch root are not watched. Use
