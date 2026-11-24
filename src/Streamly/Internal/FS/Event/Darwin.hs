@@ -246,6 +246,13 @@ setRecursiveMode recursive cfg@Config{} = cfg {watchRec = recursive}
 -- created later as a symbolic link, or in another case, is not followed.
 -- 'staleRoots' returns an empty list.
 --
+-- An object created at the root path, for example a directory moved there,
+-- reports an event for the root only, the entries already in it are not
+-- reported. Scan the root on its 'isCreated' or 'isMoved' event. The
+-- deletion of the root, for example with @rm -rf@, does not report the
+-- files in it. On its 'isDeleted' event remove the root and every path
+-- under it from the state that the application keeps.
+--
 -- /default: False/
 allowMissingRootPath :: Bool -> Config -> Config
 allowMissingRootPath allow cfg = cfg {missingRoots = allow}
