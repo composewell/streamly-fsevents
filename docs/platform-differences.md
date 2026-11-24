@@ -270,6 +270,7 @@ Directory roots:
 | A renamed watch root remains watched without the stale root check | No | No | Yes |
 | A renamed watch root reports `isMoved` | Yes | Yes | No |
 | A renamed watch root reports `isRootUnwatched` | Yes | Yes | No |
+| A change in a renamed watch root before the rename event is read is reported | No | No | No |
 | A root renamed back to its original path is watched | No | No | Yes |
 | A renamed directory root reports `isMoved` for each file in it | No | No | No |
 | A renamed symbolic link to a directory root reports `isMoved` for the root | No | No | No |
