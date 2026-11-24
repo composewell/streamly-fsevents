@@ -41,10 +41,10 @@
 - `isRootUnwatched` is reported after `removeRoot` on all platforms, it
   follows the events of the removed root. It is exported by
   `Streamly.Internal.FS.Event`.
-- Linux: the stream ends when none of its roots is watched any more, for
-  example, when all the roots are deleted or renamed, the same as on
-  Windows when all the roots are deleted. Earlier the stream waited
-  forever.
+- Linux and macOS: the stream of `watchWith` ends when none of its roots
+  is watched any more, for example, when all the roots are deleted or
+  renamed, the same as on Windows when all the roots are deleted. Earlier
+  the stream waited forever.
 - Linux: when the kernel event queue overflows, the stream reports
   `isEventsLost` and ends. Earlier the stream continued, but events could be
   missing without any indication. To continue, open a new watch and scan the
