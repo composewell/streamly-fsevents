@@ -248,14 +248,6 @@ notOnWindows :: String -> IO () -> IO ()
 notOnWindows reason test =
     if onWindows then pendingWith reason else test
 
--- | Run the test except on macOS.
-notOnDarwin :: String -> IO () -> IO ()
-#if defined(CABAL_OS_DARWIN)
-notOnDarwin reason _ = pendingWith reason
-#else
-notOnDarwin _ test = test
-#endif
-
 -------------------------------------------------------------------------------
 -- Running a watch
 -------------------------------------------------------------------------------
@@ -523,9 +515,8 @@ normalizedRoots = do
 -- The stream is read by another thread. The watch is open when it reports
 -- a file created in each root, the files are created until it does.
 --
--- On Linux and Windows a deleted root is not watched again, even if it is
--- created again, the stream ends when none of the roots is watched. On
--- macOS the watch is on the path of a root, the stream does not end.
+-- A deleted root is not watched again, even if it is created again, the
+-- stream ends when none of the roots is watched.
 --
 -- @names@ are the roots given to the watch, a name can be listed twice, or
 -- via two paths that differ only in redundant separators and @.@
@@ -534,7 +525,6 @@ normalizedRoots = do
 deletedRootsEnd :: String -> [FilePath] -> Spec
 deletedRootsEnd title names =
     it title
-        $ notOnDarwin "the stream of watchWith does not end on macOS"
         $ withSystemTempDirectory "fsevent_dir" $ \fp -> do
             let roots = nub (map (normalise . (fp </>)) names)
             mapM_ createDirectory roots
