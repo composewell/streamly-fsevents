@@ -340,21 +340,22 @@ of a symbolic link root.
 
 A missing root raises an exception on all platforms. On macOS with
 `allowMissingRootPath True`, FSEvents reports events only under the path
-resolved when the root is added. A missing root, or a missing parent of a
-root, created later as a symbolic link to a directory, does not report
-any events in that directory. On a case-insensitive file system a missing
-root `Missing` created later as `missing` does not report any events in it
-either. With `setRootPathEvents True` from
-`Streamly.FileSystem.Event.Darwin`, each of these three changes reports
-`isRootPathEvent`.
+resolved when the root is added: a symbolic link in the path is followed
+neither when it is created at a missing component nor when it is changed.
+A missing root, or a missing parent of a root, created later as a
+symbolic link to a directory, does not report any events in that
+directory. On a case-insensitive file system a missing root `Missing`
+created later as `missing` does not report any events in it either.
+With `setRootPathEvents True` from `Streamly.FileSystem.Event.Darwin`,
+each of these three changes reports `isRootPathEvent`.
 
 On all platforms a symbolic link root, or a root under a symbolic link
 parent, stays watched on the directory the link pointed to when the
 watch started, after the link is changed to point to another directory.
 No event reports the change, on macOS it does not report
 `isRootPathEvent`. The stale root check ends the watch of the root at its
-next event, without the check the events of the old directory are
-reported under the root path.
+next event. Without the check, and on macOS with `allowMissingRootPath
+True`, the events of the old directory are reported under the root path.
 
 | Behavior | Linux | macOS | Windows |
 |----------|-------|-------|---------|
