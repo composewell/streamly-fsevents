@@ -1084,9 +1084,10 @@ isRootPath path =
 -- later change of the current directory does not affect the watch.
 --
 -- A path that is already a root of the watch is not added again, its events
--- are reported once. Two paths are the same if their components are equal,
--- ignoring redundant separators and @.@ components. Case is significant even
--- on a case-insensitive file system, @C:\\Foo@ and @c:\\foo@ are two roots.
+-- are reported once. A path that differs from a root only in redundant
+-- separators and @.@ components is not added again either. Case is
+-- significant even on a case-insensitive file system, @C:\\Foo@ and
+-- @c:\\foo@ are watched separately.
 -- A directory added via different paths, for example, a
 -- recursive root and a root inside it, reports its events once for each
 -- root.

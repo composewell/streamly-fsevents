@@ -179,19 +179,22 @@ watchWith = Event.watchWith
 -- If a watch root is a symbolic link then the target of the link is watched.
 -- Deleting the link does not report 'isDeleted' for the root.
 --
--- A path listed more than once is one root, its events are reported once.
--- Paths that differ only in redundant separators and @.@ components, for
--- example, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@, are the same path. Case is
--- significant even on a case-insensitive file system. Two different paths
--- that reach the same directory, for example, a symbolic link and its
+-- A path listed more than once is monitored only once, its events are reported
+-- once. Paths that differ only in redundant separators and @.@ components, for
+-- example, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@, are also monitored only once.
+-- Case is significant even on a case-insensitive file system. Two different
+-- paths that point to the same directory, for example, a symbolic link and its
 -- target, paths that differ in case, or in a recursive watch a root and a
--- directory under it, are two roots: a change in the directory is reported
--- once for each root.
+-- directory under it, are monitored separately: a change in the directory is
+-- reported once for each path.
 --
 -- A relative path is relative to the working directory at the time the
 -- watch is started, a later change of the working directory does not
 -- affect the watch. 'getRoot' returns the relative path, 'getAbsPath'
 -- returns an absolute path.
+--
+-- If a watch root does not exist, an exception is raised when the stream
+-- starts, and none of the roots is watched.
 --
 -- A watch root is bound to the object that its path refers to when the watch
 -- starts. When the path no longer refers to that object, the watch of the

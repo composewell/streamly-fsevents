@@ -2282,7 +2282,7 @@ isRootAtPath cfg root =
 -- removed, @x\/\/y@, @x\/.\/y@ and @.\/x\/y@ become @x\/y@. 'getRoot'
 -- reports the normalized path. A path that is already a root of the watch is
 -- not added again. Case is significant even in a case-insensitive directory,
--- @\/tmp\/Foo@ and @\/tmp\/foo@ are two roots.
+-- @\/tmp\/Foo@ and @\/tmp\/foo@ are watched separately.
 --
 -- If the same directory is added via two different roots, for example, a
 -- recursive root and a root inside it, its events are reported once for each
