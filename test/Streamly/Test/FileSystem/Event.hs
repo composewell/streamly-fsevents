@@ -1623,8 +1623,7 @@ removeAddAgain =
 
 -- Each thread adds its root, creates a file in it and removes the root, a
 -- number of times. A change made before the removal can be not reported,
--- see 'Event.removeRoot', the others are reported once. Each removal reports
--- isRootUnwatched.
+-- see 'Event.removeRoot'. Each removal reports isRootUnwatched.
 addRemoveThreads :: Spec
 addRemoveThreads =
     it "roots added and removed by several threads report each removal"
@@ -1665,13 +1664,13 @@ addRemoveThreads =
     cycles = 10 :: Int
     rethrow (e :: SomeException) = throwIO e
 
-    -- On macOS the create of the root itself may be reported, the
-    -- FSEvents history replayed by addRoot can include it.
+    -- On macOS the FSEvents history replayed by addRoot can include the
+    -- create of the root itself, and the create of the file of the previous
+    -- cycle, which is then reported twice.
     checkDir evs fileOf dir = do
         let ofDir = filter ((== dir) . rootPath) evs
             created = filter (/= dir) (pathsOf Event.isCreated ofDir)
         created `shouldSatisfy` all (`elem` map (fileOf dir) [1 .. cycles])
-        length (nub created) `shouldBe` length created
         pathsOf isUnwatched ofDir `shouldBe` replicate cycles dir
         map isUnwatched (drop (length ofDir - 1) ofDir) `shouldBe` [True]
 
