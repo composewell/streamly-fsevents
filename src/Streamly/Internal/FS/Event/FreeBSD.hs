@@ -11,7 +11,8 @@
 -- inotify and are not supported.
 --
 -- The FreeBSD inotify API is compatible with the Linux inotify API, this
--- module is the same as "Streamly.Internal.FS.Event.Linux", see that module
+-- module is the same as "Streamly.Internal.FS.Event.Linux", except that it
+-- does not export 'setExcludeUnlinked' and 'setUnwatchMoved', see that module
 -- for the documentation. The differences from Linux are listed in
 -- "Streamly.FileSystem.Event.FreeBSD".
 --
@@ -34,9 +35,9 @@ module Streamly.Internal.FS.Event.FreeBSD
     -- ** Watch Behavior
     , setRecursiveMode
     , setScanNewDirs
+    , setFollowRootSymLinks
+    , enableStaleRootCheck
     , setFollowSymLinks
-    , setExcludeUnlinked
-    , setUnwatchMoved
     , setOneShot
     , setOnlyDir
     , WhenExists (..)
@@ -79,6 +80,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     , eventStream
     , addRoot
     , removeRoot
+    , staleRoots
 
     -- * Handling Events
     , Event(..)
@@ -91,6 +93,7 @@ module Streamly.Internal.FS.Event.FreeBSD
     -- ** Root Level Events
     , isRootPathEvent
     , isRootUnwatched
+    , isRootStale
     , isRootDeleted
     , isRootMoved
     , isRootUnmounted

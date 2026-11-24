@@ -30,17 +30,12 @@
 --
 -- = Watch Behavior
 --
--- /Watch root:/ A watch is attached to the path of a watch root. From the
--- observed behavior, macOS watches the path, whatever object the path points
--- to at any given point of time.
---
--- /Watch root deletion:/ If the watch root is deleted and then recreated,
--- the newly created file or directory is automatically watched.
---
--- /Watch root moved:/ If the watch root is moved to a new path, the object
--- will no longer be watched unless the new path is also being watched and was
--- pointing to an existing file at the time of starting the watch (see notes
--- about non-existing paths below).
+-- /Watch root:/ A watch root is bound to the object that its path refers to
+-- when the root is added. The watch of the root ends with 'isRootUnwatched'
+-- and 'isRootStale' when the library finds that the path no longer refers to
+-- that object, e.g. when the root is deleted or renamed, or when a symbolic
+-- link in the root path is changed to point to another directory. See
+-- 'allowMissingRootPath' and 'enableStaleRootCheck'.
 --
 -- /Symbolic link watch root:/ If the path name to be watched is a symbolic
 -- link then the target of the link is watched instead of the symbolic link
@@ -49,14 +44,10 @@
 -- the time of adding the watch. However, the paths in the events are reported
 -- via the original symbolic link, see 'getAbsPath'.
 --
--- Note that if a watched path is deleted and recreated as a symbolic link
--- pointing to another path then the symbolic link file itself is watched, it
--- won't be resolved. The symbolic link resolution happens only at the time of
--- adding the watch.
---
--- /Non-existing Paths:/ If a watch is started on a non-existing path then the
--- path is watched when it is created later (tested on macOS 26). The macOS
--- API does not fail for a non-existing path.
+-- /Non-existing Paths:/ A watch on a non-existing path raises an exception.
+-- With 'allowMissingRootPath' 'True' the path is watched, and the path is
+-- watched when it is created later (tested on macOS 26). A deleted root then
+-- stays watched, the object created at its path later is watched.
 --
 -- If a non-existing path is watched with 'setRootPathEvents' then an
 -- 'isRootPathEvent' event is reported if the path is created later and the
@@ -98,6 +89,8 @@ module Streamly.FileSystem.Event.Darwin
     , setRecursiveMode
     , BatchInfo (..)
     , setEventBatching
+    , allowMissingRootPath
+    , enableStaleRootCheck
 
     -- ** Events of Interest
     , setRootPathEvents
@@ -126,6 +119,8 @@ module Streamly.FileSystem.Event.Darwin
     , isUnmounted
     , isHistoryDone
     , isRootPathEvent
+    , isRootUnwatched
+    , isRootStale
 
     -- ** Item Level Metadata change
     , isAttrsModified

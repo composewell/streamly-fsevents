@@ -60,7 +60,7 @@ jobs:
         DISABLE_DIST_CHECKS: "y"
         PACKCHECK: "./packcheck.sh"
         PACKCHECK_GITHUB_URL: "https://raw.githubusercontent.com/composewell/packcheck"
-        PACKCHECK_GITHUB_COMMIT: "b8579a2d2a75c9d9cad5957eea63855a2e14a91d"
+        PACKCHECK_GITHUB_COMMIT: "663ade3f52e77b9f4154ad6483d085a2aedf2901"
       with:
         release: ${{ matrix.release }}
         usesh: true
@@ -107,4 +107,20 @@ jobs:
           fi
           # Use "bash -c" instead of invoking directly to preserve quoted
           # arguments in PACKCHECK_COMMAND.
-          bash -c "$PACKCHECK $PACKCHECK_COMMAND"
+          bash -c "$PACKCHECK $PACKCHECK_COMMAND" || exit 1
+          # The VM runs as root, root is not denied any permission and the
+          # permission tests are skipped. Run the suites with these tests
+          # again as a normal user. The binaries are copied to a directory
+          # that the user can read.
+          pw useradd fsevtest -m -s /bin/sh || exit 1
+          mkdir -p /tmp/fsevtest-bin
+          for t in FileSystem.Event.Behavior FileSystem.Event.FreeBSD
+          do
+            bin=$(find dist-newstyle -type f -perm -u+x -name "$t" | head -1)
+            test -n "$bin" || { echo "$t: test binary not found" >&2; exit 1; }
+            cp "$bin" /tmp/fsevtest-bin/ || exit 1
+          done
+          chmod -R a+rx /tmp/fsevtest-bin
+          su -l fsevtest -c "export LC_ALL=$LC_ALL &&
+            /tmp/fsevtest-bin/FileSystem.Event.Behavior &&
+            /tmp/fsevtest-bin/FileSystem.Event.FreeBSD"

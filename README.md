@@ -112,6 +112,7 @@ Tests on Linux:
 | Memory does not grow over a long-running watch | 3 cycles of moving 14129 dirs out and back in |
 
 See [docs/robustness.md](docs/robustness.md),
+[docs/robust-applications.md](docs/robust-applications.md),
 [docs/platform-differences.md](docs/platform-differences.md) and
 [docs/watch-limits.md](docs/watch-limits.md) for the details.
 

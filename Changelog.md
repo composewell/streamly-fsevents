@@ -14,13 +14,67 @@
 - Linux: a file deleted from or moved out of a watched directory is no
   longer watched. Earlier, a process that still had the file open
   generated events for it.
+- Linux: when a watch root is deleted, `isDeleted` is reported for the
+  root, the same as on macOS and Windows. When a watch root is renamed,
+  `isMoved` is reported for the root, the same as on macOS. Use
+  `setRootDeleted False` and `setRootMoved False` to disable them.
+- Linux: after the `isMoved` event of a renamed watch root, or the
+  `isMovedFrom` event of a directory moved out of the tree, the events of
+  the moved directory are not reported, they would report the old path.
+  Only its `isRootUnwatched` event follows. A directory root renamed back
+  before its rename event is read is no longer watched.
+- Linux: `removeRoot` removes the root at once. The events of the root still
+  in the kernel queue are not reported, its `isRootUnwatched` event follows
+  the events already read. `removeRoot` no longer needs `/proc` or a free
+  file descriptor.
+- macOS: with a watch root inside another watch root, an event in the
+  inner root is reported once for each root, the same as on Linux and
+  Windows. Earlier it was reported for the inner root only.
+- Windows: a path listed twice in the watch roots is watched once, its
+  events are reported once, the same as on Linux and macOS.
+- Windows: a deleted watch root reports an `isRootUnwatched` event after
+  its `isDeleted` event, the same as on Linux. It is the last event of the
+  root.
+- macOS: `removeRoot` does not report the events of the root that occur
+  after the call. Earlier they could be reported for a short time after
+  the call returned.
+- `isRootUnwatched` is reported after `removeRoot` on all platforms, it
+  follows the events of the removed root. It is exported by
+  `Streamly.Internal.FS.Event`.
+- Linux and macOS: the stream of `watchWith` ends when none of its roots
+  is watched any more, for example, when all the roots are deleted or
+  renamed, the same as on Windows when all the roots are deleted. Earlier
+  the stream waited forever.
 - Linux: when the kernel event queue overflows, the stream reports
   `isEventsLost` and ends. Earlier the stream continued, but events could be
   missing without any indication. To continue, open a new watch and scan the
   tree again.
+- `getAbsPath` returns an absolute path when a watch root is supplied as a
+  relative path. Earlier it returned the relative path. The root is taken
+  relative to the working directory at the time the watch is started. Use
+  `getRoot` and `getRelPath` to get the relative path.
+- A watch root is bound to the object that its path refers to when the
+  root is added. When the path no longer refers to that object, the watch
+  of the root ends with `isRootUnwatched` and `isRootStale`. The stale root
+  check, `enableStaleRootCheck`, on by default, checks the root path when
+  the events of a root are read. The events read after the path changed
+  are not returned, for example, after a parent directory of the root is
+  renamed, after a symbolic link in the root path is changed to point to
+  another directory, or the deletions of the files of a deleted root that
+  are read after the root is deleted. Use `enableStaleRootCheck False` to
+  report the events under the old path, as earlier.
+- macOS: a watch root that does not exist raises an exception, the same as
+  on Linux and Windows. A deleted or renamed root ends with
+  `isRootUnwatched` and `isRootStale`, the object created at its path
+  later is not watched. Use `allowMissingRootPath True` for the earlier
+  behavior.
+- Windows: a renamed watch root ends with `isRootUnwatched` and
+  `isRootStale` at its next change. Earlier it reported the events under
+  the old path.
 - Users of the `Streamly.Internal.FS.Event.*` modules should move to the new
   public platform specific modules. In these, the Linux `setUnwatchMoved` is
-  renamed to `setExcludeUnlinked`, and the Windows `getRelPath` returns
+  renamed to `setExcludeUnlinked`, the Linux `setFollowSymLinks` is renamed
+  to `setFollowRootSymLinks`, and the Windows `getRelPath` returns
   `Maybe Path`.
 
 ### Enhancements
@@ -40,10 +94,15 @@
 - Linux: in a recursive watch, the entries of a directory created in or
   moved into the tree are reported as `isCreated` events. See
   `setScanNewDirs` and `isScanEvent`.
-- Windows: a watch uses one thread for all its roots instead of one thread
-  for each root, and no longer depends on the `streamly` package.
-- Windows: a path that cannot be watched, for example a regular file,
-  raises an exception when the stream starts.
+- Windows: use one thread per watch instead of one thread per root, do not
+  depend on the `streamly` package.
+- `isRootStale` reports the end of the watch of a root whose path no
+  longer refers to the watched object.
+- macOS: `staleRoots` reports the roots whose path no longer refers to the
+  watched object, the same as on Linux and Windows.
+- Linux: the identity of a root includes its file handle where the file
+  system supports it, a new file that reuses the inode number of the root
+  is found to be another file.
 
 ### Bug Fixes
 
@@ -52,6 +111,8 @@
   subdirectory without read permission is skipped and reported by
   `isAccessDenied`, instead of ending the watch with an exception. Watching
   a large tree no longer overflows the event queue at the start.
+- Linux: a recursive watch on a relative path keeps watching the new
+  directories after the working directory of the process changes.
 - macOS: raise an exception when a watch fails to start.
 - macOS: closing a watch no longer hangs or crashes the process.
 - Windows: a watched directory can be deleted or renamed while it is

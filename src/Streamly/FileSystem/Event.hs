@@ -32,7 +32,7 @@
 -- import qualified Streamly.FileSystem.Event as Event
 -- import qualified Streamly.FileSystem.Event.Linux as Linux
 --
--- Event.watchWith (Linux.setFollowSymLinks False) paths
+-- Event.watchWith (Linux.setFollowRootSymLinks False) paths
 --     & Stream.filter Linux.isDir
 -- @
 --
@@ -103,6 +103,7 @@ module Streamly.FileSystem.Event
     -- ** Configuration
       Config
     , setRecursiveMode
+    , enableStaleRootCheck
 
     -- ** Watch APIs
     , watch
@@ -121,6 +122,10 @@ module Streamly.FileSystem.Event
     , isDeleted
     , isMoved
     , isModified
+
+    -- ** Root events
+    , isRootUnwatched
+    , isRootStale
 
     -- ** Exception Conditions
     , isEventsLost

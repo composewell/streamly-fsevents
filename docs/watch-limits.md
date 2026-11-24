@@ -2,7 +2,9 @@
 
 Each limit below is a limit of the operating system. These limits are important
 to understand for using the library.
-See [robustness.md](robustness.md) for how the library handles error scenarios.
+See [robustness.md](robustness.md) for how the library handles error
+scenarios, and [robust-applications.md](robust-applications.md) for how an
+application handles lost events.
 
 ## Limits on Linux
 
@@ -46,6 +48,29 @@ sudo sysctl fs.inotify.max_user_watches=1048576
 Each inotify watch uses kernel memory only while it is in use, so a large
 limit costs nothing until that many watches are added.
 
+## Limits on FreeBSD
+
+FreeBSD has the same inotify API as Linux, and the library uses inotify the
+same way, a recursive watch uses one inotify watch for each directory. The
+limits are the sysctl variables `vfs.inotify.*`:
+
+| Limit | Counts | Default | When exceeded |
+|-------|--------|---------|---------------|
+| `max_user_watches` | inotify watches of the user | Depends on the memory, 83000 on a 6 GB machine | An exception is raised |
+| `max_watches` | inotify watches of all the users | Depends on the memory, 125000 on a 6 GB machine | An exception is raised |
+| `max_user_instances` | inotify fds of the user | 256 | An exception is raised |
+| `max_queued_events` | Unread events of one inotify fd | 16384 | Events are lost, `isEventsLost` is reported |
+
+`max_user_watches`, `max_user_instances` and `max_queued_events` count the
+same things as the Linux limits of the same names. Linux does not have
+`max_watches`.
+
+To see the current values of the limits:
+
+```
+sysctl vfs.inotify
+```
+
 ## Limits on macOS
 
 | Limit | Value | When exceeded |
@@ -77,8 +102,8 @@ The system holds the changes under each root in a buffer of 63 KB until the
 watch reads them. If the program does not read events fast enough and the
 buffer overflows, all the changes in it are lost. The watch then reports one
 `isEventsLost` event for that root and continues. The program scans the tree
-under the root to learn its current state; [robustness.md](robustness.md)
-describes the recovery.
+under the root to learn its current state;
+[robust-applications.md](robust-applications.md) describes the recovery.
 
 Each watch root uses one directory handle, Windows has no specific limit on
 the number of these handles. Each watch also uses one thread and one I/O

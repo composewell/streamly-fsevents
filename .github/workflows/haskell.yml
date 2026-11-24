@@ -117,7 +117,7 @@ jobs:
       # If you have not committed packcheck.sh in your repo at PACKCHECK
       # then it is automatically pulled from this URL.
       PACKCHECK_GITHUB_URL: "https://raw.githubusercontent.com/composewell/packcheck"
-      PACKCHECK_GITHUB_COMMIT: "b8579a2d2a75c9d9cad5957eea63855a2e14a91d"
+      PACKCHECK_GITHUB_COMMIT: "663ade3f52e77b9f4154ad6483d085a2aedf2901"
 
     # ubuntu seems to have better support than debian on CI systems
     runs-on: ${{ matrix.runner }}
@@ -538,6 +538,59 @@ jobs:
         source packcheck-setup.sh
         setup_packcheck_args
         eval "./packcheck.sh $ARGS BUILD_PACKAGE_ONLY=y"
+
+    # Repeat the test of the root changes on macOS, to find whether the
+    # events of a root are reported out of order or lost while the FSEvents
+    # stream is replaced. The test reports the paths missing when its last
+    # file is read and those reported later. It runs with the default sizes
+    # and with more files and root changes. Runs even if the build step
+    # failed, if the test binary was built.
+    - name: Repeat the root change test (macOS)
+      if: always() && runner.os == 'macOS'
+      timeout-minutes: 30
+      shell: bash
+      run: |
+        if test -n "$SUBDIR"; then
+          cd "$SUBDIR"
+        fi
+        bin=$(find dist-newstyle -type f -perm -u+x -name FileSystem.Event \
+                -path '*/build/FileSystem.Event/*' | head -1)
+        if test -z "$bin"; then
+          echo "The FileSystem.Event test binary was not built"
+          exit 1
+        fi
+        test_name="a root reports all its events while other roots are added, removed"
+        failed=0
+        run_many () {
+          local runs=$1 files=$2 changes=$3
+          local pass=0 pending=0 fail=0 out
+          for i in $(seq 1 "$runs"); do
+            out=$(FSEVENT_TEST_ROOT_FILES=$files \
+                  FSEVENT_TEST_ROOT_CHANGES=$changes \
+                  "$bin" --match "$test_name" 2>&1)
+            if echo "$out" | grep -q "1 example, 1 failure"; then
+              fail=$((fail + 1))
+              echo "::group::run $i, $files files, $changes root changes: FAIL"
+              echo "$out"
+              echo "::endgroup::"
+            elif echo "$out" | grep -q "1 example, 0 failures, 1 pending"; then
+              pending=$((pending + 1))
+            elif echo "$out" | grep -q "1 example, 0 failures"; then
+              pass=$((pass + 1))
+            else
+              fail=$((fail + 1))
+              echo "::group::run $i, $files files, $changes root changes: no result"
+              echo "$out"
+              echo "::endgroup::"
+            fi
+          done
+          echo "$files files, $changes root changes, $runs runs:" \
+               "pass $pass, pending (isEventsLost) $pending, fail $fail"
+          test "$fail" -eq 0 || failed=1
+        }
+        run_many 30 2000 20
+        run_many 30 5000 100
+        exit $failed
 
     # Enable for debugging, this itself takes 50 sec on Windows, in packcheck
     # build which is tiny.
